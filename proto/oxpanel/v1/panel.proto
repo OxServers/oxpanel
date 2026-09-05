@@ -1,0 +1,154 @@
+syntax = "proto3";
+
+package oxpanel.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// OxPanelEngine is the privileged system engine of OxPanel.
+//
+// It is reachable ONLY over a local UNIX-domain socket. Every call is
+// authenticated by the kernel-supplied peer credentials (SO_PEERCRED) of the
+// connecting process against a configured allow-list; there is no in-band
+// authentication and no network transport.
+//
+// All operations are idempotent: repeating a request with identical arguments
+// after a success returns the same result and `created`/`deleted` = false.
+service OxPanelEngine {
+  // Provision an isolated POSIX tenant: a dedicated user + primary group,
+  // a mode-0700 home directory, and a systemd slice carrying its resource limits.
+  rpc CreateTenant(CreateTenantRequest) returns (CreateTenantResponse);
+  rpc GetTenant(GetTenantRequest) returns (Tenant);
+  rpc ListTenants(ListTenantsRequest) returns (ListTenantsResponse);
+  // Remove a tenant that OxPanel created. Refuses to touch users it does not manage.
+  rpc DeleteTenant(DeleteTenantRequest) returns (DeleteTenantResponse);
+
+  // Create or update an Nginx server block for a domain owned by a tenant.
+  // The configuration is validated with `nginx -t` before it is activated and
+  // rolled back if validation fails.
+  rpc ConfigureVirtualHost(ConfigureVirtualHostRequest) returns (ConfigureVirtualHostResponse);
+  rpc RemoveVirtualHost(RemoveVirtualHostRequest) returns (RemoveVirtualHostResponse);
+  rpc ListVirtualHosts(ListVirtualHostsRequest) returns (ListVirtualHostsResponse);
+}
+
+// Per-tenant resource limits, applied through systemd (cgroups v2).
+// A zero value means "leave the systemd default".
+message ResourceLimits {
+  // systemd MemoryMax= in bytes. 0 = unlimited.
+  uint64 memory_max_bytes = 1;
+  // systemd CPUWeight=, 1..=10000. 0 = default (100).
+  uint32 cpu_weight = 2;
+  // systemd IOWeight=, 1..=10000. 0 = default (100).
+  uint32 io_weight = 3;
+  // systemd TasksMax=. 0 = default.
+  uint32 tasks_max = 4;
+}
+
+message Tenant {
+  string username = 1;
+  uint32 uid = 2;
+  uint32 gid = 3;
+  string home = 4;
+  ResourceLimits limits = 5;
+  // Name of the systemd slice unit that carries the limits, e.g. "oxpanel-tenant-alice.slice".
+  string slice_unit = 6;
+  google.protobuf.Timestamp created_at = 7;
+  TenantState state = 8;
+  // Opaque label of the owning account in the panel (e.g. a reseller id).
+  // The engine stores and filters by it; it carries no OS meaning.
+  string owner = 9;
+}
+
+enum TenantState {
+  TENANT_STATE_UNSPECIFIED = 0;
+  // useradd succeeded but post-provisioning steps (limits, labels) are not
+  // all confirmed. A repeated CreateTenant call resumes them.
+  TENANT_STATE_PROVISIONING = 1;
+  TENANT_STATE_READY = 2;
+  // DeleteTenant in progress; a repeated call resumes it.
+  TENANT_STATE_DELETING = 3;
+}
+
+message CreateTenantRequest {
+  // 3..=32 chars, ^[a-z][a-z0-9_-]*$; reserved system names are rejected.
+  string username = 1;
+  ResourceLimits limits = 2;
+  // Optional owner label: ^[a-z0-9][a-z0-9_.-]{0,63}$ or empty. Part of the
+  // tenant specification for idempotency purposes.
+  string owner = 3;
+}
+
+message CreateTenantResponse {
+  Tenant tenant = 1;
+  // false when the tenant already existed with an identical specification.
+  bool created = 2;
+}
+
+message GetTenantRequest {
+  string username = 1;
+}
+
+message ListTenantsRequest {
+  // Empty = all tenants; otherwise only tenants with this owner label.
+  string owner = 1;
+}
+
+message ListTenantsResponse {
+  repeated Tenant tenants = 1;
+}
+
+message DeleteTenantRequest {
+  string username = 1;
+  // Also delete the home directory. Default: keep it.
+  bool remove_home = 2;
+}
+
+message DeleteTenantResponse {
+  // false when the tenant did not exist.
+  bool deleted = 1;
+}
+
+message VirtualHost {
+  string domain = 1;
+  string tenant = 2;
+  // Path relative to the tenant home, e.g. "public_html".
+  string document_root = 3;
+  repeated string aliases = 4;
+  // Absolute path of the generated Nginx configuration file.
+  string config_path = 5;
+}
+
+message ConfigureVirtualHostRequest {
+  // Fully-qualified host name, lower-case ASCII (IDNA A-label / punycode allowed).
+  string domain = 1;
+  // Username of an OxPanel-managed tenant that owns the domain.
+  string tenant = 2;
+  // Path relative to the tenant home; created (owned by the tenant) if absent.
+  // Empty = "public_html".
+  string document_root = 3;
+  // Additional server_name entries, each validated like `domain`.
+  repeated string aliases = 4;
+}
+
+message ConfigureVirtualHostResponse {
+  VirtualHost vhost = 1;
+  // false when an identical configuration was already active.
+  bool created = 2;
+}
+
+message RemoveVirtualHostRequest {
+  string domain = 1;
+}
+
+message RemoveVirtualHostResponse {
+  // false when no such virtual host existed.
+  bool removed = 1;
+}
+
+message ListVirtualHostsRequest {
+  // Empty = all tenants.
+  string tenant = 1;
+}
+
+message ListVirtualHostsResponse {
+  repeated VirtualHost vhosts = 1;
+}

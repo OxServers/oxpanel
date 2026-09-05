@@ -1,0 +1,41 @@
+# cargo-deny configuration: supply-chain policy for the workspace.
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+allow = [
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "MIT",
+  "BSD-2-Clause",
+  "BSD-3-Clause",
+  "ISC",
+  "Unicode-3.0",
+  "Zlib",
+  "CC0-1.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Workspace-internal path dependencies carry no version on purpose.
+allow-wildcard-paths = true
+# The daemon must never grow a shell, a scripting engine, or dynamic loading.
+deny = [
+  { crate = "openssl-sys", reason = "no TLS in the daemon; transport is a local UNIX socket" },
+  { crate = "libloading", reason = "no dynamic code loading in a root daemon" },
+  { crate = "shell-words", reason = "no shell anywhere (CLAUDE.md invariant)" },
+  { crate = "shellexpand", reason = "no shell anywhere (CLAUDE.md invariant)" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

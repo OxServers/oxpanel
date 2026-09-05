@@ -1,0 +1,25 @@
+[package]
+name = "oxpanel-ctl"
+description = "Command-line client for the OxPanel engine API"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "oxpanel-ctl"
+path = "src/main.rs"
+
+[dependencies]
+oxpanel-proto = { path = "../oxpanel-proto" }
+tokio = { workspace = true }
+tonic = { workspace = true, features = ["channel"] }
+tower = { version = "0.5", features = ["util"] }
+hyper-util = { version = "0.1", features = ["tokio"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+
+[lints]
+workspace = true

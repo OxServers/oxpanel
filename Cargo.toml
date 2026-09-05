@@ -1,0 +1,72 @@
+[workspace]
+resolver = "2"
+members = ["oxpanel-proto", "oxpanel-daemon", "oxpanel-ctl"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+license = "Apache-2.0"
+repository = "https://github.com/OxServers/oxpanel"
+authors = ["OxPanel contributors"]
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "net", "fs", "process", "signal", "sync", "time", "io-util"] }
+tokio-stream = { version = "0.1", features = ["net"] }
+# gRPC
+tonic = { version = "0.14", default-features = false, features = ["server", "codegen", "router"] }
+tonic-prost = "0.14"
+prost = "0.14"
+prost-types = "0.14"
+# codegen (build-dependencies)
+tonic-prost-build = "0.14"
+protox = "0.9"
+# OS interop
+nix = { version = "0.31", features = ["user", "fs"] }
+# Errors / logging
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+sd-notify = "0.5"
+# Serialisation for on-disk tenant records
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# Tests
+tempfile = "3"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+# Pedantic lints that are noise for this code base.
+doc_markdown = "allow"        # proper nouns (OxPanel, AlmaLinux, SELinux) are not code
+similar_names = "allow"       # allowed_uids / allowed_gids is the clearest naming
+unused_async = "allow"        # API symmetry: every workflow entry point is async
+unused_async_trait_impl = "allow"
+# Production paths must never panic (CLAUDE.md: zero unwrap/expect).
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+indexing_slicing = "warn"
+module_name_repetitions = "allow"
+missing_errors_doc = "allow"
+must_use_candidate = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+# Keep arithmetic overflow checks on: this daemon runs as root and handles
+# untrusted sizes/weights. The cost is negligible for a control plane.
+overflow-checks = true
+debug = "line-tables-only"
+strip = "none"

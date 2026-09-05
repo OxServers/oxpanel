@@ -1,0 +1,41 @@
+# Build + test environment for oxpanel-daemon.
+#
+# This is the daemon's real target platform (AlmaLinux 9), so the same image
+# serves as (a) the compile/unit-test environment for machines without a C
+# toolchain and (b) the root-privileged integration-test environment where
+# useradd, nginx and systemd are real.
+FROM docker.io/library/almalinux:9
+
+# gcc: Rust needs a C linker.  nginx/systemd/shadow-utils: the daemon's runtime
+# dependencies.  policycoreutils: restorecon.  util-linux: getent et al.
+RUN dnf -y install --setopt=install_weak_deps=False \
+        gcc make git ca-certificates \
+        nginx systemd shadow-utils policycoreutils libselinux-utils acl util-linux procps-ng \
+    && dnf clean all \
+    && rm -rf /var/cache/dnf
+
+ENV RUSTUP_HOME=/usr/local/rustup \
+    CARGO_HOME=/usr/local/cargo \
+    PATH=/usr/local/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+    CARGO_TERM_COLOR=always
+
+ARG RUST_VERSION=1.98.1
+RUN curl -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal \
+        --default-toolchain "${RUST_VERSION}" --component clippy,rustfmt \
+    && rustup --version && cargo --version
+
+# systemd inside the container (used by the integration tests via `podman run --systemd=always`).
+# Mask units that make no sense in a container.
+RUN systemctl mask systemd-udevd.service systemd-udevd-control.socket systemd-udevd-kernel.socket \
+        systemd-logind.service getty.target console-getty.service dev-hugepages.mount sys-fs-fuse-connections.mount \
+    && systemctl enable nginx
+
+WORKDIR /work
+STOPSIGNAL SIGRTMIN+3
+CMD ["/sbin/init"]
+
+# cargo-deny: advisories, licenses, bans, sources (prebuilt musl binary).
+ARG CARGO_DENY_VERSION=0.20.2
+RUN curl -sSfL "https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
+      | tar -xz -C /usr/local/cargo/bin --strip-components=1 "cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl/cargo-deny" \
+    && cargo deny --version

@@ -1,0 +1,34 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    name: fmt / clippy / test / deny (AlmaLinux 9)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build target-OS image
+        run: podman build -t localhost/oxpanel-dev:alma9 -f tests-integration/Containerfile tests-integration
+      - name: rustfmt
+        run: ./scripts/dev.sh cargo fmt --all -- --check
+      - name: clippy
+        run: ./scripts/dev.sh cargo clippy --all-targets --all-features -- -D warnings
+      - name: tests
+        run: ./scripts/dev.sh cargo test --all-targets
+      - name: cargo-deny
+        run: ./scripts/dev.sh cargo deny check
+
+  integration:
+    name: root integration (systemd container)
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build target-OS image
+        run: podman build -t localhost/oxpanel-dev:alma9 -f tests-integration/Containerfile tests-integration
+      - name: Run
+        run: ./scripts/integration-test.sh
