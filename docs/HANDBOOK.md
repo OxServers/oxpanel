@@ -53,7 +53,7 @@ not touch an account, unit or Nginx file it has no record for.
 | Init | systemd (cgroups v2, the default on EL9). |
 | Web server | `nginx` from AppStream, with the stock `/etc/nginx/nginx.conf` (it must `include /etc/nginx/conf.d/*.conf;`, which the stock file does). |
 | Tools | `shadow-utils` (useradd/userdel), `util-linux` (setpriv), `acl` (setfacl), `policycoreutils` (restorecon); on SELinux-enabled hosts also `policycoreutils-python-utils` (semanage) and `libselinux-utils` (selinuxenabled). The RPM pulls all of these in. |
-| SELinux | Enforcing is supported and is the target; the daemon detects it at start-up and labels tenant content accordingly. |
+| SELinux | Enforcing is supported and is the target; the daemon detects it at start-up and labels tenant content accordingly. The booleans `httpd_enable_homedirs` and `httpd_read_user_content` must be on (the RPM sets them; the source install block sets them), because document roots live under tenant homes. |
 | Network | None. The API is a local UNIX socket; the daemon has no network access at all under its unit. |
 | Ports | Nginx on 80 (v0.1.0 does not manage TLS). |
 
@@ -103,6 +103,8 @@ The package installs:
 
 ```sh
 sudo dnf install -y gcc git nginx shadow-utils util-linux acl policycoreutils policycoreutils-python-utils libselinux-utils
+# SELinux: sites live under tenant homes, so the web server must be allowed to traverse and read them.
+if sudo selinuxenabled; then sudo setsebool -P httpd_enable_homedirs=on httpd_read_user_content=on; fi
 curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal && source ~/.cargo/env
 
 git clone https://github.com/OxServers/oxpanel.git && cd oxpanel
@@ -345,7 +347,7 @@ needs to confirm a site is live, poll it.
 | `/etc/nginx/conf.d/00-oxpanel.conf` | `root 0644` | `include /etc/nginx/oxpanel.d/*.conf;` + catch-all default server |
 | `/etc/nginx/oxpanel.d/<domain>.conf` | `root 0644` | the server block |
 | `/run/oxpanel/oxpanel.sock` | `root:oxpanel 0660` | API socket |
-| SELinux hosts | | `semanage fcontext` rule `<docroot>(/.*)?` → `httpd_sys_content_t` |
+| SELinux hosts | | `semanage fcontext` equivalence `<docroot> = /usr/share/nginx/html` (labels the tree `httpd_sys_content_t`; a plain rule would be overridden by `file_contexts.homedirs`) |
 
 Records are the source of truth for *what OxPanel owns*. Back up
 `/var/lib/oxpanel` together with `/home` and `/etc/nginx/oxpanel.d`.
@@ -401,6 +403,8 @@ configuration with `nginx -t` on every change.
 | exits with **69** `required program … is missing` / `SELinux is enforcing but /usr/sbin/semanage is missing` | Install the listed package (`policycoreutils-python-utils` provides `semanage`). |
 | `OXPANEL_SOCKET_GROUP 'oxpanel' does not exist` | `sudo systemd-sysusers` (the RPM does this), or create the group. |
 | `OXPANEL_WEB_USER 'nginx' does not exist` / `is inside the tenant uid range` / `must not be root` | Install nginx, or point `OXPANEL_WEB_USER` at the real worker account. |
+| exits with **78** `SELinux boolean … is off` | `sudo setsebool -P httpd_enable_homedirs=on httpd_read_user_content=on` (the RPM does this in `%post`). Without them `httpd_t` cannot traverse `/home/<tenant>` and every site returns 403. |
+| `Failed at step NAMESPACE` / `status=226/NAMESPACE` in the journal | A `ReadWritePaths=` entry points at a directory systemd may not mount on under SELinux (security file types such as `semanage_store_t`). The shipped unit lists parents (`/var/lib`) for this reason; if you customised the unit, revert to that pattern. |
 | Start-up fails with `nginx include: nginx rejected the configuration: … duplicate default server` | The host already has a `default_server`. Set `OXPANEL_NGINX_DEFAULT_SERVER=false` (then unknown hosts go to *that* server). |
 | Client gets `transport error` / connection closed immediately | Peer not allowed. Check `journalctl -u oxpanel-daemon` for `rejected connection`; add the account to group `oxpanel` (or `OXPANEL_ALLOWED_UIDS`). Remember: account membership, not process groups. |
 | `PermissionDenied` on every RPC | Same as above, or the request bypassed the gate (only possible with a custom transport). |
@@ -422,8 +426,47 @@ make image         # AlmaLinux 9 dev/test image (one-time)
 make check         # rustfmt --check, clippy pedantic -D warnings, tests, cargo-deny
 make test          # 63 unit + 4 gRPC end-to-end tests (fake OS, no root)
 make integration   # boots systemd in a container, installs from packaging/, runs 79 assertions
+make rpm           # build the RPM from the working tree into dist/rpms/
+make acceptance    # REAL AlmaLinux 9 VM (KVM, SELinux enforcing): install like a user, run all phases
 ./scripts/dev.sh cargo <anything>   # run cargo inside the image
 ```
+
+### Real-host acceptance (`make acceptance`)
+
+The container suite cannot exercise SELinux, the unit's network/hostname
+namespaces, a reboot, or the RPM's dependency resolution. `make acceptance`
+boots a fresh **AlmaLinux 9 virtual machine** under KVM from the official cloud
+image — qemu runs inside a podman container, so nothing is installed on your
+workstation; you only need `/dev/kvm` to be readable — and drives it over SSH.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `INSTALL=git` | *(default)* | The VM runs this handbook's §3.2 "From source" block **verbatim** (cloned from GitHub), then the §3.4 verification block. This is the "user installing from git" test; it exercises what is on the remote, not your working tree. |
+| `INSTALL=rpm` | | Builds the RPM from your working tree and `dnf install`s it in the VM. Fast path for uncommitted changes and for the packaging. |
+| `GIT_REF=<branch or sha>` | current branch | Which commit the git install checks out. CI passes the pushed SHA. |
+| `PHASES="10 20 30 40 50 60 70"` | all | Subset of phases (below). |
+| `KEEP=1` | | Leave the VM running afterwards; the report prints the `ssh` line (`make acceptance-destroy` removes it). |
+| `SOAK_N=20` | | Cycles for the soak phase. |
+| `CONTINUE=1` | | Run remaining phases after a failure. |
+| `TARGET=user@host` | | Use a machine you provide instead of a VM (`TARGET_KEY=path` for the key). Phases 60/70 reboot it and create accounts, so this needs `I_UNDERSTAND=1`. |
+
+Phases: **10** install (`dnf install` of the RPM or the handbook's source install; services start; `--check-config`) ·
+**20** the 79-check integration suite on the real host ·
+**30** SELinux: enforcing, docroot labels, `semanage` rule lifecycle, site serves, **zero AVC denials** ·
+**40** sandbox: private network/UTS/mount namespaces, seccomp, capability bounding set, read-only `/usr` ·
+**50** `systemctl restart`, `SIGKILL` + auto-restart, a record forced back to `provisioning` is resumed with exactly one `useradd` ·
+**60** reboot with two tenants and two sites; everything must come back ·
+**70** soak: N create/destroy cycles, then nothing may be left behind.
+
+Results land in `dist/acceptance/<UTC stamp>/` (`latest` symlink): `report.md`
+with a per-phase table and failure context, `phases/*.log`, the VM's journals,
+`audit.log`, nginx logs, generated configs and records, and the serial console.
+Exit status 0 means every check passed. A full run takes roughly 8 minutes in
+RPM mode and 15–20 in git mode (it compiles the daemon inside the VM).
+
+In CI the `acceptance` job runs on every push to `main`, nightly, and on demand,
+installing from git at the pushed commit and uploading the run directory as an
+artifact.
 
 **Dry-run mode** runs the real daemon and CLI without root against an
 in-memory OS, so the panel can be developed on a laptop:

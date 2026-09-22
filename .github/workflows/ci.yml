@@ -4,13 +4,16 @@ on:
   push:
     branches: [main]
   pull_request:
+  schedule:
+    - cron: "0 3 * * *"   # nightly real-host acceptance
+  workflow_dispatch:
 
 jobs:
   check:
     name: fmt / clippy / test / deny (AlmaLinux 9)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Build target-OS image
         run: podman build -t localhost/oxpanel-dev:alma9 -f tests-integration/Containerfile tests-integration
       - name: rustfmt
@@ -27,8 +30,36 @@ jobs:
     runs-on: ubuntu-latest
     needs: check
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: Build target-OS image
         run: podman build -t localhost/oxpanel-dev:alma9 -f tests-integration/Containerfile tests-integration
       - name: Run
         run: ./scripts/integration-test.sh
+
+  acceptance:
+    name: real-host acceptance (AlmaLinux 9 VM, SELinux enforcing)
+    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    needs: check
+    timeout-minutes: 75
+    steps:
+      - uses: actions/checkout@v5
+      - name: Enable KVM for the runner user
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules && sudo udevadm trigger --name-match=kvm
+          ls -la /dev/kvm
+      - name: Build rig image
+        run: podman build -t localhost/oxpanel-rig:alma9 -f tests-acceptance/Containerfile tests-acceptance
+      - name: Acceptance — install from git at this commit, all phases
+        env:
+          INSTALL: git
+          GIT_REF: ${{ github.sha }}
+        run: ./scripts/acceptance.sh
+      - name: Upload report and logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: acceptance-${{ github.sha }}
+          path: dist/acceptance/
+          if-no-files-found: warn

@@ -16,6 +16,22 @@ use tonic::transport::{Channel, Endpoint};
 use tower::service_fn;
 
 use oxpanel_proto::v1 as pb;
+
+/// Print a line to stdout; a closed pipe (`oxpanel-ctl … | head`) ends the
+/// program quietly instead of panicking with "Broken pipe".
+fn emit(line: &str) {
+    use std::io::Write as _;
+    let mut out = std::io::stdout().lock();
+    if let Err(e) = writeln!(out, "{line}") {
+        if e.kind() == std::io::ErrorKind::BrokenPipe {
+            std::process::exit(0);
+        }
+    }
+}
+
+macro_rules! say {
+    ($($arg:tt)*) => { emit(&format!($($arg)*)) };
+}
 use oxpanel_proto::v1::ox_panel_engine_client::OxPanelEngineClient;
 
 #[derive(Parser, Debug)]
@@ -136,7 +152,7 @@ async fn connect(socket: PathBuf) -> Result<OxPanelEngineClient<Channel>, tonic:
 fn print_tenant(t: &pb::Tenant) {
     let l = t.limits.unwrap_or_default();
     let state = pb::TenantState::try_from(t.state).map_or("unknown", |s| s.as_str_name());
-    println!(
+    say!(
         "tenant={} owner={} uid={} gid={} home={} state={} slice={} memory_max={} cpu_weight={} io_weight={} tasks_max={} created_at={}",
         t.username,
         if t.owner.is_empty() { "-" } else { t.owner.as_str() },
@@ -154,7 +170,7 @@ fn print_tenant(t: &pb::Tenant) {
 }
 
 fn print_vhost(v: &pb::VirtualHost) {
-    println!(
+    say!(
         "domain={} tenant={} document_root={} aliases={} config={}",
         v.domain,
         v.tenant,
@@ -189,7 +205,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 })
                 .await?
                 .into_inner();
-            println!("created={}", r.created);
+            say!("created={}", r.created);
             if let Some(t) = &r.tenant {
                 print_tenant(t);
             }
@@ -222,7 +238,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 })
                 .await?
                 .into_inner();
-            println!("deleted={}", r.deleted);
+            say!("deleted={}", r.deleted);
         }
         Cmd::Vhost(VhostCmd::Set {
             domain,
@@ -239,7 +255,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 })
                 .await?
                 .into_inner();
-            println!("changed={}", r.created);
+            say!("changed={}", r.created);
             if let Some(v) = &r.vhost {
                 print_vhost(v);
             }
@@ -249,7 +265,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 .remove_virtual_host(pb::RemoveVirtualHostRequest { domain })
                 .await?
                 .into_inner();
-            println!("removed={}", r.removed);
+            say!("removed={}", r.removed);
         }
         Cmd::Vhost(VhostCmd::List { tenant }) => {
             for v in &c

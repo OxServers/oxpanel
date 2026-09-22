@@ -191,9 +191,16 @@ fn ensure_private_dir_sync(path: &Path, uid: u32, gid: u32) -> Result<()> {
             source,
         })?;
     }
-    if st.st_mode & 0o7777 != 0o700 {
-        warn!(path = %path.display(), mode = format_args!("{:o}", st.st_mode & 0o7777), "fixing mode to 0700");
-        fchmod(fd.as_fd(), Mode::S_IRWXU).map_err(|source| Error::Sys {
+    // Owner must have rwx; "other" and the setuid/setgid/sticky bits must be
+    // clear. The *group* bits are deliberately left alone: once web access has
+    // been granted through POSIX ACLs they hold the ACL mask (a tenant home
+    // shows as 0710), and chmod'ing them to 0 would silently revoke the
+    // web server's traverse right on every resume — found by make acceptance.
+    let mode = st.st_mode & 0o7777;
+    if mode & 0o7707 != 0o700 {
+        let fixed = 0o700 | (mode & 0o070);
+        warn!(path = %path.display(), mode = format_args!("{mode:o}"), fixed = format_args!("{fixed:o}"), "fixing mode");
+        fchmod(fd.as_fd(), Mode::from_bits_truncate(fixed)).map_err(|source| Error::Sys {
             op: "fchmod",
             source,
         })?;

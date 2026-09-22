@@ -15,6 +15,7 @@ Target platform: **AlmaLinux 9** (RHEL 9 family), SELinux enforcing, systemd, Ng
 make image        # one-time: AlmaLinux 9 build/test image (podman)
 make check        # fmt + clippy (pedantic, -D warnings) + tests + cargo-deny
 make integration  # root integration test in a systemd container on the real OS
+make acceptance   # real AlmaLinux 9 VM (KVM, SELinux enforcing): install like a user from git, all phases
 ```
 
 Documentation: [feature list](docs/FEATURES.md) · [handbook — installation, configuration, operations](docs/HANDBOOK.md) · [engine README](oxpanel-daemon/README.md).

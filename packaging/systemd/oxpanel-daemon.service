@@ -41,11 +41,15 @@ PrivateTmp=yes
 PrivateDevices=yes
 DevicePolicy=closed
 ProtectSystem=strict
-# /etc:            useradd/userdel rewrite passwd/shadow/group via rename; nginx and systemd unit files
-# /home:           tenant homes
-# /var/lib/nginx:  `nginx -t` touches its temp dirs
-# /var/lib/selinux /var/lib/sss: semanage policy store; sssd cache (harmless if absent)
-ReadWritePaths=/etc /home /var/lib/nginx -/var/lib/selinux -/var/lib/sss
+# /etc:      useradd/userdel rewrite passwd/shadow/group via rename; nginx and systemd unit files
+# /home:     tenant homes
+# /var/lib:  nginx -t temp dirs (/var/lib/nginx), the semanage policy store (/var/lib/selinux),
+#            the sssd cache (/var/lib/sss). Listed as the parent on purpose: /var/lib/selinux is
+#            labelled semanage_store_t, a SELinux *security* file type, and the targeted policy
+#            forbids init_t from mounting on it, so naming it directly makes the unit fail with
+#            "Failed at step NAMESPACE" on every enforcing host (found by make acceptance).
+# /var/log/nginx: `nginx -t` opens the configured error_log for writing even in test mode.
+ReadWritePaths=/etc /home /var/lib /var/log/nginx
 ProtectHome=no
 ProtectKernelTunables=yes
 ProtectKernelModules=yes

@@ -32,7 +32,7 @@ see "Not yet included" at the end so nobody assumes otherwise.
 | Hardened server block | `disable_symlinks if_not_owner` (symlinks to files the tenant does not own are refused), dot-files (`/.env`, `/.git`) answered with 404, `autoindex off`, `server_tokens off`. |
 | Validate → activate → roll back | Config written atomically (`tempfile` + `rename` + `fsync`), checked with `nginx -t`; only then `systemctl reload-or-restart nginx`. If validation fails the previous file (or its absence) is restored and the error text is returned. |
 | Catch-all default server | On first use the daemon installs `/etc/nginx/conf.d/00-oxpanel.conf` with an `include` of its directory **and** a `default_server` that closes the connection (`return 444`), so unknown host names and bare-IP requests never reach a tenant's site. Validated with `nginx -t`; rolled back if the host already defines a default server (configurable). |
-| SELinux | On SELinux-enabled hosts the document root gets a persistent `semanage fcontext` rule (`httpd_sys_content_t`) and `restorecon -R`; removed again when the last virtual host using that root is removed. |
+| SELinux | On SELinux-enabled hosts the document root is made label-equivalent to `/usr/share/nginx/html` (`semanage fcontext -e`, so the tree is `httpd_sys_content_t` even though the policy's own `file_contexts.homedirs` would label `~/public_html` differently; a plain rule is overridden), committed without a kernel policy reload, then `restorecon -RF` (the policy creates `~/public_html` as the *customizable* `httpd_user_content_t`, which plain `restorecon` refuses to change); removed again when the last virtual host using that root is removed. Requires the `httpd_enable_homedirs` and `httpd_read_user_content` booleans, which the RPM sets and the daemon checks at start-up. |
 | Remove / list | `RemoveVirtualHost` (config removed, validated, reloaded), `ListVirtualHosts` (optionally per tenant). |
 | Idempotent | Re-sending an identical configuration changes nothing and reports `created=false`. |
 
@@ -65,7 +65,7 @@ see "Not yet included" at the end so nobody assumes otherwise.
 
 - Rust, `#![forbid(unsafe_code)]`, clippy pedantic with warnings as errors, no `unwrap`/`expect`/`panic` in production paths.
 - No shell anywhere: every external program is an absolute path with an argv array; the only module that spawns processes is `system/real.rs`.
-- Tests: 63 unit tests (exact argv assertions against a fake OS), 4 end-to-end gRPC tests over a real UNIX socket, 79 root-level integration assertions on a real AlmaLinux 9 with systemd, `cargo-deny` for advisories/licences/bans.
+- Tests: 63 unit tests (exact argv assertions against a fake OS), 4 end-to-end gRPC tests over a real UNIX socket, an 80-check root integration suite in an AlmaLinux 9 systemd container, and `make acceptance`: ≈200 checks on a real AlmaLinux 9 VM with SELinux enforcing (install from git or RPM, SELinux labels and zero AVC denials, sandbox namespaces, restart/kill/resume, reboot, soak). `cargo-deny` for advisories/licences/bans.
 - Builds without a system `protoc` (pure-Rust `protox`) and without a host toolchain (everything runs in the AlmaLinux 9 container).
 
 ## Not yet included

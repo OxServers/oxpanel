@@ -35,6 +35,7 @@ pub mod bin {
     pub const SELINUXENABLED: &str = "/usr/sbin/selinuxenabled";
     pub const SETFACL: &str = "/usr/bin/setfacl";
     pub const SEMANAGE: &str = "/usr/sbin/semanage";
+    pub const GETSEBOOL: &str = "/usr/sbin/getsebool";
     pub const SETPRIV: &str = "/usr/bin/setpriv";
     pub const MKDIR: &str = "/usr/bin/mkdir";
     /// Login shell given to every tenant account.
@@ -71,7 +72,9 @@ pub trait System: Send + Sync + 'static {
     async fn groups_of(&self, name: &str, primary_gid: u32) -> Result<Vec<u32>>;
 
     /// Make sure `path` is an existing directory (not a symlink) owned by
-    /// `uid:gid` with mode `0700`, correcting owner and mode if necessary.
+    /// `uid:gid`, owner `rwx`, nothing for `other`, no special bits; corrects
+    /// owner and those bits if necessary. Group bits are left untouched
+    /// because they carry the ACL mask once web access has been granted.
     async fn ensure_private_dir(&self, path: &Path, uid: u32, gid: u32) -> Result<()>;
 
     /// Verify `path` is a real directory (not a symlink) owned by `uid`.

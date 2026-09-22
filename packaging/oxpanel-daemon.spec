@@ -46,6 +46,8 @@ install -D -m 0640 packaging/daemon.env %{buildroot}%{_sysconfdir}/oxpanel/daemo
 %post
 %systemd_post oxpanel-daemon.service
 %tmpfiles_create oxpanel.conf
+# Sites live under tenant homes: let the web server traverse and read them (persistent).
+if /usr/sbin/selinuxenabled 2>/dev/null; then /usr/sbin/setsebool -P httpd_enable_homedirs=on httpd_read_user_content=on || :; fi
 
 %preun
 %systemd_preun oxpanel-daemon.service

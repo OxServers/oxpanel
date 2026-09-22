@@ -1,0 +1,17 @@
+#cloud-config
+# Seed for the acceptance VM. __PUBKEY__ is replaced per run.
+hostname: oxpanel-acc
+fqdn: oxpanel-acc.test
+manage_etc_hosts: true
+timezone: UTC
+disable_root: false
+ssh_pwauth: false
+ssh_authorized_keys:
+  - __PUBKEY__
+users:
+  - default
+  - name: root
+    ssh_authorized_keys:
+      - __PUBKEY__
+runcmd:
+  - [ sh, -c, "mkdir -p /root/.ssh && chmod 700 /root/.ssh && (grep -qF '__PUBKEY__' /root/.ssh/authorized_keys 2>/dev/null || echo '__PUBKEY__' >> /root/.ssh/authorized_keys) && chmod 600 /root/.ssh/authorized_keys && (restorecon -R /root/.ssh || true)" ]

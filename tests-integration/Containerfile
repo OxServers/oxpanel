@@ -39,3 +39,7 @@ ARG CARGO_DENY_VERSION=0.20.2
 RUN curl -sSfL "https://github.com/EmbarkStudios/cargo-deny/releases/download/${CARGO_DENY_VERSION}/cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl.tar.gz" \
       | tar -xz -C /usr/local/cargo/bin --strip-components=1 "cargo-deny-${CARGO_DENY_VERSION}-x86_64-unknown-linux-musl/cargo-deny" \
     && cargo deny --version
+
+# RPM build (make rpm).
+RUN dnf -y install --setopt=install_weak_deps=False rpm-build systemd-rpm-macros \
+    && dnf clean all && rm -rf /var/cache/dnf

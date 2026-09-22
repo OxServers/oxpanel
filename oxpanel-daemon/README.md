@@ -74,6 +74,9 @@ make clippy         # pedantic, warnings are errors
 make deny           # RustSec advisories, licences, banned crates
 make integration    # boots systemd in the container, installs from packaging/, drives the
                     # daemon with oxpanel-ctl and asserts on accounts, ACLs, nginx responses
+make rpm            # RPM from the working tree → dist/rpms/
+make acceptance     # real AlmaLinux 9 VM under KVM, SELinux enforcing: install from git like a
+                    # user (or INSTALL=rpm), then SELinux / sandbox / restart / reboot / soak phases
 ```
 
 What `make integration` proves on AlmaLinux 9 (all 79 assertions must pass): the daemon starts
@@ -97,7 +100,7 @@ and the journal has no errors. The RPM spec is also built and test-installed in 
 | Dependency advisories / licences / bans | `cargo deny check` |
 | `PrivateNetwork=`, `ProtectHostname=` in the unit | **not** verifiable in a rootless container (systemd reports "ignoring"); needs a real host |
 | SELinux paths (`semanage fcontext`, `restorecon`), and whether the unit's seccomp/`MemoryDenyWriteExecute` lets `semanage` (Python) run | **not** verified — the container has no SELinux; test on a real AlmaLinux 9 host before shipping |
-| Independent adversarial review | the multi-agent audit was blocked by an account spend limit; an inline review by the author found and fixed the slice-hierarchy, orphan-account and web-user issues above. Re-run `make audit`-style review when possible |
+| Independent adversarial review | the multi-agent audit was blocked by an account spend limit; an inline review found and fixed the slice-hierarchy, orphan-account and web-user issues. The real-host rig then found five more (SELinux mount-on, `/var/log/nginx`, homedir labelling, ACL-mask repair, CLI `EPIPE`) — see `docs/superpowers/specs/2026-09-22-acceptance-rig-design.md` |
 
 **Reload semantics:** `ConfigureVirtualHost` returns after `nginx -t` succeeded and the reload was
 requested; Nginx swaps workers asynchronously, so a request in the following few milliseconds may

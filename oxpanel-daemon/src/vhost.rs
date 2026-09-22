@@ -9,8 +9,17 @@
 //!   with `--physical`, so a planted symlink is skipped rather than followed;
 //! - the generated server block carries `disable_symlinks if_not_owner`, so
 //!   Nginx refuses to serve through a symlink whose target the tenant does not own;
-//! - on SELinux hosts the document root is labelled `httpd_sys_content_t` via a
-//!   persistent `semanage fcontext` rule and `restorecon`;
+//! - on SELinux hosts the document root is labelled `httpd_sys_content_t` through a
+//!   persistent `semanage fcontext` *path equivalence* to `/usr/share/nginx/html`
+//!   plus `restorecon`. An equivalence, not a regex rule: libselinux applies the
+//!   generated `file_contexts.homedirs` (which labels `~/public_html`, `~/www`
+//!   and `~/web` as `httpd_user_content_t`) after `file_contexts.local`, so a
+//!   local rule for a path under `/home` is silently overridden, whereas a
+//!   substitution is applied before any rule is matched. `-N`: no kernel policy
+//!   reload is needed for file contexts, and `/sys` is read-only inside the unit.
+//!   `restorecon -F`: the policy creates `~/public_html` as `httpd_user_content_t`
+//!   through a named file transition, and that type is *customizable*, which a
+//!   plain `restorecon` refuses to touch;
 //! - the new configuration is validated with `nginx -t` and rolled back on failure.
 
 use std::collections::BTreeSet;
@@ -26,7 +35,9 @@ use crate::system::{bin, CommandSpec};
 use crate::validate::{Domain, RelPath, Username};
 
 pub const MAX_ALIASES: usize = 50;
-const SELINUX_TYPE: &str = "httpd_sys_content_t";
+/// Document roots are made label-equivalent to this path (`httpd_sys_content_t`,
+/// no `cgi-bin` sub-rules).
+const SELINUX_EQUIV_SOURCE: &str = "/usr/share/nginx/html";
 
 /// Raw request as received on the wire.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -300,18 +311,18 @@ impl VHostService {
             .sys
             .run(
                 CommandSpec::new(bin::SEMANAGE, timeout)
-                    .args(["fcontext", "-a", "-t", SELINUX_TYPE, "--"])
-                    .arg(fcontext_regex(root)?),
+                    .args(["fcontext", "-a", "-N", "-e", SELINUX_EQUIV_SOURCE, "--"])
+                    .arg(root),
             )
             .await?;
-        if !out.success() && !out.stderr_lossy().contains("already defined") {
+        if !out.success() && !already_present(&out.stderr_lossy()) {
             return out.into_result().map(|_| ());
         }
         self.ctx
             .sys
             .run_ok(
                 CommandSpec::new(bin::RESTORECON, timeout)
-                    .args(["-R", "--"])
+                    .args(["-RF", "--"])
                     .arg(root),
             )
             .await?;
@@ -325,18 +336,18 @@ impl VHostService {
             .sys
             .run(
                 CommandSpec::new(bin::SEMANAGE, timeout)
-                    .args(["fcontext", "-d", "--"])
-                    .arg(fcontext_regex(root)?),
+                    .args(["fcontext", "-d", "-N", "--"])
+                    .arg(root),
             )
             .await?;
-        if !out.success() && !out.stderr_lossy().contains("not defined") {
+        if !out.success() && !already_absent(&out.stderr_lossy()) {
             return out.into_result().map(|_| ());
         }
         self.ctx
             .sys
             .run_ok(
                 CommandSpec::new(bin::RESTORECON, timeout)
-                    .args(["-R", "--"])
+                    .args(["-RF", "--"])
                     .arg(root),
             )
             .await?;
@@ -344,12 +355,16 @@ impl VHostService {
     }
 }
 
-/// `semanage fcontext` takes a regular expression; escape the path's dots.
-fn fcontext_regex(root: &Path) -> Result<String> {
-    let s = root
-        .to_str()
-        .ok_or_else(|| Error::Internal(format!("{} is not UTF-8", root.display())))?;
-    Ok(format!("{}(/.*)?", s.replace('.', "\\.")))
+/// `semanage` says this when the rule is already in the store (idempotent replay).
+fn already_present(stderr: &str) -> bool {
+    stderr.contains("already defined") || stderr.contains("already exists")
+}
+
+/// `semanage` says this when there is nothing to delete.
+fn already_absent(stderr: &str) -> bool {
+    stderr.contains("not defined")
+        || stderr.contains("does not exist")
+        || stderr.contains("is not defined")
 }
 
 #[cfg(test)]
@@ -682,23 +697,24 @@ mod tests {
         let root = h.config.home_base.join("alice").join("www").join("site.v2");
         let sem = h.sys.calls_to(bin::SEMANAGE);
         assert_eq!(sem.len(), 1);
-        let expected_regex = format!("{}(/.*)?", root.to_string_lossy().replace('.', "\\."));
+        let expected_target = root.to_string_lossy().into_owned();
         assert_eq!(
             sem.first().map(args),
             Some(vec![
                 "fcontext".to_owned(),
                 "-a".into(),
-                "-t".into(),
-                SELINUX_TYPE.into(),
+                "-N".into(),
+                "-e".into(),
+                SELINUX_EQUIV_SOURCE.into(),
                 "--".into(),
-                expected_regex.clone()
+                expected_target.clone()
             ])
         );
         assert!(h
             .sys
             .calls_to(bin::RESTORECON)
             .iter()
-            .any(|c| args(c) == ["-R", "--", root.to_string_lossy().as_ref()]));
+            .any(|c| args(c) == ["-RF", "--", root.to_string_lossy().as_ref()]));
         // Intermediate directory got traverse too.
         let acl = h.sys.calls_to(bin::SETFACL);
         let first = acl.first().map(args).unwrap_or_default();
@@ -714,7 +730,7 @@ mod tests {
         h.sys.script_failure(
             bin::SEMANAGE,
             1,
-            "ValueError: File context for ... already defined",
+            "ValueError: Equivalence class for /home/alice/www/site.v2 already exists",
         );
         h.vhosts
             .configure(VHostRequest {
@@ -730,8 +746,9 @@ mod tests {
             Some(vec![
                 "fcontext".to_owned(),
                 "-d".into(),
+                "-N".into(),
                 "--".into(),
-                expected_regex
+                expected_target
             ])
         );
         Ok(())

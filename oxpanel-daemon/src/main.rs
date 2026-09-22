@@ -290,9 +290,27 @@ async fn preflight(config: &Config, sys: &dyn System) -> Result<bool, Fatal> {
         false
     };
     if selinux {
-        for b in [bin::RESTORECON, bin::SEMANAGE] {
+        for b in [bin::RESTORECON, bin::SEMANAGE, bin::GETSEBOOL] {
             if !is_executable(Path::new(b)) {
-                return Err(Fatal::Unavailable(format!("SELinux is enforcing but {b} is missing (install policycoreutils-python-utils)")));
+                return Err(Fatal::Unavailable(format!(
+                    "SELinux is enabled but {b} is missing (install policycoreutils-python-utils libselinux-utils)"
+                )));
+            }
+        }
+        // Document roots live under tenant homes. httpd_t may only traverse
+        // user_home_dir_t with httpd_enable_homedirs, and intermediate tenant
+        // directories such as ~/www carry httpd_user_content_t, readable only
+        // with httpd_read_user_content. The RPM %post and the handbook set both
+        // persistently; we refuse to run half-working.
+        for boolean in ["httpd_enable_homedirs", "httpd_read_user_content"] {
+            let out = sys
+                .run(CommandSpec::new(bin::GETSEBOOL, config.command_timeout).arg(boolean))
+                .await
+                .map_err(|e| Fatal::Runtime(e.to_string()))?;
+            if !out.stdout_lossy().contains("--> on") {
+                return Err(Fatal::Config(format!(
+                    "SELinux boolean {boolean} is off: web sites under /home cannot be served. Run: setsebool -P {boolean} on"
+                )));
             }
         }
     }

@@ -203,6 +203,10 @@ impl System for FakeSystem {
             }
             bin::NGINX => output(program, 0, "", "nginx: the configuration file /etc/nginx/nginx.conf syntax is ok\nnginx: configuration file /etc/nginx/nginx.conf test is successful"),
             bin::SELINUXENABLED => output(program, i32::from(!i.selinux_enabled), "", ""),
+            bin::GETSEBOOL => {
+                let name = args.last().map(|a| a.to_string_lossy().into_owned()).unwrap_or_default();
+                output(program, 0, &format!("{name} --> on\n"), "")
+            }
             bin::MKDIR => {
                 let Some(target) = args.iter().rev().find(|a| !a.to_string_lossy().starts_with('-')) else {
                     return Ok(output(program, 1, "", "mkdir: missing operand"));

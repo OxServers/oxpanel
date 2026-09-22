@@ -11,18 +11,23 @@ as_user() { local u="$1"; shift; setpriv --reuid="$u" --regid="$u" --clear-group
 body_eventually() { local host="$1" path="$2" want="$3" i; for i in $(seq 1 50); do [ "$(curl -s -H "Host: $host" "http://127.0.0.1$path")" = "$want" ] && return 0; sleep 0.1; done; return 1; }
 code_of() { curl -s -o /dev/null -w '%{http_code}' -H "Host: $1" "http://127.0.0.1$2"; }
 
-echo "== install (as the RPM would)"
-install -m0755 /work/target/release/oxpanel-daemon /usr/sbin/oxpanel-daemon
-install -m0755 /work/target/release/oxpanel-ctl /usr/bin/oxpanel-ctl
-install -Dm0644 /work/packaging/systemd/oxpanel-daemon.service /etc/systemd/system/oxpanel-daemon.service
-install -Dm0644 /work/packaging/sysusers.d/oxpanel.conf /usr/lib/sysusers.d/oxpanel.conf
-install -Dm0644 /work/packaging/tmpfiles.d/oxpanel.conf /usr/lib/tmpfiles.d/oxpanel.conf
-install -Dm0640 /work/packaging/daemon.env /etc/oxpanel/daemon.env
-systemd-sysusers
-systemd-tmpfiles --create oxpanel.conf
-systemctl daemon-reload
-systemctl start nginx
-check "nginx is active" systemctl -q is-active nginx
+if [ "${SKIP_INSTALL:-0}" != 1 ]; then
+  echo "== install (as the RPM would)"
+  install -m0755 /work/target/release/oxpanel-daemon /usr/sbin/oxpanel-daemon
+  install -m0755 /work/target/release/oxpanel-ctl /usr/bin/oxpanel-ctl
+  install -Dm0644 /work/packaging/systemd/oxpanel-daemon.service /etc/systemd/system/oxpanel-daemon.service
+  install -Dm0644 /work/packaging/sysusers.d/oxpanel.conf /usr/lib/sysusers.d/oxpanel.conf
+  install -Dm0644 /work/packaging/tmpfiles.d/oxpanel.conf /usr/lib/tmpfiles.d/oxpanel.conf
+  install -Dm0640 /work/packaging/daemon.env /etc/oxpanel/daemon.env
+  systemd-sysusers
+  systemd-tmpfiles --create oxpanel.conf
+  systemctl daemon-reload
+  systemctl start nginx
+  check "nginx is active" systemctl -q is-active nginx
+else
+  echo "== install skipped (SKIP_INSTALL=1): using the already installed oxpanel-daemon"
+  check "nginx is active" systemctl -q is-active nginx
+fi
 
 echo "== start daemon through its hardened unit"
 if ! systemctl start oxpanel-daemon; then

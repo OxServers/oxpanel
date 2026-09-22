@@ -1,0 +1,15 @@
+# The acceptance "rig": everything needed to boot a real AlmaLinux 9 VM under KVM
+# and drive it over SSH. Deliberately separate from the Rust dev image so a qemu
+# update never invalidates the build cache.
+FROM docker.io/library/almalinux:9
+
+RUN dnf -y install --setopt=install_weak_deps=False \
+        qemu-kvm qemu-img passt openssh-clients python3 \
+    && (dnf -y install --setopt=install_weak_deps=False xorriso \
+        || dnf -y install --setopt=install_weak_deps=False genisoimage) \
+    && dnf clean all && rm -rf /var/cache/dnf \
+    && /usr/libexec/qemu-kvm --version | head -1
+
+ENV LC_ALL=C.UTF-8
+WORKDIR /work
+ENTRYPOINT ["/bin/bash"]
