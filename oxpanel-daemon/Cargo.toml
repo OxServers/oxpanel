@@ -42,6 +42,12 @@ tempfile.workspace = true
 tonic = { workspace = true, features = ["channel"] }
 tower = { version = "0.5", features = ["util"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
+# Test-only: property tests, and a raw HTTP/2 client for malformed gRPC frames.
+proptest = { version = "1", default-features = false, features = ["std"] }
+hyper = { version = "1", features = ["client", "http2"] }
+http-body-util = "0.1"
+bytes = "1"
+prost.workspace = true
 
 [lints]
 workspace = true

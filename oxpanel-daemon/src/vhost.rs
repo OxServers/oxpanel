@@ -189,18 +189,20 @@ impl VHostService {
         if record_changed {
             self.ctx.store.save_vhost(&rec)?;
         }
-        // PHP was switched off here: drop the pool if no other site needs it.
-        let pool_removed = if !rec.php && existing.as_ref().is_some_and(|e| e.php) {
-            self.remove_pool_if_unused(&tenant_rec).await?
-        } else {
+        // PHP is off here: drop the pool if no other site needs it. Decided by
+        // what is on disk, not by what the previous record said: a request
+        // that switched PHP off may have been interrupted after the record
+        // was saved, and repeating it must still remove the pool.
+        let pool_removed = if rec.php {
             false
+        } else {
+            self.remove_pool_if_unused(&tenant_rec, None).await?
         };
-        // The application was switched off here: stop it and drop its unit.
-        let app_removed = if rec.app.is_none() && existing.as_ref().is_some_and(|e| e.app.is_some())
-        {
-            app::remove_app(&self.ctx, &domain).await?
-        } else {
+        // Likewise for the application: a unit for a site without one goes.
+        let app_removed = if rec.app.is_some() {
             false
+        } else {
+            app::remove_app(&self.ctx, &domain).await?
         };
         let changed = changed || record_changed || pool_removed || app_removed;
         if changed {
@@ -335,18 +337,22 @@ impl VHostService {
                 }
             }
         }
-        self.ctx.store.delete_vhost(&domain)?;
         // Nginx has reloaded and no longer holds the logs open for this name.
         let (access_log, error_log) = log_paths(cfg, &domain);
         fsutil::remove_if_exists(&access_log)?;
         fsutil::remove_if_exists(&error_log)?;
         if rec.php {
             if let Some(t) = self.ctx.store.load_tenant(&Username::parse(&rec.tenant)?)? {
-                self.remove_pool_if_unused(&t).await?;
+                self.remove_pool_if_unused(&t, Some(&domain)).await?;
             }
         }
         // Whatever the record says: a unit for this name must not outlive the site.
         app::remove_app(&self.ctx, &domain).await?;
+        // The record goes last. Until then a repeated request finds it and
+        // finishes whatever an interrupted attempt left behind; deleting it
+        // first would strand a running PHP pool or application with nothing
+        // left that says OxPanel owns it.
+        self.ctx.store.delete_vhost(&domain)?;
         info!(%domain, tenant = %rec.tenant, "virtual host removed");
         Ok(true)
     }
@@ -389,17 +395,46 @@ impl VHostService {
     pub async fn install_app_dependencies(&self, domain: &str) -> Result<(bool, String)> {
         let domain = Domain::parse(domain)?;
         let (tenant, rec) = self.load_app_vhost(&domain)?;
-        app::install_dependencies(&self.ctx, &tenant, &rec).await
+        let (succeeded, output) = app::install_dependencies(&self.ctx, &tenant, &rec).await?;
+        if succeeded {
+            // Minutes may have passed without the lock. Restart only what the
+            // records call for *now*: a tenant suspended or a site removed
+            // while the installer ran must stay stopped.
+            let _guard = self.ctx.lock.lock().await;
+            match self.load_app_vhost(&domain) {
+                Ok((_, current)) => app::restart(&self.ctx, &current).await?,
+                Err(
+                    e @ (Error::TenantNotReady(_)
+                    | Error::TenantNotFound(_)
+                    | Error::VHostNotFound(_)
+                    | Error::NoApp(_)),
+                ) => {
+                    info!(%domain, reason = %e, "dependencies installed; application not restarted");
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok((succeeded, output))
     }
 
-    /// Remove the tenant's PHP-FPM pool once none of its virtual hosts uses PHP.
-    async fn remove_pool_if_unused(&self, tenant: &TenantRecord) -> Result<bool> {
-        let still_used = self
-            .ctx
-            .store
-            .list_vhosts()?
-            .iter()
-            .any(|v| v.tenant == tenant.username && v.php);
+    /// Remove the tenant's PHP-FPM pool once none of its virtual hosts uses
+    /// PHP. `except` names a virtual host that is being removed and therefore
+    /// no longer counts, although its record still exists.
+    async fn remove_pool_if_unused(
+        &self,
+        tenant: &TenantRecord,
+        except: Option<&Domain>,
+    ) -> Result<bool> {
+        let cfg = &self.ctx.config;
+        let name = Username::parse(&tenant.username)?;
+        let files = php::PoolFiles::for_tenant(&cfg.php_conf_dir, &cfg.systemd_unit_dir, &name);
+        if !files.unit.exists() && !files.conf.exists() {
+            // Nothing to remove: skip reading every virtual-host record.
+            return Ok(false);
+        }
+        let still_used = self.ctx.store.list_vhosts()?.iter().any(|v| {
+            v.tenant == tenant.username && v.php && except.is_none_or(|d| v.domain != d.as_str())
+        });
         if still_used {
             return Ok(false);
         }

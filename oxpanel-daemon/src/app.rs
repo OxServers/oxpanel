@@ -390,7 +390,8 @@ pub async fn restart(ctx: &Ctx, vhost: &VHostRecord) -> Result<()> {
 /// Install the application's dependencies as the tenant. Runs in a transient
 /// unit (the daemon has no network), sandboxed like the application itself and
 /// inside the tenant's slice. Returns whether the installer succeeded and the
-/// end of its output; a failing installer is a result, not an error.
+/// end of its output; a failing installer is a result, not an error. Does
+/// not restart the application (see `VHostService::install_app_dependencies`).
 pub async fn install_dependencies(
     ctx: &Ctx,
     tenant: &TenantRecord,
@@ -471,9 +472,8 @@ pub async fn install_dependencies(
         }
         output.push_str(&own);
     }
-    if succeeded && !tenant.suspended {
-        restart(ctx, vhost).await?;
-    }
+    // Restarting the application is the caller's job: it must be decided
+    // under the mutation lock, from the records as they are by then.
     Ok((succeeded, output))
 }
 
