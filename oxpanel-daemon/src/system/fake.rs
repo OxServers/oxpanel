@@ -25,6 +25,8 @@ struct Inner {
     memberships: BTreeMap<String, Vec<u32>>,
     /// Home directories the fake `userdel -r` removed.
     removed_homes: Vec<PathBuf>,
+    /// Optional programs reported as not installed.
+    missing: Vec<&'static str>,
 }
 
 #[derive(Debug, Default)]
@@ -77,6 +79,13 @@ impl FakeSystem {
                 .entry(program)
                 .or_default()
                 .push_back((code, stderr.to_owned()));
+        }
+    }
+
+    /// Pretend `program` is not installed (see [`System::is_installed`]).
+    pub fn set_missing(&self, program: &'static str) {
+        if let Ok(mut i) = self.inner.lock() {
+            i.missing.push(program);
         }
     }
 
@@ -280,6 +289,12 @@ impl System for FakeSystem {
             }
             Ok(_) => None,
         })
+    }
+
+    async fn is_installed(&self, program: &'static str) -> bool {
+        self.inner
+            .lock()
+            .is_ok_and(|i| !i.missing.contains(&program))
     }
 
     async fn host_stats(&self, _path: &Path) -> Result<HostStats> {

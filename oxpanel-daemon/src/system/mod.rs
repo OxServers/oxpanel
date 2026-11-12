@@ -39,6 +39,8 @@ pub mod bin {
     pub const SETPRIV: &str = "/usr/bin/setpriv";
     pub const MKDIR: &str = "/usr/bin/mkdir";
     pub const DU: &str = "/usr/bin/du";
+    /// Optional: only needed once a virtual host enables PHP.
+    pub const PHP_FPM: &str = "/usr/sbin/php-fpm";
     /// Login shell given to every tenant account.
     pub const NOLOGIN: &str = "/sbin/nologin";
 }
@@ -99,6 +101,9 @@ pub trait System: Send + Sync + 'static {
     /// `path` is a real directory owned by `uid:gid` and closed to "other",
     /// otherwise a description of what is wrong. Never changes anything.
     async fn inspect_private_dir(&self, path: &Path, uid: u32, gid: u32) -> Result<Option<String>>;
+
+    /// Whether `program` is installed (a regular, executable file).
+    async fn is_installed(&self, program: &'static str) -> bool;
 
     /// Host load and memory, plus the capacity of the file system holding `path`.
     async fn host_stats(&self, path: &Path) -> Result<HostStats>;

@@ -120,7 +120,7 @@ not per object; per-owner confinement is a possible later refinement.
 
 1. ~~Per-peer scopes; `UpdateTenantLimits` / `UpdateTenantOwner`; suspend/resume; usage; host info; `Reconcile`~~ — done (management milestone).
 2. Confined SELinux domain (`oxpanel_t`) and a capability *allow*-list for the unit.
-3. Per-tenant PHP-FPM pools placed in the tenant slice.
-4. TLS for virtual hosts (ACME), per-vhost access logs.
+3. ~~Per-tenant PHP-FPM in the tenant slice; per-vhost logs~~ — done (hosting milestone 2a). Next: PHP version choice and per-tenant PHP settings.
+4. TLS for virtual hosts (ACME).
 5. Repair mode for `Reconcile` (today it reports only).
 6. Split privileged helper behind the `System` trait.

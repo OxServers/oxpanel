@@ -30,6 +30,9 @@ see "Not yet included" at the end so nobody assumes otherwise.
 | Feature | Detail |
 |---|---|
 | Configure | One server block per domain: `listen 80` / `listen [::]:80`, `server_name <domain> <aliases…>`, `root <home>/<document_root>`, `index index.html index.htm`, `try_files`. |
+| Per-site logs | Every virtual host writes its own `<domain>.access.log` and `<domain>.error.log` under `/var/log/nginx/oxpanel` (closed to tenants), rotated daily for 14 days by the shipped logrotate rule and removed with the site. `ReadVirtualHostLog` returns the end of either log (whole lines, 32 KiB by default, at most 128 KiB) so the panel can show it without shell access. |
+| PHP source is never served | On a virtual host without PHP, `*.php` answers 404 instead of handing out the script as a download. |
+| Start-up convergence | At start the daemon re-renders every virtual host from its record, so files written by an older version pick up the current template (validated and rolled back like any other change). |
 | Aliases | Up to 50 additional server names per virtual host. Every server name is unique across the whole host; a name owned by another tenant is refused. |
 | Document root | Relative to the tenant home (default `public_html`), **created as the tenant** (privileges fully dropped via `setpriv`), then verified to be a real directory owned by the tenant. |
 | Web-server access without opening the home | POSIX ACLs give the web user (`nginx`) traverse (`--x`) on the path and read (`r-x`) on the document root, plus a default ACL so new files inherit it. The home stays closed to everyone else (`group::---`, `other::---`). ACLs are set with `--physical`, so a planted symlink is skipped. |
@@ -39,6 +42,21 @@ see "Not yet included" at the end so nobody assumes otherwise.
 | SELinux | On SELinux-enabled hosts the document root is made label-equivalent to `/usr/share/nginx/html` (`semanage fcontext -e`, so the tree is `httpd_sys_content_t` even though the policy's own `file_contexts.homedirs` would label `~/public_html` differently; a plain rule is overridden), committed without a kernel policy reload, then `restorecon -RF` (the policy creates `~/public_html` as the *customizable* `httpd_user_content_t`, which plain `restorecon` refuses to change); removed again when the last virtual host using that root is removed. Requires the `httpd_enable_homedirs` and `httpd_read_user_content` booleans, which the RPM sets and the daemon checks at start-up. |
 | Remove / list | `RemoveVirtualHost` (config removed, validated, reloaded), `ListVirtualHosts` (optionally per tenant). |
 | Idempotent | Re-sending an identical configuration changes nothing and reports `created=false`. |
+
+## PHP (per-tenant PHP-FPM)
+
+| Feature | Detail |
+|---|---|
+| Opt-in per virtual host | `ConfigureVirtualHost` with `php=true`. Refused with `FAILED_PRECONDITION` if `php-fpm` is not installed; `GetHostInfo.php_available` tells the panel in advance. |
+| One FPM instance per tenant, running as the tenant | Not a pool inside a shared root-owned master: the whole instance (master and workers) runs under the tenant's uid through its own systemd unit `oxpanel-php-<name>.service`. No PHP process ever runs as root or as another tenant. |
+| Inside the tenant's limits | The unit lives in the tenant's slice, so `MemoryMax`, `CPUWeight`, `IOWeight` and `TasksMax` bound PHP, and `GetTenantUsage` reports it. At most 8 workers, started on demand and stopped when idle. |
+| Sandboxed unit | `NoNewPrivileges`, empty capability set, `ProtectSystem=strict` with only the tenant's home writable, private `/tmp` (sessions and uploads are per tenant), `PrivateDevices`, `ProtectKernel*`, `RestrictNamespaces`. |
+| Socket only the web server can reach | UNIX socket `/run/oxpanel-php/<name>/php.sock` with an ACL naming the web-server account. Other tenants cannot connect; there is no TCP listener. |
+| Confined scripts | `open_basedir` limits file access to the tenant's home and `/tmp`; `allow_url_include` and `display_errors` are off; only `.php` is executed. |
+| Safe Nginx hand-off | `try_files $uri =404` before `fastcgi_pass` (a script that does not exist is never passed on, which closes the `image.jpg/x.php` path-info trick), `SCRIPT_FILENAME` built from `$realpath_root`, dot-directories excluded, `X-Powered-By` hidden. Unknown paths fall back to `/index.php` (front controllers such as WordPress work without rewrite rules). |
+| Lifecycle | The instance is created with the tenant's first PHP-enabled virtual host and removed with the last one. It is enabled, so it returns after a reboot. Suspending the tenant stops and disables it (after the sites answer 503); resuming starts it before the sites return. |
+| SELinux | Works enforcing with zero denials. PHP runs in the web-server domain; the RPM sets `httpd_unified` so a tenant's PHP can write the tenant's own files (uploads, caches). Without the boolean PHP is read-only and the daemon logs a warning at start. |
+| Reconciliation | A missing or edited pool configuration or unit is reported as `PHP_POOL_DRIFT`, stray ones as `ORPHAN_PHP_POOL`. |
 
 ## API, transport and authentication
 
@@ -57,7 +75,7 @@ see "Not yet included" at the end so nobody assumes otherwise.
 
 | Feature | Detail |
 |---|---|
-| `oxpanel-ctl` | Command-line client: `tenant create|get|list|set-limits|set-owner|suspend|resume|usage|delete`, `vhost set|remove|list`, `host info|reconcile`, human-readable sizes (`512M`, `2G`). |
+| `oxpanel-ctl` | Command-line client: `tenant create|get|list|set-limits|set-owner|suspend|resume|usage|delete`, `vhost set|log|remove|list`, `host info|reconcile`, human-readable sizes (`512M`, `2G`). |
 | Host information | `GetHostInfo`: engine version, SELinux and dry-run state, tenant and virtual-host counts, the tenant uid range (capacity), load averages, memory, uptime, and size/free space of the file system holding tenant homes. |
 | Reconciliation | `Reconcile` compares every record with the operating system and reports differences: interrupted tenants, missing or mismatched accounts, invalid homes, edited or missing unit files, missing or edited Nginx files, virtual hosts without a tenant, and orphan files in OxPanel's own directories. Strictly read-only — most findings are healed by repeating the original request. `oxpanel-ctl host reconcile` exits `3` when drift is found. |
 | Configuration | Environment variables `OXPANEL_*` (from `/etc/oxpanel/daemon.env`); every value has a production default. `--check-config` validates configuration and host prerequisites without starting. |
@@ -72,9 +90,9 @@ see "Not yet included" at the end so nobody assumes otherwise.
 
 - Rust, `#![forbid(unsafe_code)]`, clippy pedantic with warnings as errors, no `unwrap`/`expect`/`panic` in production paths.
 - No shell anywhere: every external program is an absolute path with an argv array; the only module that spawns processes is `system/real.rs`.
-- Tests: 80 unit tests (exact argv assertions against a fake OS), 6 end-to-end gRPC tests over a real UNIX socket, a 132-check root integration suite in an AlmaLinux 9 systemd container, and `make acceptance`: ≈200 checks on a real AlmaLinux 9 VM with SELinux enforcing (install from git or RPM, SELinux labels and zero AVC denials, sandbox namespaces, restart/kill/resume, reboot, soak). `cargo-deny` for advisories/licences/bans.
+- Tests: 91 unit tests (exact argv assertions against a fake OS), 6 end-to-end gRPC tests over a real UNIX socket, a 172-check root integration suite in an AlmaLinux 9 systemd container, and `make acceptance`: ≈310 checks on a real AlmaLinux 9 VM with SELinux enforcing (install from git or RPM, SELinux labels and zero AVC denials, sandbox namespaces, restart/kill/resume, reboot, soak). `cargo-deny` for advisories/licences/bans.
 - Builds without a system `protoc` (pure-Rust `protox`) and without a host toolchain (everything runs in the AlmaLinux 9 container).
 
 ## Not yet included
 
-To be explicit, v0.1.0 does **not** provide: TLS/ACME certificates, PHP-FPM or any application runtime (Nginx serves static files only), DNS, mail, databases, FTP/SFTP/SSH access for tenants, disk quotas, backups, per-vhost access logs, automatic repair of drift found by `Reconcile`, stopping a suspended tenant's processes (there are none until tenants get runtimes or logins), a confined SELinux domain for the daemon itself, or historical metrics. These are on the roadmap in `oxpanel-daemon/PROJECT_DETAILS.md`.
+To be explicit, v0.1.0 does **not** provide: TLS/ACME certificates, a choice of PHP version or per-tenant PHP settings (the host's `php-fpm` package is used as installed), other application runtimes, DNS, mail, databases, FTP/SFTP/SSH access for tenants, disk quotas, backups, automatic repair of drift found by `Reconcile`, a confined SELinux domain for the daemon itself, or historical metrics. These are on the roadmap in `oxpanel-daemon/PROJECT_DETAILS.md`.

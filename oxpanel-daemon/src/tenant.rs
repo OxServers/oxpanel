@@ -323,8 +323,16 @@ impl TenantService {
         let mut rec = self.load_ready(&name)?;
         let changed = rec.suspended != suspended;
         rec.suspended = suspended;
+        // Resume: PHP is back before the sites are. Suspend: the sites
+        // answer 503 before PHP stops. Either way no request sees a 502.
+        if changed && !suspended {
+            crate::php::set_running(&self.ctx, &rec, true).await?;
+        }
         vhost::sync_tenant_configs(&self.ctx, &rec, changed).await?;
         if changed {
+            if suspended {
+                crate::php::set_running(&self.ctx, &rec, false).await?;
+            }
             self.ctx.store.save_tenant(&rec)?;
             info!(tenant = %name, suspended, "suspension changed");
         }
@@ -451,6 +459,8 @@ mod tests {
         cfg.state_dir = dir.path().join("state");
         cfg.home_base = dir.path().join("home");
         cfg.systemd_unit_dir = dir.path().join("systemd");
+        cfg.nginx_log_dir = dir.path().join("log");
+        cfg.php_conf_dir = dir.path().join("php");
         cfg.nginx_conf_dir = dir.path().join("nginx").join("oxpanel.d");
         cfg.nginx_include_file = dir
             .path()
@@ -736,6 +746,7 @@ mod tests {
             aliases: vec![],
             config_path: PathBuf::from("/x"),
             created_at_unix: 0,
+            php: false,
         })?;
         assert!(matches!(
             h.svc.delete("alice", false).await,
@@ -757,6 +768,8 @@ mod tests {
         cfg.state_dir = dir.path().join("state");
         cfg.home_base = dir.path().join("home");
         cfg.systemd_unit_dir = dir.path().join("systemd");
+        cfg.nginx_log_dir = dir.path().join("log");
+        cfg.php_conf_dir = dir.path().join("php");
         std::fs::create_dir_all(&cfg.home_base)
             .map_err(|e| Error::io("mkdir", &cfg.home_base, e))?;
         std::fs::create_dir_all(&cfg.systemd_unit_dir)

@@ -19,6 +19,7 @@ if [ "${SKIP_INSTALL:-0}" != 1 ]; then
   install -Dm0644 /work/packaging/sysusers.d/oxpanel.conf /usr/lib/sysusers.d/oxpanel.conf
   install -Dm0644 /work/packaging/tmpfiles.d/oxpanel.conf /usr/lib/tmpfiles.d/oxpanel.conf
   install -Dm0640 /work/packaging/daemon.env /etc/oxpanel/daemon.env
+  install -Dm0644 /work/packaging/logrotate.d/oxpanel /etc/logrotate.d/oxpanel
   systemd-sysusers
   systemd-tmpfiles --create oxpanel.conf
   systemctl daemon-reload
@@ -29,6 +30,7 @@ else
   check "nginx is active" systemctl -q is-active nginx
 fi
 
+confd_before="$(ls /etc/nginx/conf.d | grep -vc "^00-oxpanel.conf$" || true)"
 echo "== start daemon through its hardened unit"
 if ! systemctl start oxpanel-daemon; then
   systemctl status oxpanel-daemon --no-pager || true
@@ -86,7 +88,7 @@ check "nginx has read on docroot" grep -q '^user:nginx:r-x' <(getfacl -p /home/a
 check "default ACL for new files" grep -q '^default:user:nginx:r-x' <(getfacl -p /home/alice/public_html 2>/dev/null)
 check "config in managed dir" test -f /etc/nginx/oxpanel.d/example.test.conf
 check "nginx -t passes" nginx -t
-check "other conf.d untouched" test "$(ls /etc/nginx/conf.d | wc -l)" = "1"
+check "other conf.d untouched (only the include stanza was added)" test "$(ls /etc/nginx/conf.d | wc -l)" = "$((confd_before + 1))"
 
 as_user alice sh -c 'echo hello-from-alice > /home/alice/public_html/index.html; echo SECRET=1 > /home/alice/public_html/.env; ln -s /etc/shadow /home/alice/public_html/shadow; ln -s /etc /home/alice/public_html/etc'
 check "nginx serves tenant content" body_eventually example.test / hello-from-alice
@@ -205,6 +207,71 @@ cp -p /root/daemon.env.bak /etc/oxpanel/daemon.env
 systemctl restart oxpanel-daemon
 check "daemon restarts without scopes" systemctl -q is-active oxpanel-daemon
 check "unscoped panel peer has full access again" grep -q '^changed=false' <(as_panelapi oxpanel-ctl tenant set-limits alice --memory 512M --tasks-max 64)
+
+echo "== per-site logs"
+curl -s -o /dev/null -H 'Host: example.test' 'http://127.0.0.1/?marker=log-check-1'
+check "site has its own access log" test -f /var/log/nginx/oxpanel/example.test.access.log
+check "access log is readable through the API" bash -c 'for i in $(seq 1 30); do oxpanel-ctl vhost log example.test | grep -q "marker=log-check-1" && exit 0; sleep 0.1; done; exit 1'
+# The refused symlink from the virtual-host section is an error-log event.
+curl -s -o /dev/null -H 'Host: example.test' 'http://127.0.0.1/shadow?marker=error-check-1'
+check "error log is separate and readable" bash -c 'for i in $(seq 1 30); do oxpanel-ctl vhost log example.test --error | grep -q "marker=error-check-1" && exit 0; sleep 0.1; done; exit 1'
+check "log directory is closed to tenants" bash -c '! setpriv --reuid=bob --regid=bob --clear-groups -- ls /var/log/nginx/oxpanel >/dev/null 2>&1'
+check_not "log of an unknown site is refused" oxpanel-ctl vhost log nosuch.test
+check_not "log name cannot traverse" oxpanel-ctl vhost log ../../../etc/shadow
+check "logrotate accepts our configuration" logrotate -d /etc/logrotate.d/oxpanel
+as_user alice sh -c 'echo "<?php echo \"secret-source\";" > /home/alice/public_html/config.php'
+check "a static site never hands out PHP source" test "$(code_of example.test /config.php)" = "404"
+
+echo "== PHP-FPM per tenant"
+check "host info reports PHP" grep -q ' php=true ' <(oxpanel-ctl host info)
+out="$(oxpanel-ctl vhost set php.test --tenant bob --php)"
+echo "$out"
+check "php vhost changed=true php=true" bash -c 'grep -q "^changed=true" <<<"$1" && grep -q " php=true " <<<"$1"' _ "$out"
+PHPU=oxpanel-php-bob.service
+check "pool unit is active" systemctl -q is-active "$PHPU"
+check "pool unit is enabled (survives reboot)" systemctl -q is-enabled "$PHPU"
+php_pid="$(systemctl show -p MainPID --value "$PHPU")"
+check "FPM master runs as the tenant, not root" test "$(ps -o user= -p "$php_pid" | tr -d ' ')" = "bob"
+check "no PHP process of this pool runs as root" bash -c '! ps -o user= --ppid "$1" -p "$1" | grep -qw root' _ "$php_pid"
+check "pool lives in the tenant slice" grep -q 'oxpanel-tenant-bob.slice' <(systemctl show -p ControlGroup --value "$PHPU")
+check "socket exists" test -S /run/oxpanel-php/bob/php.sock
+check "socket ACL names the web server" grep -q '^user:nginx:rw-' <(getfacl -p /run/oxpanel-php/bob/php.sock 2>/dev/null)
+check "another tenant cannot connect to the socket" bash -c 'setpriv --reuid=alice --regid=alice --clear-groups -- curl -s -o /dev/null --unix-socket /run/oxpanel-php/bob/php.sock http://x/; test $? -eq 7'
+as_user bob sh -c 'cat > /home/bob/public_html/index.php' <<'PHP'
+<?php
+$f = tempnam(sys_get_temp_dir(), 'ox');
+echo 'euid=' . fileowner($f) . ' tmp=' . dirname($f);
+unlink($f);
+echo ' passwd=' . (@file_get_contents('/etc/passwd') === false ? 'blocked' : 'READABLE');
+echo ' other=' . (@scandir('/home/alice') === false ? 'blocked' : 'READABLE');
+echo ' write=' . (@file_put_contents(__DIR__ . '/written.txt', 'x') === 1 ? 'ok' : 'failed');
+PHP
+check "PHP runs as the tenant, confined by open_basedir, and can write its own site" body_eventually php.test / "euid=$(id -u bob) tmp=/tmp passwd=blocked other=blocked write=ok"
+check "file written by PHP is owned by the tenant" test "$(stat -c '%U' /home/bob/public_html/written.txt)" = "bob"
+check "file written by PHP is served by nginx (default ACL applies)" body_eventually php.test /written.txt x
+check "PHP temp files are private to the unit (not in the host /tmp)" bash -c '! ls /tmp/ox* >/dev/null 2>&1'
+check "missing script is 404, not passed to FPM" test "$(code_of php.test /nope.php)" = "404"
+as_user bob sh -c 'mkdir -p /home/bob/public_html/.hidden && echo "<?php echo 1;" > /home/bob/public_html/.hidden/x.php && echo "<?php echo 1;" > /home/bob/public_html/img.php.jpg'
+check "script under a dot-directory is not executed" test "$(code_of php.test /.hidden/x.php)" = "404"
+check "path-info trick (file.jpg/x.php) is not executed" test "$(code_of php.test /img.php.jpg/x.php)" = "404"
+check "X-Powered-By is hidden" bash -c '! curl -s -D- -o /dev/null -H "Host: php.test" http://127.0.0.1/ | grep -qi x-powered-by'
+check "unknown paths fall back to the front controller" grep -q '^euid=' <(curl -s -H 'Host: php.test' http://127.0.0.1/some/pretty/url)
+check "vhost replay with php is idempotent" grep -q '^changed=false' <(oxpanel-ctl vhost set php.test --tenant bob --php)
+check "php pool is not drift" grep -q '^drifts=0$' <(oxpanel-ctl host reconcile)
+
+check "suspend stops the tenant's PHP" bash -c 'oxpanel-ctl tenant suspend bob >/dev/null && ! systemctl -q is-active "$1" && ! systemctl -q is-enabled "$1" 2>/dev/null' _ "$PHPU"
+check "suspended PHP site answers 503" code_eventually php.test / 503
+check "resume starts PHP again" bash -c 'oxpanel-ctl tenant resume bob >/dev/null && systemctl -q is-active "$1" && systemctl -q is-enabled "$1"' _ "$PHPU"
+check "resumed PHP site works" bash -c 'for i in $(seq 1 50); do curl -s -H "Host: php.test" http://127.0.0.1/ | grep -q "^euid=" && exit 0; sleep 0.1; done; exit 1'
+
+check "memory limit applies to PHP (same slice)" bash -c 'oxpanel-ctl tenant set-limits bob --memory 128M >/dev/null && test "$(systemctl show -p MemoryMax --value oxpanel-tenant-bob.slice)" = 134217728'
+check "usage now sees the PHP processes" bash -c 'test "$(oxpanel-ctl tenant usage bob | sed -n "s/.* tasks_current=\([0-9]*\).*/\1/p")" -ge 1'
+
+check "switching PHP off removes the pool" bash -c 'oxpanel-ctl vhost set php.test --tenant bob | grep -q " php=false " && ! systemctl -q is-active "$1" && test ! -e /etc/systemd/system/"$1" && test ! -e /etc/oxpanel-php/bob.conf' _ "$PHPU"
+check "with PHP off the script source is not served" bash -c 'for i in $(seq 1 50); do [ "$(curl -s -o /dev/null -w "%{http_code}" -H "Host: php.test" http://127.0.0.1/index.php)" = 404 ] && exit 0; sleep 0.1; done; exit 1'
+check "PHP back on, then removing the site removes the pool" bash -c 'oxpanel-ctl vhost set php.test --tenant bob --php >/dev/null && systemctl -q is-active "$1" && oxpanel-ctl vhost remove php.test | grep -q "^removed=true" && ! systemctl -q is-active "$1" && test ! -e /etc/systemd/system/"$1"' _ "$PHPU"
+check "site logs removed with the site" test ! -e /var/log/nginx/oxpanel/php.test.access.log
+check "no drift after PHP teardown" grep -q '^drifts=0$' <(oxpanel-ctl host reconcile)
 
 echo "== teardown"
 check "vhost removed" grep -q '^removed=true' <(oxpanel-ctl vhost remove example.test)

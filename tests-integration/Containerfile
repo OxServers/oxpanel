@@ -43,3 +43,7 @@ RUN curl -sSfL "https://github.com/EmbarkStudios/cargo-deny/releases/download/${
 # RPM build (make rpm).
 RUN dnf -y install --setopt=install_weak_deps=False rpm-build systemd-rpm-macros \
     && dnf clean all && rm -rf /var/cache/dnf
+
+# PHP-FPM (per-tenant pools) and logrotate (per-site logs) for the integration test.
+RUN dnf -y install --setopt=install_weak_deps=False php-fpm logrotate \
+    && dnf clean all && rm -rf /var/cache/dnf

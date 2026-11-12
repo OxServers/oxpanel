@@ -27,10 +27,12 @@ use std::path::{Path, PathBuf};
 
 use tracing::{info, warn};
 
+use crate::config::Config;
 use crate::ctx::Ctx;
 use crate::error::{Error, Result};
 use crate::fsutil;
 use crate::nginx;
+use crate::php;
 use crate::records::{now_unix, TenantRecord, TenantState, VHostRecord, RECORD_VERSION};
 use crate::system::{bin, CommandSpec};
 use crate::validate::{Domain, RelPath, Username};
@@ -47,6 +49,27 @@ pub struct VHostRequest {
     pub tenant: String,
     pub document_root: String,
     pub aliases: Vec<String>,
+    pub php: bool,
+}
+
+/// Which of a virtual host's two logs to read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogKind {
+    Access,
+    Error,
+}
+
+/// Default and upper bound for [`VHostService::read_log`].
+pub const LOG_DEFAULT_BYTES: u64 = 32 * 1024;
+pub const LOG_MAX_BYTES: u64 = 128 * 1024;
+const LOG_DIR_MODE: u32 = 0o750;
+
+/// `<log_dir>/<domain>.access.log` and `<log_dir>/<domain>.error.log`.
+pub fn log_paths(cfg: &Config, domain: &Domain) -> (PathBuf, PathBuf) {
+    (
+        cfg.nginx_log_dir.join(format!("{domain}.access.log")),
+        cfg.nginx_log_dir.join(format!("{domain}.error.log")),
+    )
 }
 
 #[derive(Debug, Clone)]
@@ -127,35 +150,44 @@ impl VHostService {
             self.label_docroot(&abs_root).await?;
         }
 
-        let block = nginx::render_server_block(&nginx::ServerBlock {
-            domain: &domain,
-            aliases: &aliases,
-            tenant: &tenant,
-            document_root: &abs_root,
-            suspended: tenant_rec.suspended,
-        })?;
         let path = nginx::conf_path(&cfg.nginx_conf_dir, &domain);
-        let changed = nginx::install_config(self.ctx.sys.as_ref(), &path, &block, timeout).await?;
-
         let rec = VHostRecord {
             version: RECORD_VERSION,
             domain: domain.to_string(),
             tenant: tenant.to_string(),
             document_root: docroot.to_string(),
             aliases: aliases.iter().map(ToString::to_string).collect(),
-            config_path: path,
+            config_path: path.clone(),
             created_at_unix: existing
                 .as_ref()
                 .map_or_else(now_unix, |e| e.created_at_unix),
+            php: req.php,
         };
+        // The pool must be listening before Nginx is told to use it.
+        let pool_changed = if rec.php {
+            php::ensure_pool(&self.ctx, &tenant_rec).await?
+        } else {
+            false
+        };
+        fsutil::ensure_dir(&cfg.nginx_log_dir, LOG_DIR_MODE)?;
+        let block = render_vhost(cfg, &tenant_rec, &rec)?;
+        let changed = nginx::install_config(self.ctx.sys.as_ref(), &path, &block, timeout).await?
+            || pool_changed;
         let record_changed = existing.as_ref() != Some(&rec);
         if record_changed {
             self.ctx.store.save_vhost(&rec)?;
         }
-        if changed || record_changed {
-            info!(%domain, %tenant, root = %abs_root.display(), "virtual host configured");
+        // PHP was switched off here: drop the pool if no other site needs it.
+        let pool_removed = if !rec.php && existing.as_ref().is_some_and(|e| e.php) {
+            self.remove_pool_if_unused(&tenant_rec).await?
+        } else {
+            false
+        };
+        let changed = changed || record_changed || pool_removed;
+        if changed {
+            info!(%domain, %tenant, root = %abs_root.display(), php = rec.php, "virtual host configured");
         }
-        Ok((rec, changed || record_changed))
+        Ok((rec, changed))
     }
 
     /// Every server name must be unique across the whole host.
@@ -285,8 +317,58 @@ impl VHostService {
             }
         }
         self.ctx.store.delete_vhost(&domain)?;
+        // Nginx has reloaded and no longer holds the logs open for this name.
+        let (access_log, error_log) = log_paths(cfg, &domain);
+        fsutil::remove_if_exists(&access_log)?;
+        fsutil::remove_if_exists(&error_log)?;
+        if rec.php {
+            if let Some(t) = self.ctx.store.load_tenant(&Username::parse(&rec.tenant)?)? {
+                self.remove_pool_if_unused(&t).await?;
+            }
+        }
         info!(%domain, tenant = %rec.tenant, "virtual host removed");
         Ok(true)
+    }
+
+    /// Remove the tenant's PHP-FPM pool once none of its virtual hosts uses PHP.
+    async fn remove_pool_if_unused(&self, tenant: &TenantRecord) -> Result<bool> {
+        let still_used = self
+            .ctx
+            .store
+            .list_vhosts()?
+            .iter()
+            .any(|v| v.tenant == tenant.username && v.php);
+        if still_used {
+            return Ok(false);
+        }
+        php::remove_pool(&self.ctx, tenant).await
+    }
+
+    /// The end of one of the virtual host's logs: at most `max_bytes`
+    /// (0 = default), starting at a line boundary. Returns the text and
+    /// whether the file holds more than was returned.
+    pub async fn read_log(
+        &self,
+        domain: &str,
+        kind: LogKind,
+        max_bytes: u64,
+    ) -> Result<(String, bool)> {
+        let domain = Domain::parse(domain)?;
+        if self.ctx.store.load_vhost(&domain)?.is_none() {
+            return Err(Error::VHostNotFound(domain.to_string()));
+        }
+        let (access_log, error_log) = log_paths(&self.ctx.config, &domain);
+        let path = match kind {
+            LogKind::Access => access_log,
+            LogKind::Error => error_log,
+        };
+        let limit = match max_bytes {
+            0 => LOG_DEFAULT_BYTES,
+            n => n.min(LOG_MAX_BYTES),
+        };
+        tokio::task::spawn_blocking(move || tail_file(&path, limit))
+            .await
+            .map_err(|e| Error::Internal(format!("read_log task: {e}")))?
     }
 
     pub async fn list(&self, tenant: Option<&str>) -> Result<Vec<VHostRecord>> {
@@ -356,7 +438,11 @@ impl VHostService {
 /// The server block a virtual-host record renders to for its tenant — the
 /// single definition of "what should be on disk", shared by suspension and
 /// reconciliation.
-pub(crate) fn render_vhost(tenant: &TenantRecord, vhost: &VHostRecord) -> Result<String> {
+pub(crate) fn render_vhost(
+    cfg: &Config,
+    tenant: &TenantRecord,
+    vhost: &VHostRecord,
+) -> Result<String> {
     let domain = Domain::parse(&vhost.domain)?;
     let name = Username::parse_field(&tenant.username, "tenant")?;
     let docroot = RelPath::parse(&vhost.document_root)?;
@@ -365,13 +451,76 @@ pub(crate) fn render_vhost(tenant: &TenantRecord, vhost: &VHostRecord) -> Result
         .iter()
         .map(|a| Domain::parse_field(a, "aliases"))
         .collect::<Result<Vec<Domain>>>()?;
+    let (access_log, error_log) = log_paths(cfg, &domain);
+    let socket = vhost.php.then(|| php::socket_path(&name));
     nginx::render_server_block(&nginx::ServerBlock {
         domain: &domain,
         aliases: &aliases,
         tenant: &name,
         document_root: &tenant.home.join(docroot.as_str()),
         suspended: tenant.suspended,
+        access_log: &access_log,
+        error_log: &error_log,
+        php_socket: socket.as_deref(),
     })
+}
+
+/// Read up to `limit` bytes from the end of `path`, dropping a leading
+/// partial line. A log that does not exist yet (no request so far) is empty.
+fn tail_file(path: &Path, limit: u64) -> Result<(String, bool)> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
+    let mut file = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((String::new(), false)),
+        Err(e) => return Err(Error::io("open", path, e)),
+    };
+    let len = file
+        .metadata()
+        .map_err(|e| Error::io("stat", path, e))?
+        .len();
+    let truncated = len > limit;
+    if truncated {
+        file.seek(SeekFrom::Start(len - limit))
+            .map_err(|e| Error::io("seek", path, e))?;
+    }
+    let mut bytes = Vec::new();
+    file.take(limit)
+        .read_to_end(&mut bytes)
+        .map_err(|e| Error::io("read", path, e))?;
+    let mut text = String::from_utf8_lossy(&bytes).into_owned();
+    if truncated {
+        // The first line is almost certainly cut in half.
+        match text.find('\n') {
+            Some(i) => drain_to(&mut text, i + 1),
+            None => text.clear(),
+        }
+    }
+    Ok((text, truncated))
+}
+
+fn drain_to(text: &mut String, end: usize) {
+    if text.is_char_boundary(end) {
+        text.drain(..end);
+    }
+}
+
+/// Bring every virtual-host file in line with its record. Run once at
+/// start-up so configuration written by an older daemon version picks up
+/// what this version renders. A rejected result is rolled back per tenant
+/// and returned to the caller to log; it never prevents the daemon starting.
+pub async fn converge_all(ctx: &Ctx) -> Result<usize> {
+    let _guard = ctx.lock.lock().await;
+    if ctx.store.list_vhosts()?.is_empty() {
+        return Ok(0);
+    }
+    fsutil::ensure_dir(&ctx.config.nginx_log_dir, LOG_DIR_MODE)?;
+    let mut reloaded = 0;
+    for tenant in ctx.store.list_tenants()? {
+        if tenant.state == TenantState::Ready && sync_tenant_configs(ctx, &tenant, false).await? {
+            reloaded += 1;
+        }
+    }
+    Ok(reloaded)
 }
 
 /// Rewrite every virtual host of `tenant` from its records (used when the
@@ -396,7 +545,7 @@ pub(crate) async fn sync_tenant_configs(
         .filter(|v| v.tenant == tenant.username)
     {
         any = true;
-        let block = render_vhost(tenant, v)?;
+        let block = render_vhost(&ctx.config, tenant, v)?;
         let previous = fsutil::read_optional(&v.config_path)?;
         if fsutil::write_atomic(&v.config_path, block.as_bytes(), nginx::CONF_MODE)? {
             written.push((v.config_path.clone(), previous));
@@ -455,6 +604,8 @@ mod tests {
         cfg.state_dir = dir.path().join("state");
         cfg.home_base = dir.path().join("home");
         cfg.systemd_unit_dir = dir.path().join("systemd");
+        cfg.nginx_log_dir = dir.path().join("log");
+        cfg.php_conf_dir = dir.path().join("php");
         cfg.nginx_conf_dir = dir.path().join("nginx").join("oxpanel.d");
         cfg.nginx_include_file = dir
             .path()
@@ -927,6 +1078,246 @@ mod tests {
         let (rec, changed) = h.tenants.set_suspended("alice", true).await?;
         assert!(changed && rec.suspended);
         assert!(h.sys.calls().is_empty());
+        Ok(())
+    }
+
+    fn php_req(domain: &str, tenant: &str) -> VHostRequest {
+        VHostRequest {
+            php: true,
+            ..req(domain, tenant)
+        }
+    }
+
+    fn systemctl_calls(h: &Harness) -> Vec<Vec<String>> {
+        h.sys.calls_to(bin::SYSTEMCTL).iter().map(args).collect()
+    }
+
+    fn pool_files(h: &Harness, tenant: &str) -> (PathBuf, PathBuf) {
+        (
+            h.config.php_conf_dir.join(format!("{tenant}.conf")),
+            h.config
+                .systemd_unit_dir
+                .join(format!("oxpanel-php-{tenant}.service")),
+        )
+    }
+
+    #[tokio::test]
+    async fn php_site_gets_a_pool_started_before_nginx_uses_it() -> Result<()> {
+        let h = harness(false).await;
+        let (rec, changed) = h.vhosts.configure(php_req("example.com", "alice")).await?;
+        assert!(changed && rec.php);
+        let (conf, unit) = pool_files(&h, "alice");
+        assert!(conf.is_file() && unit.is_file());
+        assert_eq!(
+            systemctl_calls(&h),
+            vec![
+                vec!["daemon-reload".to_owned()],
+                vec![
+                    "enable".into(),
+                    "--".into(),
+                    "oxpanel-php-alice.service".into()
+                ],
+                vec![
+                    "restart".into(),
+                    "--".into(),
+                    "oxpanel-php-alice.service".into()
+                ],
+                vec!["reload-or-restart".into(), "nginx.service".into()],
+            ],
+            "pool is up before nginx is reloaded"
+        );
+        let site = std::fs::read_to_string(&rec.config_path)
+            .map_err(|e| Error::io("read", &rec.config_path, e))?;
+        assert!(site.contains("fastcgi_pass unix:/run/oxpanel-php/alice/php.sock;"));
+        assert!(h
+            .sys
+            .calls()
+            .iter()
+            .all(|c| c.run_as.is_none() || c.program == bin::MKDIR));
+
+        // Replay: nothing changes; the unit is only confirmed enabled and running.
+        h.sys.clear_calls();
+        let (_, changed) = h.vhosts.configure(php_req("example.com", "alice")).await?;
+        assert!(!changed);
+        assert_eq!(
+            systemctl_calls(&h),
+            vec![vec![
+                "enable".to_owned(),
+                "--now".into(),
+                "--".into(),
+                "oxpanel-php-alice.service".into()
+            ]]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn php_is_refused_cleanly_when_not_installed() -> Result<()> {
+        let h = harness(false).await;
+        h.sys.set_missing(bin::PHP_FPM);
+        assert!(matches!(
+            h.vhosts.configure(php_req("example.com", "alice")).await,
+            Err(Error::PhpUnavailable)
+        ));
+        let (conf, unit) = pool_files(&h, "alice");
+        assert!(!conf.exists() && !unit.exists());
+        assert!(h.vhosts.list(None).await?.is_empty(), "no record, no site");
+        assert!(h.sys.calls_to(bin::NGINX).is_empty());
+        // A static site still works on such a host.
+        h.vhosts.configure(req("example.com", "alice")).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn pool_lives_exactly_as_long_as_a_php_site_needs_it() -> Result<()> {
+        let h = harness(false).await;
+        h.vhosts.configure(php_req("example.com", "alice")).await?;
+        h.vhosts.configure(php_req("example.net", "alice")).await?;
+        h.vhosts.configure(req("bob.example", "bob")).await?;
+        let (conf, unit) = pool_files(&h, "alice");
+        assert!(
+            !pool_files(&h, "bob").1.exists(),
+            "static tenants get no pool"
+        );
+
+        // One of two PHP sites goes: the pool stays.
+        assert!(h.vhosts.remove("example.net").await?);
+        assert!(conf.is_file() && unit.is_file());
+
+        // PHP switched off on the last one: the pool goes, the site stays.
+        h.sys.clear_calls();
+        let (rec, changed) = h.vhosts.configure(req("example.com", "alice")).await?;
+        assert!(changed && !rec.php);
+        assert!(!conf.exists() && !unit.exists());
+        assert!(systemctl_calls(&h).contains(&vec![
+            "disable".to_owned(),
+            "--now".into(),
+            "--".into(),
+            "oxpanel-php-alice.service".into()
+        ]));
+        let site = std::fs::read_to_string(&rec.config_path)
+            .map_err(|e| Error::io("read", &rec.config_path, e))?;
+        assert!(!site.contains("fastcgi_pass"));
+
+        // Switched on again and then the site removed: gone again.
+        h.vhosts.configure(php_req("example.com", "alice")).await?;
+        assert!(unit.is_file());
+        assert!(h.vhosts.remove("example.com").await?);
+        assert!(!conf.exists() && !unit.exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn suspension_stops_php_after_the_sites_and_resume_starts_it_first() -> Result<()> {
+        let h = harness(false).await;
+        h.vhosts.configure(php_req("example.com", "alice")).await?;
+        h.sys.clear_calls();
+        h.tenants.set_suspended("alice", true).await?;
+        assert_eq!(
+            systemctl_calls(&h),
+            vec![
+                vec!["reload-or-restart".to_owned(), "nginx.service".into()],
+                vec![
+                    "disable".into(),
+                    "--now".into(),
+                    "--".into(),
+                    "oxpanel-php-alice.service".into()
+                ],
+            ]
+        );
+        // A PHP site added while suspended does not start PHP.
+        h.sys.clear_calls();
+        h.vhosts.configure(php_req("example.net", "alice")).await?;
+        assert!(systemctl_calls(&h)
+            .iter()
+            .all(|c| c.first().is_some_and(|v| v == "reload-or-restart")));
+        h.sys.clear_calls();
+        h.tenants.set_suspended("alice", false).await?;
+        assert_eq!(
+            systemctl_calls(&h),
+            vec![
+                vec![
+                    "enable".to_owned(),
+                    "--now".into(),
+                    "--".into(),
+                    "oxpanel-php-alice.service".into()
+                ],
+                vec!["reload-or-restart".into(), "nginx.service".into()],
+            ]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn logs_are_per_site_readable_by_tail_and_removed_with_the_site() -> Result<()> {
+        let h = harness(false).await;
+        let (rec, _) = h.vhosts.configure(req("example.com", "alice")).await?;
+        let site = std::fs::read_to_string(&rec.config_path)
+            .map_err(|e| Error::io("read", &rec.config_path, e))?;
+        let (access, error) = log_paths(&h.config, &Domain::parse("example.com")?);
+        assert!(site.contains(&format!("access_log {};", access.display())));
+        assert!(site.contains(&format!("error_log {};", error.display())));
+        assert!(h.config.nginx_log_dir.is_dir());
+
+        // No request yet: empty, not an error.
+        assert_eq!(
+            h.vhosts.read_log("example.com", LogKind::Access, 0).await?,
+            (String::new(), false)
+        );
+        let lines = (0..200)
+            .map(|i| format!("line {i:03}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+            + "\n";
+        std::fs::write(&access, &lines).map_err(|e| Error::io("write", &access, e))?;
+        std::fs::write(&error, "boom\n").map_err(|e| Error::io("write", &error, e))?;
+        let (all, truncated) = h.vhosts.read_log("example.com", LogKind::Access, 0).await?;
+        assert_eq!((all.as_str(), truncated), (lines.as_str(), false));
+        // 25 bytes from the end = 2 full lines and a partial one, which is dropped.
+        let (tail, truncated) = h
+            .vhosts
+            .read_log("example.com", LogKind::Access, 25)
+            .await?;
+        assert_eq!((tail.as_str(), truncated), ("line 198\nline 199\n", true));
+        assert_eq!(
+            h.vhosts.read_log("example.com", LogKind::Error, 0).await?.0,
+            "boom\n"
+        );
+        // Only sites with a record; names are validated (no path traversal).
+        assert!(matches!(
+            h.vhosts.read_log("other.example", LogKind::Access, 0).await,
+            Err(Error::VHostNotFound(_))
+        ));
+        assert!(matches!(
+            h.vhosts
+                .read_log("../../etc/shadow", LogKind::Access, 0)
+                .await,
+            Err(Error::InvalidInput { .. })
+        ));
+        assert!(h.vhosts.remove("example.com").await?);
+        assert!(!access.exists() && !error.exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn start_up_convergence_rewrites_stale_files_once() -> Result<()> {
+        let h = harness(false).await;
+        let (rec, _) = h.vhosts.configure(req("example.com", "alice")).await?;
+        // As written by an older version of the daemon.
+        std::fs::write(&rec.config_path, "server { listen 80; }\n")
+            .map_err(|e| Error::io("write", &rec.config_path, e))?;
+        h.sys.clear_calls();
+        assert_eq!(converge_all(&h.vhosts.ctx).await?, 1);
+        assert!(std::fs::read_to_string(&rec.config_path)
+            .map_err(|e| Error::io("read", &rec.config_path, e))?
+            .contains("access_log"));
+        assert_eq!(h.sys.calls_to(bin::NGINX).len(), 1);
+        assert_eq!(
+            converge_all(&h.vhosts.ctx).await?,
+            0,
+            "second run is a no-op"
+        );
+        assert_eq!(h.sys.calls_to(bin::NGINX).len(), 1);
         Ok(())
     }
 }

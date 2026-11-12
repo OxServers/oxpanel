@@ -15,6 +15,9 @@ Requires:       shadow-utils
 Requires:       util-linux
 Requires:       acl
 Requires:       coreutils
+Requires:       logrotate
+# PHP is optional: without php-fpm, virtual hosts are static only.
+Recommends:     php-fpm
 Requires:       policycoreutils
 Requires:       policycoreutils-python-utils
 Requires:       libselinux-utils
@@ -40,6 +43,7 @@ install -D -m 0644 packaging/systemd/oxpanel-daemon.service %{buildroot}%{_unitd
 install -D -m 0644 packaging/sysusers.d/oxpanel.conf %{buildroot}%{_sysusersdir}/oxpanel.conf
 install -D -m 0644 packaging/tmpfiles.d/oxpanel.conf %{buildroot}%{_tmpfilesdir}/oxpanel.conf
 install -D -m 0640 packaging/daemon.env %{buildroot}%{_sysconfdir}/oxpanel/daemon.env
+install -D -m 0644 packaging/logrotate.d/oxpanel %{buildroot}%{_sysconfdir}/logrotate.d/oxpanel
 
 %pre
 %sysusers_create_compat packaging/sysusers.d/oxpanel.conf
@@ -47,8 +51,10 @@ install -D -m 0640 packaging/daemon.env %{buildroot}%{_sysconfdir}/oxpanel/daemo
 %post
 %systemd_post oxpanel-daemon.service
 %tmpfiles_create oxpanel.conf
-# Sites live under tenant homes: let the web server traverse and read them (persistent).
-if /usr/sbin/selinuxenabled 2>/dev/null; then /usr/sbin/setsebool -P httpd_enable_homedirs=on httpd_read_user_content=on || :; fi
+# Sites live under tenant homes: let the web server traverse and read them, and
+# let a tenant's PHP (which runs in the web-server domain) write the tenant's own
+# site (uploads, caches). File ownership still decides whose files those are.
+if /usr/sbin/selinuxenabled 2>/dev/null; then /usr/sbin/setsebool -P httpd_enable_homedirs=on httpd_read_user_content=on httpd_unified=on || :; fi
 
 %preun
 %systemd_preun oxpanel-daemon.service
@@ -66,6 +72,7 @@ if /usr/sbin/selinuxenabled 2>/dev/null; then /usr/sbin/setsebool -P httpd_enabl
 %{_tmpfilesdir}/oxpanel.conf
 %dir %attr(0750,root,oxpanel) %{_sysconfdir}/oxpanel
 %config(noreplace) %attr(0640,root,root) %{_sysconfdir}/oxpanel/daemon.env
+%config(noreplace) %{_sysconfdir}/logrotate.d/oxpanel
 
 %changelog
 * Sat Sep 05 2026 OxPanel contributors - 0.1.0-1

@@ -9,11 +9,13 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use crate::config::Config;
 use crate::ctx::Ctx;
 use crate::error::Result;
 use crate::fsutil;
+use crate::php::{self, PoolFiles};
 use crate::records::{TenantRecord, TenantState, VHostRecord};
-use crate::system::HostStats;
+use crate::system::{bin, HostStats};
 use crate::systemd::{self, TenantUnits};
 use crate::validate::Username;
 use crate::vhost;
@@ -30,6 +32,8 @@ pub enum DriftKind {
     VHostConfigDrift,
     OrphanNginxConfig,
     OrphanSliceUnit,
+    PhpPoolDrift,
+    OrphanPhpPool,
 }
 
 /// One difference between a record and the operating system.
@@ -60,6 +64,7 @@ pub struct HostInfo {
     pub vhost_count: u32,
     pub uid_min: u32,
     pub uid_max: u32,
+    pub php_available: bool,
     pub stats: HostStats,
 }
 
@@ -83,6 +88,7 @@ impl HostService {
             vhost_count: count(self.ctx.store.list_vhosts()?.len()),
             uid_min: cfg.uid_min,
             uid_max: cfg.uid_max,
+            php_available: self.ctx.sys.is_installed(bin::PHP_FPM).await,
             stats: self.ctx.sys.host_stats(&cfg.home_base).await?,
         })
     }
@@ -102,7 +108,30 @@ impl HostService {
         let by_name: BTreeMap<&str, &TenantRecord> =
             tenants.iter().map(|t| (t.username.as_str(), t)).collect();
         for v in &vhosts {
-            check_vhost(v, by_name.get(v.tenant.as_str()).copied(), &mut out)?;
+            check_vhost(cfg, v, by_name.get(v.tenant.as_str()).copied(), &mut out)?;
+        }
+
+        // PHP-FPM pools: one per ready tenant with a PHP-enabled virtual host.
+        let mut known_pool_files: BTreeSet<PathBuf> = BTreeSet::new();
+        for t in tenants.iter().filter(|t| {
+            t.state == TenantState::Ready && vhosts.iter().any(|v| v.php && v.tenant == t.username)
+        }) {
+            let name = Username::parse(&t.username)?;
+            let files = PoolFiles::for_tenant(&cfg.php_conf_dir, &cfg.systemd_unit_dir, &name);
+            for (path, expected) in [
+                (&files.conf, php::render_pool_conf(t, &name, &cfg.web_user)?),
+                (&files.unit, php::render_unit(t, &name, &files.conf)?),
+            ] {
+                if let Some(problem) = compare_file(path, &expected)? {
+                    out.push(Drift::new(
+                        DriftKind::PhpPoolDrift,
+                        t.username.as_str(),
+                        format!("{} {problem}", path.display()),
+                    ));
+                }
+            }
+            known_pool_files.insert(files.conf);
+            known_pool_files.insert(files.unit);
         }
 
         let known_confs: BTreeSet<&Path> = vhosts.iter().map(|v| v.config_path.as_path()).collect();
@@ -129,6 +158,25 @@ impl HostService {
                     DriftKind::OrphanSliceUnit,
                     path.to_string_lossy(),
                     "no tenant record refers to this unit",
+                ));
+            }
+        }
+        let mut pool_files = fsutil::list_files_with_suffix(&cfg.php_conf_dir, ".conf")?;
+        pool_files.extend(
+            fsutil::list_files_with_suffix(&cfg.systemd_unit_dir, ".service")?
+                .into_iter()
+                .filter(|p| {
+                    p.file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("oxpanel-php-"))
+                }),
+        );
+        for path in pool_files {
+            if !known_pool_files.contains(&path) {
+                out.push(Drift::new(
+                    DriftKind::OrphanPhpPool,
+                    path.to_string_lossy(),
+                    "no PHP-enabled virtual host accounts for this file",
                 ));
             }
         }
@@ -207,7 +255,12 @@ impl HostService {
     }
 }
 
-fn check_vhost(v: &VHostRecord, tenant: Option<&TenantRecord>, out: &mut Vec<Drift>) -> Result<()> {
+fn check_vhost(
+    cfg: &Config,
+    v: &VHostRecord,
+    tenant: Option<&TenantRecord>,
+    out: &mut Vec<Drift>,
+) -> Result<()> {
     let Some(tenant) = tenant else {
         out.push(Drift::new(
             DriftKind::VHostTenantMissing,
@@ -216,7 +269,7 @@ fn check_vhost(v: &VHostRecord, tenant: Option<&TenantRecord>, out: &mut Vec<Dri
         ));
         return Ok(());
     };
-    let expected = vhost::render_vhost(tenant, v)?;
+    let expected = vhost::render_vhost(cfg, tenant, v)?;
     if let Some(problem) = compare_file(&v.config_path, &expected)? {
         out.push(Drift::new(
             DriftKind::VHostConfigDrift,
@@ -263,6 +316,8 @@ mod tests {
         cfg.state_dir = dir.path().join("state");
         cfg.home_base = dir.path().join("home");
         cfg.systemd_unit_dir = dir.path().join("systemd");
+        cfg.nginx_log_dir = dir.path().join("log");
+        cfg.php_conf_dir = dir.path().join("php");
         cfg.nginx_conf_dir = dir.path().join("nginx").join("oxpanel.d");
         cfg.nginx_include_file = dir
             .path()
@@ -412,6 +467,7 @@ mod tests {
             aliases: vec![],
             config_path: cfg.nginx_conf_dir.join("lost.example.conf"),
             created_at_unix: 0,
+            php: false,
         };
         h.ctx.store.save_vhost(&orphan_site)?;
 
@@ -444,6 +500,69 @@ mod tests {
         assert!(!i.selinux && !i.dry_run);
         assert_eq!(i.stats.memory_total_bytes, 8 << 30);
         assert!(i.stats.disk_free_bytes <= i.stats.disk_total_bytes);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reports_php_pool_drift_and_orphans() -> Result<()> {
+        let h = harness().await;
+        let cfg = &h.ctx.config;
+        h.vhosts
+            .configure(VHostRequest {
+                domain: "example.com".into(),
+                tenant: "alice".into(),
+                php: true,
+                ..VHostRequest::default()
+            })
+            .await?;
+        assert_eq!(
+            h.host.reconcile().await?,
+            vec![],
+            "a healthy pool is not drift"
+        );
+        assert!(h.host.info().await?.php_available);
+
+        let conf = cfg.php_conf_dir.join("alice.conf");
+        std::fs::write(&conf, "[alice]\nuser = root\n")
+            .map_err(|e| Error::io("write", &conf, e))?;
+        let stray_conf = cfg.php_conf_dir.join("ghost.conf");
+        let stray_unit = cfg.systemd_unit_dir.join("oxpanel-php-ghost.service");
+        for p in [
+            &stray_conf,
+            &stray_unit,
+            &cfg.systemd_unit_dir.join("sshd.service"),
+        ] {
+            std::fs::write(p, "x").map_err(|e| Error::io("write", p, e))?;
+        }
+        let drifts = h.host.reconcile().await?;
+        let (stray_conf, stray_unit) = (
+            stray_conf.to_string_lossy().into_owned(),
+            stray_unit.to_string_lossy().into_owned(),
+        );
+        assert_eq!(
+            kinds(&drifts),
+            vec![
+                (DriftKind::PhpPoolDrift, "alice"),
+                (DriftKind::OrphanPhpPool, stray_conf.as_str()),
+                (DriftKind::OrphanPhpPool, stray_unit.as_str()),
+            ]
+        );
+        // Repeating the request rewrites the pool.
+        h.vhosts
+            .configure(VHostRequest {
+                domain: "example.com".into(),
+                tenant: "alice".into(),
+                php: true,
+                ..VHostRequest::default()
+            })
+            .await?;
+        assert_eq!(
+            h.host.reconcile().await?.len(),
+            2,
+            "only the orphans remain"
+        );
+        h.sys.set_missing(bin::PHP_FPM);
+        assert!(!h.host.info().await?.php_available);
         Ok(())
     }
 }

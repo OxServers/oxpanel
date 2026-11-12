@@ -55,6 +55,10 @@ pub enum Error {
     #[error("nginx rejected the configuration: {0}")]
     NginxInvalid(String),
 
+    /// A virtual host asked for PHP but PHP-FPM is not installed.
+    #[error("PHP is not installed on this host (install php-fpm)")]
+    PhpUnavailable,
+
     #[error("{program} exited with {status}")]
     CommandFailed {
         program: String,
@@ -123,6 +127,7 @@ impl Error {
                 | Self::VHostNotFound(_)
                 | Self::VHostOwnedByOther { .. }
                 | Self::NginxInvalid(_)
+                | Self::PhpUnavailable
                 | Self::Unauthorised
         )
     }
@@ -144,6 +149,7 @@ impl From<Error> for Status {
             | Error::TenantNotReady(_)
             | Error::TenantHasVHosts(_)
             | Error::VHostOwnedByOther { .. }
+            | Error::PhpUnavailable
             | Error::NginxInvalid(_) => Status::failed_precondition(message),
             Error::UidExhausted { .. } => Status::resource_exhausted(message),
             Error::Unauthorised => Status::permission_denied(message),

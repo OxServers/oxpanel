@@ -60,6 +60,10 @@ pub struct VHostRecord {
     pub aliases: Vec<String>,
     pub config_path: PathBuf,
     pub created_at_unix: u64,
+    /// `*.php` is executed by the tenant's PHP-FPM pool. Absent in records
+    /// written before PHP support existed.
+    #[serde(default)]
+    pub php: bool,
 }
 
 impl VHostRecord {
@@ -284,6 +288,7 @@ mod tests {
             aliases: vec![],
             config_path: PathBuf::from("/x"),
             created_at_unix: 0,
+            php: false,
         };
         assert!(s.save_vhost(&v).is_err());
     }

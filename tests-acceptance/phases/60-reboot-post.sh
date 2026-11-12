@@ -11,6 +11,10 @@ check "vhost list identical" bash -c "diff <(oxpanel-ctl vhost list) vhosts.pre"
 eventually "boota.test serves after reboot" 60 0.5 http_body_is boota.test / boota
 eventually "www.boota.test alias serves" 20 0.5 http_body_is www.boota.test / boota
 eventually "bootb.test serves after reboot" 20 0.5 http_body_is bootb.test / bootb
+eventually "PHP pool came back by itself after reboot" 60 0.5 systemctl -q is-active oxpanel-php-bootb.service
+eventually "bootphp.test serves PHP after reboot" 60 0.5 http_body_is bootphp.test / php-42
+check "PHP pool is in the tenant slice after reboot" bash -c "systemctl show -p ControlGroup --value oxpanel-php-bootb.service | grep -q oxpanel-tenant-bootb.slice"
+check "no drift after reboot" bash -c "oxpanel-ctl host reconcile | grep -q '^drifts=0$'"
 check "boota slice loaded with its MemoryMax" test "$(systemctl show -p MemoryMax --value oxpanel-tenant-boota.slice)" = 268435456
 check "boota slice CPUWeight" test "$(systemctl show -p CPUWeight --value oxpanel-tenant-boota.slice)" = 40
 check "bootb slice loaded" test "$(systemctl show -p MemoryMax --value oxpanel-tenant-bootb.slice)" = 134217728
@@ -20,6 +24,6 @@ check "no sandbox directive ignored on this boot" bash -c "! journalctl -b -u ox
 check "no daemon errors on this boot" bash -c '! journalctl -b -u oxpanel-daemon -p err --no-pager | grep -q oxpanel-daemon'
 n=$(avc_count); if [ "$n" = 0 ]; then ok "zero AVC denials on this boot"; else avc_dump; fail "$n AVC denial(s) on this boot"; fi
 check "unknown host still closed" test "$(curl -s -H 'Host: nobody.test' http://127.0.0.1/; echo "rc=$?")" = "rc=52"
-for d in boota.test bootb.test; do check "remove $d" bash -c "oxpanel-ctl vhost remove $d | grep -q '^removed=true'"; done
+for d in boota.test bootb.test bootphp.test; do check "remove $d" bash -c "oxpanel-ctl vhost remove $d | grep -q '^removed=true'"; done
 for t in boota bootb; do check "delete $t" bash -c "oxpanel-ctl tenant delete $t --remove-home | grep -q '^deleted=true'"; done
 phase_end

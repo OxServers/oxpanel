@@ -19,7 +19,7 @@ use oxpanel_daemon::config::Config;
 use oxpanel_daemon::ctx::Ctx;
 use oxpanel_daemon::server::Engine;
 use oxpanel_daemon::system::{bin, CommandSpec, FakeSystem, OsUser, RealSystem, System};
-use oxpanel_daemon::{fsutil, nginx};
+use oxpanel_daemon::{fsutil, nginx, vhost};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const USAGE: &str = "\
@@ -180,6 +180,17 @@ async fn run(cli: Cli) -> Result<(), Fatal> {
     .await
     .map_err(|e| Fatal::Runtime(format!("nginx include: {e}")))?;
 
+    if !cli.check_config {
+        // Files written by an older version are re-rendered from the records.
+        match vhost::converge_all(&ctx).await {
+            Ok(0) => {}
+            Ok(n) => info!(tenants = n, "virtual-host configuration brought up to date"),
+            Err(e) => {
+                warn!(error = %e, "could not bring virtual-host configuration up to date; see `oxpanel-ctl host reconcile`");
+            }
+        }
+    }
+
     if cli.check_config {
         info!("configuration and preflight checks passed");
         return Ok(());
@@ -313,6 +324,16 @@ async fn preflight(config: &Config, sys: &dyn System) -> Result<bool, Fatal> {
                     "SELinux boolean {boolean} is off: web sites under /home cannot be served. Run: setsebool -P {boolean} on"
                 )));
             }
+        }
+    }
+    if selinux {
+        // Not fatal: static sites and read-only PHP work without it.
+        let out = sys
+            .run(CommandSpec::new(bin::GETSEBOOL, config.command_timeout).arg("httpd_unified"))
+            .await
+            .map_err(|e| Fatal::Runtime(e.to_string()))?;
+        if !out.stdout_lossy().contains("--> on") {
+            warn!("SELinux boolean httpd_unified is off: PHP sites cannot write to their own files (uploads, caches). Run: setsebool -P httpd_unified on");
         }
     }
     info!(selinux, "preflight");

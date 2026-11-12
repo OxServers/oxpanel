@@ -102,9 +102,9 @@ The package installs:
 ### 3.2 From source, on the target host
 
 ```sh
-sudo dnf install -y gcc git nginx shadow-utils util-linux acl policycoreutils policycoreutils-python-utils libselinux-utils
+sudo dnf install -y gcc git nginx shadow-utils util-linux acl policycoreutils policycoreutils-python-utils libselinux-utils logrotate php-fpm
 # SELinux: sites live under tenant homes, so the web server must be allowed to traverse and read them.
-if sudo selinuxenabled; then sudo setsebool -P httpd_enable_homedirs=on httpd_read_user_content=on; fi
+if sudo selinuxenabled; then sudo setsebool -P httpd_enable_homedirs=on httpd_read_user_content=on httpd_unified=on; fi
 curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal && source ~/.cargo/env
 
 git clone https://github.com/OxServers/oxpanel.git && cd oxpanel
@@ -116,6 +116,7 @@ sudo install -Dm0644 packaging/systemd/oxpanel-daemon.service /etc/systemd/syste
 sudo install -Dm0644 packaging/sysusers.d/oxpanel.conf        /usr/lib/sysusers.d/oxpanel.conf
 sudo install -Dm0644 packaging/tmpfiles.d/oxpanel.conf        /usr/lib/tmpfiles.d/oxpanel.conf
 sudo install -Dm0640 packaging/daemon.env                     /etc/oxpanel/daemon.env
+sudo install -Dm0644 packaging/logrotate.d/oxpanel            /etc/logrotate.d/oxpanel
 sudo systemd-sysusers && sudo systemd-tmpfiles --create oxpanel.conf
 sudo systemctl daemon-reload
 sudo systemctl enable --now nginx oxpanel-daemon
@@ -174,6 +175,8 @@ valid. After editing: `sudo systemctl restart oxpanel-daemon`.
 | `OXPANEL_NGINX_INCLUDE_FILE` | `/etc/nginx/conf.d/00-oxpanel.conf` | Include stanza (+ catch-all server). Must not be inside the conf dir. |
 | `OXPANEL_NGINX_DEFAULT_SERVER` | `true` | Install the catch-all `default_server` (`return 444`). Set `false` only if the host already defines its own default server. |
 | `OXPANEL_SYSTEMD_UNIT_DIR` | `/etc/systemd/system` | Where tenant slice units and drop-ins are written. |
+| `OXPANEL_NGINX_LOG_DIR` | `/var/log/nginx/oxpanel` | Per-site `<domain>.access.log` / `<domain>.error.log`. If you change it, change `/etc/logrotate.d/oxpanel` too. |
+| `OXPANEL_PHP_CONF_DIR` | `/etc/oxpanel-php` | One PHP-FPM configuration per tenant that uses PHP. World-readable (each tenant's FPM reads its own); holds no secrets. |
 | `OXPANEL_WEB_USER` | `nginx` | Account the web-server workers run as; receives ACL grants on document roots. Must exist, must not be root, must not be inside the tenant uid range. |
 | `OXPANEL_COMMAND_TIMEOUT_SECS` | `60` | Upper bound for any single external command (`useradd`, `nginx -t`, …). |
 | `OXPANEL_LOG` | `info` | `tracing` filter: `info`, `debug`, `oxpanel_daemon=trace`, … |
@@ -276,7 +279,8 @@ tenant delete <username> [--remove-home]
 host info
 host reconcile
 
-vhost set     <domain> --tenant <username> [--root RELATIVE_PATH] [--alias DOMAIN]...
+vhost set     <domain> --tenant <username> [--root RELATIVE_PATH] [--alias DOMAIN]... [--php]
+vhost log     <domain> [--error] [--bytes SIZE]
 vhost remove  <domain>
 vhost list    [--tenant <username>]
 ```
@@ -328,6 +332,16 @@ sudo oxpanel-ctl tenant usage acme
 sudo oxpanel-ctl host info
 sudo oxpanel-ctl host reconcile        # drifts=0
 
+# A PHP site: the tenant gets its own PHP-FPM, running as the tenant inside its limits
+sudo oxpanel-ctl vhost set blog.acme.example --tenant acme --root blog --php
+systemctl status oxpanel-php-acme.service
+# Switch PHP off again (the pool is removed when no site of the tenant uses it)
+sudo oxpanel-ctl vhost set blog.acme.example --tenant acme --root blog
+
+# The end of a site's access log, or its error log
+sudo oxpanel-ctl vhost log acme.example
+sudo oxpanel-ctl vhost log acme.example --error --bytes 64K
+
 # Tear down (order matters: vhosts first)
 sudo oxpanel-ctl vhost remove shop.acme.example
 sudo oxpanel-ctl vhost remove acme.example
@@ -375,12 +389,13 @@ resp, err := client.CreateTenant(ctx, &oxpanelv1.CreateTenantRequest{
 | `CreateTenant` | identical spec → `created=false`; different spec → `ALREADY_EXISTS`; interrupted → resumed | `INVALID_ARGUMENT` (validation), `FAILED_PRECONDITION` (name belongs to an unmanaged account, or tenant is being deleted), `RESOURCE_EXHAUSTED` (uid range full) |
 | `GetTenant` / `ListTenants` | read-only | `NOT_FOUND` |
 | `DeleteTenant` | `deleted=false` if absent | `FAILED_PRECONDITION` (still owns virtual hosts, or unmanaged account) |
-| `ConfigureVirtualHost` | identical config → `created=false` | `NOT_FOUND` (tenant), `FAILED_PRECONDITION` (name owned by another tenant; tenant not ready; **`nginx -t` rejected the result — message contains the nginx output**) |
+| `ConfigureVirtualHost` | identical config → `created=false` | `NOT_FOUND` (tenant), `FAILED_PRECONDITION` (name owned by another tenant; tenant not ready; `php=true` but PHP is not installed; **`nginx -t` rejected the result — message contains the nginx output**) |
 | `RemoveVirtualHost` | `removed=false` if absent | `FAILED_PRECONDITION` (config invalid after removal — operator attention) |
 | `UpdateTenantLimits` | same limits → `changed=false` (unit files are still re-applied, completing an interrupted attempt) | `NOT_FOUND`, `FAILED_PRECONDITION` (tenant not ready), `INVALID_ARGUMENT`. The limits are a full replacement, not a patch |
 | `UpdateTenantOwner` | same owner → `changed=false` | `NOT_FOUND`, `FAILED_PRECONDITION`, `INVALID_ARGUMENT` |
 | `SuspendTenant` / `ResumeTenant` | already in that state → `changed=false` | `NOT_FOUND`, `FAILED_PRECONDITION` (tenant not ready; `nginx -t` rejected — all files restored, state unchanged) |
 | `GetTenantUsage` / `GetHostInfo` | read-only measurements | `NOT_FOUND`; usage runs `du` on the home, so cache it in the panel rather than polling per page view |
+| `ReadVirtualHostLog` | read-only; at most 128 KiB of whole lines from the end of the current file | `NOT_FOUND` (no such site). Log lines contain visitor IP addresses: show a site's log only to its owner |
 | `Reconcile` | read-only; waits for the mutation lock | — (an empty `drifts` list means records and OS agree) |
 | any | | `PERMISSION_DENIED` (peer not allowed, or its scopes do not cover the RPC — §5), `DEADLINE_EXCEEDED` (a system command hit `OXPANEL_COMMAND_TIMEOUT_SECS`), `INTERNAL` (redacted; see the journal) |
 
@@ -407,6 +422,10 @@ needs to confirm a site is live, poll it.
 | `/etc/systemd/system/user-<uid>.slice.d/50-oxpanel.conf` | `root 0644` | the same limits for login sessions |
 | `/etc/nginx/conf.d/00-oxpanel.conf` | `root 0644` | `include /etc/nginx/oxpanel.d/*.conf;` + catch-all default server |
 | `/etc/nginx/oxpanel.d/<domain>.conf` | `root 0644` | the server block |
+| `/var/log/nginx/oxpanel/<domain>.{access,error}.log` | directory `root 0750` | per-site logs; rotated by `/etc/logrotate.d/oxpanel`, removed with the site |
+| `/etc/oxpanel-php/<username>.conf` | `root 0644` | PHP-FPM configuration of a tenant with a PHP-enabled site |
+| `/etc/systemd/system/oxpanel-php-<name>.service` | `root 0644` | that tenant's PHP-FPM unit (`User=<tenant>`, in the tenant slice) |
+| `/run/oxpanel-php/<username>/php.sock` | `<t>:<t>` + ACL `user:nginx:rw-` | socket Nginx passes PHP requests to |
 | `/run/oxpanel/oxpanel.sock` | `root:oxpanel 0660` | API socket |
 | SELinux hosts | | `semanage fcontext` equivalence `<docroot> = /usr/share/nginx/html` (labels the tree `httpd_sys_content_t`; a plain rule would be overridden by `file_contexts.homedirs`) |
 
@@ -444,6 +463,18 @@ overwrites them, and `host reconcile` reports the edit as drift.
 web-serving state: sites answer `503` with `Retry-After: 3600`. The account,
 files and limits are unchanged, and `tenant get` shows `suspended=true`.
 
+**PHP** — needs the `php-fpm` package (the RPM recommends it; `host info` shows
+`php=true`). OxPanel uses the PHP version the host has installed; to change it,
+switch the AppStream module (`dnf module switch-to php:8.3`) and restart the
+pools (`systemctl restart 'oxpanel-php-*'`). Install extensions with dnf
+(`php-mysqlnd`, `php-gd`, …) and restart the pools the same way. A tenant's PHP
+errors go to the journal: `journalctl -u oxpanel-php-<name>`.
+
+The `php-fpm` package also ships a *shared* pool (`php-fpm.service`, running as
+`apache`) and makes Nginx start it. OxPanel never uses it — every tenant has
+its own instance — so on a hosting node switch it off:
+`sudo systemctl mask --now php-fpm.service`.
+
 **Checking for drift** — `oxpanel-ctl host reconcile` compares every record
 with the accounts, homes, unit files and Nginx files, and prints one line per
 difference (`kind=… subject=… detail=…`); exit status `3` means drift, so it
@@ -458,6 +489,8 @@ What to do with each finding:
 | `TENANT_UNIT_DRIFT` | A slice unit or drop-in was edited or removed. | `tenant set-limits` with the recorded limits rewrites both. |
 | `VHOST_CONFIG_DRIFT` | A site's Nginx file was edited or removed. | Repeat `vhost set` for the domain. |
 | `VHOST_TENANT_MISSING` | A site record names a tenant without a record. | `vhost remove` the domain. |
+| `PHP_POOL_DRIFT` | A tenant's PHP-FPM configuration or unit was edited or removed. | Repeat `vhost set … --php` for one of the tenant's PHP sites. |
+| `ORPHAN_PHP_POOL` | A PHP-FPM file no PHP-enabled site accounts for. | Inspect and remove by hand. |
 | `ORPHAN_NGINX_CONFIG` / `ORPHAN_SLICE_UNIT` | A file in OxPanel's directories that no record accounts for. | Inspect and remove by hand; OxPanel will not touch what it did not record. |
 
 **Recovering a stuck tenant** — a record in `provisioning` or `deleting`
@@ -487,6 +520,9 @@ configuration with `nginx -t` on every change.
 | `OXPANEL_SOCKET_GROUP 'oxpanel' does not exist` | `sudo systemd-sysusers` (the RPM does this), or create the group. |
 | `OXPANEL_WEB_USER 'nginx' does not exist` / `is inside the tenant uid range` / `must not be root` | Install nginx, or point `OXPANEL_WEB_USER` at the real worker account. |
 | exits with **78** `SELinux boolean … is off` | `sudo setsebool -P httpd_enable_homedirs=on httpd_read_user_content=on` (the RPM does this in `%post`). Without them `httpd_t` cannot traverse `/home/<tenant>` and every site returns 403. |
+| PHP site works but cannot write (uploads fail, "Permission denied") | SELinux boolean `httpd_unified` is off (the daemon warns at start): `sudo setsebool -P httpd_unified on`. |
+| `FailedPrecondition: PHP is not installed on this host` | `sudo dnf install php-fpm`; no daemon restart needed. |
+| PHP site answers 502 | The tenant's pool is not running: `systemctl status oxpanel-php-<name>`, `journalctl -u oxpanel-php-<name>`. Usually the tenant hit its `MemoryMax`/`TasksMax`. |
 | `Failed at step NAMESPACE` / `status=226/NAMESPACE` in the journal | A `ReadWritePaths=` entry points at a directory systemd may not mount on under SELinux (security file types such as `semanage_store_t`). The shipped unit lists parents (`/var/lib`) for this reason; if you customised the unit, revert to that pattern. |
 | Start-up fails with `nginx include: nginx rejected the configuration: … duplicate default server` | The host already has a `default_server`. Set `OXPANEL_NGINX_DEFAULT_SERVER=false` (then unknown hosts go to *that* server). |
 | Client gets `transport error` / connection closed immediately | Peer not allowed. Check `journalctl -u oxpanel-daemon` for `rejected connection`; add the account to group `oxpanel` (or `OXPANEL_ALLOWED_UIDS`). Remember: account membership, not process groups. |
@@ -507,8 +543,8 @@ configuration with `nginx -t` on every change.
 ```sh
 make image         # AlmaLinux 9 dev/test image (one-time)
 make check         # rustfmt --check, clippy pedantic -D warnings, tests, cargo-deny
-make test          # 80 unit + 6 gRPC end-to-end tests (fake OS, no root)
-make integration   # boots systemd in a container, installs from packaging/, runs 79 assertions
+make test          # 91 unit + 6 gRPC end-to-end tests (fake OS, no root)
+make integration   # boots systemd in a container, installs from packaging/, runs 172 assertions
 make rpm           # build the RPM from the working tree into dist/rpms/
 make acceptance    # REAL AlmaLinux 9 VM (KVM, SELinux enforcing): install like a user, run all phases
 ./scripts/dev.sh cargo <anything>   # run cargo inside the image

@@ -17,7 +17,7 @@ use crate::host::{Drift, DriftKind, HostService};
 use crate::records::{TenantRecord, TenantState, VHostRecord};
 use crate::tenant::TenantService;
 use crate::validate::Limits;
-use crate::vhost::{VHostRequest, VHostService};
+use crate::vhost::{LogKind, VHostRequest, VHostService};
 use oxpanel_proto::v1 as pb;
 use oxpanel_proto::v1::ox_panel_engine_server::{OxPanelEngine, OxPanelEngineServer};
 
@@ -105,6 +105,8 @@ fn drift_to(d: &Drift) -> pb::Drift {
         DriftKind::VHostConfigDrift => pb::DriftKind::VhostConfigDrift,
         DriftKind::OrphanNginxConfig => pb::DriftKind::OrphanNginxConfig,
         DriftKind::OrphanSliceUnit => pb::DriftKind::OrphanSliceUnit,
+        DriftKind::PhpPoolDrift => pb::DriftKind::PhpPoolDrift,
+        DriftKind::OrphanPhpPool => pb::DriftKind::OrphanPhpPool,
     };
     pb::Drift {
         kind: kind.into(),
@@ -133,6 +135,7 @@ fn fail(rpc: &'static str, peer: &str, err: Error) -> Status {
         | Error::TenantHasVHosts(_)
         | Error::VHostOwnedByOther { .. }
         | Error::UidExhausted { .. }
+        | Error::PhpUnavailable
         | Error::NginxInvalid(_) => {
             warn!(rpc, peer, error = %err, "request refused");
             err.into()
@@ -186,6 +189,7 @@ fn vhost_to(rec: &VHostRecord) -> pb::VirtualHost {
         document_root: rec.document_root.clone(),
         aliases: rec.aliases.clone(),
         config_path: rec.config_path.to_string_lossy().into_owned(),
+        php: rec.php,
     }
 }
 
@@ -269,6 +273,7 @@ impl OxPanelEngine for Engine {
                 tenant: r.tenant,
                 document_root: r.document_root,
                 aliases: r.aliases,
+                php: r.php,
             })
             .await
             .map_err(|e| fail("ConfigureVirtualHost", &peer, e))?;
@@ -306,6 +311,29 @@ impl OxPanelEngine for Engine {
             .map_err(|e| fail("ListVirtualHosts", &peer, e))?;
         Ok(Response::new(pb::ListVirtualHostsResponse {
             vhosts: recs.iter().map(vhost_to).collect(),
+        }))
+    }
+
+    async fn read_virtual_host_log(
+        &self,
+        req: Request<pb::ReadVirtualHostLogRequest>,
+    ) -> Result<Response<pb::ReadVirtualHostLogResponse>, Status> {
+        const RPC: &str = "ReadVirtualHostLog";
+        let peer = self.authorise(&req, RPC, Scope::Read)?;
+        let r = req.into_inner();
+        let kind = match pb::LogKind::try_from(r.kind) {
+            Ok(pb::LogKind::Error) => LogKind::Error,
+            Ok(pb::LogKind::Access | pb::LogKind::Unspecified) => LogKind::Access,
+            Err(_) => return Err(fail(RPC, &peer, Error::invalid("kind", "unknown log kind"))),
+        };
+        let (text, truncated) = self
+            .vhosts
+            .read_log(&r.domain, kind, u64::from(r.max_bytes))
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(pb::ReadVirtualHostLogResponse {
+            text,
+            truncated,
         }))
     }
 
@@ -419,6 +447,7 @@ impl OxPanelEngine for Engine {
             home_disk_total_bytes: i.stats.disk_total_bytes,
             home_disk_free_bytes: i.stats.disk_free_bytes,
             uptime_seconds: i.stats.uptime_secs,
+            php_available: i.php_available,
         }))
     }
 

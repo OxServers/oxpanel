@@ -28,6 +28,8 @@ service OxPanelEngine {
   rpc ConfigureVirtualHost(ConfigureVirtualHostRequest) returns (ConfigureVirtualHostResponse);
   rpc RemoveVirtualHost(RemoveVirtualHostRequest) returns (RemoveVirtualHostResponse);
   rpc ListVirtualHosts(ListVirtualHostsRequest) returns (ListVirtualHostsResponse);
+  // The end of a virtual host's access or error log.
+  rpc ReadVirtualHostLog(ReadVirtualHostLogRequest) returns (ReadVirtualHostLogResponse);
 
   // Replace a tenant's resource limits. Applied through systemd immediately.
   rpc UpdateTenantLimits(UpdateTenantLimitsRequest) returns (UpdateTenantResponse);
@@ -134,6 +136,8 @@ message VirtualHost {
   repeated string aliases = 4;
   // Absolute path of the generated Nginx configuration file.
   string config_path = 5;
+  // PHP is enabled: *.php is executed by the tenant's own PHP-FPM pool.
+  bool php = 6;
 }
 
 message ConfigureVirtualHostRequest {
@@ -146,6 +150,11 @@ message ConfigureVirtualHostRequest {
   string document_root = 3;
   // Additional server_name entries, each validated like `domain`.
   repeated string aliases = 4;
+  // Execute *.php through the tenant's PHP-FPM pool. The pool runs as the
+  // tenant, inside the tenant's slice, and is created on first use and
+  // removed with the tenant's last PHP-enabled virtual host.
+  // FAILED_PRECONDITION if PHP-FPM is not installed on the host.
+  bool php = 5;
 }
 
 message ConfigureVirtualHostResponse {
@@ -235,6 +244,8 @@ message HostInfo {
   uint64 home_disk_total_bytes = 13;
   uint64 home_disk_free_bytes = 14;
   uint64 uptime_seconds = 15;
+  // PHP-FPM is installed, so virtual hosts may enable `php`.
+  bool php_available = 16;
 }
 
 message ReconcileRequest {}
@@ -259,6 +270,11 @@ enum DriftKind {
   DRIFT_KIND_ORPHAN_NGINX_CONFIG = 8;
   // An oxpanel-tenant-*.slice unit that no record accounts for.
   DRIFT_KIND_ORPHAN_SLICE_UNIT = 9;
+  // A tenant's PHP-FPM pool configuration or service unit is missing or
+  // differs from what the records render to.
+  DRIFT_KIND_PHP_POOL_DRIFT = 10;
+  // A PHP-FPM pool file or unit that no PHP-enabled virtual host accounts for.
+  DRIFT_KIND_ORPHAN_PHP_POOL = 11;
 }
 
 message Drift {
@@ -271,4 +287,25 @@ message Drift {
 message ReconcileResponse {
   // Empty when records and operating system agree.
   repeated Drift drifts = 1;
+}
+
+enum LogKind {
+  // Treated as ACCESS.
+  LOG_KIND_UNSPECIFIED = 0;
+  LOG_KIND_ACCESS = 1;
+  LOG_KIND_ERROR = 2;
+}
+
+message ReadVirtualHostLogRequest {
+  string domain = 1;
+  LogKind kind = 2;
+  // How much of the end of the log to return. 0 = 32 KiB; at most 128 KiB.
+  uint32 max_bytes = 3;
+}
+
+message ReadVirtualHostLogResponse {
+  // Whole lines from the end of the current log file (not rotated ones).
+  string text = 1;
+  // true when the file holds more than was returned.
+  bool truncated = 2;
 }

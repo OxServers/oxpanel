@@ -188,6 +188,11 @@ impl System for RealSystem {
         .map_err(|e| Error::Internal(format!("inspect_private_dir task: {e}")))?
     }
 
+    async fn is_installed(&self, program: &'static str) -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::metadata(program).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    }
+
     async fn host_stats(&self, path: &Path) -> Result<HostStats> {
         let path: PathBuf = path.to_owned();
         tokio::task::spawn_blocking(move || {

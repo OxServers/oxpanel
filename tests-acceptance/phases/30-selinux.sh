@@ -13,7 +13,7 @@ check "create tenant selx" bash -c "oxpanel-ctl tenant create selx --memory 128M
 check "home has the standard home label" bash -c "ls -dZ /home/selx | grep -q ':user_home_dir_t:'"
 check "configure selx.test" bash -c "oxpanel-ctl vhost set selx.test --tenant selx | grep -q '^changed=true'"
 check "fcontext equivalence recorded" bash -c "semanage fcontext -l -C | grep -qE '^/home/selx/public_html = /usr/share/nginx/html'"
-for b in httpd_enable_homedirs httpd_read_user_content; do
+for b in httpd_enable_homedirs httpd_read_user_content httpd_unified; do
   check "boolean $b is on" bash -c "getsebool $b | tee /dev/stderr | grep -q -- '--> on'"
 done
 check "matchpathcon agrees" bash -c "matchpathcon /home/selx/public_html | grep -q httpd_sys_content_t"

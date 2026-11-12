@@ -1,0 +1,14 @@
+# Per-virtual-host logs written by Nginx for OxPanel tenants.
+/var/log/nginx/oxpanel/*.log {
+    create 0640 nginx root
+    daily
+    rotate 14
+    missingok
+    notifempty
+    compress
+    delaycompress
+    sharedscripts
+    postrotate
+        /bin/kill -USR1 `cat /run/nginx.pid 2>/dev/null` 2>/dev/null || true
+    endscript
+}

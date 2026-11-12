@@ -41,6 +41,11 @@ pub struct Config {
     pub nginx_include_file: PathBuf,
     /// Where tenant slice units and drop-ins are written.
     pub systemd_unit_dir: PathBuf,
+    /// Per-virtual-host access and error logs.
+    pub nginx_log_dir: PathBuf,
+    /// One PHP-FPM pool configuration per tenant that uses PHP. World-readable
+    /// (no secrets): each pool's master runs as its tenant and must read it.
+    pub php_conf_dir: PathBuf,
     /// Account the web server workers run as; it is granted traverse/read
     /// access to document roots through POSIX ACLs.
     pub web_user: String,
@@ -72,6 +77,8 @@ impl Default for Config {
             nginx_conf_dir: PathBuf::from("/etc/nginx/oxpanel.d"),
             nginx_include_file: PathBuf::from("/etc/nginx/conf.d/00-oxpanel.conf"),
             systemd_unit_dir: PathBuf::from("/etc/systemd/system"),
+            nginx_log_dir: PathBuf::from("/var/log/nginx/oxpanel"),
+            php_conf_dir: PathBuf::from("/etc/oxpanel-php"),
             web_user: "nginx".to_owned(),
             nginx_default_server: true,
             command_timeout: Duration::from_secs(60),
@@ -109,6 +116,8 @@ impl Config {
         path("OXPANEL_NGINX_CONF_DIR", &mut c.nginx_conf_dir)?;
         path("OXPANEL_NGINX_INCLUDE_FILE", &mut c.nginx_include_file)?;
         path("OXPANEL_SYSTEMD_UNIT_DIR", &mut c.systemd_unit_dir)?;
+        path("OXPANEL_NGINX_LOG_DIR", &mut c.nginx_log_dir)?;
+        path("OXPANEL_PHP_CONF_DIR", &mut c.php_conf_dir)?;
 
         if let Some(g) = get("OXPANEL_SOCKET_GROUP") {
             let g = g.trim();
@@ -182,6 +191,8 @@ impl Config {
             ("OXPANEL_NGINX_CONF_DIR", &self.nginx_conf_dir),
             ("OXPANEL_NGINX_INCLUDE_FILE", &self.nginx_include_file),
             ("OXPANEL_SYSTEMD_UNIT_DIR", &self.systemd_unit_dir),
+            ("OXPANEL_NGINX_LOG_DIR", &self.nginx_log_dir),
+            ("OXPANEL_PHP_CONF_DIR", &self.php_conf_dir),
         ] {
             check_path(key, p)?;
         }

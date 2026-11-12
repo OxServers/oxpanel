@@ -44,6 +44,8 @@ async fn start_scoped(policy: PeerPolicy, scopes: &[Scope]) -> TestServer {
     cfg.state_dir = dir.path().join("state");
     cfg.home_base = dir.path().join("home");
     cfg.systemd_unit_dir = dir.path().join("systemd");
+    cfg.nginx_log_dir = dir.path().join("log");
+    cfg.php_conf_dir = dir.path().join("php");
     cfg.nginx_conf_dir = dir.path().join("nginx").join("oxpanel.d");
     cfg.nginx_include_file = dir
         .path()
@@ -198,6 +200,7 @@ async fn full_tenant_and_vhost_lifecycle_over_uds() {
             tenant: "alice".into(),
             document_root: String::new(),
             aliases: vec!["www.example.com".into()],
+            php: false,
         })
         .await
         .expect("vhost")
@@ -313,6 +316,7 @@ async fn validation_errors_surface_as_invalid_argument_with_message() {
             tenant: "carol".into(),
             document_root: String::new(),
             aliases: vec![],
+            php: false,
         })
         .await
         .expect_err("bad domain");
@@ -380,6 +384,7 @@ async fn management_rpcs_over_uds() {
             tenant: "alice".into(),
             document_root: String::new(),
             aliases: vec![],
+            php: false,
         })
         .await
         .expect("vhost");
@@ -590,6 +595,7 @@ async fn a_scoped_peer_can_only_call_its_scopes() {
             tenant: "alice".into(),
             document_root: String::new(),
             aliases: vec![],
+            php: false,
         })
         .await
         .expect_err("no tenant");

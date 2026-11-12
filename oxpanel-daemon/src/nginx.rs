@@ -63,11 +63,18 @@ pub struct ServerBlock<'a> {
     pub document_root: &'a Path,
     /// The owning tenant is suspended: answer every request with 503.
     pub suspended: bool,
+    /// Absolute paths of this virtual host's own logs.
+    pub access_log: &'a Path,
+    pub error_log: &'a Path,
+    /// Socket of the tenant's PHP-FPM instance; `None` = static files only.
+    pub php_socket: Option<&'a Path>,
 }
 
 /// Render a complete, self-contained server block.
 pub fn render_server_block(b: &ServerBlock<'_>) -> Result<String> {
     let root = safe_path_str(b.document_root)?;
+    let access_log = safe_path_str(b.access_log)?;
+    let error_log = safe_path_str(b.error_log)?;
     let mut names = String::from(b.domain.as_str());
     for a in b.aliases {
         names.push(' ');
@@ -82,6 +89,8 @@ server {{
     listen [::]:80;
     server_name {names};
 
+    access_log {access_log};
+    error_log {error_log};
     server_tokens off;
 
     location / {{
@@ -93,6 +102,40 @@ server {{
             tenant = b.tenant,
         ));
     }
+    let (index, fallback, php) = match b.php_socket {
+        // Without PHP a script must never be handed out as a download:
+        // its source routinely holds database passwords.
+        None => (
+            "index.html index.htm",
+            "=404",
+            "
+    location ~ \\.php$ {
+        return 404;
+    }
+"
+            .to_owned(),
+        ),
+        Some(sock) => (
+            "index.php index.html index.htm",
+            "/index.php$is_args$args",
+            // `try_files` first: never hand FPM a script that does not exist
+            // (the classic cgi.fix_pathinfo trap). $realpath_root, so FPM and
+            // open_basedir see the same resolved path Nginx checked.
+            format!(
+                "
+    location ~ \\.php$ {{
+        try_files $uri =404;
+        include fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME $realpath_root$fastcgi_script_name;
+        fastcgi_param DOCUMENT_ROOT $realpath_root;
+        fastcgi_hide_header X-Powered-By;
+        fastcgi_pass unix:{};
+    }}
+",
+                safe_path_str(sock)?
+            ),
+        ),
+    };
     Ok(format!(
         "{HEADER}# tenant: {tenant}
 server {{
@@ -101,8 +144,10 @@ server {{
     server_name {names};
 
     root {root};
-    index index.html index.htm;
+    index {index};
 
+    access_log {access_log};
+    error_log {error_log};
     server_tokens off;
     autoindex off;
     # Refuse to serve through symlinks whose target the tenant does not own.
@@ -115,9 +160,9 @@ server {{
     }}
 
     location / {{
-        try_files $uri $uri/ =404;
+        try_files $uri $uri/ {fallback};
     }}
-}}
+{php}}}
 ",
         tenant = b.tenant,
     ))
@@ -125,7 +170,7 @@ server {{
 
 /// Paths are interpolated unquoted into Nginx directives, so restrict them to
 /// characters that can never terminate or extend a directive.
-fn safe_path_str(p: &Path) -> Result<&str> {
+pub(crate) fn safe_path_str(p: &Path) -> Result<&str> {
     let s = p
         .to_str()
         .ok_or_else(|| Error::Internal(format!("{} is not valid UTF-8", p.display())))?;
@@ -272,11 +317,19 @@ mod tests {
             tenant: &alice,
             document_root: Path::new("/home/alice/public_html"),
             suspended: false,
+            access_log: Path::new("/var/log/nginx/oxpanel/example.com.access.log"),
+            error_log: Path::new("/var/log/nginx/oxpanel/example.com.error.log"),
+            php_socket: None,
         })?;
         assert!(s.starts_with(HEADER));
         assert!(s.contains("server_name example.com www.example.com example.net;\n"));
         assert!(s.contains("root /home/alice/public_html;\n"));
         assert!(s.contains("location ~ /\\. {"));
+        assert!(
+            s.contains("location ~ \\.php$ {\n        return 404;"),
+            "PHP source is never served as a file"
+        );
+        assert!(!s.contains("fastcgi_pass"));
         assert!(s.contains("server_tokens off;"));
         assert!(s.contains("disable_symlinks if_not_owner;"));
         assert!(!s.contains("autoindex on"));
@@ -300,6 +353,9 @@ mod tests {
                 tenant: &alice,
                 document_root: Path::new(bad),
                 suspended: false,
+                access_log: Path::new("/var/log/nginx/oxpanel/example.com.access.log"),
+                error_log: Path::new("/var/log/nginx/oxpanel/example.com.error.log"),
+                php_socket: None,
             });
             assert!(r.is_err(), "{bad}");
         }
@@ -427,12 +483,54 @@ mod tests {
             tenant: &alice,
             document_root: Path::new("/home/alice/public_html"),
             suspended: true,
+            access_log: Path::new("/var/log/nginx/oxpanel/example.com.access.log"),
+            error_log: Path::new("/var/log/nginx/oxpanel/example.com.error.log"),
+            php_socket: None,
         })?;
         assert!(s.contains("server_name example.com www.example.com;"));
         assert!(s.contains("return 503;"));
         assert!(!s.contains("root "), "no document root while suspended");
         assert!(!s.contains("/home/alice"));
         assert!(s.contains("# tenant: alice (suspended)"));
+        Ok(())
+    }
+
+    #[test]
+    fn php_block_passes_only_existing_scripts_to_the_tenant_socket() -> Result<()> {
+        let alice = Username::parse("alice")?;
+        let s = render_server_block(&ServerBlock {
+            domain: &d("example.com"),
+            aliases: &[],
+            tenant: &alice,
+            document_root: Path::new("/home/alice/public_html"),
+            suspended: false,
+            access_log: Path::new("/var/log/nginx/oxpanel/example.com.access.log"),
+            error_log: Path::new("/var/log/nginx/oxpanel/example.com.error.log"),
+            php_socket: Some(Path::new("/run/oxpanel-php/alice/php.sock")),
+        })?;
+        assert!(s.contains("index index.php index.html index.htm;"));
+        assert!(s.contains("try_files $uri $uri/ /index.php$is_args$args;"));
+        assert!(s.contains("location ~ \\.php$ {\n        try_files $uri =404;"));
+        assert!(s.contains("fastcgi_param SCRIPT_FILENAME $realpath_root$fastcgi_script_name;"));
+        assert!(s.contains("fastcgi_pass unix:/run/oxpanel-php/alice/php.sock;"));
+        assert!(s.contains("access_log /var/log/nginx/oxpanel/example.com.access.log;"));
+        assert!(s.contains("error_log /var/log/nginx/oxpanel/example.com.error.log;"));
+        // The dot-file rule comes first, so /.user.php or /.git/x.php is never executed.
+        let dot = s.find("location ~ /\\.").unwrap_or(usize::MAX);
+        let php = s.find("location ~ \\.php$").unwrap_or(0);
+        assert!(dot < php);
+        // A hostile socket path cannot inject directives.
+        let bad = render_server_block(&ServerBlock {
+            domain: &d("example.com"),
+            aliases: &[],
+            tenant: &alice,
+            document_root: Path::new("/home/alice/public_html"),
+            suspended: false,
+            access_log: Path::new("/var/log/nginx/oxpanel/example.com.access.log"),
+            error_log: Path::new("/var/log/nginx/oxpanel/example.com.error.log"),
+            php_socket: Some(Path::new("/run/x.sock; include /etc/shadow")),
+        });
+        assert!(bad.is_err());
         Ok(())
     }
 }
