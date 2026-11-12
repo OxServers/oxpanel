@@ -61,6 +61,8 @@ pub struct ServerBlock<'a> {
     pub tenant: &'a Username,
     /// Absolute document root.
     pub document_root: &'a Path,
+    /// The owning tenant is suspended: answer every request with 503.
+    pub suspended: bool,
 }
 
 /// Render a complete, self-contained server block.
@@ -70,6 +72,26 @@ pub fn render_server_block(b: &ServerBlock<'_>) -> Result<String> {
     for a in b.aliases {
         names.push(' ');
         names.push_str(a.as_str());
+    }
+    if b.suspended {
+        // No `root`: a suspended site serves nothing from the tenant's files.
+        return Ok(format!(
+            "{HEADER}# tenant: {tenant} (suspended)
+server {{
+    listen 80;
+    listen [::]:80;
+    server_name {names};
+
+    server_tokens off;
+
+    location / {{
+        add_header Retry-After 3600 always;
+        return 503;
+    }}
+}}
+",
+            tenant = b.tenant,
+        ));
     }
     Ok(format!(
         "{HEADER}# tenant: {tenant}
@@ -224,7 +246,7 @@ pub async fn remove_config(sys: &dyn System, path: &Path, timeout: Duration) -> 
     }
 }
 
-fn rollback(path: &Path, previous: Option<&[u8]>) -> Result<()> {
+pub(crate) fn rollback(path: &Path, previous: Option<&[u8]>) -> Result<()> {
     match previous {
         Some(bytes) => fsutil::write_atomic(path, bytes, CONF_MODE).map(|_| ()),
         None => fsutil::remove_if_exists(path).map(|_| ()),
@@ -249,6 +271,7 @@ mod tests {
             aliases: &aliases,
             tenant: &alice,
             document_root: Path::new("/home/alice/public_html"),
+            suspended: false,
         })?;
         assert!(s.starts_with(HEADER));
         assert!(s.contains("server_name example.com www.example.com example.net;\n"));
@@ -276,6 +299,7 @@ mod tests {
                 aliases: &[],
                 tenant: &alice,
                 document_root: Path::new(bad),
+                suspended: false,
             });
             assert!(r.is_err(), "{bad}");
         }
@@ -390,6 +414,25 @@ mod tests {
         install_config(&sys, &p, "good\n", t).await?;
         assert!(remove_config(&sys, &p, t).await?);
         assert!(!p.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn suspended_block_serves_nothing_from_the_tenant() -> Result<()> {
+        let alice = Username::parse("alice")?;
+        let aliases = [d("www.example.com")];
+        let s = render_server_block(&ServerBlock {
+            domain: &d("example.com"),
+            aliases: &aliases,
+            tenant: &alice,
+            document_root: Path::new("/home/alice/public_html"),
+            suspended: true,
+        })?;
+        assert!(s.contains("server_name example.com www.example.com;"));
+        assert!(s.contains("return 503;"));
+        assert!(!s.contains("root "), "no document root while suspended");
+        assert!(!s.contains("/home/alice"));
+        assert!(s.contains("# tenant: alice (suspended)"));
         Ok(())
     }
 }

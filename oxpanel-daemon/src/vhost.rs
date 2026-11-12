@@ -29,8 +29,9 @@ use tracing::{info, warn};
 
 use crate::ctx::Ctx;
 use crate::error::{Error, Result};
+use crate::fsutil;
 use crate::nginx;
-use crate::records::{now_unix, TenantState, VHostRecord, RECORD_VERSION};
+use crate::records::{now_unix, TenantRecord, TenantState, VHostRecord, RECORD_VERSION};
 use crate::system::{bin, CommandSpec};
 use crate::validate::{Domain, RelPath, Username};
 
@@ -131,6 +132,7 @@ impl VHostService {
             aliases: &aliases,
             tenant: &tenant,
             document_root: &abs_root,
+            suspended: tenant_rec.suspended,
         })?;
         let path = nginx::conf_path(&cfg.nginx_conf_dir, &domain);
         let changed = nginx::install_config(self.ctx.sys.as_ref(), &path, &block, timeout).await?;
@@ -197,11 +199,7 @@ impl VHostService {
 
     /// Create the document root *as the tenant*, with no privileges, then
     /// confirm it is a real directory the tenant owns.
-    async fn create_document_root(
-        &self,
-        tenant: &crate::records::TenantRecord,
-        abs_root: &Path,
-    ) -> Result<()> {
+    async fn create_document_root(&self, tenant: &TenantRecord, abs_root: &Path) -> Result<()> {
         let timeout = self.ctx.config.command_timeout;
         self.ctx
             .sys
@@ -352,6 +350,73 @@ impl VHostService {
             )
             .await?;
         Ok(())
+    }
+}
+
+/// The server block a virtual-host record renders to for its tenant — the
+/// single definition of "what should be on disk", shared by suspension and
+/// reconciliation.
+pub(crate) fn render_vhost(tenant: &TenantRecord, vhost: &VHostRecord) -> Result<String> {
+    let domain = Domain::parse(&vhost.domain)?;
+    let name = Username::parse_field(&tenant.username, "tenant")?;
+    let docroot = RelPath::parse(&vhost.document_root)?;
+    let aliases = vhost
+        .aliases
+        .iter()
+        .map(|a| Domain::parse_field(a, "aliases"))
+        .collect::<Result<Vec<Domain>>>()?;
+    nginx::render_server_block(&nginx::ServerBlock {
+        domain: &domain,
+        aliases: &aliases,
+        tenant: &name,
+        document_root: &tenant.home.join(docroot.as_str()),
+        suspended: tenant.suspended,
+    })
+}
+
+/// Rewrite every virtual host of `tenant` from its records (used when the
+/// tenant is suspended or resumed), validate once and activate. All files are
+/// restored if Nginx rejects the result. With `force` the configuration is
+/// validated and reloaded even when no file changed, which completes an
+/// earlier attempt that wrote the files but failed before the reload.
+///
+/// The caller holds the mutation lock. Returns whether Nginx was reloaded.
+pub(crate) async fn sync_tenant_configs(
+    ctx: &Ctx,
+    tenant: &TenantRecord,
+    force: bool,
+) -> Result<bool> {
+    let timeout = ctx.config.command_timeout;
+    let mut written: Vec<(PathBuf, Option<Vec<u8>>)> = Vec::new();
+    let mut any = false;
+    for v in ctx
+        .store
+        .list_vhosts()?
+        .iter()
+        .filter(|v| v.tenant == tenant.username)
+    {
+        any = true;
+        let block = render_vhost(tenant, v)?;
+        let previous = fsutil::read_optional(&v.config_path)?;
+        if fsutil::write_atomic(&v.config_path, block.as_bytes(), nginx::CONF_MODE)? {
+            written.push((v.config_path.clone(), previous));
+        }
+    }
+    if !any || (written.is_empty() && !force) {
+        return Ok(false);
+    }
+    match nginx::test_config(ctx.sys.as_ref(), timeout).await? {
+        Ok(()) => {
+            nginx::reload(ctx.sys.as_ref(), timeout).await?;
+            Ok(true)
+        }
+        Err(output) => {
+            warn!(tenant = %tenant.username, %output, "nginx rejected re-rendered virtual hosts; rolling back");
+            for (path, previous) in &written {
+                nginx::rollback(path, previous.as_deref())?;
+            }
+            Err(Error::NginxInvalid(output))
+        }
     }
 }
 
@@ -763,6 +828,105 @@ mod tests {
             rec.config_path.file_name().and_then(|n| n.to_str()),
             Some("example.com.conf")
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn suspend_turns_every_site_of_the_tenant_into_503_and_resume_restores() -> Result<()> {
+        let h = harness(false).await;
+        let (a, _) = h.vhosts.configure(req("example.com", "alice")).await?;
+        let (b, _) = h.vhosts.configure(req("example.net", "alice")).await?;
+        let (other, _) = h.vhosts.configure(req("bob.example", "bob")).await?;
+        let read = |p: &Path| std::fs::read_to_string(p).map_err(|e| Error::io("read", p, e));
+        let before = read(&a.config_path)?;
+        let bob_before = read(&other.config_path)?;
+        h.sys.clear_calls();
+
+        let (rec, changed) = h.tenants.set_suspended("alice", true).await?;
+        assert!(changed && rec.suspended);
+        for p in [&a.config_path, &b.config_path] {
+            let conf = read(p)?;
+            assert!(conf.contains("return 503;"), "{conf}");
+            assert!(!conf.contains("root "));
+        }
+        assert_eq!(
+            read(&other.config_path)?,
+            bob_before,
+            "other tenants untouched"
+        );
+        assert_eq!(
+            h.sys.calls_to(bin::NGINX).len(),
+            1,
+            "one validation for all sites"
+        );
+        assert_eq!(h.sys.calls_to(bin::SYSTEMCTL).len(), 1);
+        assert!(h.tenants.get("alice").await?.suspended);
+
+        // Idempotent: nothing to write, nothing to reload.
+        let (_, changed) = h.tenants.set_suspended("alice", true).await?;
+        assert!(!changed);
+        assert_eq!(h.sys.calls_to(bin::NGINX).len(), 1);
+
+        // A site added while suspended is born suspended.
+        let (c, _) = h.vhosts.configure(req("example.org", "alice")).await?;
+        assert!(read(&c.config_path)?.contains("return 503;"));
+
+        let (rec, changed) = h.tenants.set_suspended("alice", false).await?;
+        assert!(changed && !rec.suspended);
+        assert_eq!(read(&a.config_path)?, before);
+        assert!(read(&c.config_path)?.contains("try_files"));
+        assert!(!h.tenants.set_suspended("alice", false).await?.1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn suspend_rolls_back_every_file_when_nginx_rejects() -> Result<()> {
+        let h = harness(false).await;
+        let (a, _) = h.vhosts.configure(req("example.com", "alice")).await?;
+        let (b, _) = h.vhosts.configure(req("example.net", "alice")).await?;
+        let read = |p: &Path| std::fs::read_to_string(p).map_err(|e| Error::io("read", p, e));
+        let (before_a, before_b) = (read(&a.config_path)?, read(&b.config_path)?);
+        h.sys
+            .script_failure(bin::NGINX, 1, "nginx: [emerg] broken elsewhere");
+        assert!(matches!(
+            h.tenants.set_suspended("alice", true).await,
+            Err(Error::NginxInvalid(_))
+        ));
+        assert_eq!(read(&a.config_path)?, before_a);
+        assert_eq!(read(&b.config_path)?, before_b);
+        assert!(!h.tenants.get("alice").await?.suspended, "record unchanged");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn suspend_retry_reloads_even_when_files_are_already_written() -> Result<()> {
+        let h = harness(false).await;
+        h.vhosts.configure(req("example.com", "alice")).await?;
+        h.sys.clear_calls();
+        // nginx -t passes (default), the reload fails: files are on disk, not active.
+        h.sys
+            .script_failure(bin::SYSTEMCTL, 1, "Job for nginx.service failed");
+        assert!(matches!(
+            h.tenants.set_suspended("alice", true).await,
+            Err(Error::CommandFailed { .. })
+        ));
+        assert!(!h.tenants.get("alice").await?.suspended);
+        let (rec, changed) = h.tenants.set_suspended("alice", true).await?;
+        assert!(changed && rec.suspended);
+        assert_eq!(
+            h.sys.calls_to(bin::SYSTEMCTL).len(),
+            2,
+            "the retry reloads although no file changed"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn suspending_a_tenant_without_sites_touches_nothing() -> Result<()> {
+        let h = harness(false).await;
+        let (rec, changed) = h.tenants.set_suspended("alice", true).await?;
+        assert!(changed && rec.suspended);
+        assert!(h.sys.calls().is_empty());
         Ok(())
     }
 }

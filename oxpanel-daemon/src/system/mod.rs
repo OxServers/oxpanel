@@ -38,6 +38,7 @@ pub mod bin {
     pub const GETSEBOOL: &str = "/usr/sbin/getsebool";
     pub const SETPRIV: &str = "/usr/bin/setpriv";
     pub const MKDIR: &str = "/usr/bin/mkdir";
+    pub const DU: &str = "/usr/bin/du";
     /// Login shell given to every tenant account.
     pub const NOLOGIN: &str = "/sbin/nologin";
 }
@@ -50,6 +51,19 @@ pub struct OsUser {
     pub gid: u32,
     pub home: PathBuf,
     pub shell: PathBuf,
+}
+
+/// Load, memory and disk figures of the host.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct HostStats {
+    /// 1, 5 and 15 minute load averages.
+    pub load: (f64, f64, f64),
+    pub memory_total_bytes: u64,
+    pub memory_free_bytes: u64,
+    pub uptime_secs: u64,
+    /// Size and unprivileged-available space of the queried file system.
+    pub disk_total_bytes: u64,
+    pub disk_free_bytes: u64,
 }
 
 /// Operating-system primitives the daemon depends on.
@@ -80,4 +94,12 @@ pub trait System: Send + Sync + 'static {
     /// Verify `path` is a real directory (not a symlink) owned by `uid`.
     /// Returns [`crate::Error::InvalidInput`] otherwise.
     async fn verify_owned_dir(&self, path: &Path, uid: u32) -> Result<()>;
+
+    /// Read-only counterpart of [`System::ensure_private_dir`]: `None` when
+    /// `path` is a real directory owned by `uid:gid` and closed to "other",
+    /// otherwise a description of what is wrong. Never changes anything.
+    async fn inspect_private_dir(&self, path: &Path, uid: u32, gid: u32) -> Result<Option<String>>;
+
+    /// Host load and memory, plus the capacity of the file system holding `path`.
+    async fn host_stats(&self, path: &Path) -> Result<HostStats>;
 }

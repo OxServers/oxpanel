@@ -12,6 +12,7 @@
 //! - [`fsutil`]   — atomic file writes and permission checks.
 //! - [`records`]  — on-disk state (`/var/lib/oxpanel`) that marks what OxPanel owns.
 //! - [`tenant`], [`vhost`] — the provisioning workflows.
+//! - [`host`]     — host information and record ↔ OS reconciliation.
 //! - [`auth`]     — peer-credential gate for the UNIX socket.
 //! - [`server`]   — gRPC ↔ domain mapping.
 
@@ -31,6 +32,7 @@ pub mod config;
 pub mod ctx;
 pub mod error;
 pub mod fsutil;
+pub mod host;
 pub mod nginx;
 pub mod records;
 pub mod server;

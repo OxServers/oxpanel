@@ -6,7 +6,7 @@
 //! immediately; authorised ones are wrapped in [`AuthedStream`], whose
 //! connect-info carries the verified [`PeerInfo`] into every request.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -79,6 +79,65 @@ impl PeerPolicy {
     /// True when only root (at most) can connect — worth a startup warning.
     pub fn only_root(&self) -> bool {
         self.allowed_uids.is_empty() && self.allowed_gids.is_empty()
+    }
+}
+
+/// A class of RPCs a peer may be limited to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum Scope {
+    /// Get/List RPCs, usage, host information, reconciliation.
+    Read,
+    /// `ConfigureVirtualHost`, `RemoveVirtualHost`.
+    VHost,
+    /// `CreateTenant`, the update RPCs, suspend and resume.
+    Tenant,
+    /// `DeleteTenant`.
+    Delete,
+}
+
+impl Scope {
+    pub const ALL: [Self; 4] = [Self::Read, Self::VHost, Self::Tenant, Self::Delete];
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw {
+            "read" => Some(Self::Read),
+            "vhost" => Some(Self::VHost),
+            "tenant" => Some(Self::Tenant),
+            "delete" => Some(Self::Delete),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Read => "read",
+            Self::VHost => "vhost",
+            Self::Tenant => "tenant",
+            Self::Delete => "delete",
+        }
+    }
+}
+
+/// Per-peer limits on *what* an already authenticated peer may call.
+///
+/// A uid with an entry may call only RPCs in its scopes; a uid without one
+/// is unrestricted. This lets a customer-facing service account be confined
+/// to, say, `read+vhost`, so that compromising it can never reach
+/// `DeleteTenant`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScopePolicy {
+    by_uid: BTreeMap<u32, BTreeSet<Scope>>,
+}
+
+impl ScopePolicy {
+    pub fn new(by_uid: BTreeMap<u32, BTreeSet<Scope>>) -> Self {
+        Self { by_uid }
+    }
+
+    pub fn permits(&self, peer: &PeerInfo, scope: Scope) -> bool {
+        self.by_uid
+            .get(&peer.uid)
+            .is_none_or(|allowed| allowed.contains(&scope))
     }
 }
 
@@ -256,6 +315,33 @@ mod tests {
         assert!(!no_root.is_allowed(&root, &[]));
         assert!(no_root.only_root());
         assert!(!p.only_root());
+    }
+
+    #[test]
+    fn scopes_confine_listed_uids_only() {
+        let peer = |uid| PeerInfo {
+            uid,
+            gid: uid,
+            pid: None,
+        };
+        let policy = ScopePolicy::new(
+            [(1001, [Scope::Read, Scope::VHost].into_iter().collect())]
+                .into_iter()
+                .collect(),
+        );
+        assert!(policy.permits(&peer(1001), Scope::Read));
+        assert!(policy.permits(&peer(1001), Scope::VHost));
+        assert!(!policy.permits(&peer(1001), Scope::Tenant));
+        assert!(!policy.permits(&peer(1001), Scope::Delete));
+        for s in Scope::ALL {
+            assert!(
+                policy.permits(&peer(1002), s),
+                "unlisted uid is unrestricted"
+            );
+            assert!(ScopePolicy::default().permits(&peer(1001), s));
+            assert_eq!(Scope::parse(s.as_str()), Some(s));
+        }
+        assert_eq!(Scope::parse("admin"), None);
     }
 
     #[test]

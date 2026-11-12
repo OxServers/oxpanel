@@ -18,7 +18,7 @@ use tonic::transport::{Channel, Endpoint, Server};
 use tonic::Code;
 use tower::service_fn;
 
-use oxpanel_daemon::auth::{self, PeerPolicy};
+use oxpanel_daemon::auth::{self, PeerPolicy, Scope};
 use oxpanel_daemon::config::Config;
 use oxpanel_daemon::ctx::Ctx;
 use oxpanel_daemon::server::Engine;
@@ -34,6 +34,11 @@ struct TestServer {
 }
 
 async fn start(policy: PeerPolicy) -> TestServer {
+    start_scoped(policy, &[]).await
+}
+
+/// Like [`start`], with the calling uid confined to `scopes` (empty = unrestricted).
+async fn start_scoped(policy: PeerPolicy, scopes: &[Scope]) -> TestServer {
     let dir = tempfile::tempdir().expect("tempdir");
     let mut cfg = Config::default();
     cfg.state_dir = dir.path().join("state");
@@ -46,6 +51,12 @@ async fn start(policy: PeerPolicy) -> TestServer {
         .join("conf.d")
         .join("00-oxpanel.conf");
     cfg.socket_path = dir.path().join("oxpanel.sock");
+    if !scopes.is_empty() {
+        cfg.peer_scopes.insert(
+            nix::unistd::geteuid().as_raw(),
+            scopes.iter().copied().collect(),
+        );
+    }
     for d in [
         &cfg.home_base,
         &cfg.systemd_unit_dir,
@@ -349,4 +360,238 @@ async fn unauthorised_peer_is_cut_off_before_grpc() {
     };
     assert!(result.is_err(), "unauthorised peer must not be served");
     assert!(srv.sys.calls().is_empty());
+}
+
+#[tokio::test]
+async fn management_rpcs_over_uds() {
+    let srv = start(allow_me()).await;
+    let mut client = connect(&srv.socket).await.expect("connect");
+    client
+        .create_tenant(pb::CreateTenantRequest {
+            username: "alice".into(),
+            owner: "r1".into(),
+            limits: None,
+        })
+        .await
+        .expect("create");
+    client
+        .configure_virtual_host(pb::ConfigureVirtualHostRequest {
+            domain: "example.com".into(),
+            tenant: "alice".into(),
+            document_root: String::new(),
+            aliases: vec![],
+        })
+        .await
+        .expect("vhost");
+
+    // Limits
+    let new_limits = pb::ResourceLimits {
+        memory_max_bytes: 256 << 20,
+        cpu_weight: 50,
+        io_weight: 0,
+        tasks_max: 0,
+    };
+    let r = client
+        .update_tenant_limits(pb::UpdateTenantLimitsRequest {
+            username: "alice".into(),
+            limits: Some(new_limits),
+        })
+        .await
+        .expect("limits")
+        .into_inner();
+    assert!(r.changed);
+    assert_eq!(r.tenant.and_then(|t| t.limits), Some(new_limits));
+    let bad = client
+        .update_tenant_limits(pb::UpdateTenantLimitsRequest {
+            username: "alice".into(),
+            limits: Some(pb::ResourceLimits {
+                cpu_weight: 10_001,
+                ..pb::ResourceLimits::default()
+            }),
+        })
+        .await
+        .expect_err("weight out of range");
+    assert_eq!(bad.code(), Code::InvalidArgument);
+
+    // Owner
+    let r = client
+        .update_tenant_owner(pb::UpdateTenantOwnerRequest {
+            username: "alice".into(),
+            owner: "r2".into(),
+        })
+        .await
+        .expect("owner")
+        .into_inner();
+    assert!(r.changed);
+    assert_eq!(r.tenant.map(|t| t.owner).as_deref(), Some("r2"));
+
+    // Suspend / resume
+    let conf = srv.config.nginx_conf_dir.join("example.com.conf");
+    let r = client
+        .suspend_tenant(pb::SuspendTenantRequest {
+            username: "alice".into(),
+        })
+        .await
+        .expect("suspend")
+        .into_inner();
+    assert!(r.changed && r.tenant.is_some_and(|t| t.suspended));
+    assert!(std::fs::read_to_string(&conf)
+        .expect("conf")
+        .contains("return 503;"));
+    assert!(
+        client
+            .get_tenant(pb::GetTenantRequest {
+                username: "alice".into()
+            })
+            .await
+            .expect("get")
+            .into_inner()
+            .suspended
+    );
+    let r = client
+        .resume_tenant(pb::ResumeTenantRequest {
+            username: "alice".into(),
+        })
+        .await
+        .expect("resume")
+        .into_inner();
+    assert!(r.changed && r.tenant.is_some_and(|t| !t.suspended));
+    assert!(!std::fs::read_to_string(&conf)
+        .expect("conf")
+        .contains("503"));
+
+    // Usage, host info, reconcile
+    let u = client
+        .get_tenant_usage(pb::GetTenantUsageRequest {
+            username: "alice".into(),
+        })
+        .await
+        .expect("usage")
+        .into_inner();
+    assert_eq!(u.username, "alice");
+    assert_eq!(
+        (u.memory_current_bytes, u.disk_usage_bytes),
+        (1_048_576, 8192)
+    );
+    assert!(u.measured_at.is_some());
+    let i = client
+        .get_host_info(pb::GetHostInfoRequest {})
+        .await
+        .expect("info")
+        .into_inner();
+    assert_eq!(i.daemon_version, env!("CARGO_PKG_VERSION"));
+    assert_eq!((i.tenant_count, i.vhost_count), (1, 1));
+    assert!(i.memory_total_bytes > 0);
+    let rec = client
+        .reconcile(pb::ReconcileRequest {})
+        .await
+        .expect("reconcile")
+        .into_inner();
+    assert!(rec.drifts.is_empty(), "{:?}", rec.drifts);
+    std::fs::remove_file(&conf).expect("rm conf");
+    let rec = client
+        .reconcile(pb::ReconcileRequest {})
+        .await
+        .expect("reconcile")
+        .into_inner();
+    assert_eq!(rec.drifts.len(), 1);
+    let d = rec.drifts.first().expect("one drift");
+    assert_eq!(d.kind, i32::from(pb::DriftKind::VhostConfigDrift));
+    assert_eq!(d.subject, "example.com");
+
+    // Unknown tenants
+    let nf = client
+        .suspend_tenant(pb::SuspendTenantRequest {
+            username: "ghost".into(),
+        })
+        .await
+        .expect_err("no such tenant");
+    assert_eq!(nf.code(), Code::NotFound);
+}
+
+#[tokio::test]
+async fn a_scoped_peer_can_only_call_its_scopes() {
+    let srv = start_scoped(allow_me(), &[Scope::Read, Scope::VHost]).await;
+    let mut client = connect(&srv.socket).await.expect("connect");
+
+    // Reads are allowed.
+    client
+        .list_tenants(pb::ListTenantsRequest::default())
+        .await
+        .expect("list");
+    client
+        .get_host_info(pb::GetHostInfoRequest {})
+        .await
+        .expect("info");
+    client
+        .reconcile(pb::ReconcileRequest {})
+        .await
+        .expect("reconcile");
+
+    // Every tenant-changing RPC is refused before validation or any OS call.
+    let denied = [
+        client
+            .create_tenant(pb::CreateTenantRequest {
+                username: "alice".into(),
+                owner: String::new(),
+                limits: None,
+            })
+            .await
+            .map(|_| ()),
+        client
+            .update_tenant_limits(pb::UpdateTenantLimitsRequest {
+                username: "alice".into(),
+                limits: None,
+            })
+            .await
+            .map(|_| ()),
+        client
+            .update_tenant_owner(pb::UpdateTenantOwnerRequest {
+                username: "alice".into(),
+                owner: "x".into(),
+            })
+            .await
+            .map(|_| ()),
+        client
+            .suspend_tenant(pb::SuspendTenantRequest {
+                username: "alice".into(),
+            })
+            .await
+            .map(|_| ()),
+        client
+            .resume_tenant(pb::ResumeTenantRequest {
+                username: "alice".into(),
+            })
+            .await
+            .map(|_| ()),
+        client
+            .delete_tenant(pb::DeleteTenantRequest {
+                username: "alice".into(),
+                remove_home: true,
+            })
+            .await
+            .map(|_| ()),
+    ];
+    for (i, r) in denied.into_iter().enumerate() {
+        let e = r.expect_err("must be denied");
+        assert_eq!(e.code(), Code::PermissionDenied, "rpc #{i}");
+        assert!(e.message().contains("scope"), "{}", e.message());
+    }
+    assert!(
+        srv.sys.calls().is_empty(),
+        "denied requests never reach the OS"
+    );
+
+    // The vhost scope is honoured: the call gets past the gate (and then
+    // fails on the missing tenant, not on permissions).
+    let e = client
+        .configure_virtual_host(pb::ConfigureVirtualHostRequest {
+            domain: "example.com".into(),
+            tenant: "alice".into(),
+            document_root: String::new(),
+            aliases: vec![],
+        })
+        .await
+        .expect_err("no tenant");
+    assert_eq!(e.code(), Code::NotFound);
 }

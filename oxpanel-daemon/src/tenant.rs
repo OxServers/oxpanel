@@ -14,8 +14,41 @@ use crate::records::{now_unix, TenantRecord, TenantState, RECORD_VERSION};
 use crate::system::{bin, CommandSpec};
 use crate::systemd;
 use crate::validate::{Limits, OwnerLabel, Username};
+use crate::vhost;
 
 const GECOS: &str = "OxPanel tenant";
+
+/// A point-in-time measurement of what a tenant consumes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct TenantUsage {
+    pub memory_current_bytes: u64,
+    pub cpu_usage_nsec: u64,
+    pub tasks_current: u64,
+    pub disk_usage_bytes: u64,
+    pub measured_at_unix: u64,
+}
+
+/// Sum `MemoryCurrent`, `CPUUsageNSec` and `TasksCurrent` over the units in a
+/// `systemctl show` listing. Units with nothing running report `[not set]`
+/// (or 2^64-1 on older systemd); both count as zero.
+fn parse_cgroup_usage(show_output: &str) -> (u64, u64, u64) {
+    let (mut mem, mut cpu, mut tasks) = (0u64, 0u64, 0u64);
+    for line in show_output.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let Some(n) = value.trim().parse::<u64>().ok().filter(|n| *n != u64::MAX) else {
+            continue;
+        };
+        match key {
+            "MemoryCurrent" => mem = mem.saturating_add(n),
+            "CPUUsageNSec" => cpu = cpu.saturating_add(n),
+            "TasksCurrent" => tasks = tasks.saturating_add(n),
+            _ => {}
+        }
+    }
+    (mem, cpu, tasks)
+}
 
 #[derive(Debug, Clone)]
 pub struct TenantService {
@@ -86,6 +119,7 @@ impl TenantService {
             created_at_unix: now_unix(),
             state: TenantState::Provisioning,
             owner,
+            suspended: false,
         };
         // Claim the name and uid *before* the irreversible step, so a crash
         // can never leave behind an account the daemon refuses to recognise.
@@ -215,6 +249,135 @@ impl TenantService {
             all.retain(|t| t.owner == o);
         }
         Ok(all)
+    }
+
+    /// A tenant that exists and is fully provisioned, for the update RPCs.
+    fn load_ready(&self, name: &Username) -> Result<TenantRecord> {
+        let rec = self
+            .ctx
+            .store
+            .load_tenant(name)?
+            .ok_or_else(|| Error::TenantNotFound(name.to_string()))?;
+        if rec.state != TenantState::Ready {
+            return Err(Error::TenantNotReady(name.to_string()));
+        }
+        Ok(rec)
+    }
+
+    /// Replace the tenant's limits. The record is written first, so a failed
+    /// `daemon-reload` is completed by repeating the request: the unit files
+    /// are re-applied even when the record already carries these limits.
+    pub async fn update_limits(
+        &self,
+        username: &str,
+        limits: Limits,
+    ) -> Result<(TenantRecord, bool)> {
+        let name = Username::parse(username)?;
+        let _guard = self.ctx.lock.lock().await;
+        let mut rec = self.load_ready(&name)?;
+        let changed = rec.limits != limits;
+        if changed {
+            rec.limits = limits;
+            self.ctx.store.save_tenant(&rec)?;
+        }
+        systemd::apply_tenant_limits(
+            self.ctx.sys.as_ref(),
+            &self.ctx.config.systemd_unit_dir,
+            &name,
+            rec.uid,
+            &rec.limits,
+            self.ctx.config.command_timeout,
+        )
+        .await?;
+        if changed {
+            info!(tenant = %name, "limits updated");
+        }
+        Ok((rec, changed))
+    }
+
+    /// Replace the tenant's owner label; an empty label clears it.
+    pub async fn update_owner(&self, username: &str, owner: &str) -> Result<(TenantRecord, bool)> {
+        let name = Username::parse(username)?;
+        let owner = OwnerLabel::parse_optional(owner)?.map_or_else(String::new, |o| o.to_string());
+        let _guard = self.ctx.lock.lock().await;
+        let mut rec = self.load_ready(&name)?;
+        if rec.owner == owner {
+            return Ok((rec, false));
+        }
+        info!(tenant = %name, from = %rec.owner, to = %owner, "owner updated");
+        rec.owner = owner;
+        self.ctx.store.save_tenant(&rec)?;
+        Ok((rec, true))
+    }
+
+    /// Suspend or resume: every virtual host of the tenant is re-rendered
+    /// (503 while suspended), validated and activated; only then is the
+    /// record updated, so an interrupted attempt is simply repeated.
+    pub async fn set_suspended(
+        &self,
+        username: &str,
+        suspended: bool,
+    ) -> Result<(TenantRecord, bool)> {
+        let name = Username::parse(username)?;
+        let _guard = self.ctx.lock.lock().await;
+        let mut rec = self.load_ready(&name)?;
+        let changed = rec.suspended != suspended;
+        rec.suspended = suspended;
+        vhost::sync_tenant_configs(&self.ctx, &rec, changed).await?;
+        if changed {
+            self.ctx.store.save_tenant(&rec)?;
+            info!(tenant = %name, suspended, "suspension changed");
+        }
+        Ok((rec, changed))
+    }
+
+    /// Memory, CPU and task counts from systemd (tenant slice plus login
+    /// slice) and the disk space allocated under the home. Read-only.
+    pub async fn usage(&self, username: &str) -> Result<TenantUsage> {
+        let name = Username::parse(username)?;
+        let rec = self.load_ready(&name)?;
+        let timeout = self.ctx.config.command_timeout;
+        let show = self
+            .ctx
+            .sys
+            .run_ok(
+                CommandSpec::new(bin::SYSTEMCTL, timeout)
+                    .args([
+                        "show",
+                        "--property=MemoryCurrent",
+                        "--property=CPUUsageNSec",
+                        "--property=TasksCurrent",
+                        "--",
+                    ])
+                    .arg(&rec.slice_unit)
+                    .arg(format!("user-{}.slice", rec.uid)),
+            )
+            .await?;
+        let (memory_current_bytes, cpu_usage_nsec, tasks_current) =
+            parse_cgroup_usage(&show.stdout_lossy());
+        // -x: stay on the home's file system; du never follows symlinks.
+        let du = self
+            .ctx
+            .sys
+            .run_ok(
+                CommandSpec::new(bin::DU, timeout)
+                    .args(["--summarize", "--one-file-system", "--block-size=1", "--"])
+                    .arg(&rec.home),
+            )
+            .await?;
+        let disk_usage_bytes = du
+            .stdout_lossy()
+            .split_whitespace()
+            .next()
+            .and_then(|n| n.parse::<u64>().ok())
+            .ok_or_else(|| Error::Internal(format!("unexpected du output for '{name}'")))?;
+        Ok(TenantUsage {
+            memory_current_bytes,
+            cpu_usage_nsec,
+            tasks_current,
+            disk_usage_bytes,
+            measured_at_unix: now_unix(),
+        })
     }
 
     /// Delete a tenant OxPanel created. Returns `false` if it did not exist.
@@ -612,5 +775,186 @@ mod tests {
             ])
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_limits_rewrites_units_and_is_idempotent() -> Result<()> {
+        let h = harness();
+        h.svc.create("alice", Limits::default(), "").await?;
+        h.sys.clear_calls();
+        let limits = Limits {
+            memory_max_bytes: Some(64 << 20),
+            tasks_max: Some(50),
+            ..Limits::default()
+        };
+        let (rec, changed) = h.svc.update_limits("alice", limits).await?;
+        assert!(changed);
+        assert_eq!(rec.limits, limits);
+        assert_eq!(h.svc.get("alice").await?.limits, limits);
+        let slice = h.config.systemd_unit_dir.join("oxpanel-tenant-alice.slice");
+        let unit = std::fs::read_to_string(&slice).map_err(|e| Error::io("read", &slice, e))?;
+        assert!(unit.contains("MemoryMax=67108864\nMemorySwapMax=0\nTasksMax=50\n"));
+        let dropin = h
+            .config
+            .systemd_unit_dir
+            .join("user-20000.slice.d/50-oxpanel.conf");
+        assert!(std::fs::read_to_string(&dropin)
+            .map_err(|e| Error::io("read", &dropin, e))?
+            .contains("TasksMax=50"));
+        let reloads = h.sys.calls_to(bin::SYSTEMCTL);
+        assert_eq!(reloads.len(), 1);
+        assert_eq!(
+            reloads.first().map(args),
+            Some(vec!["daemon-reload".to_owned()])
+        );
+        // Same limits again: nothing changes, nothing reloads.
+        let (_, changed) = h.svc.update_limits("alice", limits).await?;
+        assert!(!changed);
+        assert_eq!(h.sys.calls_to(bin::SYSTEMCTL).len(), 1);
+        assert!(h.sys.calls_to(bin::USERADD).is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_limits_is_completed_by_a_retry_after_a_failed_reload() -> Result<()> {
+        let h = harness();
+        h.svc.create("alice", Limits::default(), "").await?;
+        let limits = Limits {
+            cpu_weight: Some(7),
+            ..Limits::default()
+        };
+        h.sys.script_failure(bin::SYSTEMCTL, 1, "dbus down");
+        assert!(matches!(
+            h.svc.update_limits("alice", limits).await,
+            Err(Error::CommandFailed { .. })
+        ));
+        // The unit file is already on disk, so the retry has nothing to write;
+        // the record carries the new limits and reports no change.
+        let (rec, _) = h.svc.update_limits("alice", limits).await?;
+        assert_eq!(rec.limits, limits);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn updates_require_a_ready_managed_tenant_and_valid_input() -> Result<()> {
+        let h = harness();
+        assert!(matches!(
+            h.svc.update_limits("ghost", Limits::default()).await,
+            Err(Error::TenantNotFound(_))
+        ));
+        assert!(matches!(
+            h.svc.update_owner("ghost", "r1").await,
+            Err(Error::TenantNotFound(_))
+        ));
+        assert!(matches!(
+            h.svc.set_suspended("ghost", true).await,
+            Err(Error::TenantNotFound(_))
+        ));
+        assert!(matches!(
+            h.svc.usage("ghost").await,
+            Err(Error::TenantNotFound(_))
+        ));
+        assert!(matches!(
+            h.svc.update_limits("root", Limits::default()).await,
+            Err(Error::InvalidInput { .. })
+        ));
+        h.sys.script_failure(bin::SYSTEMCTL, 1, "dbus down");
+        assert!(h.svc.create("alice", Limits::default(), "").await.is_err());
+        assert!(matches!(
+            h.svc.update_owner("alice", "r1").await,
+            Err(Error::TenantNotReady(_))
+        ));
+        assert!(matches!(
+            h.svc.set_suspended("alice", true).await,
+            Err(Error::TenantNotReady(_))
+        ));
+        assert!(h.sys.calls().iter().all(|c| c.program != bin::DU));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn update_owner_sets_clears_and_validates() -> Result<()> {
+        let h = harness();
+        h.svc.create("alice", Limits::default(), "r1").await?;
+        h.sys.clear_calls();
+        let (rec, changed) = h.svc.update_owner("alice", "r2").await?;
+        assert!(changed);
+        assert_eq!(rec.owner, "r2");
+        assert!(!h.svc.update_owner("alice", "r2").await?.1);
+        assert_eq!(h.svc.list(Some("r2")).await?.len(), 1);
+        assert!(h.svc.list(Some("r1")).await?.is_empty());
+        assert!(matches!(
+            h.svc.update_owner("alice", "Bad Owner").await,
+            Err(Error::InvalidInput { .. })
+        ));
+        let (rec, changed) = h.svc.update_owner("alice", "").await?;
+        assert!(changed);
+        assert_eq!(rec.owner, "");
+        assert!(
+            h.sys.calls().is_empty(),
+            "an owner label never touches the OS"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn usage_runs_exact_commands_and_sums_both_slices() -> Result<()> {
+        let h = harness();
+        h.svc.create("foo-bar", Limits::default(), "").await?;
+        h.sys.clear_calls();
+        let u = h.svc.usage("foo-bar").await?;
+        assert_eq!(
+            (u.memory_current_bytes, u.cpu_usage_nsec, u.tasks_current),
+            (1_048_576, 5_000_000, 3)
+        );
+        assert_eq!(u.disk_usage_bytes, 8192);
+        assert!(u.measured_at_unix > 1_600_000_000);
+        let calls = h.sys.calls();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(
+            calls.first().map(args),
+            Some(vec![
+                "show".to_owned(),
+                "--property=MemoryCurrent".into(),
+                "--property=CPUUsageNSec".into(),
+                "--property=TasksCurrent".into(),
+                "--".into(),
+                "oxpanel-tenant-foo\\x2dbar.slice".into(),
+                "user-20000.slice".into(),
+            ])
+        );
+        assert_eq!(calls.get(1).map(|c| c.program), Some(bin::DU));
+        assert_eq!(
+            calls.get(1).map(args),
+            Some(vec![
+                "--summarize".to_owned(),
+                "--one-file-system".into(),
+                "--block-size=1".into(),
+                "--".into(),
+                h.config
+                    .home_base
+                    .join("foo-bar")
+                    .to_string_lossy()
+                    .into_owned(),
+            ])
+        );
+        assert!(calls.iter().all(|c| c.run_as.is_none()));
+        Ok(())
+    }
+
+    #[test]
+    fn cgroup_usage_parsing_tolerates_unset_and_garbage() {
+        assert_eq!(parse_cgroup_usage(""), (0, 0, 0));
+        assert_eq!(
+            parse_cgroup_usage(
+                "MemoryCurrent=10\nCPUUsageNSec=[not set]\nTasksCurrent=2\n\nMemoryCurrent=5\nCPUUsageNSec=7\nTasksCurrent=18446744073709551615\nOther=9\nnonsense\n"
+            ),
+            (15, 7, 2)
+        );
+        assert_eq!(
+            parse_cgroup_usage("MemoryCurrent=18446744073709551614\nMemoryCurrent=5\n").0,
+            u64::MAX,
+            "saturates instead of overflowing"
+        );
     }
 }

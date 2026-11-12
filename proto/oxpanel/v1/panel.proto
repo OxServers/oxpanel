@@ -28,6 +28,23 @@ service OxPanelEngine {
   rpc ConfigureVirtualHost(ConfigureVirtualHostRequest) returns (ConfigureVirtualHostResponse);
   rpc RemoveVirtualHost(RemoveVirtualHostRequest) returns (RemoveVirtualHostResponse);
   rpc ListVirtualHosts(ListVirtualHostsRequest) returns (ListVirtualHostsResponse);
+
+  // Replace a tenant's resource limits. Applied through systemd immediately.
+  rpc UpdateTenantLimits(UpdateTenantLimitsRequest) returns (UpdateTenantResponse);
+  // Replace a tenant's owner label (e.g. move it to another reseller).
+  rpc UpdateTenantOwner(UpdateTenantOwnerRequest) returns (UpdateTenantResponse);
+  // Suspend a tenant: every virtual host it owns answers 503 until resumed.
+  // Files, limits and the account are left untouched.
+  rpc SuspendTenant(SuspendTenantRequest) returns (UpdateTenantResponse);
+  rpc ResumeTenant(ResumeTenantRequest) returns (UpdateTenantResponse);
+  // Current resource consumption of one tenant.
+  rpc GetTenantUsage(GetTenantUsageRequest) returns (TenantUsage);
+
+  // Engine version, capacity and host load.
+  rpc GetHostInfo(GetHostInfoRequest) returns (HostInfo);
+  // Compare every record with the operating system and report differences.
+  // Read-only: nothing is repaired.
+  rpc Reconcile(ReconcileRequest) returns (ReconcileResponse);
 }
 
 // Per-tenant resource limits, applied through systemd (cgroups v2).
@@ -56,6 +73,8 @@ message Tenant {
   // Opaque label of the owning account in the panel (e.g. a reseller id).
   // The engine stores and filters by it; it carries no OS meaning.
   string owner = 9;
+  // True while the tenant is suspended (its sites answer 503).
+  bool suspended = 10;
 }
 
 enum TenantState {
@@ -151,4 +170,105 @@ message ListVirtualHostsRequest {
 
 message ListVirtualHostsResponse {
   repeated VirtualHost vhosts = 1;
+}
+
+message UpdateTenantLimitsRequest {
+  string username = 1;
+  // The complete new set of limits (not a patch). Absent = no limits.
+  ResourceLimits limits = 2;
+}
+
+message UpdateTenantOwnerRequest {
+  string username = 1;
+  // New owner label; empty clears it.
+  string owner = 2;
+}
+
+message SuspendTenantRequest {
+  string username = 1;
+}
+
+message ResumeTenantRequest {
+  string username = 1;
+}
+
+message UpdateTenantResponse {
+  Tenant tenant = 1;
+  // false when the tenant already had exactly this value.
+  bool changed = 2;
+}
+
+message GetTenantUsageRequest {
+  string username = 1;
+}
+
+// A point-in-time measurement. Memory, CPU and tasks cover the tenant slice
+// and the tenant's login-session slice together; 0 when nothing is running.
+message TenantUsage {
+  string username = 1;
+  uint64 memory_current_bytes = 2;
+  // Total CPU time consumed since the slices were started.
+  uint64 cpu_usage_nsec = 3;
+  uint64 tasks_current = 4;
+  // Disk space allocated under the tenant home (one file system).
+  uint64 disk_usage_bytes = 5;
+  google.protobuf.Timestamp measured_at = 6;
+}
+
+message GetHostInfoRequest {}
+
+message HostInfo {
+  string daemon_version = 1;
+  bool selinux_enabled = 2;
+  bool dry_run = 3;
+  uint32 tenant_count = 4;
+  uint32 vhost_count = 5;
+  // Inclusive uid range tenants are allocated from (capacity = max - min + 1).
+  uint32 uid_min = 6;
+  uint32 uid_max = 7;
+  double load_1m = 8;
+  double load_5m = 9;
+  double load_15m = 10;
+  uint64 memory_total_bytes = 11;
+  uint64 memory_free_bytes = 12;
+  // The file system that holds tenant homes.
+  uint64 home_disk_total_bytes = 13;
+  uint64 home_disk_free_bytes = 14;
+  uint64 uptime_seconds = 15;
+}
+
+message ReconcileRequest {}
+
+enum DriftKind {
+  DRIFT_KIND_UNSPECIFIED = 0;
+  // A tenant record is not in state READY (interrupted create or delete).
+  DRIFT_KIND_TENANT_INCOMPLETE = 1;
+  // The record exists but the POSIX account does not.
+  DRIFT_KIND_TENANT_ACCOUNT_MISSING = 2;
+  // uid, gid or home of the account differ from the record.
+  DRIFT_KIND_TENANT_ACCOUNT_MISMATCH = 3;
+  // The home is missing, not a directory, wrongly owned or open to others.
+  DRIFT_KIND_TENANT_HOME_INVALID = 4;
+  // A slice unit or drop-in is missing or differs from the recorded limits.
+  DRIFT_KIND_TENANT_UNIT_DRIFT = 5;
+  // A virtual host names a tenant that has no record.
+  DRIFT_KIND_VHOST_TENANT_MISSING = 6;
+  // The Nginx file is missing or differs from what the record renders to.
+  DRIFT_KIND_VHOST_CONFIG_DRIFT = 7;
+  // A file in the OxPanel Nginx directory that no record accounts for.
+  DRIFT_KIND_ORPHAN_NGINX_CONFIG = 8;
+  // An oxpanel-tenant-*.slice unit that no record accounts for.
+  DRIFT_KIND_ORPHAN_SLICE_UNIT = 9;
+}
+
+message Drift {
+  DriftKind kind = 1;
+  // Tenant name, domain, or file path the finding is about.
+  string subject = 2;
+  string detail = 3;
+}
+
+message ReconcileResponse {
+  // Empty when records and operating system agree.
+  repeated Drift drifts = 1;
 }

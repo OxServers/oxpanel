@@ -14,6 +14,7 @@ Requires:       nginx
 Requires:       shadow-utils
 Requires:       util-linux
 Requires:       acl
+Requires:       coreutils
 Requires:       policycoreutils
 Requires:       policycoreutils-python-utils
 Requires:       libselinux-utils

@@ -69,7 +69,7 @@ scripts/                       dev.sh (run cargo in the image), integration-test
 
 ```sh
 make image          # build localhost/oxpanel-dev:alma9 (rustup 1.98.1, gcc, nginx, systemd, cargo-deny)
-make test           # 63 unit tests + 4 gRPC end-to-end tests (fake OS, no root)
+make test           # 80 unit tests + 6 gRPC end-to-end tests (fake OS, no root)
 make clippy         # pedantic, warnings are errors
 make deny           # RustSec advisories, licences, banned crates
 make integration    # boots systemd in the container, installs from packaging/, drives the

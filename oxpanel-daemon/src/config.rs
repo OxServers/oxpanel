@@ -3,10 +3,11 @@
 //! The systemd unit ships an `EnvironmentFile=/etc/oxpanel/daemon.env`; every
 //! value has a production default so an empty file is a valid configuration.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::auth::Scope;
 use crate::error::{Error, Result};
 
 /// Everything the daemon needs to know about its environment.
@@ -23,6 +24,9 @@ pub struct Config {
     pub allowed_gids: BTreeSet<u32>,
     /// Whether UID 0 may call the API regardless of the lists above.
     pub allow_root_peer: bool,
+    /// Peers confined to a subset of the API: uid -> scopes. A uid that is
+    /// not listed may call everything (see [`crate::auth::ScopePolicy`]).
+    pub peer_scopes: BTreeMap<u32, BTreeSet<Scope>>,
     /// Inclusive UID range tenants are allocated from. A dedicated primary
     /// group with the same numeric id is created for each tenant.
     pub uid_min: u32,
@@ -60,6 +64,7 @@ impl Default for Config {
             allowed_uids: BTreeSet::new(),
             allowed_gids: BTreeSet::new(),
             allow_root_peer: true,
+            peer_scopes: BTreeMap::new(),
             uid_min: 20_000,
             uid_max: 29_999,
             home_base: PathBuf::from("/home"),
@@ -121,6 +126,9 @@ impl Config {
         }
         if let Some(v) = get("OXPANEL_ALLOW_ROOT_PEER") {
             c.allow_root_peer = parse_bool("OXPANEL_ALLOW_ROOT_PEER", &v)?;
+        }
+        if let Some(v) = get("OXPANEL_PEER_SCOPES") {
+            c.peer_scopes = parse_peer_scopes(&v)?;
         }
         if let Some(v) = get("OXPANEL_UID_MIN") {
             c.uid_min = parse_u32("OXPANEL_UID_MIN", &v)?;
@@ -269,6 +277,38 @@ fn parse_id_list(key: &str, raw: &str) -> Result<BTreeSet<u32>> {
         .collect()
 }
 
+/// `uid:scope+scope,uid:scope` — e.g. `1001:read+vhost,1002:all`.
+fn parse_peer_scopes(raw: &str) -> Result<BTreeMap<u32, BTreeSet<Scope>>> {
+    const KEY: &str = "OXPANEL_PEER_SCOPES";
+    let bad = |why: String| Error::invalid("config", format!("{KEY}: {why}"));
+    let mut out = BTreeMap::new();
+    for entry in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let (uid, scopes) = entry
+            .split_once(':')
+            .ok_or_else(|| bad(format!("'{entry}' is not uid:scope+scope")))?;
+        let uid = uid
+            .trim()
+            .parse::<u32>()
+            .map_err(|_| bad(format!("'{uid}' is not a numeric uid")))?;
+        let mut set = BTreeSet::new();
+        for s in scopes.split('+').map(str::trim) {
+            if s == "all" {
+                set.extend(Scope::ALL);
+            } else {
+                set.insert(Scope::parse(s).ok_or_else(|| {
+                    bad(format!(
+                        "'{s}' is not a scope (read, vhost, tenant, delete, all)"
+                    ))
+                })?);
+            }
+        }
+        if out.insert(uid, set).is_some() {
+            return Err(bad(format!("uid {uid} is listed twice")));
+        }
+    }
+    Ok(out)
+}
+
 fn parse_u32(key: &str, raw: &str) -> Result<u32> {
     raw.trim().parse::<u32>().map_err(|_| {
         Error::invalid(
@@ -326,6 +366,27 @@ mod tests {
         assert!(!c.allow_root_peer);
         assert_eq!(c.socket_group, None);
         assert!(c.dry_run);
+    }
+
+    #[test]
+    fn parses_peer_scopes() {
+        let c = from(&[("OXPANEL_PEER_SCOPES", "1001:read+vhost, 1002:all,")])
+            .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            c.peer_scopes.get(&1001),
+            Some(&[Scope::Read, Scope::VHost].into_iter().collect())
+        );
+        assert_eq!(c.peer_scopes.get(&1002).map(BTreeSet::len), Some(4));
+        assert!(from(&[]).is_ok_and(|c| c.peer_scopes.is_empty()));
+        for bad in [
+            "1001",
+            "abc:read",
+            "1001:admin",
+            "1001:",
+            "1001:read,1001:vhost",
+        ] {
+            assert!(from(&[("OXPANEL_PEER_SCOPES", bad)]).is_err(), "{bad}");
+        }
     }
 
     #[test]

@@ -8,9 +8,12 @@ pub const MAX_REQUEST_BYTES: usize = 256 * 1024;
 use tonic::{Request, Response, Status};
 use tracing::{error, info, warn};
 
-use crate::auth::PeerInfo;
+use std::sync::Arc;
+
+use crate::auth::{PeerInfo, Scope, ScopePolicy};
 use crate::ctx::Ctx;
 use crate::error::Error;
+use crate::host::{Drift, DriftKind, HostService};
 use crate::records::{TenantRecord, TenantState, VHostRecord};
 use crate::tenant::TenantService;
 use crate::validate::Limits;
@@ -23,6 +26,8 @@ use oxpanel_proto::v1::ox_panel_engine_server::{OxPanelEngine, OxPanelEngineServ
 pub struct Engine {
     tenants: TenantService,
     vhosts: VHostService,
+    host: HostService,
+    scopes: Arc<ScopePolicy>,
 }
 
 /// Interceptor type used by [`Engine::into_service`].
@@ -31,8 +36,10 @@ pub type Interceptor = fn(Request<()>) -> Result<Request<()>, Status>;
 impl Engine {
     pub fn new(ctx: Ctx) -> Self {
         Self {
+            scopes: Arc::new(ScopePolicy::new(ctx.config.peer_scopes.clone())),
             tenants: TenantService::new(ctx.clone()),
-            vhosts: VHostService::new(ctx),
+            vhosts: VHostService::new(ctx.clone()),
+            host: HostService::new(ctx),
         }
     }
 
@@ -55,10 +62,62 @@ pub fn require_authenticated_peer(req: Request<()>) -> Result<Request<()>, Statu
     }
 }
 
-fn peer_of<T>(req: &Request<T>) -> String {
-    req.extensions()
-        .get::<PeerInfo>()
-        .map_or_else(|| "unknown".to_owned(), ToString::to_string)
+impl Engine {
+    /// Second gate, per RPC: the verified peer must hold `scope`. Returns the
+    /// peer's description for the request log.
+    fn authorise<T>(
+        &self,
+        req: &Request<T>,
+        rpc: &'static str,
+        scope: Scope,
+    ) -> Result<String, Status> {
+        let Some(peer) = req.extensions().get::<PeerInfo>() else {
+            return Err(Status::permission_denied(
+                "request did not arrive over an authenticated transport",
+            ));
+        };
+        if !self.scopes.permits(peer, scope) {
+            warn!(rpc, %peer, scope = scope.as_str(), "request refused: peer lacks scope");
+            return Err(Status::permission_denied(format!(
+                "this peer is not permitted to call {rpc} (scope '{}' required)",
+                scope.as_str()
+            )));
+        }
+        Ok(peer.to_string())
+    }
+}
+
+fn timestamp(unix: u64) -> prost_types::Timestamp {
+    prost_types::Timestamp {
+        seconds: i64::try_from(unix).unwrap_or(i64::MAX),
+        nanos: 0,
+    }
+}
+
+fn drift_to(d: &Drift) -> pb::Drift {
+    let kind = match d.kind {
+        DriftKind::TenantIncomplete => pb::DriftKind::TenantIncomplete,
+        DriftKind::TenantAccountMissing => pb::DriftKind::TenantAccountMissing,
+        DriftKind::TenantAccountMismatch => pb::DriftKind::TenantAccountMismatch,
+        DriftKind::TenantHomeInvalid => pb::DriftKind::TenantHomeInvalid,
+        DriftKind::TenantUnitDrift => pb::DriftKind::TenantUnitDrift,
+        DriftKind::VHostTenantMissing => pb::DriftKind::VhostTenantMissing,
+        DriftKind::VHostConfigDrift => pb::DriftKind::VhostConfigDrift,
+        DriftKind::OrphanNginxConfig => pb::DriftKind::OrphanNginxConfig,
+        DriftKind::OrphanSliceUnit => pb::DriftKind::OrphanSliceUnit,
+    };
+    pb::Drift {
+        kind: kind.into(),
+        subject: d.subject.clone(),
+        detail: d.detail.clone(),
+    }
+}
+
+fn updated(rec: &TenantRecord, changed: bool) -> Response<pb::UpdateTenantResponse> {
+    Response::new(pb::UpdateTenantResponse {
+        tenant: Some(tenant_to(rec)),
+        changed,
+    })
 }
 
 /// Log and convert. Operator-relevant detail stays in the journal.
@@ -113,12 +172,10 @@ fn tenant_to(rec: &TenantRecord) -> pb::Tenant {
         home: rec.home.to_string_lossy().into_owned(),
         limits: Some(limits_to(&rec.limits)),
         slice_unit: rec.slice_unit.clone(),
-        created_at: Some(prost_types::Timestamp {
-            seconds: i64::try_from(rec.created_at_unix).unwrap_or(i64::MAX),
-            nanos: 0,
-        }),
+        created_at: Some(timestamp(rec.created_at_unix)),
         state: state.into(),
         owner: rec.owner.clone(),
+        suspended: rec.suspended,
     }
 }
 
@@ -138,7 +195,7 @@ impl OxPanelEngine for Engine {
         &self,
         req: Request<pb::CreateTenantRequest>,
     ) -> Result<Response<pb::CreateTenantResponse>, Status> {
-        let peer = peer_of(&req);
+        let peer = self.authorise(&req, "CreateTenant", Scope::Tenant)?;
         let r = req.into_inner();
         info!(rpc = "CreateTenant", peer, username = %r.username, "request");
         let limits = limits_from(r.limits).map_err(|e| fail("CreateTenant", &peer, e))?;
@@ -157,7 +214,7 @@ impl OxPanelEngine for Engine {
         &self,
         req: Request<pb::GetTenantRequest>,
     ) -> Result<Response<pb::Tenant>, Status> {
-        let peer = peer_of(&req);
+        let peer = self.authorise(&req, "GetTenant", Scope::Read)?;
         let r = req.into_inner();
         let rec = self
             .tenants
@@ -171,7 +228,7 @@ impl OxPanelEngine for Engine {
         &self,
         req: Request<pb::ListTenantsRequest>,
     ) -> Result<Response<pb::ListTenantsResponse>, Status> {
-        let peer = peer_of(&req);
+        let peer = self.authorise(&req, "ListTenants", Scope::Read)?;
         let owner = req.into_inner().owner;
         let recs = self
             .tenants
@@ -187,7 +244,7 @@ impl OxPanelEngine for Engine {
         &self,
         req: Request<pb::DeleteTenantRequest>,
     ) -> Result<Response<pb::DeleteTenantResponse>, Status> {
-        let peer = peer_of(&req);
+        let peer = self.authorise(&req, "DeleteTenant", Scope::Delete)?;
         let r = req.into_inner();
         info!(rpc = "DeleteTenant", peer, username = %r.username, remove_home = r.remove_home, "request");
         let deleted = self
@@ -202,7 +259,7 @@ impl OxPanelEngine for Engine {
         &self,
         req: Request<pb::ConfigureVirtualHostRequest>,
     ) -> Result<Response<pb::ConfigureVirtualHostResponse>, Status> {
-        let peer = peer_of(&req);
+        let peer = self.authorise(&req, "ConfigureVirtualHost", Scope::VHost)?;
         let r = req.into_inner();
         info!(rpc = "ConfigureVirtualHost", peer, domain = %r.domain, tenant = %r.tenant, "request");
         let (rec, created) = self
@@ -225,7 +282,7 @@ impl OxPanelEngine for Engine {
         &self,
         req: Request<pb::RemoveVirtualHostRequest>,
     ) -> Result<Response<pb::RemoveVirtualHostResponse>, Status> {
-        let peer = peer_of(&req);
+        let peer = self.authorise(&req, "RemoveVirtualHost", Scope::VHost)?;
         let r = req.into_inner();
         info!(rpc = "RemoveVirtualHost", peer, domain = %r.domain, "request");
         let removed = self
@@ -240,7 +297,7 @@ impl OxPanelEngine for Engine {
         &self,
         req: Request<pb::ListVirtualHostsRequest>,
     ) -> Result<Response<pb::ListVirtualHostsResponse>, Status> {
-        let peer = peer_of(&req);
+        let peer = self.authorise(&req, "ListVirtualHosts", Scope::Read)?;
         let r = req.into_inner();
         let recs = self
             .vhosts
@@ -249,6 +306,136 @@ impl OxPanelEngine for Engine {
             .map_err(|e| fail("ListVirtualHosts", &peer, e))?;
         Ok(Response::new(pb::ListVirtualHostsResponse {
             vhosts: recs.iter().map(vhost_to).collect(),
+        }))
+    }
+
+    async fn update_tenant_limits(
+        &self,
+        req: Request<pb::UpdateTenantLimitsRequest>,
+    ) -> Result<Response<pb::UpdateTenantResponse>, Status> {
+        const RPC: &str = "UpdateTenantLimits";
+        let peer = self.authorise(&req, RPC, Scope::Tenant)?;
+        let r = req.into_inner();
+        info!(rpc = RPC, peer, username = %r.username, "request");
+        let limits = limits_from(r.limits).map_err(|e| fail(RPC, &peer, e))?;
+        let (rec, changed) = self
+            .tenants
+            .update_limits(&r.username, limits)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(updated(&rec, changed))
+    }
+
+    async fn update_tenant_owner(
+        &self,
+        req: Request<pb::UpdateTenantOwnerRequest>,
+    ) -> Result<Response<pb::UpdateTenantResponse>, Status> {
+        const RPC: &str = "UpdateTenantOwner";
+        let peer = self.authorise(&req, RPC, Scope::Tenant)?;
+        let r = req.into_inner();
+        info!(rpc = RPC, peer, username = %r.username, owner = %r.owner, "request");
+        let (rec, changed) = self
+            .tenants
+            .update_owner(&r.username, &r.owner)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(updated(&rec, changed))
+    }
+
+    async fn suspend_tenant(
+        &self,
+        req: Request<pb::SuspendTenantRequest>,
+    ) -> Result<Response<pb::UpdateTenantResponse>, Status> {
+        const RPC: &str = "SuspendTenant";
+        let peer = self.authorise(&req, RPC, Scope::Tenant)?;
+        let r = req.into_inner();
+        info!(rpc = RPC, peer, username = %r.username, "request");
+        let (rec, changed) = self
+            .tenants
+            .set_suspended(&r.username, true)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(updated(&rec, changed))
+    }
+
+    async fn resume_tenant(
+        &self,
+        req: Request<pb::ResumeTenantRequest>,
+    ) -> Result<Response<pb::UpdateTenantResponse>, Status> {
+        const RPC: &str = "ResumeTenant";
+        let peer = self.authorise(&req, RPC, Scope::Tenant)?;
+        let r = req.into_inner();
+        info!(rpc = RPC, peer, username = %r.username, "request");
+        let (rec, changed) = self
+            .tenants
+            .set_suspended(&r.username, false)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(updated(&rec, changed))
+    }
+
+    async fn get_tenant_usage(
+        &self,
+        req: Request<pb::GetTenantUsageRequest>,
+    ) -> Result<Response<pb::TenantUsage>, Status> {
+        const RPC: &str = "GetTenantUsage";
+        let peer = self.authorise(&req, RPC, Scope::Read)?;
+        let r = req.into_inner();
+        let u = self
+            .tenants
+            .usage(&r.username)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(pb::TenantUsage {
+            username: r.username,
+            memory_current_bytes: u.memory_current_bytes,
+            cpu_usage_nsec: u.cpu_usage_nsec,
+            tasks_current: u.tasks_current,
+            disk_usage_bytes: u.disk_usage_bytes,
+            measured_at: Some(timestamp(u.measured_at_unix)),
+        }))
+    }
+
+    async fn get_host_info(
+        &self,
+        req: Request<pb::GetHostInfoRequest>,
+    ) -> Result<Response<pb::HostInfo>, Status> {
+        const RPC: &str = "GetHostInfo";
+        let peer = self.authorise(&req, RPC, Scope::Read)?;
+        let i = self.host.info().await.map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(pb::HostInfo {
+            daemon_version: env!("CARGO_PKG_VERSION").to_owned(),
+            selinux_enabled: i.selinux,
+            dry_run: i.dry_run,
+            tenant_count: i.tenant_count,
+            vhost_count: i.vhost_count,
+            uid_min: i.uid_min,
+            uid_max: i.uid_max,
+            load_1m: i.stats.load.0,
+            load_5m: i.stats.load.1,
+            load_15m: i.stats.load.2,
+            memory_total_bytes: i.stats.memory_total_bytes,
+            memory_free_bytes: i.stats.memory_free_bytes,
+            home_disk_total_bytes: i.stats.disk_total_bytes,
+            home_disk_free_bytes: i.stats.disk_free_bytes,
+            uptime_seconds: i.stats.uptime_secs,
+        }))
+    }
+
+    async fn reconcile(
+        &self,
+        req: Request<pb::ReconcileRequest>,
+    ) -> Result<Response<pb::ReconcileResponse>, Status> {
+        const RPC: &str = "Reconcile";
+        let peer = self.authorise(&req, RPC, Scope::Read)?;
+        let drifts = self
+            .host
+            .reconcile()
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        info!(rpc = RPC, peer, findings = drifts.len(), "reconciled");
+        Ok(Response::new(pb::ReconcileResponse {
+            drifts: drifts.iter().map(drift_to).collect(),
         }))
     }
 }

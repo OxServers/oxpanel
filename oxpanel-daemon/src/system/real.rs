@@ -12,7 +12,7 @@ use std::ffi::CString;
 use nix::unistd::{fchown, getgrouplist, Gid, Group, Uid, User};
 use tracing::{debug, warn};
 
-use super::{CommandOutput, CommandSpec, OsUser, System};
+use super::{CommandOutput, CommandSpec, HostStats, OsUser, System};
 use crate::error::{Error, Result};
 
 /// Environment handed to every child process. Nothing from the daemon's own
@@ -154,6 +154,65 @@ impl System for RealSystem {
         })
         .await
         .map_err(|e| Error::Internal(format!("verify_owned_dir task: {e}")))?
+    }
+
+    async fn inspect_private_dir(&self, path: &Path, uid: u32, gid: u32) -> Result<Option<String>> {
+        let path: PathBuf = path.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let md = match std::fs::symlink_metadata(&path) {
+                Ok(md) => md,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok(Some("missing".to_owned()))
+                }
+                Err(e) => return Err(Error::io("lstat", &path, e)),
+            };
+            if md.file_type().is_symlink() || !md.is_dir() {
+                return Ok(Some("not a directory".to_owned()));
+            }
+            if md.uid() != uid || md.gid() != gid {
+                return Ok(Some(format!(
+                    "owned by {}:{}, expected {uid}:{gid}",
+                    md.uid(),
+                    md.gid()
+                )));
+            }
+            let mode = md.mode() & 0o7777;
+            if mode & 0o7707 != 0o700 {
+                return Ok(Some(format!(
+                    "mode {mode:o}, expected 0700 (group bits may carry the ACL mask)"
+                )));
+            }
+            Ok(None)
+        })
+        .await
+        .map_err(|e| Error::Internal(format!("inspect_private_dir task: {e}")))?
+    }
+
+    async fn host_stats(&self, path: &Path) -> Result<HostStats> {
+        let path: PathBuf = path.to_owned();
+        tokio::task::spawn_blocking(move || {
+            // sysinfo(2) rather than /proc: the unit runs with ProcSubset=pid,
+            // so /proc/loadavg and /proc/meminfo are not there to read.
+            let si = nix::sys::sysinfo::sysinfo().map_err(|source| Error::Sys {
+                op: "sysinfo",
+                source,
+            })?;
+            let vfs = nix::sys::statvfs::statvfs(&path).map_err(|source| Error::Sys {
+                op: "statvfs",
+                source,
+            })?;
+            let frag = vfs.fragment_size();
+            Ok(HostStats {
+                load: si.load_average(),
+                memory_total_bytes: si.ram_total(),
+                memory_free_bytes: si.ram_unused(),
+                uptime_secs: si.uptime().as_secs(),
+                disk_total_bytes: vfs.blocks().saturating_mul(frag),
+                disk_free_bytes: vfs.blocks_available().saturating_mul(frag),
+            })
+        })
+        .await
+        .map_err(|e| Error::Internal(format!("host_stats task: {e}")))?
     }
 }
 

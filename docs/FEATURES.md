@@ -19,6 +19,10 @@ see "Not yet included" at the end so nobody assumes otherwise.
 | Idempotent | Repeating `CreateTenant` with an identical specification returns the existing tenant (`created=false`); a different specification is refused (`ALREADY_EXISTS`). |
 | Resumable | The tenant record is written **before** `useradd`; if the daemon crashes at any point, the next identical request resumes the remaining steps. Records carry a state: `provisioning`, `ready`, `deleting`. |
 | Never adopts foreign accounts | A user or group that exists but was not created by OxPanel is refused (`FAILED_PRECONDITION`), and can never be deleted through the API. |
+| Update limits | `UpdateTenantLimits` replaces the tenant's limits (a complete set, not a patch): both unit files are rewritten and applied with `daemon-reload`, so the new values are live immediately. Repeating the call completes an interrupted attempt. |
+| Update owner | `UpdateTenantOwner` replaces or clears the owner label (e.g. moving a customer to another reseller). Touches no OS state. |
+| Suspend / resume | `SuspendTenant` re-renders every virtual host of the tenant to answer `503` with `Retry-After` and no document root, validates once and reloads; all files are restored if Nginx rejects the result. Files, limits and the account are untouched; sites added while suspended are born suspended. `ResumeTenant` reverses it. |
+| Usage | `GetTenantUsage`: current memory, total CPU time and task count from systemd (tenant slice + login-session slice), and disk space allocated under the home (`du`, one file system, no symlink following). |
 | Reserved names | `root`, `nginx`, `apache`, `oxpanel*`, `systemd-*`, `wheel`, `sudo`, … are rejected before anything touches the OS. |
 
 ## Virtual hosts (Nginx)
@@ -46,15 +50,18 @@ see "Not yet included" at the end so nobody assumes otherwise.
 | Strict input validation | Allow-list newtypes for user names (`^[a-z][a-z0-9_-]{2,31}$`), domains (lower-case ASCII / punycode labels, no wildcards, no IPs), document roots (no `..`, no metacharacters), owner labels, and limits (memory ≥ 16 MiB or unlimited, weights 1–10000). Invalid input never reaches the OS. |
 | Precise error codes | `INVALID_ARGUMENT`, `ALREADY_EXISTS`, `NOT_FOUND`, `FAILED_PRECONDITION`, `RESOURCE_EXHAUSTED`, `PERMISSION_DENIED`, `DEADLINE_EXCEEDED`, `INTERNAL`. Internal failures are redacted for the client and logged in full to the journal. |
 | Limits | Requests capped at 256 KiB, 16 concurrent streams per connection, 300 s per request, HTTP/2 keep-alive. |
+| Per-peer scopes | `OXPANEL_PEER_SCOPES=uid:scope+scope,…` confines an authenticated peer to `read`, `vhost`, `tenant` and/or `delete` RPCs; anything else is refused with `PERMISSION_DENIED` before validation or any OS call. Unlisted peers keep full access. A customer-facing service account limited to `read+vhost` can never reach `DeleteTenant`. |
 | Serialised mutations | One global lock: exactly one tenant/vhost mutation runs at a time (the account database, Nginx and systemd are not transactional). |
 
 ## Operations
 
 | Feature | Detail |
 |---|---|
-| `oxpanel-ctl` | Command-line client: `tenant create|get|list|delete`, `vhost set|remove|list`, human-readable sizes (`512M`, `2G`). |
+| `oxpanel-ctl` | Command-line client: `tenant create|get|list|set-limits|set-owner|suspend|resume|usage|delete`, `vhost set|remove|list`, `host info|reconcile`, human-readable sizes (`512M`, `2G`). |
+| Host information | `GetHostInfo`: engine version, SELinux and dry-run state, tenant and virtual-host counts, the tenant uid range (capacity), load averages, memory, uptime, and size/free space of the file system holding tenant homes. |
+| Reconciliation | `Reconcile` compares every record with the operating system and reports differences: interrupted tenants, missing or mismatched accounts, invalid homes, edited or missing unit files, missing or edited Nginx files, virtual hosts without a tenant, and orphan files in OxPanel's own directories. Strictly read-only — most findings are healed by repeating the original request. `oxpanel-ctl host reconcile` exits `3` when drift is found. |
 | Configuration | Environment variables `OXPANEL_*` (from `/etc/oxpanel/daemon.env`); every value has a production default. `--check-config` validates configuration and host prerequisites without starting. |
-| Preflight | Refuses to start without root, without the required tools (`useradd`, `userdel`, `nginx`, `systemctl`, `setpriv`, `setfacl`, `mkdir`, and on SELinux hosts `restorecon`, `semanage`), if the socket group does not exist, or if the web user is root / a tenant. |
+| Preflight | Refuses to start without root, without the required tools (`useradd`, `userdel`, `nginx`, `systemctl`, `setpriv`, `setfacl`, `mkdir`, `du`, and on SELinux hosts `restorecon`, `semanage`), if the socket group does not exist, or if the web user is root / a tenant. |
 | systemd integration | `Type=notify` readiness, clean shutdown on `SIGTERM`/`SIGINT` (socket removed), logs via `tracing` to the journal, `RuntimeDirectory`/`StateDirectory` managed by systemd. |
 | Hardened unit | `ProtectSystem=strict` with an explicit `ReadWritePaths` list, `PrivateNetwork` + `IPAddressDeny=any`, `NoNewPrivileges`, `PrivateDevices`, `ProtectKernel*`, `RestrictNamespaces`, `MemoryDenyWriteExecute`, capability deny-list, seccomp allow-list. |
 | Packaging | RPM spec (`packaging/oxpanel-daemon.spec`), `sysusers.d` (creates the `oxpanel` group), `tmpfiles.d`, environment file. |
@@ -65,9 +72,9 @@ see "Not yet included" at the end so nobody assumes otherwise.
 
 - Rust, `#![forbid(unsafe_code)]`, clippy pedantic with warnings as errors, no `unwrap`/`expect`/`panic` in production paths.
 - No shell anywhere: every external program is an absolute path with an argv array; the only module that spawns processes is `system/real.rs`.
-- Tests: 63 unit tests (exact argv assertions against a fake OS), 4 end-to-end gRPC tests over a real UNIX socket, an 80-check root integration suite in an AlmaLinux 9 systemd container, and `make acceptance`: ≈200 checks on a real AlmaLinux 9 VM with SELinux enforcing (install from git or RPM, SELinux labels and zero AVC denials, sandbox namespaces, restart/kill/resume, reboot, soak). `cargo-deny` for advisories/licences/bans.
+- Tests: 80 unit tests (exact argv assertions against a fake OS), 6 end-to-end gRPC tests over a real UNIX socket, a 132-check root integration suite in an AlmaLinux 9 systemd container, and `make acceptance`: ≈200 checks on a real AlmaLinux 9 VM with SELinux enforcing (install from git or RPM, SELinux labels and zero AVC denials, sandbox namespaces, restart/kill/resume, reboot, soak). `cargo-deny` for advisories/licences/bans.
 - Builds without a system `protoc` (pure-Rust `protox`) and without a host toolchain (everything runs in the AlmaLinux 9 container).
 
 ## Not yet included
 
-To be explicit, v0.1.0 does **not** provide: TLS/ACME certificates, PHP-FPM or any application runtime (Nginx serves static files only), DNS, mail, databases, FTP/SFTP/SSH access for tenants, disk quotas, backups, per-vhost access logs, update RPCs (`UpdateTenantLimits`, owner transfer), reconciliation of records against the OS, a confined SELinux domain for the daemon itself, per-peer API scopes, or metrics. These are on the roadmap in `oxpanel-daemon/PROJECT_DETAILS.md`.
+To be explicit, v0.1.0 does **not** provide: TLS/ACME certificates, PHP-FPM or any application runtime (Nginx serves static files only), DNS, mail, databases, FTP/SFTP/SSH access for tenants, disk quotas, backups, per-vhost access logs, automatic repair of drift found by `Reconcile`, stopping a suspended tenant's processes (there are none until tenants get runtimes or logins), a confined SELinux domain for the daemon itself, or historical metrics. These are on the roadmap in `oxpanel-daemon/PROJECT_DETAILS.md`.

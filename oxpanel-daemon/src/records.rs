@@ -45,6 +45,10 @@ pub struct TenantRecord {
     /// Opaque owner label from the panel; empty = none. Absent in v1 records.
     #[serde(default)]
     pub owner: String,
+    /// While set, every virtual host of the tenant answers 503. Absent in
+    /// records written before suspension existed.
+    #[serde(default)]
+    pub suspended: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -199,6 +203,7 @@ mod tests {
             created_at_unix: 1_700_000_000,
             state: TenantState::Ready,
             owner: String::new(),
+            suspended: false,
         }
     }
 

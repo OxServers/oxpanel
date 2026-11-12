@@ -110,16 +110,17 @@ role-agnostic: all three reach it through the single `panelapi` service
 account, and authorisation (a customer may only touch their own virtual hosts,
 a reseller only tenants with their `owner` label, root everything) is enforced
 in the Go API. Aggregate reseller quotas are business logic and belong there;
-per-tenant hard limits are enforced here. Planned hardening: run the
-customer-facing tier under its own service account and give the engine
-per-peer scopes (uid → allowed RPCs and owner) in `auth.rs`, so a compromise of
-the customer web tier can never reach `DeleteTenant`.
+per-tenant hard limits are enforced here. The customer-facing tier should run
+under its own service account confined with `OXPANEL_PEER_SCOPES`
+(`auth::ScopePolicy`: uid → allowed RPC classes), so a compromise of the
+customer web tier can never reach `DeleteTenant`. Scopes are per RPC class,
+not per object; per-owner confinement is a possible later refinement.
 
 ## 9. Roadmap
 
-1. Per-peer scopes (above); `UpdateTenantLimits` / `UpdateTenantOwner` RPCs.
+1. ~~Per-peer scopes; `UpdateTenantLimits` / `UpdateTenantOwner`; suspend/resume; usage; host info; `Reconcile`~~ — done (management milestone).
 2. Confined SELinux domain (`oxpanel_t`) and a capability *allow*-list for the unit.
 3. Per-tenant PHP-FPM pools placed in the tenant slice.
 4. TLS for virtual hosts (ACME), per-vhost access logs.
-5. Reconciliation (`Reconcile` RPC: records ↔ OS drift report).
+5. Repair mode for `Reconcile` (today it reports only).
 6. Split privileged helper behind the `System` trait.

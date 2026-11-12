@@ -270,6 +270,7 @@ async fn preflight(config: &Config, sys: &dyn System) -> Result<bool, Fatal> {
         bin::SETPRIV,
         bin::SETFACL,
         bin::MKDIR,
+        bin::DU,
     ] {
         if !is_executable(Path::new(b)) {
             return Err(Fatal::Unavailable(format!(

@@ -52,7 +52,7 @@ not touch an account, unit or Nginx file it has no record for.
 | OS | AlmaLinux 9 (RHEL 9 family). Other systemd + Nginx distributions are untested. |
 | Init | systemd (cgroups v2, the default on EL9). |
 | Web server | `nginx` from AppStream, with the stock `/etc/nginx/nginx.conf` (it must `include /etc/nginx/conf.d/*.conf;`, which the stock file does). |
-| Tools | `shadow-utils` (useradd/userdel), `util-linux` (setpriv), `acl` (setfacl), `policycoreutils` (restorecon); on SELinux-enabled hosts also `policycoreutils-python-utils` (semanage) and `libselinux-utils` (selinuxenabled). The RPM pulls all of these in. |
+| Tools | `shadow-utils` (useradd/userdel), `util-linux` (setpriv), `acl` (setfacl), `coreutils` (mkdir, du), `policycoreutils` (restorecon); on SELinux-enabled hosts also `policycoreutils-python-utils` (semanage) and `libselinux-utils` (selinuxenabled). The RPM pulls all of these in. |
 | SELinux | Enforcing is supported and is the target; the daemon detects it at start-up and labels tenant content accordingly. The booleans `httpd_enable_homedirs` and `httpd_read_user_content` must be on (the RPM sets them; the source install block sets them), because document roots live under tenant homes. |
 | Network | None. The API is a local UNIX socket; the daemon has no network access at all under its unit. |
 | Ports | Nginx on 80 (v0.1.0 does not manage TLS). |
@@ -166,6 +166,7 @@ valid. After editing: `sudo systemctl restart oxpanel-daemon`.
 | `OXPANEL_ALLOWED_UIDS` | *(empty)* | Comma-separated numeric uids allowed to call the API. |
 | `OXPANEL_ALLOWED_GIDS` | *(empty)* | Comma-separated numeric gids allowed (primary or supplementary group of the peer's account). The socket group is always included. |
 | `OXPANEL_ALLOW_ROOT_PEER` | `true` | Whether uid 0 may call the API regardless of the lists. |
+| `OXPANEL_PEER_SCOPES` | *(empty)* | Confine peers to parts of the API: `uid:scope+scope,uid:scope`. Scopes: `read`, `vhost`, `tenant`, `delete`, `all`. See §5. |
 | `OXPANEL_UID_MIN` / `OXPANEL_UID_MAX` | `20000` / `29999` | Inclusive uid range for tenants (lowest free id is used). `UID_MIN` must be ≥ 1000. |
 | `OXPANEL_HOME_BASE` | `/home` | Tenant homes are `<base>/<username>`. |
 | `OXPANEL_STATE_DIR` | `/var/lib/oxpanel` | Records. Created by systemd (`StateDirectory=oxpanel`, `0700`). |
@@ -230,6 +231,33 @@ logged as `rejected connection reason="uid=… gid=… is not in the allow-list"
 
 Tenants themselves must never be in the `oxpanel` group.
 
+**Confining a peer to part of the API (scopes)**
+
+Authentication decides *who* may connect; `OXPANEL_PEER_SCOPES` decides *what*
+a connected peer may call. A uid that is listed may call only the RPCs in its
+scopes; a uid that is not listed (including root) may call everything.
+
+| Scope | RPCs |
+|---|---|
+| `read` | `GetTenant`, `ListTenants`, `ListVirtualHosts`, `GetTenantUsage`, `GetHostInfo`, `Reconcile` |
+| `vhost` | `ConfigureVirtualHost`, `RemoveVirtualHost` |
+| `tenant` | `CreateTenant`, `UpdateTenantLimits`, `UpdateTenantOwner`, `SuspendTenant`, `ResumeTenant` |
+| `delete` | `DeleteTenant` |
+
+```sh
+# The customer-facing tier runs as its own account and can never create,
+# resize, suspend or delete a tenant, even if it is fully compromised.
+sudo useradd -r -G oxpanel -s /sbin/nologin panelweb
+echo "OXPANEL_PEER_SCOPES=$(id -u panelweb):read+vhost" | sudo tee -a /etc/oxpanel/daemon.env
+sudo systemctl restart oxpanel-daemon
+```
+
+A refused call returns `PERMISSION_DENIED` ("this peer is not permitted to call
+DeleteTenant (scope 'delete' required)") and is logged with the peer's uid and
+pid. It is refused before input validation and before anything touches the OS.
+Scopes limit RPC classes, not objects: which tenant a customer may touch is
+still the panel API's decision.
+
 ## 6. Using `oxpanel-ctl`
 
 ```
@@ -238,7 +266,15 @@ oxpanel-ctl [--socket PATH] <command>        # --socket defaults to $OXPANEL_SOC
 tenant create <username> [--owner LABEL] [--memory SIZE] [--cpu-weight N] [--io-weight N] [--tasks-max N]
 tenant get    <username>
 tenant list   [--owner LABEL]
+tenant set-limits <username> [--memory SIZE] [--cpu-weight N] [--io-weight N] [--tasks-max N]
+tenant set-owner  <username> <LABEL|''>
+tenant suspend <username>
+tenant resume  <username>
+tenant usage   <username>
 tenant delete <username> [--remove-home]
+
+host info
+host reconcile
 
 vhost set     <domain> --tenant <username> [--root RELATIVE_PATH] [--alias DOMAIN]...
 vhost remove  <domain>
@@ -247,7 +283,8 @@ vhost list    [--tenant <username>]
 
 Sizes accept `k`, `m`, `g`, `t` suffixes (binary units) or plain bytes.
 Exit status: `0` success, `1` API error (message on stderr, e.g.
-`error: FailedPrecondition: nginx rejected the configuration: …`), `2` usage.
+`error: FailedPrecondition: nginx rejected the configuration: …`), `2` usage,
+`3` when `host reconcile` found differences.
 
 **Examples**
 
@@ -271,6 +308,25 @@ sudo oxpanel-ctl vhost set shop.acme.example --tenant acme --root sites/shop
 
 # Everything a reseller owns
 sudo oxpanel-ctl tenant list --owner reseller-north
+
+# Resize: set-limits replaces ALL limits, so repeat the ones you want to keep
+sudo oxpanel-ctl tenant set-limits acme --memory 1G --cpu-weight 25 --tasks-max 200
+# changed=true ...
+
+# Non-payment: every site of the tenant answers 503 until resumed; files are untouched
+sudo oxpanel-ctl tenant suspend acme
+sudo oxpanel-ctl tenant resume acme
+
+# Move the customer to another reseller
+sudo oxpanel-ctl tenant set-owner acme reseller-south
+
+# What is it using right now?
+sudo oxpanel-ctl tenant usage acme
+# tenant=acme memory_current=0 cpu_usage_nsec=0 tasks_current=0 disk_usage=28672 measured_at=1794571200
+
+# The host, and whether the records still match it
+sudo oxpanel-ctl host info
+sudo oxpanel-ctl host reconcile        # drifts=0
 
 # Tear down (order matters: vhosts first)
 sudo oxpanel-ctl vhost remove shop.acme.example
@@ -321,7 +377,12 @@ resp, err := client.CreateTenant(ctx, &oxpanelv1.CreateTenantRequest{
 | `DeleteTenant` | `deleted=false` if absent | `FAILED_PRECONDITION` (still owns virtual hosts, or unmanaged account) |
 | `ConfigureVirtualHost` | identical config → `created=false` | `NOT_FOUND` (tenant), `FAILED_PRECONDITION` (name owned by another tenant; tenant not ready; **`nginx -t` rejected the result — message contains the nginx output**) |
 | `RemoveVirtualHost` | `removed=false` if absent | `FAILED_PRECONDITION` (config invalid after removal — operator attention) |
-| any | | `PERMISSION_DENIED` (peer not allowed), `DEADLINE_EXCEEDED` (a system command hit `OXPANEL_COMMAND_TIMEOUT_SECS`), `INTERNAL` (redacted; see the journal) |
+| `UpdateTenantLimits` | same limits → `changed=false` (unit files are still re-applied, completing an interrupted attempt) | `NOT_FOUND`, `FAILED_PRECONDITION` (tenant not ready), `INVALID_ARGUMENT`. The limits are a full replacement, not a patch |
+| `UpdateTenantOwner` | same owner → `changed=false` | `NOT_FOUND`, `FAILED_PRECONDITION`, `INVALID_ARGUMENT` |
+| `SuspendTenant` / `ResumeTenant` | already in that state → `changed=false` | `NOT_FOUND`, `FAILED_PRECONDITION` (tenant not ready; `nginx -t` rejected — all files restored, state unchanged) |
+| `GetTenantUsage` / `GetHostInfo` | read-only measurements | `NOT_FOUND`; usage runs `du` on the home, so cache it in the panel rather than polling per page view |
+| `Reconcile` | read-only; waits for the mutation lock | — (an empty `drifts` list means records and OS agree) |
+| any | | `PERMISSION_DENIED` (peer not allowed, or its scopes do not cover the RPC — §5), `DEADLINE_EXCEEDED` (a system command hit `OXPANEL_COMMAND_TIMEOUT_SECS`), `INTERNAL` (redacted; see the journal) |
 
 Guidance for the three panels (root / reseller / customer): the engine is
 role-agnostic and authorises the *panel process*, not end users. Enforce in the
@@ -373,9 +434,31 @@ systemctl is-active oxpanel-daemon && sudo oxpanel-ctl tenant list >/dev/null &&
 systemctl show -p MemoryMax,CPUWeight,TasksMax oxpanel-tenant-acme.slice
 ```
 
-**Adjusting limits** — not yet an RPC. Until `UpdateTenantLimits` exists, edit
-the two unit files for the tenant, run `systemctl daemon-reload`, and update
-`limits` in the tenant record so future `CreateTenant` replays match.
+**Adjusting limits** — `oxpanel-ctl tenant set-limits` (`UpdateTenantLimits`).
+The limits given replace the old set entirely and are live as soon as the call
+returns. Afterwards a `CreateTenant` replay must carry the *new* limits to be
+treated as idempotent. Never edit the unit files by hand: the next change
+overwrites them, and `host reconcile` reports the edit as drift.
+
+**Suspending a tenant** — `tenant suspend` / `tenant resume`. Suspension is a
+web-serving state: sites answer `503` with `Retry-After: 3600`. The account,
+files and limits are unchanged, and `tenant get` shows `suspended=true`.
+
+**Checking for drift** — `oxpanel-ctl host reconcile` compares every record
+with the accounts, homes, unit files and Nginx files, and prints one line per
+difference (`kind=… subject=… detail=…`); exit status `3` means drift, so it
+drops straight into a cron job or monitoring check. It never repairs anything.
+What to do with each finding:
+
+| Kind | Meaning | Fix |
+|---|---|---|
+| `TENANT_INCOMPLETE` | A create or delete was interrupted. | Repeat the same `tenant create` / `tenant delete`. |
+| `TENANT_ACCOUNT_MISSING` / `_MISMATCH` | The account was removed or changed outside OxPanel. | See "Recovering a stuck tenant" below. |
+| `TENANT_HOME_INVALID` | Home missing, not a directory, wrong owner, or open to others. | Restore it; `chown`/`chmod 0700`. |
+| `TENANT_UNIT_DRIFT` | A slice unit or drop-in was edited or removed. | `tenant set-limits` with the recorded limits rewrites both. |
+| `VHOST_CONFIG_DRIFT` | A site's Nginx file was edited or removed. | Repeat `vhost set` for the domain. |
+| `VHOST_TENANT_MISSING` | A site record names a tenant without a record. | `vhost remove` the domain. |
+| `ORPHAN_NGINX_CONFIG` / `ORPHAN_SLICE_UNIT` | A file in OxPanel's directories that no record accounts for. | Inspect and remove by hand; OxPanel will not touch what it did not record. |
 
 **Recovering a stuck tenant** — a record in `provisioning` or `deleting`
 resumes on the next identical `CreateTenant`/`DeleteTenant`. A record whose
@@ -424,7 +507,7 @@ configuration with `nginx -t` on every change.
 ```sh
 make image         # AlmaLinux 9 dev/test image (one-time)
 make check         # rustfmt --check, clippy pedantic -D warnings, tests, cargo-deny
-make test          # 63 unit + 4 gRPC end-to-end tests (fake OS, no root)
+make test          # 80 unit + 6 gRPC end-to-end tests (fake OS, no root)
 make integration   # boots systemd in a container, installs from packaging/, runs 79 assertions
 make rpm           # build the RPM from the working tree into dist/rpms/
 make acceptance    # REAL AlmaLinux 9 VM (KVM, SELinux enforcing): install like a user, run all phases

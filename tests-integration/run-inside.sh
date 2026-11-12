@@ -124,6 +124,88 @@ check "nginx -t output has no warnings" bash -c '! nginx -t 2>&1 | grep -q warn'
 check_not "tenant with vhosts cannot be deleted" oxpanel-ctl tenant delete alice
 check "daemon still healthy after refusals" systemctl -q is-active oxpanel-daemon
 
+echo "== management: limits, owner, suspension, usage, host info, reconcile"
+code_eventually() { local host="$1" path="$2" want="$3" i; for i in $(seq 1 50); do [ "$(code_of "$host" "$path")" = "$want" ] && return 0; sleep 0.1; done; return 1; }
+check "a consistent host has no drift" grep -q '^drifts=0$' <(oxpanel-ctl host reconcile)
+out="$(oxpanel-ctl tenant set-limits alice --memory 512M --tasks-max 64)"
+check "set-limits changed=true" grep -q '^changed=true' <<<"$out"
+check "new MemoryMax is live in systemd" test "$(systemctl show -p MemoryMax --value oxpanel-tenant-alice.slice)" = "536870912"
+check "new TasksMax is live in systemd" test "$(systemctl show -p TasksMax --value oxpanel-tenant-alice.slice)" = "64"
+check "a limit that was dropped is gone from the unit" bash -c '! grep -q CPUWeight /etc/systemd/system/oxpanel-tenant-alice.slice'
+check "login-slice drop-in follows" grep -q '^TasksMax=64$' "/etc/systemd/system/user-$(id -u alice).slice.d/50-oxpanel.conf"
+check "set-limits replay changed=false" grep -q '^changed=false' <(oxpanel-ctl tenant set-limits alice --memory 512M --tasks-max 64)
+check_not "invalid limit is refused" oxpanel-ctl tenant set-limits alice --memory 1
+check_not "limits of an unknown tenant are refused" oxpanel-ctl tenant set-limits ghost --memory 512M
+check "owner label replaced" grep -q ' owner=reseller2 ' <(oxpanel-ctl tenant set-owner alice reseller2)
+check "owner label cleared" grep -q ' owner=- ' <(oxpanel-ctl tenant set-owner alice '')
+check_not "invalid owner label refused" oxpanel-ctl tenant set-owner alice 'Bad Owner'
+
+out="$(oxpanel-ctl tenant suspend alice)"
+check "suspend changed=true suspended=true" bash -c 'grep -q "^changed=true" <<<"$1" && grep -q " suspended=true " <<<"$1"' _ "$out"
+check "suspended site answers 503" code_eventually example.test / 503
+check "suspended alias answers 503" code_eventually www.example.test / 503
+check "suspended site sends Retry-After" grep -qi '^retry-after: 3600' <(curl -s -D- -o /dev/null -H 'Host: example.test' http://127.0.0.1/)
+check "suspended config has no document root" bash -c '! grep -q "root " /etc/nginx/oxpanel.d/example.test.conf'
+check "tenant files untouched by suspension" test -f /home/alice/public_html/index.html
+check "suspend replay changed=false" grep -q '^changed=false' <(oxpanel-ctl tenant suspend alice)
+check "suspension is not drift" grep -q '^drifts=0$' <(oxpanel-ctl host reconcile)
+check "resume changed=true" grep -q '^changed=true' <(oxpanel-ctl tenant resume alice)
+check "resumed site serves content again" body_eventually example.test / hello-from-alice
+
+out="$(oxpanel-ctl tenant usage alice)"
+echo "$out"
+check "usage reports the tenant" grep -q '^tenant=alice ' <<<"$out"
+check "disk usage is measured (> 0 bytes)" test "$(sed -n 's/.* disk_usage=\([0-9]*\).*/\1/p' <<<"$out")" -gt 0
+out="$(oxpanel-ctl host info)"
+echo "$out"
+check "host info reports the version" grep -qE '^version=[0-9]+\.[0-9]+\.[0-9]+ ' <<<"$out"
+check "host info counts tenants and vhosts" grep -q ' tenants=3 vhosts=1 ' <<<"$out"
+check "host info reports memory (> 0)" test "$(sed -n 's/.* memory_total=\([0-9]*\).*/\1/p' <<<"$out")" -gt 0
+check "host info reports home disk (> 0)" test "$(sed -n 's/.* home_disk_total=\([0-9]*\).*/\1/p' <<<"$out")" -gt 0
+
+# Drift: edit a unit by hand, remove a site's config, drop a stray file in our directory.
+cp -p /etc/systemd/system/oxpanel-tenant-bob.slice /root/bob.slice.bak
+echo 'CPUWeight=9999' >> /etc/systemd/system/oxpanel-tenant-bob.slice
+mv /etc/nginx/oxpanel.d/example.test.conf /root/example.test.conf.bak
+echo '# stray' > /etc/nginx/oxpanel.d/stray.conf
+out="$(oxpanel-ctl host reconcile || true)"
+echo "$out"
+check "reconcile exits 3 on drift" bash -c 'oxpanel-ctl host reconcile >/dev/null; test $? -eq 3'
+check "reconcile finds 3 differences" grep -q '^drifts=3$' <<<"$out"
+check "reconcile reports the edited unit" grep -q '^kind=DRIFT_KIND_TENANT_UNIT_DRIFT subject=bob ' <<<"$out"
+check "reconcile reports the missing config" grep -q '^kind=DRIFT_KIND_VHOST_CONFIG_DRIFT subject=example.test ' <<<"$out"
+check "reconcile reports the orphan" grep -q '^kind=DRIFT_KIND_ORPHAN_NGINX_CONFIG subject=/etc/nginx/oxpanel.d/stray.conf ' <<<"$out"
+check "reconcile repaired nothing (read-only)" bash -c 'test -e /etc/nginx/oxpanel.d/stray.conf && test ! -e /etc/nginx/oxpanel.d/example.test.conf && grep -q 9999 /etc/systemd/system/oxpanel-tenant-bob.slice'
+rm -f /etc/nginx/oxpanel.d/stray.conf
+cp -p /root/bob.slice.bak /etc/systemd/system/oxpanel-tenant-bob.slice
+check "repeating the request heals the site" grep -q '^changed=true' <(oxpanel-ctl vhost set example.test --tenant alice --alias www.example.test)
+check "host is consistent again" grep -q '^drifts=0$' <(oxpanel-ctl host reconcile)
+check "healed site serves content" body_eventually example.test / hello-from-alice
+
+echo "== per-peer scopes"
+as_panelapi() { setpriv --reuid=panelapi --regid=panelapi --init-groups --no-new-privs -- "$@"; }
+cp -p /etc/oxpanel/daemon.env /root/daemon.env.bak
+echo "OXPANEL_PEER_SCOPES=$(id -u panelapi):read+vhost" >> /etc/oxpanel/daemon.env
+systemctl restart oxpanel-daemon
+check "daemon restarts with scopes configured" systemctl -q is-active oxpanel-daemon
+check "scoped peer may read" bash -c 'setpriv --reuid=panelapi --regid=panelapi --init-groups --no-new-privs -- oxpanel-ctl tenant list | grep -q tenant=alice'
+check "scoped peer may manage virtual hosts" grep -q '^changed=true' <(as_panelapi oxpanel-ctl vhost set scoped.test --tenant bob)
+check "scoped peer may remove virtual hosts" grep -q '^removed=true' <(as_panelapi oxpanel-ctl vhost remove scoped.test)
+check_not "scoped peer cannot create tenants" as_panelapi oxpanel-ctl tenant create mallory
+check_not "scoped peer cannot change limits" as_panelapi oxpanel-ctl tenant set-limits alice --memory 1G
+check_not "scoped peer cannot suspend" as_panelapi oxpanel-ctl tenant suspend alice
+check_not "scoped peer cannot delete tenants" as_panelapi oxpanel-ctl tenant delete bob --remove-home
+check "refusal names the missing scope" grep -q "PermissionDenied.*scope 'delete' required" <(as_panelapi oxpanel-ctl tenant delete bob 2>&1 || true)
+check_not "no account was created by the refused call" id mallory
+check "bob survived the refused delete" id bob
+check "root stays unrestricted" grep -q '^changed=false' <(oxpanel-ctl tenant set-limits alice --memory 512M --tasks-max 64)
+echo "OXPANEL_PEER_SCOPES=$(id -u panelapi):everything" >> /etc/oxpanel/daemon.env
+check "an unknown scope name is rejected by --check-config" bash -c 'set -a; . /etc/oxpanel/daemon.env; /usr/sbin/oxpanel-daemon --check-config 2>&1 | grep -q "is not a scope"'
+cp -p /root/daemon.env.bak /etc/oxpanel/daemon.env
+systemctl restart oxpanel-daemon
+check "daemon restarts without scopes" systemctl -q is-active oxpanel-daemon
+check "unscoped panel peer has full access again" grep -q '^changed=false' <(as_panelapi oxpanel-ctl tenant set-limits alice --memory 512M --tasks-max 64)
+
 echo "== teardown"
 check "vhost removed" grep -q '^removed=true' <(oxpanel-ctl vhost remove example.test)
 check "config gone" test ! -e /etc/nginx/oxpanel.d/example.test.conf

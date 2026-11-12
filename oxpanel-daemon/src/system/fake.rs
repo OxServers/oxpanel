@@ -10,7 +10,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use super::{bin, CommandOutput, CommandSpec, OsUser, System};
+use super::{bin, CommandOutput, CommandSpec, HostStats, OsUser, System};
 use crate::error::{Error, Result};
 
 #[derive(Debug, Default)]
@@ -216,6 +216,14 @@ impl System for FakeSystem {
                     Err(e) => output(program, 1, "", &format!("mkdir: {e}")),
                 }
             }
+            bin::DU => {
+                let target = args.last().map(|a| a.to_string_lossy().into_owned()).unwrap_or_default();
+                output(program, 0, &format!("8192\t{target}\n"), "")
+            }
+            bin::SYSTEMCTL if args.first().is_some_and(|a| a == "show") => {
+                // Two units are queried; only the first has anything running.
+                output(program, 0, "MemoryCurrent=1048576\nCPUUsageNSec=5000000\nTasksCurrent=3\n\nMemoryCurrent=[not set]\nCPUUsageNSec=[not set]\nTasksCurrent=[not set]\n", "")
+            }
             // systemctl, restorecon, setfacl and anything else: succeed silently.
             _ => output(program, 0, "", ""),
         };
@@ -256,5 +264,32 @@ impl System for FakeSystem {
             ));
         }
         Ok(())
+    }
+
+    /// Unprivileged fake: ownership cannot be checked, only the file type.
+    async fn inspect_private_dir(
+        &self,
+        path: &Path,
+        _uid: u32,
+        _gid: u32,
+    ) -> Result<Option<String>> {
+        Ok(match std::fs::symlink_metadata(path) {
+            Err(_) => Some("missing".to_owned()),
+            Ok(md) if md.file_type().is_symlink() || !md.is_dir() => {
+                Some("not a directory".to_owned())
+            }
+            Ok(_) => None,
+        })
+    }
+
+    async fn host_stats(&self, _path: &Path) -> Result<HostStats> {
+        Ok(HostStats {
+            load: (0.25, 0.5, 0.75),
+            memory_total_bytes: 8 << 30,
+            memory_free_bytes: 6 << 30,
+            uptime_secs: 3600,
+            disk_total_bytes: 100 << 30,
+            disk_free_bytes: 80 << 30,
+        })
     }
 }
