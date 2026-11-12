@@ -76,6 +76,8 @@ pub struct HostInfo {
     pub uid_min: u32,
     pub uid_max: u32,
     pub runtimes: Runtimes,
+    /// Installed Node.js version; empty if none.
+    pub node_version: String,
     pub stats: HostStats,
 }
 
@@ -92,6 +94,9 @@ impl HostService {
     pub async fn info(&self) -> Result<HostInfo> {
         let cfg = &self.ctx.config;
         let count = |n: usize| u32::try_from(n).unwrap_or(u32::MAX);
+        let node_version = app::node_version(&self.ctx).await?.unwrap_or_default();
+        let node_usable =
+            app::major_of(&node_version).is_some_and(|major| major >= app::MIN_NODE_MAJOR);
         Ok(HostInfo {
             selinux: self.ctx.selinux,
             dry_run: cfg.dry_run,
@@ -101,9 +106,10 @@ impl HostService {
             uid_max: cfg.uid_max,
             runtimes: Runtimes {
                 php: self.ctx.sys.is_installed(bin::PHP_FPM).await,
-                node: self.ctx.sys.is_installed(bin::NODE).await,
+                node: node_usable,
                 python: self.ctx.sys.is_installed(bin::PYTHON3).await,
             },
+            node_version,
             stats: self.ctx.sys.host_stats(&cfg.home_base).await?,
         })
     }
@@ -682,6 +688,23 @@ mod tests {
             vec![(DriftKind::OrphanAppUnit, stray.as_str())],
             "repeating the request rewrites the unit"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn info_reports_node_version_and_usability() -> Result<()> {
+        let h = harness().await;
+        let i = h.host.info().await?;
+        assert!(i.runtimes.node);
+        assert_eq!(i.node_version, "22.11.0");
+        h.sys.set_node_version("v16.20.2");
+        let i = h.host.info().await?;
+        assert!(!i.runtimes.node, "installed but too old is not available");
+        assert_eq!(i.node_version, "16.20.2");
+        h.sys.set_missing(bin::NODE);
+        let i = h.host.info().await?;
+        assert!(!i.runtimes.node);
+        assert_eq!(i.node_version, "");
         Ok(())
     }
 }

@@ -133,6 +133,14 @@ impl VHostService {
         }
         self.check_names_unique(&domain, &aliases, &tenant)?;
 
+        // A runtime the host cannot provide is refused before anything is created.
+        if req.php && !self.ctx.sys.is_installed(bin::PHP_FPM).await {
+            return Err(Error::PhpUnavailable);
+        }
+        if let Some(a) = &app_rec {
+            app::preflight(&self.ctx, a.runtime).await?;
+        }
+
         nginx::ensure_include(
             self.ctx.sys.as_ref(),
             &cfg.nginx_conf_dir,
@@ -1909,6 +1917,49 @@ mod tests {
             .await?
             .iter()
             .all(|v| v.domain != "example.net"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn node_older_than_22_is_refused_before_anything_is_created() -> Result<()> {
+        let h = harness(false).await;
+        for old in ["v16.20.2", "v20.18.0", "v21.7.3", "garbage", ""] {
+            h.sys.set_node_version(old);
+            let err = h
+                .vhosts
+                .configure(app_req("example.com", "alice", AppRuntime::Node))
+                .await;
+            assert!(
+                matches!(err, Err(Error::RuntimeTooOld { minimum: 22, .. })),
+                "{old:?}: {err:?}"
+            );
+        }
+        assert!(!app_unit(&h, "example.com").exists());
+        assert!(h.vhosts.list(None).await?.is_empty());
+        assert!(
+            h.sys.calls_to(bin::MKDIR).is_empty(),
+            "not even the directory"
+        );
+        let msg = Error::RuntimeTooOld {
+            runtime: "Node.js",
+            found: "16.20.2".into(),
+            minimum: 22,
+        }
+        .to_string();
+        assert_eq!(
+            msg,
+            "Node.js 16.20.2 is installed, but version 22 or newer is required (dnf module switch-to nodejs:22)"
+        );
+        // Python is unaffected by the Node.js version; 22 and newer are accepted.
+        h.vhosts
+            .configure(app_req("example.net", "alice", AppRuntime::Python))
+            .await?;
+        for ok in ["v22.0.0", "v24.1.0"] {
+            h.sys.set_node_version(ok);
+            h.vhosts
+                .configure(app_req("example.com", "alice", AppRuntime::Node))
+                .await?;
+        }
         Ok(())
     }
 }

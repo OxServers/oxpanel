@@ -27,6 +27,8 @@ struct Inner {
     removed_homes: Vec<PathBuf>,
     /// Optional programs reported as not installed.
     missing: Vec<&'static str>,
+    /// What `node --version` prints; `None` = a supported version.
+    node_version: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -86,6 +88,13 @@ impl FakeSystem {
     pub fn set_missing(&self, program: &'static str) {
         if let Ok(mut i) = self.inner.lock() {
             i.missing.push(program);
+        }
+    }
+
+    /// Make `node --version` report `version` (e.g. `v16.20.2`).
+    pub fn set_node_version(&self, version: &str) {
+        if let Ok(mut i) = self.inner.lock() {
+            i.node_version = Some(version.to_owned());
         }
     }
 
@@ -229,6 +238,10 @@ impl System for FakeSystem {
             bin::SEMODULE => {
                 let listing = if i.missing.contains(&bin::SEMODULE) { "abrt\nzebra\n" } else { "abrt\noxpanel\nzebra\n" };
                 output(program, 0, listing, "")
+            }
+            bin::NODE => {
+                let version = i.node_version.clone().unwrap_or_else(|| "v22.11.0".to_owned());
+                output(program, 0, &format!("{version}\n"), "")
             }
             bin::DU => {
                 let target = args.last().map(|a| a.to_string_lossy().into_owned()).unwrap_or_default();

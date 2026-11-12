@@ -15,13 +15,15 @@ fi
 # The registry cache and target dir live in named volumes so incremental builds
 # stay fast and the host tree is never littered with root-owned files.
 # label=disable: don't relabel the developer's source tree on SELinux hosts.
+# OXPANEL_TARGET_VOLUME: a separate build volume, for working in several
+# checkouts (git worktrees) at once without them overwriting each other's binaries.
 TTY=(); COLOR=never
 if [ -t 0 ] && [ -t 1 ]; then TTY=(-t); COLOR=always; fi
 exec podman run --rm -i "${TTY[@]}" \
   --security-opt label=disable \
   -v "$ROOT:/work" \
   -v oxpanel-cargo-registry:/usr/local/cargo/registry \
-  -v oxpanel-target:/work/target \
+  -v "${OXPANEL_TARGET_VOLUME:-oxpanel-target}":/work/target \
   -w /work \
   -e CARGO_TERM_COLOR="$COLOR" \
   -e RUST_BACKTRACE="${RUST_BACKTRACE:-0}" \

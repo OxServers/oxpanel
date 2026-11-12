@@ -67,6 +67,14 @@ pub enum Error {
     #[error("the OxPanel SELinux module is not installed; run: semodule -i /usr/share/oxpanel/selinux/oxpanel.cil")]
     AppPolicyMissing,
 
+    /// The runtime is installed but older than OxPanel supports.
+    #[error("{runtime} {found} is installed, but version {minimum} or newer is required (dnf module switch-to nodejs:{minimum})")]
+    RuntimeTooOld {
+        runtime: &'static str,
+        found: String,
+        minimum: u32,
+    },
+
     /// The operation needs an application and the virtual host runs none.
     #[error("virtual host '{0}' does not run an application")]
     NoApp(String),
@@ -142,6 +150,7 @@ impl Error {
                 | Self::PhpUnavailable
                 | Self::RuntimeUnavailable(_)
                 | Self::NoApp(_)
+                | Self::RuntimeTooOld { .. }
                 | Self::AppPolicyMissing
                 | Self::Unauthorised
         )
@@ -167,6 +176,7 @@ impl From<Error> for Status {
             | Error::PhpUnavailable
             | Error::RuntimeUnavailable(_)
             | Error::NoApp(_)
+            | Error::RuntimeTooOld { .. }
             | Error::AppPolicyMissing
             | Error::NginxInvalid(_) => Status::failed_precondition(message),
             Error::UidExhausted { .. } => Status::resource_exhausted(message),

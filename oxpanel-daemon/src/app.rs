@@ -49,6 +49,29 @@ const LOG_LINES: &str = "200";
 const SELINUX_APP_CONTEXT: &str = "system_u:system_r:oxpanel_app_t:s0";
 const SELINUX_MODULE: &str = "oxpanel";
 
+/// Oldest Node.js major version OxPanel runs applications on.
+pub const MIN_NODE_MAJOR: u32 = 22;
+
+/// The installed Node.js version (`22.11.0`), or `None` if Node.js is not
+/// installed or does not report a version.
+pub async fn node_version(ctx: &Ctx) -> Result<Option<String>> {
+    if !ctx.sys.is_installed(bin::NODE).await {
+        return Ok(None);
+    }
+    let out = ctx
+        .sys
+        .run(CommandSpec::new(bin::NODE, ctx.config.command_timeout).arg("--version"))
+        .await?;
+    let text = out.stdout_lossy();
+    let version = text.trim().trim_start_matches('v');
+    Ok((out.success() && !version.is_empty()).then(|| version.to_owned()))
+}
+
+/// Major component of a version string such as `22.11.0`.
+pub fn major_of(version: &str) -> Option<u32> {
+    version.split('.').next()?.parse().ok()
+}
+
 /// `oxpanel-app-<escaped domain>.service`
 pub fn unit_name(domain: &Domain) -> String {
     format!(
@@ -209,19 +232,26 @@ fn parts(vhost: &VHostRecord) -> Result<(Domain, &AppRecord)> {
     Ok((Domain::parse(&vhost.domain)?, app))
 }
 
-/// Create the application directory (as the tenant), a virtualenv for Python,
-/// write the unit and make sure the application runs (unless the tenant is
-/// suspended). Idempotent; a changed unit restarts the application.
-/// The caller holds the mutation lock. Returns whether the unit changed.
-pub async fn ensure_app(ctx: &Ctx, tenant: &TenantRecord, vhost: &VHostRecord) -> Result<bool> {
-    let (domain, app) = parts(vhost)?;
-    let cfg = &ctx.config;
-    let timeout = cfg.command_timeout;
-    if !ctx.sys.is_installed(required_program(app.runtime)).await {
-        return Err(Error::RuntimeUnavailable(match app.runtime {
+/// Everything the host must provide before an application of `runtime` can
+/// be enabled. Read-only, so a request that cannot succeed is refused before
+/// it has created anything.
+pub async fn preflight(ctx: &Ctx, runtime: AppRuntime) -> Result<()> {
+    let timeout = ctx.config.command_timeout;
+    if !ctx.sys.is_installed(required_program(runtime)).await {
+        return Err(Error::RuntimeUnavailable(match runtime {
             AppRuntime::Node => "Node.js (nodejs)",
             AppRuntime::Python => "Python (python3)",
         }));
+    }
+    if runtime == AppRuntime::Node {
+        let found = node_version(ctx).await?.unwrap_or_default();
+        if major_of(&found).is_none_or(|major| major < MIN_NODE_MAJOR) {
+            return Err(Error::RuntimeTooOld {
+                runtime: "Node.js",
+                found,
+                minimum: MIN_NODE_MAJOR,
+            });
+        }
     }
     if ctx.selinux {
         // Without the module the unit could not start in its domain and the
@@ -238,6 +268,18 @@ pub async fn ensure_app(ctx: &Ctx, tenant: &TenantRecord, vhost: &VHostRecord) -
             return Err(Error::AppPolicyMissing);
         }
     }
+    Ok(())
+}
+
+/// Create the application directory (as the tenant), a virtualenv for Python,
+/// write the unit and make sure the application runs (unless the tenant is
+/// suspended). Idempotent; a changed unit restarts the application.
+/// The caller holds the mutation lock. Returns whether the unit changed.
+pub async fn ensure_app(ctx: &Ctx, tenant: &TenantRecord, vhost: &VHostRecord) -> Result<bool> {
+    let (domain, app) = parts(vhost)?;
+    let cfg = &ctx.config;
+    let timeout = cfg.command_timeout;
+    preflight(ctx, app.runtime).await?;
     let root = app_root(tenant, app);
     ctx.sys
         .run_ok(

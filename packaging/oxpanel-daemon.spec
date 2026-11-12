@@ -18,8 +18,10 @@ Requires:       coreutils
 Requires:       logrotate
 # PHP is optional: without php-fpm, virtual hosts are static only.
 Recommends:     php-fpm
-# Likewise optional: Node.js applications. (Python 3 is part of the base system.)
-Recommends:     nodejs
+# Likewise optional: Node.js applications need Node.js 22 or newer. AlmaLinux 9
+# only offers that as a module stream, so these are satisfied (and installed)
+# only after `dnf module enable nodejs:22`. (Python 3 is part of the base system.)
+Recommends:     nodejs >= 1:22
 Recommends:     npm
 Requires:       policycoreutils
 Requires:       policycoreutils-python-utils

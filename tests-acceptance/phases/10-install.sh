@@ -14,7 +14,9 @@ case "$INSTALL" in
     RPM=$(ls rpms/oxpanel-daemon-[0-9]*.el9.x86_64.rpm 2>/dev/null | grep -vE 'debuginfo|debugsource' | head -1)
     [ -n "$RPM" ] || fail "no RPM found in $(pwd)/rpms"
     info "installing $RPM"
+    check "enable the Node.js 22 module stream" dnf -y -q module enable nodejs:22
     check "dnf install resolves every dependency" dnf -y -q install "./$RPM"
+    check "the recommended Node.js is 22 or newer" bash -c 'test "$(node --version | sed "s/^v//; s/\..*//")" -ge 22'
     check "rpm -V is clean" rpm -V oxpanel-daemon
     check "unit shipped by the package" test -f /usr/lib/systemd/system/oxpanel-daemon.service
     check "enable and start services" systemctl enable --now nginx oxpanel-daemon

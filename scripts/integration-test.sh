@@ -21,7 +21,7 @@ echo "[it] building release binaries"
 
 echo "[it] booting systemd container $NAME"
 podman run -d --name "$NAME" --systemd=always --security-opt label=disable \
-  -v "$ROOT:/work:ro" -v oxpanel-target:/work/target:ro "$IMAGE" >/dev/null
+  -v "$ROOT:/work:ro" -v "${OXPANEL_TARGET_VOLUME:-oxpanel-target}":/work/target:ro "$IMAGE" >/dev/null
 trap 'echo "[it] logs:"; podman exec "$NAME" journalctl -u oxpanel-daemon --no-pager -o short-monotonic 2>/dev/null | tail -60 || true; podman rm -f "$NAME" >/dev/null' EXIT
 
 for _ in $(seq 1 60); do

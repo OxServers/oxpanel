@@ -75,6 +75,15 @@ the cgroup. A confining policy is on the roadmap.
 On SELinux hosts the daemon checks that the module is loaded before enabling an
 application and refuses with the install command otherwise.
 
+## Node.js version
+
+Node.js 22 is the minimum (decided by Waseem, 2026-11-13). AlmaLinux 9 ships
+16 by default, long past its end of life. The daemon runs `node --version`
+when an application is enabled and refuses anything older with the command
+that fixes it; `GetHostInfo` reports the version found and
+`node_available=false`. The RPM recommends `nodejs >= 22`, which dnf can only
+satisfy after `dnf module enable nodejs:22`.
+
 ## Not included
 
 Runtime version choice per application, custom start commands, environment

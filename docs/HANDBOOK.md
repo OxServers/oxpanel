@@ -102,6 +102,7 @@ The package installs:
 ### 3.2 From source, on the target host
 
 ```sh
+sudo dnf module enable -y nodejs:22        # Node.js applications need version 22 or newer
 sudo dnf install -y gcc git nginx shadow-utils util-linux acl policycoreutils policycoreutils-python-utils libselinux-utils logrotate php-fpm nodejs npm
 # SELinux: sites live under tenant homes, so the web server must be allowed to traverse and read them.
 if sudo selinuxenabled; then sudo setsebool -P httpd_enable_homedirs=on httpd_read_user_content=on httpd_unified=on; fi
@@ -503,9 +504,13 @@ its own instance — so on a hosting node switch it off:
 
 **Node.js and Python applications** — need `nodejs` and `npm` (the RPM
 recommends them; Python 3 is part of the system); `host info` shows
-`node=true python=true`. AlmaLinux 9 installs Node.js 16 by default, which is
-past its end of life: pick a current stream before installing
-(`sudo dnf module enable nodejs:22 && sudo dnf install nodejs npm`). After
+`node=true node_version=22.x python=true`. **Node.js 22 is the minimum.**
+AlmaLinux 9 installs Node.js 16 by default, which is past its end of life, so
+enable a current stream first
+(`sudo dnf module enable nodejs:22 && sudo dnf install nodejs npm`; on a host
+that already has an older one: `sudo dnf module switch-to nodejs:22`). With an
+older version installed, `host info` shows `node=false` with the version found,
+and enabling a Node.js application is refused. After
 changing the Node.js or Python version, restart the applications
 (`systemctl restart 'oxpanel-app-*'`).
 
@@ -583,7 +588,8 @@ configuration with `nginx -t` on every change.
 | `FailedPrecondition: PHP is not installed on this host` | `sudo dnf install php-fpm`; no daemon restart needed. |
 | App site answers 502 | The application is not listening on `$PORT`: `oxpanel-ctl vhost log <domain> --app`, then `vhost restart-app`. |
 | `FailedPrecondition: the OxPanel SELinux module is not installed` | `sudo semodule -i /usr/share/oxpanel/selinux/oxpanel.cil` (the RPM does this in `%post`). |
-| `FailedPrecondition: Node.js (nodejs) is not installed on this host` | `sudo dnf install nodejs npm`; no daemon restart needed. |
+| `FailedPrecondition: Node.js (nodejs) is not installed on this host` | `sudo dnf module enable nodejs:22 && sudo dnf install nodejs npm`; no daemon restart needed. |
+| `FailedPrecondition: Node.js 16.x is installed, but version 22 or newer is required` | `sudo dnf module switch-to nodejs:22`, then `systemctl restart 'oxpanel-app-*'`. |
 | PHP site answers 502 | The tenant's pool is not running: `systemctl status oxpanel-php-<name>`, `journalctl -u oxpanel-php-<name>`. Usually the tenant hit its `MemoryMax`/`TasksMax`. |
 | `Failed at step NAMESPACE` / `status=226/NAMESPACE` in the journal | A `ReadWritePaths=` entry points at a directory systemd may not mount on under SELinux (security file types such as `semanage_store_t`). The shipped unit lists parents (`/var/lib`) for this reason; if you customised the unit, revert to that pattern. |
 | Start-up fails with `nginx include: nginx rejected the configuration: … duplicate default server` | The host already has a `default_server`. Set `OXPANEL_NGINX_DEFAULT_SERVER=false` (then unknown hosts go to *that* server). |
@@ -605,8 +611,8 @@ configuration with `nginx -t` on every change.
 ```sh
 make image         # AlmaLinux 9 dev/test image (one-time)
 make check         # rustfmt --check, clippy pedantic -D warnings, tests, cargo-deny
-make test          # 104 unit + 6 gRPC end-to-end tests (fake OS, no root)
-make integration   # boots systemd in a container, installs from packaging/, runs 223 assertions
+make test          # 106 unit + 6 gRPC end-to-end tests (fake OS, no root)
+make integration   # boots systemd in a container, installs from packaging/, runs 224 assertions
 make rpm           # build the RPM from the working tree into dist/rpms/
 make acceptance    # REAL AlmaLinux 9 VM (KVM, SELinux enforcing): install like a user, run all phases
 ./scripts/dev.sh cargo <anything>   # run cargo inside the image

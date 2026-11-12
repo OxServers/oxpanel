@@ -48,6 +48,8 @@ RUN dnf -y install --setopt=install_weak_deps=False rpm-build systemd-rpm-macros
 RUN dnf -y install --setopt=install_weak_deps=False php-fpm logrotate \
     && dnf clean all && rm -rf /var/cache/dnf
 
-# Node.js for application hosting (Python 3 is part of the base system).
-RUN dnf -y install --setopt=install_weak_deps=False nodejs npm \
+# Node.js 22 (the minimum OxPanel supports) for application hosting; Python 3
+# is part of the base system.
+RUN dnf -y module enable nodejs:22 \
+    && dnf -y install --setopt=install_weak_deps=False nodejs npm \
     && dnf clean all && rm -rf /var/cache/dnf

@@ -140,6 +140,7 @@ fn fail(rpc: &'static str, peer: &str, err: Error) -> Status {
         | Error::PhpUnavailable
         | Error::RuntimeUnavailable(_)
         | Error::NoApp(_)
+        | Error::RuntimeTooOld { .. }
         | Error::AppPolicyMissing
         | Error::NginxInvalid(_) => {
             warn!(rpc, peer, error = %err, "request refused");
@@ -518,6 +519,7 @@ impl OxPanelEngine for Engine {
             php_available: i.runtimes.php,
             node_available: i.runtimes.node,
             python_available: i.runtimes.python,
+            node_version: i.node_version,
         }))
     }
 

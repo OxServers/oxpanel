@@ -274,7 +274,8 @@ check "site logs removed with the site" test ! -e /var/log/nginx/oxpanel/php.tes
 check "no drift after PHP teardown" grep -q '^drifts=0$' <(oxpanel-ctl host reconcile)
 
 echo "== Node.js and Python applications"
-check "host info reports Node.js and Python" grep -q ' node=true python=true ' <(oxpanel-ctl host info)
+check "host info reports Node.js and Python" grep -qE ' node=true node_version=[0-9.]+ python=true ' <(oxpanel-ctl host info)
+check "Node.js is version 22 or newer" test "$(node --version | sed 's/^v//; s/\..*//')" -ge 22
 out="$(oxpanel-ctl vhost set node.test --tenant bob --app node)"
 echo "$out"
 check "node app vhost changed=true with defaults" bash -c 'grep -q "^changed=true" <<<"$1" && grep -q " app=node:apps/node.test:app.js " <<<"$1"' _ "$out"
@@ -323,6 +324,8 @@ check "files written by npm belong to the tenant" test "$(stat -c '%U' /home/bob
 check "the app is back after the installation" body_eventually node.test /again "node uid=$(id -u bob) url=/again host=node.test xff=set other=blocked etc=blocked"
 as_user bob sh -c 'echo "{ this is not json" > /home/bob/apps/node.test/package.json'
 check "a failing installation is reported with exit status 4" bash -c 'oxpanel-ctl vhost install-deps node.test > /root/deps.out 2>&1; rc=$?; grep -q "^succeeded=false" /root/deps.out && test $rc -eq 4'
+# Put a valid package.json back: Node.js reads it at start-up and refuses to run with a broken one.
+as_user bob sh -c 'echo "{\"name\":\"probe\",\"version\":\"1.0.0\",\"private\":true}" > /home/bob/apps/node.test/package.json'
 check "vhost replay with an app is idempotent" grep -q '^changed=false' <(oxpanel-ctl vhost set node.test --tenant bob --app node)
 check_not "app and php cannot be combined" oxpanel-ctl vhost set both.test --tenant bob --app node --php
 check_not "app root inside the document root is refused" oxpanel-ctl vhost set bad.test --tenant bob --app node --app-root public_html/app

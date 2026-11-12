@@ -534,11 +534,16 @@ async fn run_host(
                 .await?
                 .into_inner();
             say!(
-                "version={} selinux={} php={} node={} python={} dry_run={} tenants={} vhosts={} uid_range={}-{} load={:.2},{:.2},{:.2} memory_total={} memory_free={} home_disk_total={} home_disk_free={} uptime={}",
+                "version={} selinux={} php={} node={} node_version={} python={} dry_run={} tenants={} vhosts={} uid_range={}-{} load={:.2},{:.2},{:.2} memory_total={} memory_free={} home_disk_total={} home_disk_free={} uptime={}",
                 i.daemon_version,
                 i.selinux_enabled,
                 i.php_available,
                 i.node_available,
+                if i.node_version.is_empty() {
+                    "-"
+                } else {
+                    i.node_version.as_str()
+                },
                 i.python_available,
                 i.dry_run,
                 i.tenant_count,

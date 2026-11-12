@@ -536,6 +536,9 @@ async fn a_scoped_peer_can_only_call_its_scopes() {
         .await
         .expect("reconcile");
 
+    // (Host information asks the installed Node.js for its version.)
+    srv.sys.clear_calls();
+
     // Every tenant-changing RPC is refused before validation or any OS call.
     let denied = [
         client

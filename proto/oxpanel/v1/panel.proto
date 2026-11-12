@@ -279,9 +279,13 @@ message HostInfo {
   uint64 uptime_seconds = 15;
   // PHP-FPM is installed, so virtual hosts may enable `php`.
   bool php_available = 16;
-  // Node.js / Python are installed, so virtual hosts may run such applications.
+  // Node.js (version 22 or newer) / Python are installed, so virtual hosts
+  // may run such applications.
   bool node_available = 17;
   bool python_available = 18;
+  // Installed Node.js version, e.g. "22.11.0"; empty if none. A version
+  // older than 22 is reported here while `node_available` stays false.
+  string node_version = 19;
 }
 
 message ReconcileRequest {}
