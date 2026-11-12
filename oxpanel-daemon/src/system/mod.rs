@@ -35,12 +35,21 @@ pub mod bin {
     pub const SELINUXENABLED: &str = "/usr/sbin/selinuxenabled";
     pub const SETFACL: &str = "/usr/bin/setfacl";
     pub const SEMANAGE: &str = "/usr/sbin/semanage";
+    pub const SEMODULE: &str = "/usr/sbin/semodule";
     pub const GETSEBOOL: &str = "/usr/sbin/getsebool";
     pub const SETPRIV: &str = "/usr/bin/setpriv";
     pub const MKDIR: &str = "/usr/bin/mkdir";
     pub const DU: &str = "/usr/bin/du";
     /// Optional: only needed once a virtual host enables PHP.
     pub const PHP_FPM: &str = "/usr/sbin/php-fpm";
+    /// Optional: only needed once a virtual host runs such an application.
+    pub const NODE: &str = "/usr/bin/node";
+    pub const NPM: &str = "/usr/bin/npm";
+    pub const PYTHON3: &str = "/usr/bin/python3";
+    pub const ENV: &str = "/usr/bin/env";
+    /// Runs dependency installation outside the daemon's network-less sandbox.
+    pub const SYSTEMD_RUN: &str = "/usr/bin/systemd-run";
+    pub const JOURNALCTL: &str = "/usr/bin/journalctl";
     /// Login shell given to every tenant account.
     pub const NOLOGIN: &str = "/sbin/nologin";
 }

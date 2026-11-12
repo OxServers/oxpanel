@@ -28,6 +28,12 @@ service OxPanelEngine {
   rpc ConfigureVirtualHost(ConfigureVirtualHostRequest) returns (ConfigureVirtualHostResponse);
   rpc RemoveVirtualHost(RemoveVirtualHostRequest) returns (RemoveVirtualHostResponse);
   rpc ListVirtualHosts(ListVirtualHostsRequest) returns (ListVirtualHostsResponse);
+  // Restart a virtual host's application (after new code was put in place).
+  rpc RestartApp(RestartAppRequest) returns (RestartAppResponse);
+  // Install the application's dependencies as the tenant: `npm install` for
+  // Node.js, `pip install -r requirements.txt` into the app's virtualenv for
+  // Python. The application is restarted when the installation succeeds.
+  rpc InstallAppDependencies(InstallAppDependenciesRequest) returns (InstallAppDependenciesResponse);
   // The end of a virtual host's access or error log.
   rpc ReadVirtualHostLog(ReadVirtualHostLogRequest) returns (ReadVirtualHostLogResponse);
 
@@ -138,6 +144,30 @@ message VirtualHost {
   string config_path = 5;
   // PHP is enabled: *.php is executed by the tenant's own PHP-FPM pool.
   bool php = 6;
+  // Set when the virtual host runs an application.
+  App app = 7;
+}
+
+enum AppRuntime {
+  APP_RUNTIME_UNSPECIFIED = 0;
+  // `node <entry>`
+  APP_RUNTIME_NODE = 1;
+  // `<root>/.venv/bin/python <entry>`; the virtualenv is created for the app.
+  APP_RUNTIME_PYTHON = 2;
+}
+
+// A long-running application behind a virtual host. It runs as the tenant in
+// its own sandboxed service inside the tenant's slice and must listen on the
+// UNIX socket whose path it receives in the PORT (and OXPANEL_SOCKET)
+// environment variable. Nginx serves files that exist in the document root
+// itself and passes every other request to the application.
+message App {
+  AppRuntime runtime = 1;
+  // Application directory relative to the tenant home; created (owned by the
+  // tenant) if absent. Empty = "apps/<domain>". Not readable by the web server.
+  string root = 2;
+  // Program to run, relative to `root`. Empty = "app.js" / "app.py".
+  string entry = 3;
 }
 
 message ConfigureVirtualHostRequest {
@@ -155,6 +185,9 @@ message ConfigureVirtualHostRequest {
   // removed with the tenant's last PHP-enabled virtual host.
   // FAILED_PRECONDITION if PHP-FPM is not installed on the host.
   bool php = 5;
+  // Run an application behind this virtual host. Cannot be combined with
+  // `php`. FAILED_PRECONDITION if the runtime is not installed on the host.
+  App app = 6;
 }
 
 message ConfigureVirtualHostResponse {
@@ -246,6 +279,9 @@ message HostInfo {
   uint64 uptime_seconds = 15;
   // PHP-FPM is installed, so virtual hosts may enable `php`.
   bool php_available = 16;
+  // Node.js / Python are installed, so virtual hosts may run such applications.
+  bool node_available = 17;
+  bool python_available = 18;
 }
 
 message ReconcileRequest {}
@@ -275,6 +311,10 @@ enum DriftKind {
   DRIFT_KIND_PHP_POOL_DRIFT = 10;
   // A PHP-FPM pool file or unit that no PHP-enabled virtual host accounts for.
   DRIFT_KIND_ORPHAN_PHP_POOL = 11;
+  // An application's service unit is missing or differs from its record.
+  DRIFT_KIND_APP_UNIT_DRIFT = 12;
+  // An oxpanel-app-*.service unit that no virtual host accounts for.
+  DRIFT_KIND_ORPHAN_APP_UNIT = 13;
 }
 
 message Drift {
@@ -294,6 +334,9 @@ enum LogKind {
   LOG_KIND_UNSPECIFIED = 0;
   LOG_KIND_ACCESS = 1;
   LOG_KIND_ERROR = 2;
+  // Output of the virtual host's application (stdout and stderr, from the
+  // journal), most recent lines last. INVALID_ARGUMENT if it runs none.
+  LOG_KIND_APP = 3;
 }
 
 message ReadVirtualHostLogRequest {
@@ -308,4 +351,21 @@ message ReadVirtualHostLogResponse {
   string text = 1;
   // true when the file holds more than was returned.
   bool truncated = 2;
+}
+
+message RestartAppRequest {
+  string domain = 1;
+}
+
+message RestartAppResponse {}
+
+message InstallAppDependenciesRequest {
+  string domain = 1;
+}
+
+message InstallAppDependenciesResponse {
+  // false when the installer exited with an error; `output` says why.
+  bool succeeded = 1;
+  // The end of the installer's output.
+  string output = 2;
 }

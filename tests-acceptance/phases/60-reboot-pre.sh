@@ -9,6 +9,10 @@ check "site bootb.test" bash -c "oxpanel-ctl vhost set bootb.test --tenant bootb
 check "php site bootphp.test" bash -c "oxpanel-ctl vhost set bootphp.test --tenant bootb --root phpsite --php | grep -q '^changed=true'"
 as_user bootb sh -c 'echo "<?php echo \"php-\" . (6*7);" > /home/bootb/phpsite/index.php'
 eventually "bootphp.test serves" 30 0.2 http_body_is bootphp.test / php-42
+check "node app site bootnode.test" bash -c "oxpanel-ctl vhost set bootnode.test --tenant boota --app node | grep -q '^changed=true'"
+as_user boota sh -c "echo \"require('http').createServer((q, s) => s.end('node-42')).listen(process.env.PORT);\" > /home/boota/apps/bootnode.test/app.js"
+check "restart node app" bash -c "oxpanel-ctl vhost restart-app bootnode.test | grep -q '^restarted=true'"
+eventually "bootnode.test serves" 50 0.2 http_body_is bootnode.test / node-42
 as_user boota sh -c 'echo boota > /home/boota/public_html/index.html'
 as_user bootb sh -c 'echo bootb > /home/bootb/www/site/index.html'
 eventually "boota.test serves" 30 0.2 http_body_is boota.test / boota

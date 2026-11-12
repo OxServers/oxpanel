@@ -1,0 +1,45 @@
+; OxPanel SELinux policy module (CIL; no compiler needed):
+;   semodule -i /usr/share/oxpanel/selinux/oxpanel.cil
+;
+; Tenant applications (Node.js, Python) run in their own domain,
+; oxpanel_app_t, so that the one thing the web server needs — connecting to
+; an application's UNIX socket — can be allowed for exactly those processes
+; and for nothing else on the host.
+;
+; Within that domain SELinux does not restrict ordinary file and network
+; access: an application is confined by running as its tenant (file
+; ownership), by its systemd sandbox and by the tenant's cgroup limits. It is
+; nevertheless narrower than the stock unconfined service domain it would
+; otherwise run in (see the attribute list). A confining policy is a roadmap item.
+
+(type oxpanel_app_t)
+(roletype system_r oxpanel_app_t)
+(typeattributeset domain (oxpanel_app_t))
+; The attributes of the stock unconfined service domain that an ordinary
+; program needs (files, network, devices, file systems, kernel interfaces).
+; Deliberately left out: loading policy or kernel modules, changing booleans
+; or enforcement, raw storage, relabelling to shadow or policy types, and
+; unconfined D-Bus access.
+(typeattributeset unconfined_domain_type (oxpanel_app_t))
+(typeattributeset files_unconfined_type (oxpanel_app_t))
+(typeattributeset corenet_unconfined_type (oxpanel_app_t))
+(typeattributeset devices_unconfined_type (oxpanel_app_t))
+(typeattributeset filesystem_unconfined_type (oxpanel_app_t))
+(typeattributeset kern_unconfined (oxpanel_app_t))
+(typeattributeset process_uncond_exempt (oxpanel_app_t))
+
+; systemd starts an application in this domain (SELinuxContext= in its unit);
+; the interpreters (node, python) are ordinary bin_t programs.
+(allow init_t oxpanel_app_t (process (transition)))
+; The units set NoNewPrivileges=yes; a domain transition under it needs this.
+(allow init_t oxpanel_app_t (process2 (nnp_transition nosuid_transition)))
+(allow oxpanel_app_t bin_t (file (entrypoint)))
+; Just-in-time compilers (V8 in Node.js) need writable-executable memory.
+(allow oxpanel_app_t self (process (execmem)))
+
+; The web server may connect to application sockets, and only to those.
+(allow httpd_t oxpanel_app_t (unix_stream_socket (connectto)))
+
+; Runtime directories of applications: sockets created inside inherit the
+; type, which the web server is allowed to write to.
+(filecon "/var/run/oxpanel-app(/.*)?" any (system_u object_r httpd_var_run_t ((s0) (s0))))

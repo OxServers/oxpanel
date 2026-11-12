@@ -18,6 +18,9 @@ Requires:       coreutils
 Requires:       logrotate
 # PHP is optional: without php-fpm, virtual hosts are static only.
 Recommends:     php-fpm
+# Likewise optional: Node.js applications. (Python 3 is part of the base system.)
+Recommends:     nodejs
+Recommends:     npm
 Requires:       policycoreutils
 Requires:       policycoreutils-python-utils
 Requires:       libselinux-utils
@@ -44,6 +47,7 @@ install -D -m 0644 packaging/sysusers.d/oxpanel.conf %{buildroot}%{_sysusersdir}
 install -D -m 0644 packaging/tmpfiles.d/oxpanel.conf %{buildroot}%{_tmpfilesdir}/oxpanel.conf
 install -D -m 0640 packaging/daemon.env %{buildroot}%{_sysconfdir}/oxpanel/daemon.env
 install -D -m 0644 packaging/logrotate.d/oxpanel %{buildroot}%{_sysconfdir}/logrotate.d/oxpanel
+install -D -m 0644 packaging/selinux/oxpanel.cil %{buildroot}%{_datadir}/oxpanel/selinux/oxpanel.cil
 
 %pre
 %sysusers_create_compat packaging/sysusers.d/oxpanel.conf
@@ -56,11 +60,16 @@ install -D -m 0644 packaging/logrotate.d/oxpanel %{buildroot}%{_sysconfdir}/logr
 # site (uploads, caches). File ownership still decides whose files those are.
 if /usr/sbin/selinuxenabled 2>/dev/null; then /usr/sbin/setsebool -P httpd_enable_homedirs=on httpd_read_user_content=on httpd_unified=on || :; fi
 
+# The domain tenant applications run in, and the label of their socket directories.
+if /usr/sbin/selinuxenabled 2>/dev/null; then /usr/sbin/semodule -i %{_datadir}/oxpanel/selinux/oxpanel.cil || :; fi
+
 %preun
 %systemd_preun oxpanel-daemon.service
 
 %postun
 %systemd_postun_with_restart oxpanel-daemon.service
+# On removal (not upgrade) take the policy module out again.
+if [ "$1" -eq 0 ] && /usr/sbin/selinuxenabled 2>/dev/null; then /usr/sbin/semodule -r oxpanel 2>/dev/null || :; fi
 
 %files
 %license LICENSE
@@ -73,6 +82,9 @@ if /usr/sbin/selinuxenabled 2>/dev/null; then /usr/sbin/setsebool -P httpd_enabl
 %dir %attr(0750,root,oxpanel) %{_sysconfdir}/oxpanel
 %config(noreplace) %attr(0640,root,root) %{_sysconfdir}/oxpanel/daemon.env
 %config(noreplace) %{_sysconfdir}/logrotate.d/oxpanel
+%dir %{_datadir}/oxpanel
+%dir %{_datadir}/oxpanel/selinux
+%{_datadir}/oxpanel/selinux/oxpanel.cil
 
 %changelog
 * Sat Sep 05 2026 OxPanel contributors - 0.1.0-1

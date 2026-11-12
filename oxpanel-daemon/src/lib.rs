@@ -13,6 +13,7 @@
 //! - [`records`]  — on-disk state (`/var/lib/oxpanel`) that marks what OxPanel owns.
 //! - [`tenant`], [`vhost`] — the provisioning workflows.
 //! - [`php`]      — per-tenant PHP-FPM instances.
+//! - [`app`]      — Node.js and Python applications behind virtual hosts.
 //! - [`host`]     — host information and record ↔ OS reconciliation.
 //! - [`auth`]     — peer-credential gate for the UNIX socket.
 //! - [`server`]   — gRPC ↔ domain mapping.
@@ -28,6 +29,7 @@
     )
 )]
 
+pub mod app;
 pub mod auth;
 pub mod config;
 pub mod ctx;

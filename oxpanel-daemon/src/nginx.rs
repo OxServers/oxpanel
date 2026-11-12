@@ -35,7 +35,18 @@ pub fn conf_path(conf_dir: &Path, domain: &Domain) -> PathBuf {
 /// destination for every unknown `Host` header and bare-IP request.
 pub fn render_include(conf_dir: &Path, default_server: bool) -> Result<String> {
     let dir = safe_path_str(conf_dir)?;
-    let mut s = format!("{HEADER}include {dir}/*.conf;\n");
+    let mut s = format!(
+        "{HEADER}
+# WebSocket upgrade for proxied applications: pass `Connection: upgrade` on
+# when the client asked for one, close otherwise.
+map $http_upgrade $oxpanel_connection {{
+    default upgrade;
+    ''      close;
+}}
+
+include {dir}/*.conf;
+"
+    );
     if default_server {
         s.push_str(
             "
@@ -66,8 +77,10 @@ pub struct ServerBlock<'a> {
     /// Absolute paths of this virtual host's own logs.
     pub access_log: &'a Path,
     pub error_log: &'a Path,
-    /// Socket of the tenant's PHP-FPM instance; `None` = static files only.
+    /// Socket of the tenant's PHP-FPM instance, if PHP is enabled.
     pub php_socket: Option<&'a Path>,
+    /// Socket of the virtual host's application, if it runs one.
+    pub app_socket: Option<&'a Path>,
 }
 
 /// Render a complete, self-contained server block.
@@ -102,22 +115,18 @@ server {{
             tenant = b.tenant,
         ));
     }
-    let (index, fallback, php) = match b.php_socket {
-        // Without PHP a script must never be handed out as a download:
-        // its source routinely holds database passwords.
-        None => (
-            "index.html index.htm",
-            "=404",
-            "
+    // Without PHP a script must never be handed out as a download: its
+    // source routinely holds database passwords.
+    let no_php = "
     location ~ \\.php$ {
         return 404;
     }
-"
-            .to_owned(),
-        ),
-        Some(sock) => (
+";
+    let (index, tries, extra) = match (b.php_socket, b.app_socket) {
+        (None, None) => ("index.html index.htm", "$uri $uri/ =404", no_php.to_owned()),
+        (Some(sock), _) => (
             "index.php index.html index.htm",
-            "/index.php$is_args$args",
+            "$uri $uri/ /index.php$is_args$args",
             // `try_files` first: never hand FPM a script that does not exist
             // (the classic cgi.fix_pathinfo trap). $realpath_root, so FPM and
             // open_basedir see the same resolved path Nginx checked.
@@ -130,6 +139,28 @@ server {{
         fastcgi_param DOCUMENT_ROOT $realpath_root;
         fastcgi_hide_header X-Powered-By;
         fastcgi_pass unix:{};
+    }}
+",
+                safe_path_str(sock)?
+            ),
+        ),
+        // Files that exist in the document root are served directly; every
+        // other request (directories included) goes to the application.
+        (None, Some(sock)) => (
+            "index.html index.htm",
+            "$uri @app",
+            format!(
+                "{no_php}
+    location @app {{
+        proxy_pass http://unix:{}:;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection $oxpanel_connection;
+        proxy_hide_header X-Powered-By;
     }}
 ",
                 safe_path_str(sock)?
@@ -160,9 +191,9 @@ server {{
     }}
 
     location / {{
-        try_files $uri $uri/ {fallback};
+        try_files {tries};
     }}
-{php}}}
+{extra}}}
 ",
         tenant = b.tenant,
     ))
@@ -320,6 +351,7 @@ mod tests {
             access_log: Path::new("/var/log/nginx/oxpanel/example.com.access.log"),
             error_log: Path::new("/var/log/nginx/oxpanel/example.com.error.log"),
             php_socket: None,
+            app_socket: None,
         })?;
         assert!(s.starts_with(HEADER));
         assert!(s.contains("server_name example.com www.example.com example.net;\n"));
@@ -356,13 +388,18 @@ mod tests {
                 access_log: Path::new("/var/log/nginx/oxpanel/example.com.access.log"),
                 error_log: Path::new("/var/log/nginx/oxpanel/example.com.error.log"),
                 php_socket: None,
+                app_socket: None,
             });
             assert!(r.is_err(), "{bad}");
         }
         assert!(render_include(Path::new("/etc/nginx/ox panel.d"), false).is_err());
-        assert_eq!(
-            render_include(Path::new("/etc/nginx/oxpanel.d"), false)?,
-            format!("{HEADER}include /etc/nginx/oxpanel.d/*.conf;\n")
+        let include = render_include(Path::new("/etc/nginx/oxpanel.d"), false)?;
+        assert!(include.starts_with(HEADER));
+        assert!(include.ends_with("\ninclude /etc/nginx/oxpanel.d/*.conf;\n"));
+        assert!(include.contains("map $http_upgrade $oxpanel_connection {"));
+        assert!(
+            !include.contains("server {"),
+            "no catch-all unless asked for"
         );
         Ok(())
     }
@@ -486,6 +523,7 @@ mod tests {
             access_log: Path::new("/var/log/nginx/oxpanel/example.com.access.log"),
             error_log: Path::new("/var/log/nginx/oxpanel/example.com.error.log"),
             php_socket: None,
+            app_socket: None,
         })?;
         assert!(s.contains("server_name example.com www.example.com;"));
         assert!(s.contains("return 503;"));
@@ -507,6 +545,7 @@ mod tests {
             access_log: Path::new("/var/log/nginx/oxpanel/example.com.access.log"),
             error_log: Path::new("/var/log/nginx/oxpanel/example.com.error.log"),
             php_socket: Some(Path::new("/run/oxpanel-php/alice/php.sock")),
+            app_socket: None,
         })?;
         assert!(s.contains("index index.php index.html index.htm;"));
         assert!(s.contains("try_files $uri $uri/ /index.php$is_args$args;"));
@@ -529,6 +568,45 @@ mod tests {
             access_log: Path::new("/var/log/nginx/oxpanel/example.com.access.log"),
             error_log: Path::new("/var/log/nginx/oxpanel/example.com.error.log"),
             php_socket: Some(Path::new("/run/x.sock; include /etc/shadow")),
+            app_socket: None,
+        });
+        assert!(bad.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn app_block_serves_static_files_and_proxies_the_rest() -> Result<()> {
+        let alice = Username::parse("alice")?;
+        let s = render_server_block(&ServerBlock {
+            domain: &d("example.com"),
+            aliases: &[],
+            tenant: &alice,
+            document_root: Path::new("/home/alice/public_html"),
+            suspended: false,
+            access_log: Path::new("/var/log/nginx/oxpanel/example.com.access.log"),
+            error_log: Path::new("/var/log/nginx/oxpanel/example.com.error.log"),
+            php_socket: None,
+            app_socket: Some(Path::new("/run/oxpanel-app/example.com/app.sock")),
+        })?;
+        assert!(s.contains("location / {\n        try_files $uri @app;\n    }"));
+        assert!(s.contains("proxy_pass http://unix:/run/oxpanel-app/example.com/app.sock:;"));
+        assert!(s.contains("proxy_set_header Host $host;"));
+        assert!(s.contains("proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;"));
+        assert!(s.contains("proxy_set_header Connection $oxpanel_connection;"));
+        assert!(s.contains("root /home/alice/public_html;"));
+        assert!(s.contains("location ~ \\.php$ {\n        return 404;"));
+        assert!(!s.contains("fastcgi_pass"));
+        assert!(!s.contains("127.0.0.1"), "never a TCP upstream");
+        let bad = render_server_block(&ServerBlock {
+            domain: &d("example.com"),
+            aliases: &[],
+            tenant: &alice,
+            document_root: Path::new("/home/alice/public_html"),
+            suspended: false,
+            access_log: Path::new("/var/log/nginx/oxpanel/example.com.access.log"),
+            error_log: Path::new("/var/log/nginx/oxpanel/example.com.error.log"),
+            php_socket: None,
+            app_socket: Some(Path::new("/run/a.sock:/admin; proxy_pass http://evil")),
         });
         assert!(bad.is_err());
         Ok(())

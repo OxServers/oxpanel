@@ -102,7 +102,7 @@ The package installs:
 ### 3.2 From source, on the target host
 
 ```sh
-sudo dnf install -y gcc git nginx shadow-utils util-linux acl policycoreutils policycoreutils-python-utils libselinux-utils logrotate php-fpm
+sudo dnf install -y gcc git nginx shadow-utils util-linux acl policycoreutils policycoreutils-python-utils libselinux-utils logrotate php-fpm nodejs npm
 # SELinux: sites live under tenant homes, so the web server must be allowed to traverse and read them.
 if sudo selinuxenabled; then sudo setsebool -P httpd_enable_homedirs=on httpd_read_user_content=on httpd_unified=on; fi
 curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal && source ~/.cargo/env
@@ -117,6 +117,9 @@ sudo install -Dm0644 packaging/sysusers.d/oxpanel.conf        /usr/lib/sysusers.
 sudo install -Dm0644 packaging/tmpfiles.d/oxpanel.conf        /usr/lib/tmpfiles.d/oxpanel.conf
 sudo install -Dm0640 packaging/daemon.env                     /etc/oxpanel/daemon.env
 sudo install -Dm0644 packaging/logrotate.d/oxpanel            /etc/logrotate.d/oxpanel
+sudo install -Dm0644 packaging/selinux/oxpanel.cil            /usr/share/oxpanel/selinux/oxpanel.cil
+# SELinux: the domain tenant applications (Node.js, Python) run in.
+if sudo selinuxenabled; then sudo semodule -i /usr/share/oxpanel/selinux/oxpanel.cil; fi
 sudo systemd-sysusers && sudo systemd-tmpfiles --create oxpanel.conf
 sudo systemctl daemon-reload
 sudo systemctl enable --now nginx oxpanel-daemon
@@ -280,7 +283,10 @@ host info
 host reconcile
 
 vhost set     <domain> --tenant <username> [--root RELATIVE_PATH] [--alias DOMAIN]... [--php]
-vhost log     <domain> [--error] [--bytes SIZE]
+              [--app node|python [--app-root RELATIVE_PATH] [--app-entry FILE]]
+vhost log     <domain> [--error | --app] [--bytes SIZE]
+vhost restart-app  <domain>
+vhost install-deps <domain>
 vhost remove  <domain>
 vhost list    [--tenant <username>]
 ```
@@ -288,7 +294,8 @@ vhost list    [--tenant <username>]
 Sizes accept `k`, `m`, `g`, `t` suffixes (binary units) or plain bytes.
 Exit status: `0` success, `1` API error (message on stderr, e.g.
 `error: FailedPrecondition: nginx rejected the configuration: …`), `2` usage,
-`3` when `host reconcile` found differences.
+`3` when `host reconcile` found differences, `4` when `vhost install-deps` ran
+and the installer failed.
 
 **Examples**
 
@@ -337,6 +344,19 @@ sudo oxpanel-ctl vhost set blog.acme.example --tenant acme --root blog --php
 systemctl status oxpanel-php-acme.service
 # Switch PHP off again (the pool is removed when no site of the tenant uses it)
 sudo oxpanel-ctl vhost set blog.acme.example --tenant acme --root blog
+
+# A Node.js application. It must listen on the socket path it gets in PORT:
+#   require('http').createServer(handler).listen(process.env.PORT)
+sudo oxpanel-ctl vhost set app.acme.example --tenant acme --app node
+#   code goes to /home/acme/apps/app.acme.example/ (entry: app.js), as the tenant
+sudo oxpanel-ctl vhost install-deps app.acme.example      # npm install --omit=dev, as the tenant
+sudo oxpanel-ctl vhost restart-app  app.acme.example      # after putting new code in place
+sudo oxpanel-ctl vhost log app.acme.example --app         # what the application printed
+
+# A Python application in its own virtualenv; static files from apps/api/public
+sudo oxpanel-ctl vhost set api.acme.example --tenant acme --app python \
+     --app-root apps/api --app-entry main.py --root apps/api/public
+sudo oxpanel-ctl vhost install-deps api.acme.example      # pip install -r requirements.txt
 
 # The end of a site's access log, or its error log
 sudo oxpanel-ctl vhost log acme.example
@@ -395,6 +415,8 @@ resp, err := client.CreateTenant(ctx, &oxpanelv1.CreateTenantRequest{
 | `UpdateTenantOwner` | same owner → `changed=false` | `NOT_FOUND`, `FAILED_PRECONDITION`, `INVALID_ARGUMENT` |
 | `SuspendTenant` / `ResumeTenant` | already in that state → `changed=false` | `NOT_FOUND`, `FAILED_PRECONDITION` (tenant not ready; `nginx -t` rejected — all files restored, state unchanged) |
 | `GetTenantUsage` / `GetHostInfo` | read-only measurements | `NOT_FOUND`; usage runs `du` on the home, so cache it in the panel rather than polling per page view |
+| `RestartApp` | restarts every time | `NOT_FOUND`, `FAILED_PRECONDITION` (the site runs no application; tenant suspended) |
+| `InstallAppDependencies` | re-runs the installer; **not** under the mutation lock (it can take minutes), other RPCs proceed meanwhile | returns `succeeded=false` plus the installer output when npm/pip fails — show it to the site owner. `FAILED_PRECONDITION` as for `RestartApp`. Allow up to 5 minutes |
 | `ReadVirtualHostLog` | read-only; at most 128 KiB of whole lines from the end of the current file | `NOT_FOUND` (no such site). Log lines contain visitor IP addresses: show a site's log only to its owner |
 | `Reconcile` | read-only; waits for the mutation lock | — (an empty `drifts` list means records and OS agree) |
 | any | | `PERMISSION_DENIED` (peer not allowed, or its scopes do not cover the RPC — §5), `DEADLINE_EXCEEDED` (a system command hit `OXPANEL_COMMAND_TIMEOUT_SECS`), `INTERNAL` (redacted; see the journal) |
@@ -426,6 +448,10 @@ needs to confirm a site is live, poll it.
 | `/etc/oxpanel-php/<username>.conf` | `root 0644` | PHP-FPM configuration of a tenant with a PHP-enabled site |
 | `/etc/systemd/system/oxpanel-php-<name>.service` | `root 0644` | that tenant's PHP-FPM unit (`User=<tenant>`, in the tenant slice) |
 | `/run/oxpanel-php/<username>/php.sock` | `<t>:<t>` + ACL `user:nginx:rw-` | socket Nginx passes PHP requests to |
+| `/home/<username>/<app root>` | `<t>:<t>`, no web-server ACL | application code (default `apps/<domain>`); Python apps also `.venv/` |
+| `/etc/systemd/system/oxpanel-app-<domain>.service` | `root 0644` | the application's unit (`User=<tenant>`, in the tenant slice) |
+| `/run/oxpanel-app/<domain>/app.sock` | directory `<t>:<t> 0750` + ACL `user:nginx:--x` | socket Nginx proxies to; created by the application |
+| `/usr/share/oxpanel/selinux/oxpanel.cil` | `root 0644` | SELinux module: the `oxpanel_app_t` domain and the socket-directory label |
 | `/run/oxpanel/oxpanel.sock` | `root:oxpanel 0660` | API socket |
 | SELinux hosts | | `semanage fcontext` equivalence `<docroot> = /usr/share/nginx/html` (labels the tree `httpd_sys_content_t`; a plain rule would be overridden by `file_contexts.homedirs`) |
 
@@ -475,6 +501,37 @@ The `php-fpm` package also ships a *shared* pool (`php-fpm.service`, running as
 its own instance — so on a hosting node switch it off:
 `sudo systemctl mask --now php-fpm.service`.
 
+**Node.js and Python applications** — need `nodejs` and `npm` (the RPM
+recommends them; Python 3 is part of the system); `host info` shows
+`node=true python=true`. AlmaLinux 9 installs Node.js 16 by default, which is
+past its end of life: pick a current stream before installing
+(`sudo dnf module enable nodejs:22 && sudo dnf install nodejs npm`). After
+changing the Node.js or Python version, restart the applications
+(`systemctl restart 'oxpanel-app-*'`).
+
+What an application must do: **listen on the UNIX socket path in `PORT`**
+(also in `OXPANEL_SOCKET`). It cannot listen on a TCP port for visitors;
+that is what keeps tenants from reaching each other's applications.
+
+```js
+// Node.js (Express: app.listen(process.env.PORT) is the same thing)
+require('http').createServer((req, res) => res.end('hello')).listen(process.env.PORT);
+```
+```python
+# Python with gunicorn installed through requirements.txt — main.py:
+import os, sys
+os.execv(os.path.join(sys.prefix, 'bin', 'gunicorn'),
+         ['gunicorn', '--bind', 'unix:' + os.environ['PORT'], 'myapp.wsgi:application'])
+```
+
+The application runs with `NODE_ENV=production`, the application directory as
+its working directory, the tenant's home as `HOME`, and a private `/tmp`. If a
+site answers **502**, the application is not listening: `vhost log <domain>
+--app` shows why (a crash loop stops after five quick failures;
+`vhost restart-app` starts it again). Until tenants have file access
+(SFTP is the next milestone), put code in place as the tenant, as for static
+content.
+
 **Checking for drift** — `oxpanel-ctl host reconcile` compares every record
 with the accounts, homes, unit files and Nginx files, and prints one line per
 difference (`kind=… subject=… detail=…`); exit status `3` means drift, so it
@@ -490,6 +547,8 @@ What to do with each finding:
 | `VHOST_CONFIG_DRIFT` | A site's Nginx file was edited or removed. | Repeat `vhost set` for the domain. |
 | `VHOST_TENANT_MISSING` | A site record names a tenant without a record. | `vhost remove` the domain. |
 | `PHP_POOL_DRIFT` | A tenant's PHP-FPM configuration or unit was edited or removed. | Repeat `vhost set … --php` for one of the tenant's PHP sites. |
+| `APP_UNIT_DRIFT` | An application's unit was edited or removed. | Repeat `vhost set … --app …` for the site. |
+| `ORPHAN_APP_UNIT` | An application unit no site accounts for. | Inspect and remove by hand. |
 | `ORPHAN_PHP_POOL` | A PHP-FPM file no PHP-enabled site accounts for. | Inspect and remove by hand. |
 | `ORPHAN_NGINX_CONFIG` / `ORPHAN_SLICE_UNIT` | A file in OxPanel's directories that no record accounts for. | Inspect and remove by hand; OxPanel will not touch what it did not record. |
 
@@ -522,6 +581,9 @@ configuration with `nginx -t` on every change.
 | exits with **78** `SELinux boolean … is off` | `sudo setsebool -P httpd_enable_homedirs=on httpd_read_user_content=on` (the RPM does this in `%post`). Without them `httpd_t` cannot traverse `/home/<tenant>` and every site returns 403. |
 | PHP site works but cannot write (uploads fail, "Permission denied") | SELinux boolean `httpd_unified` is off (the daemon warns at start): `sudo setsebool -P httpd_unified on`. |
 | `FailedPrecondition: PHP is not installed on this host` | `sudo dnf install php-fpm`; no daemon restart needed. |
+| App site answers 502 | The application is not listening on `$PORT`: `oxpanel-ctl vhost log <domain> --app`, then `vhost restart-app`. |
+| `FailedPrecondition: the OxPanel SELinux module is not installed` | `sudo semodule -i /usr/share/oxpanel/selinux/oxpanel.cil` (the RPM does this in `%post`). |
+| `FailedPrecondition: Node.js (nodejs) is not installed on this host` | `sudo dnf install nodejs npm`; no daemon restart needed. |
 | PHP site answers 502 | The tenant's pool is not running: `systemctl status oxpanel-php-<name>`, `journalctl -u oxpanel-php-<name>`. Usually the tenant hit its `MemoryMax`/`TasksMax`. |
 | `Failed at step NAMESPACE` / `status=226/NAMESPACE` in the journal | A `ReadWritePaths=` entry points at a directory systemd may not mount on under SELinux (security file types such as `semanage_store_t`). The shipped unit lists parents (`/var/lib`) for this reason; if you customised the unit, revert to that pattern. |
 | Start-up fails with `nginx include: nginx rejected the configuration: … duplicate default server` | The host already has a `default_server`. Set `OXPANEL_NGINX_DEFAULT_SERVER=false` (then unknown hosts go to *that* server). |
@@ -543,8 +605,8 @@ configuration with `nginx -t` on every change.
 ```sh
 make image         # AlmaLinux 9 dev/test image (one-time)
 make check         # rustfmt --check, clippy pedantic -D warnings, tests, cargo-deny
-make test          # 91 unit + 6 gRPC end-to-end tests (fake OS, no root)
-make integration   # boots systemd in a container, installs from packaging/, runs 172 assertions
+make test          # 104 unit + 6 gRPC end-to-end tests (fake OS, no root)
+make integration   # boots systemd in a container, installs from packaging/, runs 223 assertions
 make rpm           # build the RPM from the working tree into dist/rpms/
 make acceptance    # REAL AlmaLinux 9 VM (KVM, SELinux enforcing): install like a user, run all phases
 ./scripts/dev.sh cargo <anything>   # run cargo inside the image

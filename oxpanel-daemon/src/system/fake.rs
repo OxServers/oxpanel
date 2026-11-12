@@ -225,6 +225,11 @@ impl System for FakeSystem {
                     Err(e) => output(program, 1, "", &format!("mkdir: {e}")),
                 }
             }
+            // The OxPanel policy module is loaded unless a test says otherwise.
+            bin::SEMODULE => {
+                let listing = if i.missing.contains(&bin::SEMODULE) { "abrt\nzebra\n" } else { "abrt\noxpanel\nzebra\n" };
+                output(program, 0, listing, "")
+            }
             bin::DU => {
                 let target = args.last().map(|a| a.to_string_lossy().into_owned()).unwrap_or_default();
                 output(program, 0, &format!("8192\t{target}\n"), "")

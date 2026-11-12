@@ -9,6 +9,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
+use crate::app;
 use crate::config::Config;
 use crate::ctx::Ctx;
 use crate::error::Result;
@@ -17,7 +18,7 @@ use crate::php::{self, PoolFiles};
 use crate::records::{TenantRecord, TenantState, VHostRecord};
 use crate::system::{bin, HostStats};
 use crate::systemd::{self, TenantUnits};
-use crate::validate::Username;
+use crate::validate::{Domain, Username};
 use crate::vhost;
 
 /// What kind of difference a [`Drift`] describes.
@@ -34,6 +35,8 @@ pub enum DriftKind {
     OrphanSliceUnit,
     PhpPoolDrift,
     OrphanPhpPool,
+    AppUnitDrift,
+    OrphanAppUnit,
 }
 
 /// One difference between a record and the operating system.
@@ -55,6 +58,14 @@ impl Drift {
     }
 }
 
+/// Which optional runtimes are installed on the host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Runtimes {
+    pub php: bool,
+    pub node: bool,
+    pub python: bool,
+}
+
 /// Engine and host facts for the panel's overview.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HostInfo {
@@ -64,7 +75,7 @@ pub struct HostInfo {
     pub vhost_count: u32,
     pub uid_min: u32,
     pub uid_max: u32,
-    pub php_available: bool,
+    pub runtimes: Runtimes,
     pub stats: HostStats,
 }
 
@@ -88,7 +99,11 @@ impl HostService {
             vhost_count: count(self.ctx.store.list_vhosts()?.len()),
             uid_min: cfg.uid_min,
             uid_max: cfg.uid_max,
-            php_available: self.ctx.sys.is_installed(bin::PHP_FPM).await,
+            runtimes: Runtimes {
+                php: self.ctx.sys.is_installed(bin::PHP_FPM).await,
+                node: self.ctx.sys.is_installed(bin::NODE).await,
+                python: self.ctx.sys.is_installed(bin::PYTHON3).await,
+            },
             stats: self.ctx.sys.host_stats(&cfg.home_base).await?,
         })
     }
@@ -109,29 +124,6 @@ impl HostService {
             tenants.iter().map(|t| (t.username.as_str(), t)).collect();
         for v in &vhosts {
             check_vhost(cfg, v, by_name.get(v.tenant.as_str()).copied(), &mut out)?;
-        }
-
-        // PHP-FPM pools: one per ready tenant with a PHP-enabled virtual host.
-        let mut known_pool_files: BTreeSet<PathBuf> = BTreeSet::new();
-        for t in tenants.iter().filter(|t| {
-            t.state == TenantState::Ready && vhosts.iter().any(|v| v.php && v.tenant == t.username)
-        }) {
-            let name = Username::parse(&t.username)?;
-            let files = PoolFiles::for_tenant(&cfg.php_conf_dir, &cfg.systemd_unit_dir, &name);
-            for (path, expected) in [
-                (&files.conf, php::render_pool_conf(t, &name, &cfg.web_user)?),
-                (&files.unit, php::render_unit(t, &name, &files.conf)?),
-            ] {
-                if let Some(problem) = compare_file(path, &expected)? {
-                    out.push(Drift::new(
-                        DriftKind::PhpPoolDrift,
-                        t.username.as_str(),
-                        format!("{} {problem}", path.display()),
-                    ));
-                }
-            }
-            known_pool_files.insert(files.conf);
-            known_pool_files.insert(files.unit);
         }
 
         let known_confs: BTreeSet<&Path> = vhosts.iter().map(|v| v.config_path.as_path()).collect();
@@ -161,25 +153,8 @@ impl HostService {
                 ));
             }
         }
-        let mut pool_files = fsutil::list_files_with_suffix(&cfg.php_conf_dir, ".conf")?;
-        pool_files.extend(
-            fsutil::list_files_with_suffix(&cfg.systemd_unit_dir, ".service")?
-                .into_iter()
-                .filter(|p| {
-                    p.file_name()
-                        .and_then(|n| n.to_str())
-                        .is_some_and(|n| n.starts_with("oxpanel-php-"))
-                }),
-        );
-        for path in pool_files {
-            if !known_pool_files.contains(&path) {
-                out.push(Drift::new(
-                    DriftKind::OrphanPhpPool,
-                    path.to_string_lossy(),
-                    "no PHP-enabled virtual host accounts for this file",
-                ));
-            }
-        }
+        check_php_pools(cfg, &tenants, &vhosts, &mut out)?;
+        check_apps(cfg, self.ctx.selinux, &by_name, &vhosts, &mut out)?;
         Ok(out)
     }
 
@@ -277,6 +252,99 @@ fn check_vhost(
             format!("{} {problem}", v.config_path.display()),
         ));
     }
+    Ok(())
+}
+
+/// PHP-FPM pools: one per ready tenant with a PHP-enabled virtual host.
+fn check_php_pools(
+    cfg: &Config,
+    tenants: &[TenantRecord],
+    vhosts: &[VHostRecord],
+    out: &mut Vec<Drift>,
+) -> Result<()> {
+    let mut known_pool_files: BTreeSet<PathBuf> = BTreeSet::new();
+    for t in tenants.iter().filter(|t| {
+        t.state == TenantState::Ready && vhosts.iter().any(|v| v.php && v.tenant == t.username)
+    }) {
+        let name = Username::parse(&t.username)?;
+        let files = PoolFiles::for_tenant(&cfg.php_conf_dir, &cfg.systemd_unit_dir, &name);
+        for (path, expected) in [
+            (&files.conf, php::render_pool_conf(t, &name, &cfg.web_user)?),
+            (&files.unit, php::render_unit(t, &name, &files.conf)?),
+        ] {
+            if let Some(problem) = compare_file(path, &expected)? {
+                out.push(Drift::new(
+                    DriftKind::PhpPoolDrift,
+                    t.username.as_str(),
+                    format!("{} {problem}", path.display()),
+                ));
+            }
+        }
+        known_pool_files.insert(files.conf);
+        known_pool_files.insert(files.unit);
+    }
+
+    let mut pool_files = fsutil::list_files_with_suffix(&cfg.php_conf_dir, ".conf")?;
+    pool_files.extend(
+        fsutil::list_files_with_suffix(&cfg.systemd_unit_dir, ".service")?
+            .into_iter()
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("oxpanel-php-"))
+            }),
+    );
+    for path in pool_files {
+        if !known_pool_files.contains(&path) {
+            out.push(Drift::new(
+                DriftKind::OrphanPhpPool,
+                path.to_string_lossy(),
+                "no PHP-enabled virtual host accounts for this file",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Applications: one unit per virtual host that runs one.
+fn check_apps(
+    cfg: &Config,
+    selinux: bool,
+    by_name: &BTreeMap<&str, &TenantRecord>,
+    vhosts: &[VHostRecord],
+    out: &mut Vec<Drift>,
+) -> Result<()> {
+    let mut known_app_units: BTreeSet<PathBuf> = BTreeSet::new();
+    for v in vhosts.iter().filter(|v| v.app.is_some()) {
+        let (Some(t), Some(a)) = (by_name.get(v.tenant.as_str()), v.app.as_ref()) else {
+            continue; // already reported as a virtual host without a tenant
+        };
+        let domain = Domain::parse(&v.domain)?;
+        let path = app::unit_path(&cfg.systemd_unit_dir, &domain);
+        let expected = app::render_unit(t, &domain, a, &cfg.web_user, selinux)?;
+        if let Some(problem) = compare_file(&path, &expected)? {
+            out.push(Drift::new(
+                DriftKind::AppUnitDrift,
+                v.domain.as_str(),
+                format!("{} {problem}", path.display()),
+            ));
+        }
+        known_app_units.insert(path);
+    }
+    for path in fsutil::list_files_with_suffix(&cfg.systemd_unit_dir, ".service")? {
+        let ours = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.starts_with("oxpanel-app-"));
+        if ours && !known_app_units.contains(&path) {
+            out.push(Drift::new(
+                DriftKind::OrphanAppUnit,
+                path.to_string_lossy(),
+                "no virtual host accounts for this unit",
+            ));
+        }
+    }
+
     Ok(())
 }
 
@@ -468,6 +536,7 @@ mod tests {
             config_path: cfg.nginx_conf_dir.join("lost.example.conf"),
             created_at_unix: 0,
             php: false,
+            app: None,
         };
         h.ctx.store.save_vhost(&orphan_site)?;
 
@@ -520,7 +589,7 @@ mod tests {
             vec![],
             "a healthy pool is not drift"
         );
-        assert!(h.host.info().await?.php_available);
+        assert!(h.host.info().await?.runtimes.php);
 
         let conf = cfg.php_conf_dir.join("alice.conf");
         std::fs::write(&conf, "[alice]\nuser = root\n")
@@ -562,7 +631,57 @@ mod tests {
             "only the orphans remain"
         );
         h.sys.set_missing(bin::PHP_FPM);
-        assert!(!h.host.info().await?.php_available);
+        assert!(!h.host.info().await?.runtimes.php);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reports_app_unit_drift_and_orphans() -> Result<()> {
+        use crate::records::AppRuntime;
+        use crate::vhost::AppRequest;
+        let h = harness().await;
+        let cfg = &h.ctx.config;
+        let request = || VHostRequest {
+            domain: "example.com".into(),
+            tenant: "alice".into(),
+            app: Some(AppRequest {
+                runtime: AppRuntime::Node,
+                root: String::new(),
+                entry: String::new(),
+            }),
+            ..VHostRequest::default()
+        };
+        h.vhosts.configure(request()).await?;
+        assert_eq!(
+            h.host.reconcile().await?,
+            vec![],
+            "a healthy application is not drift"
+        );
+        let info = h.host.info().await?;
+        assert!(info.runtimes.node && info.runtimes.python);
+
+        let unit = cfg.systemd_unit_dir.join("oxpanel-app-example.com.service");
+        let mut edited = std::fs::read_to_string(&unit).map_err(|e| Error::io("read", &unit, e))?;
+        edited = edited.replace("User=alice", "User=root");
+        std::fs::write(&unit, edited).map_err(|e| Error::io("write", &unit, e))?;
+        let stray = cfg
+            .systemd_unit_dir
+            .join("oxpanel-app-ghost.example.service");
+        std::fs::write(&stray, "x").map_err(|e| Error::io("write", &stray, e))?;
+        let stray = stray.to_string_lossy().into_owned();
+        assert_eq!(
+            kinds(&h.host.reconcile().await?),
+            vec![
+                (DriftKind::AppUnitDrift, "example.com"),
+                (DriftKind::OrphanAppUnit, stray.as_str()),
+            ]
+        );
+        h.vhosts.configure(request()).await?;
+        assert_eq!(
+            kinds(&h.host.reconcile().await?),
+            vec![(DriftKind::OrphanAppUnit, stray.as_str())],
+            "repeating the request rewrites the unit"
+        );
         Ok(())
     }
 }

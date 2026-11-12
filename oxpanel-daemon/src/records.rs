@@ -64,6 +64,43 @@ pub struct VHostRecord {
     /// written before PHP support existed.
     #[serde(default)]
     pub php: bool,
+    /// The application behind this virtual host, if any.
+    #[serde(default)]
+    pub app: Option<AppRecord>,
+}
+
+/// Which interpreter runs an application.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AppRuntime {
+    Node,
+    Python,
+}
+
+impl AppRuntime {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Node => "node",
+            Self::Python => "python",
+        }
+    }
+
+    /// Entry point used when the request names none.
+    pub fn default_entry(self) -> &'static str {
+        match self {
+            Self::Node => "app.js",
+            Self::Python => "app.py",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AppRecord {
+    pub runtime: AppRuntime,
+    /// Application directory relative to the tenant home.
+    pub root: String,
+    /// Program to run, relative to `root`.
+    pub entry: String,
 }
 
 impl VHostRecord {
@@ -133,6 +170,10 @@ impl Store {
     pub fn save_vhost(&self, rec: &VHostRecord) -> Result<()> {
         let domain = Domain::parse(&rec.domain)?;
         RelPath::parse(&rec.document_root)?;
+        if let Some(app) = &rec.app {
+            RelPath::parse_field(&app.root, "app.root")?;
+            RelPath::parse_field(&app.entry, "app.entry")?;
+        }
         save(&self.vhost_path(&domain), rec)
     }
 
@@ -289,6 +330,7 @@ mod tests {
             config_path: PathBuf::from("/x"),
             created_at_unix: 0,
             php: false,
+            app: None,
         };
         assert!(s.save_vhost(&v).is_err());
     }

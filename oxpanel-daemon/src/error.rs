@@ -59,6 +59,18 @@ pub enum Error {
     #[error("PHP is not installed on this host (install php-fpm)")]
     PhpUnavailable,
 
+    /// A virtual host asked for an application runtime that is not installed.
+    #[error("{0} is not installed on this host")]
+    RuntimeUnavailable(&'static str),
+
+    /// SELinux is enforcing but OxPanel's policy module is not loaded.
+    #[error("the OxPanel SELinux module is not installed; run: semodule -i /usr/share/oxpanel/selinux/oxpanel.cil")]
+    AppPolicyMissing,
+
+    /// The operation needs an application and the virtual host runs none.
+    #[error("virtual host '{0}' does not run an application")]
+    NoApp(String),
+
     #[error("{program} exited with {status}")]
     CommandFailed {
         program: String,
@@ -128,6 +140,9 @@ impl Error {
                 | Self::VHostOwnedByOther { .. }
                 | Self::NginxInvalid(_)
                 | Self::PhpUnavailable
+                | Self::RuntimeUnavailable(_)
+                | Self::NoApp(_)
+                | Self::AppPolicyMissing
                 | Self::Unauthorised
         )
     }
@@ -150,6 +165,9 @@ impl From<Error> for Status {
             | Error::TenantHasVHosts(_)
             | Error::VHostOwnedByOther { .. }
             | Error::PhpUnavailable
+            | Error::RuntimeUnavailable(_)
+            | Error::NoApp(_)
+            | Error::AppPolicyMissing
             | Error::NginxInvalid(_) => Status::failed_precondition(message),
             Error::UidExhausted { .. } => Status::resource_exhausted(message),
             Error::Unauthorised => Status::permission_denied(message),

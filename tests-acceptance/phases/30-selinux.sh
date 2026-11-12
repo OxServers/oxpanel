@@ -16,6 +16,8 @@ check "fcontext equivalence recorded" bash -c "semanage fcontext -l -C | grep -q
 for b in httpd_enable_homedirs httpd_read_user_content httpd_unified; do
   check "boolean $b is on" bash -c "getsebool $b | tee /dev/stderr | grep -q -- '--> on'"
 done
+check "OxPanel policy module is loaded" bash -c "semodule --list-modules | grep -qx oxpanel"
+check "application runtime directories are labelled for the web server" bash -c "matchpathcon /run/oxpanel-app/x.test/app.sock | grep -q httpd_var_run_t"
 check "matchpathcon agrees" bash -c "matchpathcon /home/selx/public_html | grep -q httpd_sys_content_t"
 info "labels: $(ls -dZ /home/selx /home/selx/public_html | awk '{print $1}' | tr '\n' ' ')"
 check "docroot labelled httpd_sys_content_t" bash -c "ls -dZ /home/selx/public_html | grep -q ':httpd_sys_content_t:'"

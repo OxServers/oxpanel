@@ -14,10 +14,10 @@ use crate::auth::{PeerInfo, Scope, ScopePolicy};
 use crate::ctx::Ctx;
 use crate::error::Error;
 use crate::host::{Drift, DriftKind, HostService};
-use crate::records::{TenantRecord, TenantState, VHostRecord};
+use crate::records::{AppRuntime, TenantRecord, TenantState, VHostRecord};
 use crate::tenant::TenantService;
 use crate::validate::Limits;
-use crate::vhost::{LogKind, VHostRequest, VHostService};
+use crate::vhost::{AppRequest, LogKind, VHostRequest, VHostService};
 use oxpanel_proto::v1 as pb;
 use oxpanel_proto::v1::ox_panel_engine_server::{OxPanelEngine, OxPanelEngineServer};
 
@@ -107,6 +107,8 @@ fn drift_to(d: &Drift) -> pb::Drift {
         DriftKind::OrphanSliceUnit => pb::DriftKind::OrphanSliceUnit,
         DriftKind::PhpPoolDrift => pb::DriftKind::PhpPoolDrift,
         DriftKind::OrphanPhpPool => pb::DriftKind::OrphanPhpPool,
+        DriftKind::AppUnitDrift => pb::DriftKind::AppUnitDrift,
+        DriftKind::OrphanAppUnit => pb::DriftKind::OrphanAppUnit,
     };
     pb::Drift {
         kind: kind.into(),
@@ -136,6 +138,9 @@ fn fail(rpc: &'static str, peer: &str, err: Error) -> Status {
         | Error::VHostOwnedByOther { .. }
         | Error::UidExhausted { .. }
         | Error::PhpUnavailable
+        | Error::RuntimeUnavailable(_)
+        | Error::NoApp(_)
+        | Error::AppPolicyMissing
         | Error::NginxInvalid(_) => {
             warn!(rpc, peer, error = %err, "request refused");
             err.into()
@@ -190,6 +195,15 @@ fn vhost_to(rec: &VHostRecord) -> pb::VirtualHost {
         aliases: rec.aliases.clone(),
         config_path: rec.config_path.to_string_lossy().into_owned(),
         php: rec.php,
+        app: rec.app.as_ref().map(|a| pb::App {
+            runtime: match a.runtime {
+                AppRuntime::Node => pb::AppRuntime::Node,
+                AppRuntime::Python => pb::AppRuntime::Python,
+            }
+            .into(),
+            root: a.root.clone(),
+            entry: a.entry.clone(),
+        }),
     }
 }
 
@@ -266,6 +280,24 @@ impl OxPanelEngine for Engine {
         let peer = self.authorise(&req, "ConfigureVirtualHost", Scope::VHost)?;
         let r = req.into_inner();
         info!(rpc = "ConfigureVirtualHost", peer, domain = %r.domain, tenant = %r.tenant, "request");
+        let app = match r.app {
+            None => None,
+            Some(a) => Some(AppRequest {
+                runtime: match pb::AppRuntime::try_from(a.runtime) {
+                    Ok(pb::AppRuntime::Node) => AppRuntime::Node,
+                    Ok(pb::AppRuntime::Python) => AppRuntime::Python,
+                    _ => {
+                        return Err(fail(
+                            "ConfigureVirtualHost",
+                            &peer,
+                            Error::invalid("app.runtime", "must be NODE or PYTHON"),
+                        ))
+                    }
+                },
+                root: a.root,
+                entry: a.entry,
+            }),
+        };
         let (rec, created) = self
             .vhosts
             .configure(VHostRequest {
@@ -274,6 +306,7 @@ impl OxPanelEngine for Engine {
                 document_root: r.document_root,
                 aliases: r.aliases,
                 php: r.php,
+                app,
             })
             .await
             .map_err(|e| fail("ConfigureVirtualHost", &peer, e))?;
@@ -314,6 +347,40 @@ impl OxPanelEngine for Engine {
         }))
     }
 
+    async fn restart_app(
+        &self,
+        req: Request<pb::RestartAppRequest>,
+    ) -> Result<Response<pb::RestartAppResponse>, Status> {
+        const RPC: &str = "RestartApp";
+        let peer = self.authorise(&req, RPC, Scope::VHost)?;
+        let r = req.into_inner();
+        info!(rpc = RPC, peer, domain = %r.domain, "request");
+        self.vhosts
+            .restart_app(&r.domain)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(pb::RestartAppResponse {}))
+    }
+
+    async fn install_app_dependencies(
+        &self,
+        req: Request<pb::InstallAppDependenciesRequest>,
+    ) -> Result<Response<pb::InstallAppDependenciesResponse>, Status> {
+        const RPC: &str = "InstallAppDependencies";
+        let peer = self.authorise(&req, RPC, Scope::VHost)?;
+        let r = req.into_inner();
+        info!(rpc = RPC, peer, domain = %r.domain, "request");
+        let (succeeded, output) = self
+            .vhosts
+            .install_app_dependencies(&r.domain)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(pb::InstallAppDependenciesResponse {
+            succeeded,
+            output,
+        }))
+    }
+
     async fn read_virtual_host_log(
         &self,
         req: Request<pb::ReadVirtualHostLogRequest>,
@@ -323,6 +390,7 @@ impl OxPanelEngine for Engine {
         let r = req.into_inner();
         let kind = match pb::LogKind::try_from(r.kind) {
             Ok(pb::LogKind::Error) => LogKind::Error,
+            Ok(pb::LogKind::App) => LogKind::App,
             Ok(pb::LogKind::Access | pb::LogKind::Unspecified) => LogKind::Access,
             Err(_) => return Err(fail(RPC, &peer, Error::invalid("kind", "unknown log kind"))),
         };
@@ -447,7 +515,9 @@ impl OxPanelEngine for Engine {
             home_disk_total_bytes: i.stats.disk_total_bytes,
             home_disk_free_bytes: i.stats.disk_free_bytes,
             uptime_seconds: i.stats.uptime_secs,
-            php_available: i.php_available,
+            php_available: i.runtimes.php,
+            node_available: i.runtimes.node,
+            python_available: i.runtimes.python,
         }))
     }
 

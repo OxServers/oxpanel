@@ -201,6 +201,7 @@ async fn full_tenant_and_vhost_lifecycle_over_uds() {
             document_root: String::new(),
             aliases: vec!["www.example.com".into()],
             php: false,
+            app: None,
         })
         .await
         .expect("vhost")
@@ -317,6 +318,7 @@ async fn validation_errors_surface_as_invalid_argument_with_message() {
             document_root: String::new(),
             aliases: vec![],
             php: false,
+            app: None,
         })
         .await
         .expect_err("bad domain");
@@ -385,6 +387,7 @@ async fn management_rpcs_over_uds() {
             document_root: String::new(),
             aliases: vec![],
             php: false,
+            app: None,
         })
         .await
         .expect("vhost");
@@ -596,6 +599,7 @@ async fn a_scoped_peer_can_only_call_its_scopes() {
             document_root: String::new(),
             aliases: vec![],
             php: false,
+            app: None,
         })
         .await
         .expect_err("no tenant");

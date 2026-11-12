@@ -27,13 +27,16 @@ use std::path::{Path, PathBuf};
 
 use tracing::{info, warn};
 
+use crate::app;
 use crate::config::Config;
 use crate::ctx::Ctx;
 use crate::error::{Error, Result};
 use crate::fsutil;
 use crate::nginx;
 use crate::php;
-use crate::records::{now_unix, TenantRecord, TenantState, VHostRecord, RECORD_VERSION};
+use crate::records::{
+    now_unix, AppRecord, AppRuntime, TenantRecord, TenantState, VHostRecord, RECORD_VERSION,
+};
 use crate::system::{bin, CommandSpec};
 use crate::validate::{Domain, RelPath, Username};
 
@@ -50,6 +53,15 @@ pub struct VHostRequest {
     pub document_root: String,
     pub aliases: Vec<String>,
     pub php: bool,
+    pub app: Option<AppRequest>,
+}
+
+/// An application as requested on the wire; empty strings mean "default".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AppRequest {
+    pub runtime: AppRuntime,
+    pub root: String,
+    pub entry: String,
 }
 
 /// Which of a virtual host's two logs to read.
@@ -57,6 +69,8 @@ pub struct VHostRequest {
 pub enum LogKind {
     Access,
     Error,
+    /// Output of the virtual host's application.
+    App,
 }
 
 /// Default and upper bound for [`VHostService::read_log`].
@@ -92,21 +106,8 @@ impl VHostService {
         } else {
             RelPath::parse(&req.document_root)?
         };
-        if req.aliases.len() > MAX_ALIASES {
-            return Err(Error::invalid(
-                "aliases",
-                format!("at most {MAX_ALIASES} aliases"),
-            ));
-        }
-        let mut aliases: BTreeSet<Domain> = BTreeSet::new();
-        for a in &req.aliases {
-            let a = Domain::parse_field(a, "aliases")?;
-            if a == domain {
-                return Err(Error::invalid("aliases", "alias must differ from domain"));
-            }
-            aliases.insert(a);
-        }
-        let aliases: Vec<Domain> = aliases.into_iter().collect();
+        let aliases = parse_aliases(&req.aliases, &domain)?;
+        let app_rec = parse_app(req.app.as_ref(), req.php, &domain, &docroot)?;
 
         let _guard = self.ctx.lock.lock().await;
         let cfg = &self.ctx.config;
@@ -162,10 +163,13 @@ impl VHostService {
                 .as_ref()
                 .map_or_else(now_unix, |e| e.created_at_unix),
             php: req.php,
+            app: app_rec,
         };
         // The pool must be listening before Nginx is told to use it.
         let pool_changed = if rec.php {
             php::ensure_pool(&self.ctx, &tenant_rec).await?
+        } else if rec.app.is_some() {
+            app::ensure_app(&self.ctx, &tenant_rec, &rec).await?
         } else {
             false
         };
@@ -183,9 +187,16 @@ impl VHostService {
         } else {
             false
         };
-        let changed = changed || record_changed || pool_removed;
+        // The application was switched off here: stop it and drop its unit.
+        let app_removed = if rec.app.is_none() && existing.as_ref().is_some_and(|e| e.app.is_some())
+        {
+            app::remove_app(&self.ctx, &domain).await?
+        } else {
+            false
+        };
+        let changed = changed || record_changed || pool_removed || app_removed;
         if changed {
-            info!(%domain, %tenant, root = %abs_root.display(), php = rec.php, "virtual host configured");
+            info!(%domain, %tenant, root = %abs_root.display(), php = rec.php, app = rec.app.as_ref().map_or("-", |a| a.runtime.as_str()), "virtual host configured");
         }
         Ok((rec, changed))
     }
@@ -326,8 +337,51 @@ impl VHostService {
                 self.remove_pool_if_unused(&t).await?;
             }
         }
+        // Whatever the record says: a unit for this name must not outlive the site.
+        app::remove_app(&self.ctx, &domain).await?;
         info!(%domain, tenant = %rec.tenant, "virtual host removed");
         Ok(true)
+    }
+
+    /// The virtual host and its (ready) tenant, for the application RPCs.
+    fn load_app_vhost(&self, domain: &Domain) -> Result<(TenantRecord, VHostRecord)> {
+        let rec = self
+            .ctx
+            .store
+            .load_vhost(domain)?
+            .ok_or_else(|| Error::VHostNotFound(domain.to_string()))?;
+        if rec.app.is_none() {
+            return Err(Error::NoApp(domain.to_string()));
+        }
+        let name = Username::parse_field(&rec.tenant, "tenant")?;
+        let tenant = self
+            .ctx
+            .store
+            .load_tenant(&name)?
+            .ok_or_else(|| Error::TenantNotFound(name.to_string()))?;
+        if tenant.state != TenantState::Ready || tenant.suspended {
+            return Err(Error::TenantNotReady(name.to_string()));
+        }
+        Ok((tenant, rec))
+    }
+
+    /// Restart the virtual host's application.
+    pub async fn restart_app(&self, domain: &str) -> Result<()> {
+        let domain = Domain::parse(domain)?;
+        let _guard = self.ctx.lock.lock().await;
+        let (_, rec) = self.load_app_vhost(&domain)?;
+        app::restart(&self.ctx, &rec).await
+    }
+
+    /// Install the application's dependencies as the tenant. Returns whether
+    /// the installer succeeded and the end of its output.
+    ///
+    /// Deliberately *not* under the mutation lock: an installation may take
+    /// minutes and touches only the tenant's own files.
+    pub async fn install_app_dependencies(&self, domain: &str) -> Result<(bool, String)> {
+        let domain = Domain::parse(domain)?;
+        let (tenant, rec) = self.load_app_vhost(&domain)?;
+        app::install_dependencies(&self.ctx, &tenant, &rec).await
     }
 
     /// Remove the tenant's PHP-FPM pool once none of its virtual hosts uses PHP.
@@ -354,13 +408,14 @@ impl VHostService {
         max_bytes: u64,
     ) -> Result<(String, bool)> {
         let domain = Domain::parse(domain)?;
-        if self.ctx.store.load_vhost(&domain)?.is_none() {
+        let Some(rec) = self.ctx.store.load_vhost(&domain)? else {
             return Err(Error::VHostNotFound(domain.to_string()));
-        }
+        };
         let (access_log, error_log) = log_paths(&self.ctx.config, &domain);
         let path = match kind {
             LogKind::Access => access_log,
             LogKind::Error => error_log,
+            LogKind::App => return Ok((app::read_log(&self.ctx, &rec).await?, false)),
         };
         let limit = match max_bytes {
             0 => LOG_DEFAULT_BYTES,
@@ -435,6 +490,64 @@ impl VHostService {
     }
 }
 
+/// Validate, de-duplicate and sort the aliases of `domain`.
+fn parse_aliases(raw: &[String], domain: &Domain) -> Result<Vec<Domain>> {
+    if raw.len() > MAX_ALIASES {
+        return Err(Error::invalid(
+            "aliases",
+            format!("at most {MAX_ALIASES} aliases"),
+        ));
+    }
+    let mut aliases: BTreeSet<Domain> = BTreeSet::new();
+    for a in raw {
+        let a = Domain::parse_field(a, "aliases")?;
+        if &a == domain {
+            return Err(Error::invalid("aliases", "alias must differ from domain"));
+        }
+        aliases.insert(a);
+    }
+    Ok(aliases.into_iter().collect())
+}
+
+/// Validate an application request and fill in its defaults.
+fn parse_app(
+    req: Option<&AppRequest>,
+    php: bool,
+    domain: &Domain,
+    docroot: &RelPath,
+) -> Result<Option<AppRecord>> {
+    let Some(a) = req else {
+        return Ok(None);
+    };
+    if php {
+        return Err(Error::invalid("app", "cannot be combined with php"));
+    }
+    let root = if a.root.is_empty() {
+        RelPath::parse_field(&format!("apps/{domain}"), "app.root")?
+    } else {
+        RelPath::parse_field(&a.root, "app.root")?
+    };
+    let entry = if a.entry.is_empty() {
+        RelPath::parse_field(a.runtime.default_entry(), "app.entry")?
+    } else {
+        RelPath::parse_field(&a.entry, "app.entry")?
+    };
+    // Source code must never sit where Nginx serves files from. (A document
+    // root *inside* the application directory, such as apps/shop/public, is
+    // the normal layout and fine.)
+    if Path::new(root.as_str()).starts_with(docroot.as_str()) {
+        return Err(Error::invalid(
+            "app.root",
+            "must not be the document root or inside it",
+        ));
+    }
+    Ok(Some(AppRecord {
+        runtime: a.runtime,
+        root: root.to_string(),
+        entry: entry.to_string(),
+    }))
+}
+
 /// The server block a virtual-host record renders to for its tenant — the
 /// single definition of "what should be on disk", shared by suspension and
 /// reconciliation.
@@ -453,6 +566,7 @@ pub(crate) fn render_vhost(
         .collect::<Result<Vec<Domain>>>()?;
     let (access_log, error_log) = log_paths(cfg, &domain);
     let socket = vhost.php.then(|| php::socket_path(&name));
+    let app_socket = vhost.app.as_ref().map(|_| app::socket_path(&domain));
     nginx::render_server_block(&nginx::ServerBlock {
         domain: &domain,
         aliases: &aliases,
@@ -462,6 +576,7 @@ pub(crate) fn render_vhost(
         access_log: &access_log,
         error_log: &error_log,
         php_socket: socket.as_deref(),
+        app_socket: app_socket.as_deref(),
     })
 }
 
@@ -1318,6 +1433,482 @@ mod tests {
             "second run is a no-op"
         );
         assert_eq!(h.sys.calls_to(bin::NGINX).len(), 1);
+        Ok(())
+    }
+
+    fn app_req(domain: &str, tenant: &str, runtime: AppRuntime) -> VHostRequest {
+        VHostRequest {
+            app: Some(AppRequest {
+                runtime,
+                root: String::new(),
+                entry: String::new(),
+            }),
+            ..req(domain, tenant)
+        }
+    }
+
+    fn app_unit(h: &Harness, domain: &str) -> PathBuf {
+        h.config
+            .systemd_unit_dir
+            .join(format!("oxpanel-app-{domain}.service"))
+    }
+
+    #[tokio::test]
+    async fn node_app_is_created_as_the_tenant_and_started_before_nginx_uses_it() -> Result<()> {
+        let h = harness(false).await;
+        let (rec, changed) = h
+            .vhosts
+            .configure(app_req("example.com", "alice", AppRuntime::Node))
+            .await?;
+        assert!(changed);
+        assert_eq!(
+            rec.app,
+            Some(AppRecord {
+                runtime: AppRuntime::Node,
+                root: "apps/example.com".into(),
+                entry: "app.js".into()
+            })
+        );
+        let home = h.config.home_base.join("alice");
+        let root = home.join("apps/example.com");
+        assert!(root.is_dir());
+        // Both directories were created as the tenant; only the document
+        // root is opened to the web server.
+        let mk = h.sys.calls_to(bin::MKDIR);
+        assert_eq!(mk.len(), 2);
+        assert!(mk
+            .iter()
+            .all(|c| c.run_as.map(|r| (r.uid, r.gid)) == Some((20000, 20000))));
+        let root_s = root.to_string_lossy().into_owned();
+        assert!(
+            h.sys
+                .calls_to(bin::SETFACL)
+                .iter()
+                .all(|c| !args(c).contains(&root_s)),
+            "the application directory gets no web-server ACL"
+        );
+        assert!(h.sys.calls_to(bin::PYTHON3).is_empty());
+        assert_eq!(
+            systemctl_calls(&h),
+            vec![
+                vec!["daemon-reload".to_owned()],
+                vec![
+                    "enable".into(),
+                    "--".into(),
+                    "oxpanel-app-example.com.service".into()
+                ],
+                vec![
+                    "restart".into(),
+                    "--".into(),
+                    "oxpanel-app-example.com.service".into()
+                ],
+                vec!["reload-or-restart".into(), "nginx.service".into()],
+            ]
+        );
+        let unit = std::fs::read_to_string(app_unit(&h, "example.com"))
+            .map_err(|e| Error::io("read", "unit", e))?;
+        assert!(unit.contains(&format!("ExecStart=/usr/bin/node {root_s}/app.js\n")));
+        let site = std::fs::read_to_string(&rec.config_path)
+            .map_err(|e| Error::io("read", &rec.config_path, e))?;
+        assert!(site.contains("proxy_pass http://unix:/run/oxpanel-app/example.com/app.sock:;"));
+
+        // Replay changes nothing.
+        h.sys.clear_calls();
+        let (_, changed) = h
+            .vhosts
+            .configure(app_req("example.com", "alice", AppRuntime::Node))
+            .await?;
+        assert!(!changed);
+        assert_eq!(
+            systemctl_calls(&h),
+            vec![vec![
+                "enable".to_owned(),
+                "--now".into(),
+                "--".into(),
+                "oxpanel-app-example.com.service".into()
+            ]]
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn python_app_gets_its_own_virtualenv_created_as_the_tenant() -> Result<()> {
+        let h = harness(false).await;
+        let (rec, _) = h
+            .vhosts
+            .configure(VHostRequest {
+                app: Some(AppRequest {
+                    runtime: AppRuntime::Python,
+                    root: "apps/api".into(),
+                    entry: "src/main.py".into(),
+                }),
+                ..req("example.com", "alice")
+            })
+            .await?;
+        let root = h.config.home_base.join("alice/apps/api");
+        let venv = h.sys.calls_to(bin::PYTHON3);
+        assert_eq!(venv.len(), 1);
+        assert_eq!(
+            venv.first().map(args),
+            Some(vec![
+                "-m".to_owned(),
+                "venv".into(),
+                "--".into(),
+                root.join(".venv").to_string_lossy().into_owned()
+            ])
+        );
+        assert_eq!(
+            venv.first().and_then(|c| c.run_as).map(|r| (r.uid, r.gid)),
+            Some((20000, 20000)),
+            "the virtualenv is created by the tenant, never by root"
+        );
+        let unit = std::fs::read_to_string(app_unit(&h, "example.com"))
+            .map_err(|e| Error::io("read", "unit", e))?;
+        assert!(unit.contains(&format!(
+            "ExecStart=/usr/bin/env {0}/.venv/bin/python {0}/src/main.py\n",
+            root.display()
+        )));
+        assert_eq!(rec.app.map(|a| a.entry).as_deref(), Some("src/main.py"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn app_requests_are_validated_before_anything_happens() -> Result<()> {
+        let h = harness(false).await;
+        let with = |root: &str, entry: &str| VHostRequest {
+            app: Some(AppRequest {
+                runtime: AppRuntime::Node,
+                root: root.into(),
+                entry: entry.into(),
+            }),
+            ..req("example.com", "alice")
+        };
+        for bad in [
+            with("../other", ""),
+            with("/etc", ""),
+            with("apps/x", "../../../etc/passwd"),
+            with("apps/x", "app.js --inspect"),
+            with("apps/x; rm -rf /", ""),
+            // Source code where Nginx serves files from.
+            with("public_html", ""),
+            with("public_html/app", ""),
+        ] {
+            assert!(
+                matches!(
+                    h.vhosts.configure(bad.clone()).await,
+                    Err(Error::InvalidInput { .. })
+                ),
+                "{bad:?}"
+            );
+        }
+        assert!(matches!(
+            h.vhosts
+                .configure(VHostRequest {
+                    php: true,
+                    ..app_req("example.com", "alice", AppRuntime::Node)
+                })
+                .await,
+            Err(Error::InvalidInput { .. })
+        ));
+        assert!(h.sys.calls().is_empty(), "nothing reached the OS");
+        // The document root may live inside the application directory.
+        h.vhosts
+            .configure(VHostRequest {
+                document_root: "apps/shop/public".into(),
+                ..with("apps/shop", "")
+            })
+            .await?;
+        // A missing runtime is refused cleanly.
+        h.sys.set_missing(bin::NODE);
+        assert!(matches!(
+            h.vhosts
+                .configure(app_req("example.net", "alice", AppRuntime::Node))
+                .await,
+            Err(Error::RuntimeUnavailable(_))
+        ));
+        assert!(!app_unit(&h, "example.net").exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn app_lifecycle_follows_the_site_and_the_tenant() -> Result<()> {
+        let h = harness(false).await;
+        h.vhosts
+            .configure(app_req("example.com", "alice", AppRuntime::Node))
+            .await?;
+        h.vhosts
+            .configure(app_req("example.net", "alice", AppRuntime::Python))
+            .await?;
+        let stop = |d: &str| {
+            vec![
+                "disable".to_owned(),
+                "--now".into(),
+                "--".into(),
+                format!("oxpanel-app-{d}.service"),
+            ]
+        };
+        let start = |d: &str| {
+            vec![
+                "enable".to_owned(),
+                "--now".into(),
+                "--".into(),
+                format!("oxpanel-app-{d}.service"),
+            ]
+        };
+
+        // Suspend: sites go 503 first, then both applications stop.
+        h.sys.clear_calls();
+        h.tenants.set_suspended("alice", true).await?;
+        assert_eq!(
+            systemctl_calls(&h),
+            vec![
+                vec!["reload-or-restart".to_owned(), "nginx.service".into()],
+                stop("example.com"),
+                stop("example.net"),
+            ]
+        );
+        // The application RPCs are refused while suspended.
+        assert!(matches!(
+            h.vhosts.restart_app("example.com").await,
+            Err(Error::TenantNotReady(_))
+        ));
+        assert!(matches!(
+            h.vhosts.install_app_dependencies("example.com").await,
+            Err(Error::TenantNotReady(_))
+        ));
+        // Resume: applications start before the sites return.
+        h.sys.clear_calls();
+        h.tenants.set_suspended("alice", false).await?;
+        assert_eq!(
+            systemctl_calls(&h),
+            vec![
+                start("example.com"),
+                start("example.net"),
+                vec!["reload-or-restart".into(), "nginx.service".into()],
+            ]
+        );
+
+        // Switching the application off removes its unit; the code stays.
+        h.sys.clear_calls();
+        let (rec, changed) = h.vhosts.configure(req("example.com", "alice")).await?;
+        assert!(changed && rec.app.is_none());
+        assert!(!app_unit(&h, "example.com").exists());
+        assert!(systemctl_calls(&h).contains(&stop("example.com")));
+        assert!(h.config.home_base.join("alice/apps/example.com").is_dir());
+        // Removing the site removes its unit too.
+        assert!(h.vhosts.remove("example.net").await?);
+        assert!(!app_unit(&h, "example.net").exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restart_and_dependency_installation_run_exact_commands() -> Result<()> {
+        let h = harness(false).await;
+        h.vhosts
+            .configure(app_req("my-app.example.com", "alice", AppRuntime::Node))
+            .await?;
+        h.vhosts.configure(req("static.example", "alice")).await?;
+        h.sys.clear_calls();
+
+        h.vhosts.restart_app("my-app.example.com").await?;
+        let unit = "oxpanel-app-my\\x2dapp.example.com.service";
+        assert_eq!(
+            systemctl_calls(&h),
+            vec![
+                vec!["reset-failed".to_owned(), "--".into(), unit.into()],
+                vec!["restart".into(), "--".into(), unit.into()],
+            ]
+        );
+        for rpc_on_static in [
+            h.vhosts.restart_app("static.example").await.err(),
+            h.vhosts
+                .install_app_dependencies("static.example")
+                .await
+                .err(),
+        ] {
+            assert!(matches!(rpc_on_static, Some(Error::NoApp(_))));
+        }
+        assert!(matches!(
+            h.vhosts.restart_app("nosuch.example").await,
+            Err(Error::VHostNotFound(_))
+        ));
+
+        h.sys.clear_calls();
+        let (ok, _) = h
+            .vhosts
+            .install_app_dependencies("my-app.example.com")
+            .await?;
+        assert!(ok);
+        let run = h.sys.calls_to(bin::SYSTEMD_RUN);
+        assert_eq!(run.len(), 1);
+        let argv = run.first().map(args).unwrap_or_default();
+        let home = h.config.home_base.join("alice");
+        let expect_props = [
+            "User=alice".to_owned(),
+            "Group=alice".into(),
+            "Slice=oxpanel-tenant-alice.slice".into(),
+            format!(
+                "WorkingDirectory={}/apps/my-app.example.com",
+                home.display()
+            ),
+            format!("ReadWritePaths={}", home.display()),
+            "NoNewPrivileges=yes".into(),
+            "CapabilityBoundingSet=".into(),
+            "ProtectSystem=strict".into(),
+        ];
+        for p in &expect_props {
+            assert!(
+                argv.windows(2)
+                    .any(|w| w == ["--property".to_owned(), p.clone()]),
+                "missing property {p}: {argv:?}"
+            );
+        }
+        assert!(argv.contains(&"--unit=oxpanel-appdeps-my\\x2dapp.example.com".to_owned()));
+        assert!(
+            !argv.contains(&"--pipe".to_owned()),
+            "output is read from the journal; SELinux forbids systemd writing to our pipes"
+        );
+        let journal = h.sys.calls_to(bin::JOURNALCTL);
+        assert_eq!(journal.len(), 1);
+        let jargv = journal.first().map(args).unwrap_or_default();
+        assert!(jargv.ends_with(&[
+            "--unit".to_owned(),
+            "oxpanel-appdeps-my\\x2dapp.example.com.service".to_owned()
+        ]));
+        assert!(
+            jargv.iter().any(|a| a.starts_with('@')),
+            "bounded to this run: {jargv:?}"
+        );
+        let tail: Vec<&str> = argv
+            .iter()
+            .skip_while(|a| a.as_str() != "--")
+            .map(String::as_str)
+            .collect();
+        assert_eq!(
+            tail,
+            [
+                "--",
+                "/usr/bin/npm",
+                "install",
+                "--omit=dev",
+                "--no-audit",
+                "--no-fund"
+            ]
+        );
+        assert!(
+            run.first().is_some_and(|c| c.run_as.is_none()),
+            "systemd-run itself is root; the unit it creates is the tenant"
+        );
+        // A successful installation restarts the application.
+        assert!(systemctl_calls(&h).contains(&vec![
+            "restart".to_owned(),
+            "--".into(),
+            unit.into()
+        ]));
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_failing_installer_is_a_result_and_restarts_nothing() -> Result<()> {
+        let h = harness(false).await;
+        h.vhosts
+            .configure(app_req("my-app.example.com", "alice", AppRuntime::Node))
+            .await?;
+        // A failing installer is a result, and does not restart anything.
+        h.sys.clear_calls();
+        h.sys
+            .script_failure(bin::SYSTEMD_RUN, 1, "npm ERR! code E404");
+        let (ok, output) = h
+            .vhosts
+            .install_app_dependencies("my-app.example.com")
+            .await?;
+        assert!(!ok);
+        assert!(output.contains("E404"));
+        assert!(systemctl_calls(&h).is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn python_dependencies_install_into_the_virtualenv() -> Result<()> {
+        let h = harness(false).await;
+        h.vhosts
+            .configure(app_req("example.com", "alice", AppRuntime::Python))
+            .await?;
+        h.sys.clear_calls();
+        h.vhosts.install_app_dependencies("example.com").await?;
+        let run = h.sys.calls_to(bin::SYSTEMD_RUN);
+        let argv = run.first().map(args).unwrap_or_default();
+        let tail: Vec<String> = argv
+            .iter()
+            .skip_while(|a| a.as_str() != "--")
+            .cloned()
+            .collect();
+        let python = h
+            .config
+            .home_base
+            .join("alice/apps/example.com/.venv/bin/python")
+            .to_string_lossy()
+            .into_owned();
+        assert_eq!(
+            tail,
+            [
+                "--",
+                "/usr/bin/env",
+                python.as_str(),
+                "-m",
+                "pip",
+                "install",
+                "--no-input",
+                "--disable-pip-version-check",
+                "--requirement",
+                "requirements.txt"
+            ]
+        );
+        // The application log comes from the journal of exactly this unit.
+        h.sys.clear_calls();
+        h.vhosts.read_log("example.com", LogKind::App, 0).await?;
+        assert_eq!(
+            h.sys.calls_to(bin::JOURNALCTL).first().map(args),
+            Some(vec![
+                "--no-pager".to_owned(),
+                "--output=short-iso".into(),
+                "--lines".into(),
+                "200".into(),
+                "--unit".into(),
+                "oxpanel-app-example.com.service".into()
+            ])
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn selinux_hosts_run_apps_in_their_own_domain_and_need_the_module() -> Result<()> {
+        let h = harness(true).await;
+        h.vhosts
+            .configure(app_req("example.com", "alice", AppRuntime::Node))
+            .await?;
+        let unit = std::fs::read_to_string(app_unit(&h, "example.com"))
+            .map_err(|e| Error::io("read", "unit", e))?;
+        assert!(unit.contains("SELinuxContext=system_u:system_r:oxpanel_app_t:s0\n"));
+        assert_eq!(
+            h.sys.calls_to(bin::SEMODULE).first().map(args),
+            Some(vec!["--list-modules".to_owned()])
+        );
+        // Without the module nothing is created and the error says what to do.
+        h.sys.set_missing(bin::SEMODULE);
+        let err = h
+            .vhosts
+            .configure(app_req("example.net", "alice", AppRuntime::Node))
+            .await;
+        assert!(matches!(err, Err(Error::AppPolicyMissing)));
+        assert!(!app_unit(&h, "example.net").exists());
+        assert!(h
+            .vhosts
+            .list(None)
+            .await?
+            .iter()
+            .all(|v| v.domain != "example.net"));
         Ok(())
     }
 }

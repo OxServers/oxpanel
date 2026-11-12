@@ -273,6 +273,110 @@ check "PHP back on, then removing the site removes the pool" bash -c 'oxpanel-ct
 check "site logs removed with the site" test ! -e /var/log/nginx/oxpanel/php.test.access.log
 check "no drift after PHP teardown" grep -q '^drifts=0$' <(oxpanel-ctl host reconcile)
 
+echo "== Node.js and Python applications"
+check "host info reports Node.js and Python" grep -q ' node=true python=true ' <(oxpanel-ctl host info)
+out="$(oxpanel-ctl vhost set node.test --tenant bob --app node)"
+echo "$out"
+check "node app vhost changed=true with defaults" bash -c 'grep -q "^changed=true" <<<"$1" && grep -q " app=node:apps/node.test:app.js " <<<"$1"' _ "$out"
+NODEU=oxpanel-app-node.test.service
+check "application directory created for the tenant" test "$(stat -c '%U:%G' /home/bob/apps/node.test)" = "bob:bob"
+check "application directory is not opened to the web server" bash -c '! getfacl -p /home/bob/apps/node.test 2>/dev/null | grep -q "^user:nginx"'
+check "before any code exists the site answers 502" code_eventually node.test / 502
+as_user bob sh -c 'cat > /home/bob/apps/node.test/app.js' <<'JS'
+const http = require('http');
+const fs = require('fs');
+console.log('node-app-started-marker');
+http.createServer((req, res) => {
+  let other = 'blocked';
+  try { fs.readdirSync('/home/alice'); other = 'READABLE'; } catch (e) {}
+  let etc = 'blocked';
+  try { fs.writeFileSync('/etc/oxpanel-app-probe', 'x'); etc = 'WRITABLE'; } catch (e) {}
+  res.setHeader('X-Powered-By', 'leak');
+  res.end(`node uid=${process.getuid()} url=${req.url} host=${req.headers.host} xff=${req.headers['x-forwarded-for'] ? 'set' : 'unset'} other=${other} etc=${etc}`);
+}).listen(process.env.PORT);
+JS
+check "restart-app picks up the new code" grep -q '^restarted=true' <(oxpanel-ctl vhost restart-app node.test)
+check "Node app answers as the tenant, behind the proxy, confined" body_eventually node.test /hello "node uid=$(id -u bob) url=/hello host=node.test xff=set other=blocked etc=blocked"
+check "app unit is active and enabled" bash -c 'systemctl -q is-active "$1" && systemctl -q is-enabled "$1"' _ "$NODEU"
+check "app process runs as the tenant, not root" test "$(ps -o user= -p "$(systemctl show -p MainPID --value "$NODEU")" | tr -d ' ')" = "bob"
+if selinuxenabled 2>/dev/null; then
+  check "SELinux: the app runs in its own domain" grep -q ':oxpanel_app_t:' <(ps -o label= -p "$(systemctl show -p MainPID --value "$NODEU")")
+  check "SELinux: the app socket carries the web-server runtime type" grep -q ':httpd_var_run_t:' <(ls -Z /run/oxpanel-app/node.test/app.sock)
+fi
+check "app lives in the tenant slice" grep -q 'oxpanel-tenant-bob.slice' <(systemctl show -p ControlGroup --value "$NODEU")
+check "app socket exists" test -S /run/oxpanel-app/node.test/app.sock
+check "another tenant cannot enter the socket directory" bash -c '! setpriv --reuid=alice --regid=alice --clear-groups -- ls /run/oxpanel-app/node.test >/dev/null 2>&1'
+check "another tenant cannot connect to the app socket" bash -c 'setpriv --reuid=alice --regid=alice --clear-groups -- curl -s -o /dev/null --unix-socket /run/oxpanel-app/node.test/app.sock http://x/; test $? -eq 7'
+check "the app listens on no TCP port" bash -c '! ss -ltnp 2>/dev/null | grep -q "pid=$(systemctl show -p MainPID --value "$1"),"' _ "$NODEU"
+as_user bob sh -c 'echo static-file > /home/bob/public_html/static.txt'
+check "files in the document root are served by nginx, not the app" body_eventually node.test /static.txt static-file
+check "application source is never served as a file" bash -c '! curl -s -H "Host: node.test" http://127.0.0.1/app.js | grep -q createServer'
+check "the app's X-Powered-By is hidden" bash -c '! curl -s -D- -o /dev/null -H "Host: node.test" http://127.0.0.1/ | grep -qi x-powered-by'
+check "application output is readable through the API" bash -c 'for i in $(seq 1 30); do oxpanel-ctl vhost log node.test --app | grep -q node-app-started-marker && exit 0; sleep 0.2; done; exit 1'
+check_not "app log of a static site is refused" oxpanel-ctl vhost log example.test --app
+check_not "restart-app of a static site is refused" oxpanel-ctl vhost restart-app example.test
+as_user bob sh -c 'echo "{\"name\":\"probe\",\"version\":\"1.0.0\",\"private\":true}" > /home/bob/apps/node.test/package.json'
+out="$(oxpanel-ctl vhost install-deps node.test || true)"
+echo "$out" | tail -3
+check "npm install runs as the tenant and succeeds" grep -q '^succeeded=true' <<<"$out"
+check "files written by npm belong to the tenant" test "$(stat -c '%U' /home/bob/apps/node.test/package-lock.json)" = "bob"
+check "the app is back after the installation" body_eventually node.test /again "node uid=$(id -u bob) url=/again host=node.test xff=set other=blocked etc=blocked"
+as_user bob sh -c 'echo "{ this is not json" > /home/bob/apps/node.test/package.json'
+check "a failing installation is reported with exit status 4" bash -c 'oxpanel-ctl vhost install-deps node.test > /root/deps.out 2>&1; rc=$?; grep -q "^succeeded=false" /root/deps.out && test $rc -eq 4'
+check "vhost replay with an app is idempotent" grep -q '^changed=false' <(oxpanel-ctl vhost set node.test --tenant bob --app node)
+check_not "app and php cannot be combined" oxpanel-ctl vhost set both.test --tenant bob --app node --php
+check_not "app root inside the document root is refused" oxpanel-ctl vhost set bad.test --tenant bob --app node --app-root public_html/app
+check_not "app entry cannot leave the app directory" oxpanel-ctl vhost set bad.test --tenant bob --app node --app-entry ../../../usr/bin/id
+
+out="$(oxpanel-ctl vhost set py.test --tenant bob --app python --app-root apps/py --app-entry main.py)"
+echo "$out"
+check "python app vhost changed=true" bash -c 'grep -q "^changed=true" <<<"$1" && grep -q " app=python:apps/py:main.py " <<<"$1"' _ "$out"
+PYU=oxpanel-app-py.test.service
+check "virtualenv created by the tenant" bash -c 'test -x /home/bob/apps/py/.venv/bin/python && test "$(stat -c %U /home/bob/apps/py/.venv)" = bob'
+as_user bob sh -c 'cat > /home/bob/apps/py/main.py' <<'PY'
+import os, sys
+from http.server import BaseHTTPRequestHandler
+from socketserver import UnixStreamServer
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        try:
+            os.listdir('/home/alice'); other = 'READABLE'
+        except OSError:
+            other = 'blocked'
+        body = f"python uid={os.getuid()} venv={int(sys.prefix != sys.base_prefix)} url={self.path} other={other}".encode()
+        self.send_response(200)
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *args):
+        pass
+
+print('python-app-started-marker')
+UnixStreamServer(os.environ['PORT'], Handler).serve_forever()
+PY
+as_user bob sh -c ': > /home/bob/apps/py/requirements.txt'
+out="$(oxpanel-ctl vhost install-deps py.test || true)"
+check "pip install into the virtualenv succeeds (and restarts the app)" grep -q '^succeeded=true' <<<"$out"
+check "Python app answers as the tenant from its own virtualenv" body_eventually py.test /x "python uid=$(id -u bob) venv=1 url=/x other=blocked"
+check "python app process runs as the tenant" test "$(ps -o user= -p "$(systemctl show -p MainPID --value "$PYU")" | tr -d ' ')" = "bob"
+check "python app output is readable through the API" bash -c 'for i in $(seq 1 30); do oxpanel-ctl vhost log py.test --app | grep -q python-app-started-marker && exit 0; sleep 0.2; done; exit 1'
+check "applications are not drift" grep -q '^drifts=0$' <(oxpanel-ctl host reconcile)
+check "usage counts the applications' processes" bash -c 'test "$(oxpanel-ctl tenant usage bob | sed -n "s/.* tasks_current=\([0-9]*\).*/\1/p")" -ge 2'
+
+check "suspend stops every application of the tenant" bash -c 'oxpanel-ctl tenant suspend bob >/dev/null && ! systemctl -q is-active "$1" && ! systemctl -q is-active "$2" && ! systemctl -q is-enabled "$1" 2>/dev/null' _ "$NODEU" "$PYU"
+check "suspended app site answers 503" code_eventually node.test / 503
+check_not "restart-app is refused while suspended" oxpanel-ctl vhost restart-app node.test
+check "resume starts the applications again" bash -c 'oxpanel-ctl tenant resume bob >/dev/null && systemctl -q is-active "$1" && systemctl -q is-active "$2" && systemctl -q is-enabled "$1"' _ "$NODEU" "$PYU"
+check "resumed Node app works" body_eventually node.test /r "node uid=$(id -u bob) url=/r host=node.test xff=set other=blocked etc=blocked"
+check "resumed Python app works" body_eventually py.test /r "python uid=$(id -u bob) venv=1 url=/r other=blocked"
+
+check "switching the app off removes its unit and keeps the code" bash -c 'oxpanel-ctl vhost set node.test --tenant bob | grep -q " app=- " && ! systemctl -q is-active "$1" && test ! -e /etc/systemd/system/"$1" && test -f /home/bob/apps/node.test/app.js' _ "$NODEU"
+check "the site is static again" body_eventually node.test /static.txt static-file
+check "removing the sites removes the remaining unit" bash -c 'oxpanel-ctl vhost remove py.test | grep -q "^removed=true" && oxpanel-ctl vhost remove node.test | grep -q "^removed=true" && ! systemctl -q is-active "$1" && test ! -e /etc/systemd/system/"$1"' _ "$PYU"
+check "no runtime directories left behind" bash -c '! ls /run/oxpanel-app/*/app.sock >/dev/null 2>&1'
+check "no drift after application teardown" grep -q '^drifts=0$' <(oxpanel-ctl host reconcile)
+
 echo "== teardown"
 check "vhost removed" grep -q '^removed=true' <(oxpanel-ctl vhost remove example.test)
 check "config gone" test ! -e /etc/nginx/oxpanel.d/example.test.conf

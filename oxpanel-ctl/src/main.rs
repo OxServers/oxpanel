@@ -1,7 +1,8 @@
 //! `oxpanel-ctl` — talk to `oxpanel-daemon` over its UNIX socket.
 //!
 //! Exit status: 0 on success, 1 on an API error (message on stderr),
-//! 2 on usage errors, 3 when `host reconcile` found drift.
+//! 2 on usage errors, 3 when `host reconcile` found drift, 4 when
+//! `vhost install-deps` ran and the installer failed.
 // A CLI's whole job is to print.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
@@ -152,6 +153,25 @@ enum VhostCmd {
         /// Run *.php through the tenant's own PHP-FPM pool.
         #[arg(long)]
         php: bool,
+        /// Run an application behind the site: node or python.
+        #[arg(long, value_enum)]
+        app: Option<AppKind>,
+        /// Application directory relative to the tenant home (default apps/<domain>).
+        #[arg(long, default_value = "", requires = "app")]
+        app_root: String,
+        /// Program to run, relative to the application directory (default app.js / app.py).
+        #[arg(long, default_value = "", requires = "app")]
+        app_entry: String,
+    },
+    /// Restart the site's application (after putting new code in place).
+    RestartApp {
+        domain: String,
+    },
+    /// Install the application's dependencies as the tenant
+    /// (npm install / pip install -r requirements.txt), then restart it.
+    /// Exits with status 4 when the installer fails.
+    InstallDeps {
+        domain: String,
     },
     /// Print the end of a site's access log (or error log).
     Log {
@@ -159,6 +179,9 @@ enum VhostCmd {
         /// The error log instead of the access log.
         #[arg(long)]
         error: bool,
+        /// The application's own output instead (stdout and stderr).
+        #[arg(long, conflicts_with = "error")]
+        app: bool,
         /// How much of the end of the log to fetch (default 32K, at most 128K).
         #[arg(long, value_parser = parse_size, default_value = "0")]
         bytes: u64,
@@ -171,6 +194,15 @@ enum VhostCmd {
         tenant: String,
     },
 }
+
+#[derive(clap::ValueEnum, Debug, Clone, Copy)]
+enum AppKind {
+    Node,
+    Python,
+}
+
+/// Exit status of `vhost install-deps` when the installer failed.
+const EXIT_INSTALL_FAILED: u8 = 4;
 
 fn parse_size(s: &str) -> Result<u64, String> {
     let s = s.trim();
@@ -240,7 +272,7 @@ fn print_tenant(t: &pb::Tenant) {
 
 fn print_vhost(v: &pb::VirtualHost) {
     say!(
-        "domain={} tenant={} document_root={} aliases={} php={} config={}",
+        "domain={} tenant={} document_root={} aliases={} php={} app={} config={}",
         v.domain,
         v.tenant,
         v.document_root,
@@ -250,6 +282,17 @@ fn print_vhost(v: &pb::VirtualHost) {
             v.aliases.join(",")
         },
         v.php,
+        v.app.as_ref().map_or_else(
+            || "-".to_owned(),
+            |a| {
+                let runtime = match pb::AppRuntime::try_from(a.runtime) {
+                    Ok(pb::AppRuntime::Node) => "node",
+                    Ok(pb::AppRuntime::Python) => "python",
+                    _ => "unknown",
+                };
+                format!("{runtime}:{}:{}", a.root, a.entry)
+            }
+        ),
         v.config_path
     );
 }
@@ -366,6 +409,37 @@ async fn run_tenant(
     Ok(ExitCode::SUCCESS)
 }
 
+async fn vhost_log(
+    c: &mut OxPanelEngineClient<Channel>,
+    domain: String,
+    error: bool,
+    app: bool,
+    bytes: u64,
+) -> Result<(), tonic::Status> {
+    let kind = if app {
+        pb::LogKind::App
+    } else if error {
+        pb::LogKind::Error
+    } else {
+        pb::LogKind::Access
+    };
+    let r = c
+        .read_virtual_host_log(pb::ReadVirtualHostLogRequest {
+            domain,
+            kind: kind.into(),
+            max_bytes: u32::try_from(bytes).unwrap_or(u32::MAX),
+        })
+        .await?
+        .into_inner();
+    if r.truncated {
+        eprintln!("(showing the end of the log only)");
+    }
+    for line in r.text.lines() {
+        say!("{line}");
+    }
+    Ok(())
+}
+
 async fn run_vhost(
     c: &mut OxPanelEngineClient<Channel>,
     cmd: VhostCmd,
@@ -377,6 +451,9 @@ async fn run_vhost(
             root,
             aliases,
             php,
+            app,
+            app_root,
+            app_entry,
         } => {
             let r = c
                 .configure_virtual_host(pb::ConfigureVirtualHostRequest {
@@ -385,6 +462,15 @@ async fn run_vhost(
                     document_root: root,
                     aliases,
                     php,
+                    app: app.map(|kind| pb::App {
+                        runtime: match kind {
+                            AppKind::Node => pb::AppRuntime::Node,
+                            AppKind::Python => pb::AppRuntime::Python,
+                        }
+                        .into(),
+                        root: app_root,
+                        entry: app_entry,
+                    }),
                 })
                 .await?
                 .into_inner();
@@ -393,31 +479,29 @@ async fn run_vhost(
                 print_vhost(v);
             }
         }
+        VhostCmd::RestartApp { domain } => {
+            c.restart_app(pb::RestartAppRequest { domain }).await?;
+            say!("restarted=true");
+        }
+        VhostCmd::InstallDeps { domain } => {
+            let r = c
+                .install_app_dependencies(pb::InstallAppDependenciesRequest { domain })
+                .await?
+                .into_inner();
+            for line in r.output.lines() {
+                say!("{line}");
+            }
+            say!("succeeded={}", r.succeeded);
+            if !r.succeeded {
+                return Ok(ExitCode::from(EXIT_INSTALL_FAILED));
+            }
+        }
         VhostCmd::Log {
             domain,
             error,
+            app,
             bytes,
-        } => {
-            let kind = if error {
-                pb::LogKind::Error
-            } else {
-                pb::LogKind::Access
-            };
-            let r = c
-                .read_virtual_host_log(pb::ReadVirtualHostLogRequest {
-                    domain,
-                    kind: kind.into(),
-                    max_bytes: u32::try_from(bytes).unwrap_or(u32::MAX),
-                })
-                .await?
-                .into_inner();
-            if r.truncated {
-                eprintln!("(showing the end of the log only)");
-            }
-            for line in r.text.lines() {
-                say!("{line}");
-            }
-        }
+        } => vhost_log(c, domain, error, app, bytes).await?,
         VhostCmd::Remove { domain } => {
             let r = c
                 .remove_virtual_host(pb::RemoveVirtualHostRequest { domain })
@@ -450,10 +534,12 @@ async fn run_host(
                 .await?
                 .into_inner();
             say!(
-                "version={} selinux={} php={} dry_run={} tenants={} vhosts={} uid_range={}-{} load={:.2},{:.2},{:.2} memory_total={} memory_free={} home_disk_total={} home_disk_free={} uptime={}",
+                "version={} selinux={} php={} node={} python={} dry_run={} tenants={} vhosts={} uid_range={}-{} load={:.2},{:.2},{:.2} memory_total={} memory_free={} home_disk_total={} home_disk_free={} uptime={}",
                 i.daemon_version,
                 i.selinux_enabled,
                 i.php_available,
+                i.node_available,
+                i.python_available,
                 i.dry_run,
                 i.tenant_count,
                 i.vhost_count,

@@ -327,11 +327,13 @@ impl TenantService {
         // answer 503 before PHP stops. Either way no request sees a 502.
         if changed && !suspended {
             crate::php::set_running(&self.ctx, &rec, true).await?;
+            crate::app::set_running_all(&self.ctx, &rec, true).await?;
         }
         vhost::sync_tenant_configs(&self.ctx, &rec, changed).await?;
         if changed {
             if suspended {
                 crate::php::set_running(&self.ctx, &rec, false).await?;
+                crate::app::set_running_all(&self.ctx, &rec, false).await?;
             }
             self.ctx.store.save_tenant(&rec)?;
             info!(tenant = %name, suspended, "suspension changed");
@@ -747,6 +749,7 @@ mod tests {
             config_path: PathBuf::from("/x"),
             created_at_unix: 0,
             php: false,
+            app: None,
         })?;
         assert!(matches!(
             h.svc.delete("alice", false).await,

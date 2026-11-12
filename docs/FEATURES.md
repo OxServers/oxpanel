@@ -58,6 +58,21 @@ see "Not yet included" at the end so nobody assumes otherwise.
 | SELinux | Works enforcing with zero denials. PHP runs in the web-server domain; the RPM sets `httpd_unified` so a tenant's PHP can write the tenant's own files (uploads, caches). Without the boolean PHP is read-only and the daemon logs a warning at start. |
 | Reconciliation | A missing or edited pool configuration or unit is reported as `PHP_POOL_DRIFT`, stray ones as `ORPHAN_PHP_POOL`. |
 
+## Node.js and Python applications
+
+| Feature | Detail |
+|---|---|
+| Opt-in per virtual host | `ConfigureVirtualHost` with `app { runtime: NODE | PYTHON, root, entry }` (defaults: `apps/<domain>`, `app.js` / `app.py`). Cannot be combined with `php`. Refused with `FAILED_PRECONDITION` if the runtime is not installed; `GetHostInfo` reports `node_available` / `python_available`. |
+| One service per application, running as the tenant | `oxpanel-app-<domain>.service`: `User=<tenant>`, in the tenant's slice (so the tenant's limits bound it and `GetTenantUsage` counts it), sandboxed like PHP (`NoNewPrivileges`, empty capability set, `ProtectSystem=strict` with only the tenant's home writable, private `/tmp`). Restarted automatically if it crashes; enabled, so it returns after a reboot. |
+| No TCP ports | The application listens on a UNIX socket whose path it receives in `PORT` and `OXPANEL_SOCKET` (`server.listen(process.env.PORT)` works unchanged in Node.js). The socket directory is `0750` with an ACL for the web server only: other tenants can neither enter it nor connect, and there are no ports to allocate or collide. |
+| Source is never web-readable | The application directory gets no web-server ACL and must not be the document root or inside it. Nginx serves files that exist in the document root itself (static assets) and proxies everything else, including WebSocket upgrades, to the application; `X-Forwarded-For`/`-Proto` and `Host` are passed on, `X-Powered-By` is hidden. |
+| Python virtualenv | Every Python application gets its own virtualenv (`<root>/.venv`), created as the tenant. The application runs with that interpreter, so its packages are its own. |
+| Dependencies | `InstallAppDependencies` runs `npm install --omit=dev` or `pip install -r requirements.txt` (into the virtualenv) as the tenant, in a sandboxed transient unit inside the tenant's slice with a 4-minute limit, returns the installer's output, and restarts the application on success. A failing installer is a result, not an error. |
+| Restart and output | `RestartApp` (after new code is in place; also clears a crash loop). `ReadVirtualHostLog` with kind `APP` returns the application's recent stdout/stderr from the journal. |
+| Lifecycle | The unit is removed when the application is switched off or the virtual host is removed; the code stays (it is the tenant's data). Suspension stops and disables every application of the tenant after the sites answer 503; resume starts them before the sites return. |
+| SELinux | Works enforcing with zero denials. Applications run in their own domain, `oxpanel_app_t` (a small CIL module shipped with the package), so the web server is allowed to connect to application sockets and to nothing else; socket directories are labelled `httpd_var_run_t`. If the module is missing, enabling an application is refused with the command that installs it. |
+| Reconciliation | An edited or missing application unit is `APP_UNIT_DRIFT`, a stray one `ORPHAN_APP_UNIT`. |
+
 ## API, transport and authentication
 
 | Feature | Detail |
@@ -75,7 +90,7 @@ see "Not yet included" at the end so nobody assumes otherwise.
 
 | Feature | Detail |
 |---|---|
-| `oxpanel-ctl` | Command-line client: `tenant create|get|list|set-limits|set-owner|suspend|resume|usage|delete`, `vhost set|log|remove|list`, `host info|reconcile`, human-readable sizes (`512M`, `2G`). |
+| `oxpanel-ctl` | Command-line client: `tenant create|get|list|set-limits|set-owner|suspend|resume|usage|delete`, `vhost set|log|restart-app|install-deps|remove|list`, `host info|reconcile`, human-readable sizes (`512M`, `2G`). |
 | Host information | `GetHostInfo`: engine version, SELinux and dry-run state, tenant and virtual-host counts, the tenant uid range (capacity), load averages, memory, uptime, and size/free space of the file system holding tenant homes. |
 | Reconciliation | `Reconcile` compares every record with the operating system and reports differences: interrupted tenants, missing or mismatched accounts, invalid homes, edited or missing unit files, missing or edited Nginx files, virtual hosts without a tenant, and orphan files in OxPanel's own directories. Strictly read-only — most findings are healed by repeating the original request. `oxpanel-ctl host reconcile` exits `3` when drift is found. |
 | Configuration | Environment variables `OXPANEL_*` (from `/etc/oxpanel/daemon.env`); every value has a production default. `--check-config` validates configuration and host prerequisites without starting. |
@@ -90,9 +105,9 @@ see "Not yet included" at the end so nobody assumes otherwise.
 
 - Rust, `#![forbid(unsafe_code)]`, clippy pedantic with warnings as errors, no `unwrap`/`expect`/`panic` in production paths.
 - No shell anywhere: every external program is an absolute path with an argv array; the only module that spawns processes is `system/real.rs`.
-- Tests: 91 unit tests (exact argv assertions against a fake OS), 6 end-to-end gRPC tests over a real UNIX socket, a 172-check root integration suite in an AlmaLinux 9 systemd container, and `make acceptance`: ≈310 checks on a real AlmaLinux 9 VM with SELinux enforcing (install from git or RPM, SELinux labels and zero AVC denials, sandbox namespaces, restart/kill/resume, reboot, soak). `cargo-deny` for advisories/licences/bans.
+- Tests: 104 unit tests (exact argv assertions against a fake OS), 6 end-to-end gRPC tests over a real UNIX socket, a 223-check root integration suite in an AlmaLinux 9 systemd container, and `make acceptance`: ≈370 checks on a real AlmaLinux 9 VM with SELinux enforcing (install from git or RPM, SELinux labels and zero AVC denials, sandbox namespaces, restart/kill/resume, reboot, soak). `cargo-deny` for advisories/licences/bans.
 - Builds without a system `protoc` (pure-Rust `protox`) and without a host toolchain (everything runs in the AlmaLinux 9 container).
 
 ## Not yet included
 
-To be explicit, v0.1.0 does **not** provide: TLS/ACME certificates, a choice of PHP version or per-tenant PHP settings (the host's `php-fpm` package is used as installed), other application runtimes, DNS, mail, databases, FTP/SFTP/SSH access for tenants, disk quotas, backups, automatic repair of drift found by `Reconcile`, a confined SELinux domain for the daemon itself, or historical metrics. These are on the roadmap in `oxpanel-daemon/PROJECT_DETAILS.md`.
+To be explicit, v0.1.0 does **not** provide: TLS/ACME certificates, a choice of PHP version or per-tenant PHP settings (the host's `php-fpm` package is used as installed), a choice of Node.js/Python version per application (the host's packages are used), other runtimes, custom start commands or environment variables for applications, a confining SELinux policy for applications, DNS, mail, databases, FTP/SFTP/SSH access for tenants, disk quotas, backups, automatic repair of drift found by `Reconcile`, a confined SELinux domain for the daemon itself, or historical metrics. These are on the roadmap in `oxpanel-daemon/PROJECT_DETAILS.md`.
