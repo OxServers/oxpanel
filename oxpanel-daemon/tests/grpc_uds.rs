@@ -281,6 +281,34 @@ async fn full_tenant_and_vhost_lifecycle_over_uds() {
 async fn validation_errors_surface_as_invalid_argument_with_message() {
     let srv = start(allow_me()).await;
     let mut client = connect(&srv.socket).await.expect("connect");
+    // A restore must say what happens to existing files: no default.
+    for unchosen in [0, 7] {
+        let e = client
+            .restore_backup(pb::RestoreBackupRequest {
+                tenant: "alice".into(),
+                backup_id: "b1731500000123".into(),
+                on_existing: unchosen,
+            })
+            .await
+            .expect_err("must fail");
+        assert_eq!(e.code(), Code::InvalidArgument);
+        assert!(
+            e.message().starts_with("invalid on_existing"),
+            "{}",
+            e.message()
+        );
+        let e = client
+            .restore_retained_backup(pb::RestoreRetainedBackupRequest {
+                backup_id: "b1731500000123".into(),
+                source_tenant: "alice".into(),
+                target_tenant: "bob".into(),
+                on_existing: unchosen,
+            })
+            .await
+            .expect_err("must fail");
+        assert_eq!(e.code(), Code::InvalidArgument);
+    }
+    assert!(srv.sys.calls().is_empty(), "refused before anything ran");
     for bad in ["root", "Alice", "a;b", "../etc", ""] {
         let e = client
             .create_tenant(pb::CreateTenantRequest {
@@ -623,6 +651,7 @@ async fn a_scoped_peer_can_only_call_its_scopes() {
                 backup_id: "b1731500000123".into(),
                 source_tenant: "alice".into(),
                 target_tenant: "bob".into(),
+                on_existing: pb::OnExisting::Keep.into(),
             })
             .await
             .map(|_| ()),
@@ -630,6 +659,7 @@ async fn a_scoped_peer_can_only_call_its_scopes() {
             .restore_backup(pb::RestoreBackupRequest {
                 tenant: "alice".into(),
                 backup_id: "b1731500000123".into(),
+                on_existing: pb::OnExisting::Overwrite.into(),
             })
             .await
             .map(|_| ()),

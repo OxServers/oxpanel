@@ -33,8 +33,9 @@ domains at the time; `DeleteBackup(tenant, backup_id)`.
   `DeleteBackup.tenant_deleted` (`delete`); `Backup.retain_until`,
   `Backup.tenant_deleted`.
 - `oxpanel-ctl backup create [--retain-months N]|list|delete
-  [--tenant-deleted]|restore|job|retain|list-retained|restore-retained`, with
-  `--wait` (exit 5 if the job failed).
+  [--tenant-deleted]|restore (--overwrite|--keep-existing)|job|retain|
+  list-retained|restore-retained (--overwrite|--keep-existing)`, with `--wait`
+  (exit 5 if the job failed).
 
 ## Jobs
 
@@ -116,11 +117,30 @@ better, `tar --zstd` works, but the `zstd` binary is not installed by default
 and an operator's rescue system may lack it), `pigz` (not in BaseOS). Gzip is
 the archive any tool can open.
 
-**Included and excluded.** The whole home, except `./.cache` and `./.npm`
-(package-manager download caches, regenerated on demand). Virtualenvs and
-`node_modules` are **included**: a backup that needs the network and
-today's package versions to turn back into a working site is not a backup of
-that site, and both are typically small next to user content. Not recorded:
+**Included and excluded (owner decision, reversing the first version).**
+The whole home except what is large and can be rebuilt:
+
+- `./.cache` and `./.npm` (download caches);
+- every `node_modules`, at any depth (`--no-anchored --exclude=node_modules`);
+- every Python virtualenv, recognised by what it is: any directory that
+  contains a `pyvenv.cfg` (`--exclude-tag-all=pyvenv.cfg`, GNU tar 1.34 as
+  shipped by AlmaLinux 9 — the directory is dropped together with its tag),
+  plus each Python application's `<app root>/.venv` by path (`--exclude=./…`,
+  passed to the worker as `--venvs`), even if its `pyvenv.cfg` is gone.
+
+tar drops a tagged directory silently, so the daemon runs a **pre-scan as
+the tenant** (`find <home> -xdev …`, mirroring the tar rules, not following
+symlinks) and records what it matched: `BackupRecord.excluded` (relative
+paths, "." for the home itself, outermost only, at most 200 named) and
+`excluded_count`; the manifest carries both plus `exclude_rules` in words, and
+`ListBackups` returns them. A tenant who plants a `pyvenv.cfg` can at worst
+make its own directory (even its whole home, ".") be left out — and that is
+then visible in the manifest and the listing. The pre-scan and tar run at
+different moments, so the list describes the home when the backup started.
+The free-space estimate (`du`, as the tenant) leaves out `node_modules`, the
+caches and every directory the scan found (names with `*?[\` are counted —
+the estimate errs on the large side; the archive's size cap still protects
+the disk). Not recorded:
 ACLs, xattrs, SELinux labels (`--no-acls --no-selinux --no-xattrs`) — the
 engine re-creates the ones it manages after a restore; set-uid/gid bits are
 stripped at creation (`--mode=u-s,g-s`).
@@ -189,12 +209,40 @@ the uid it was taken from; a restore into an account with a different uid
 
 ## Restore semantics
 
-- **Merge over the home**: files in the backup replace current ones; files
-  created since stay. Rejected: *replace* (deleting a live site's newer data
-  on the say-so of one request is the worse failure, and needs root-side
-  recursive deletion inside a tenant home); *side directory* (safe but the
-  site does not come back, which is the point of a restore — a panel can
-  offer "restore to folder" later).
+- **Into the home, with an explicit choice for existing files** (owner
+  decision: never overwrite silently). `RestoreBackup` and
+  `RestoreRetainedBackup` take `on_existing` with no default — `UNSPECIFIED`
+  is `INVALID_ARGUMENT`; the CLI requires `--overwrite` or `--keep-existing`:
+  - `OVERWRITE`: tar's default: an existing file or symlink is unlinked and
+    replaced (never written through), existing directories keep their
+    contents and get the archived mode;
+  - `KEEP`: `--skip-old-files`: every existing entry — file, symlink,
+    directory (its mode too) — is left as it is; only missing entries are
+    created. A file-type change (a directory in the backup where a file now
+    is) makes the members below it fail ("Not a directory"), so the job is
+    `FAILED` with the other files restored. An existing symlink is kept and
+    tar may then write *through* it when creating a missing member below it
+    — as the tenant, inside the sandbox (only the home writable), so at most
+    into the tenant's own files: the hostile-archive guarantees hold under
+    both modes (tested both ways on the VM).
+  Files created since the backup always stay. The job reports
+  `restored_entries` and `skipped_entries` (counted by the worker from tar's
+  `--verbose` list and its `--warning=existing-file` lines; directories count
+  as entries) and says them in its message. Rejected: *replace the home*
+  (deleting a live site's newer data on the say-so of one request, and
+  root-side recursive deletion inside a tenant home); *side directory*
+  (safe, but the site does not come back — a panel can offer it later).
+- **Applications are rebuilt** (dependencies are not in backups): before the
+  tenant's services start again, for every application site the Python
+  virtualenv is recreated if missing (`app::ensure_venv`, as the tenant, no
+  network needed) and, if the application has a `package.json` /
+  `requirements.txt`, its dependencies are installed exactly as
+  `InstallAppDependencies` does (`app::run_installer`: a transient unit as
+  the tenant, in its slice, with network — the daemon and the job's worker
+  have none). This runs in the job, at its conclusion, under the mutation
+  lock (up to 4 minutes per application). Each site's outcome is in
+  `Job.sites`; a failed installation is reported there and in the message
+  but does not make the restore of the files `FAILED`.
 - The tenant's PHP-FPM instance and applications are **stopped** for the
   duration (`systemctl disable --now`, so a reboot mid-restore does not
   revive them on half-restored files) and started again at the end — also
@@ -286,4 +334,10 @@ reserve and retention bound it).
   restore starts them again either way. The panel should not do that.
 - A device node root planted in a home is archived as a node; restoring it as
   the tenant fails, so that restore reports `FAILED` (the rest is restored).
-- Measuring a very large home (`du`) is limited to 240 s inside the request.
+- Measuring a very large home (`find` + `du`) is limited to 240 s each,
+  inside the request.
+- The excluded-directory list comes from a scan before tar runs; a
+  directory created or tagged in between is excluded but not listed.
+- Dependency reinstallation after a restore holds the engine's mutation lock
+  while it runs (other mutations wait), and needs the package registry to be
+  reachable unless dependencies are local (`file:`).

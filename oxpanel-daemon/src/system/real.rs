@@ -29,14 +29,15 @@ impl RealSystem {
 }
 
 /// Start `spec` for the job worker ([`crate::worker`]), which connects the
-/// child's standard input and output itself (a pipe or an open file) instead
-/// of collecting output; errors go to the worker's own stderr, the journal.
+/// child's standard input, output and error itself (a pipe, an open file, or
+/// its own stderr — the journal) instead of collecting output.
 /// The rules of [`System::run`] hold: absolute program, argv array, privileges
 /// dropped through `setpriv`, nothing inherited from our environment.
 pub fn spawn_streaming(
     spec: &CommandSpec,
     stdin: Stdio,
     stdout: Stdio,
+    stderr: Stdio,
 ) -> Result<std::process::Child> {
     let (program, argv) = spec.exec_plan();
     std::process::Command::new(program)
@@ -46,7 +47,7 @@ pub fn spawn_streaming(
         .env("LC_ALL", "C")
         .stdin(stdin)
         .stdout(stdout)
-        .stderr(Stdio::inherit())
+        .stderr(stderr)
         .spawn()
         .map_err(|e| Error::io("spawn", program, e))
 }

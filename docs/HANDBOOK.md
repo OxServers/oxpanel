@@ -374,9 +374,14 @@ sudo oxpanel-ctl backup create acme --wait
 # job=j1794571200123 kind=JOB_KIND_BACKUP tenant=acme backup=b1794571200123 state=JOB_STATE_SUCCEEDED ...
 sudo oxpanel-ctl backup list acme
 # backup=b1794571200123 tenant=acme state=BACKUP_STATE_READY created_at=1794571200 size=48213 domains=acme.example,shop.acme.example members=home:home.tar.gz:47101,records:records.json:1112
-# Put the files back (merges over the home; PHP/apps stop meanwhile).
+# Put the files back. You must choose what happens to files that exist now:
+# --overwrite replaces them, --keep-existing leaves them and restores only
+# what is missing. PHP/apps stop meanwhile; apps get their virtualenv and
+# dependencies reinstalled (backups leave node_modules and virtualenvs out).
 # --wait exits 5 if the job failed.
-sudo oxpanel-ctl backup restore acme b1794571200123 --wait
+sudo oxpanel-ctl backup restore acme b1794571200123 --keep-existing --wait
+# restored_entries=12 skipped_entries=40
+# site=app.acme.example dependencies_ok=true detail=dependencies reinstalled from package.json
 sudo oxpanel-ctl backup delete acme b1794571200123
 
 # Closing a customer's account: a final backup kept for 6 months after the
@@ -386,7 +391,7 @@ sudo oxpanel-ctl backup list-retained
 # backup=b1794571300456 tenant=acme state=BACKUP_STATE_READY created_at=... retain_until=1810349000 ...
 # After the deletion it is listed with tenant_deleted=true; a new tenant named
 # acme never sees it. The customer came back as acme2: restore it there
-sudo oxpanel-ctl backup restore-retained b1794571300456 --from acme --to acme2 --wait
+sudo oxpanel-ctl backup restore-retained b1794571300456 --from acme --to acme2 --overwrite --wait
 # ...or drop it early
 sudo oxpanel-ctl backup delete acme b1794571300456 --tenant-deleted
 
@@ -610,9 +615,18 @@ are removed by the daemon when their date passes (at start-up and hourly).
 `backup list-retained`, `backup delete … --tenant-deleted` and `backup
 restore-retained <id> --from <deleted tenant> --to <tenant>` (needs the
 `delete` scope) are the operator's tools for them.
-Restore merges the backup over the home (newer files stay), stops the
+Backups leave out `node_modules`, Python virtualenvs (any directory holding
+a `pyvenv.cfg`, and each Python application's `.venv`) and the `.cache` /
+`.npm` caches; `backup list` shows how many directories were left out
+(`excluded=`), and the manifest names them. A restore needs an explicit
+`--overwrite` or `--keep-existing`; newer files always stay. It stops the
 tenant's PHP and applications while it runs, then restores the home's
-privacy, SELinux labels and the web server's ACLs and starts them again. A
+privacy, SELinux labels and the web server's ACLs, recreates each Python
+application's virtualenv and reinstalls every application's dependencies
+(like `vhost install-deps`, so the package registry must be reachable unless
+dependencies are local), and starts them again. A failed reinstallation is
+reported per site (`dependencies_ok=false`) without failing the restore;
+fix the cause and run `vhost install-deps`. A
 `FAILED` restore of an engine-made backup usually means a member could not be
 written as the tenant (e.g. a device node root once put in the home); the
 other files were restored — see `backup job <id>`.

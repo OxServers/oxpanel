@@ -52,6 +52,8 @@ pub mod bin {
     pub const JOURNALCTL: &str = "/usr/bin/journalctl";
     /// Backups: the archiver and its compressor, both run as the tenant.
     pub const TAR: &str = "/usr/bin/tar";
+    /// Backups: finds what the archive leaves out (run as the tenant).
+    pub const FIND: &str = "/usr/bin/find";
     pub const GZIP: &str = "/usr/bin/gzip";
     /// Login shell given to every tenant account.
     pub const NOLOGIN: &str = "/sbin/nologin";

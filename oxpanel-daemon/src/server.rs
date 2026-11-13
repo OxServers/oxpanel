@@ -16,8 +16,8 @@ use crate::ctx::Ctx;
 use crate::error::Error;
 use crate::host::{Drift, DriftKind, HostService};
 use crate::records::{
-    AppRuntime, BackupRecord, BackupState, JobKind, JobRecord, JobState, TenantRecord, TenantState,
-    VHostRecord,
+    AppRuntime, BackupRecord, BackupState, JobKind, JobRecord, JobState, OnExisting, TenantRecord,
+    TenantState, VHostRecord,
 };
 use crate::tenant::TenantService;
 use crate::validate::Limits;
@@ -626,10 +626,11 @@ impl OxPanelEngine for Engine {
         const RPC: &str = "RestoreBackup";
         let peer = self.authorise(&req, RPC, Scope::Tenant)?;
         let r = req.into_inner();
-        info!(rpc = RPC, peer, tenant = %r.tenant, backup = %r.backup_id, "request");
+        info!(rpc = RPC, peer, tenant = %r.tenant, backup = %r.backup_id, on_existing = r.on_existing, "request");
+        let mode = on_existing(r.on_existing).map_err(|e| fail(RPC, &peer, e))?;
         let (job, started) = self
             .backups
-            .restore(&r.tenant, &r.backup_id)
+            .restore(&r.tenant, &r.backup_id, mode)
             .await
             .map_err(|e| fail(RPC, &peer, e))?;
         Ok(Response::new(pb::StartJobResponse {
@@ -690,16 +691,29 @@ impl OxPanelEngine for Engine {
         // Data of one (deleted) account into another: the strongest scope.
         let peer = self.authorise(&req, RPC, Scope::Delete)?;
         let r = req.into_inner();
-        info!(rpc = RPC, peer, backup = %r.backup_id, from = %r.source_tenant, to = %r.target_tenant, "request");
+        info!(rpc = RPC, peer, backup = %r.backup_id, from = %r.source_tenant, to = %r.target_tenant, on_existing = r.on_existing, "request");
+        let mode = on_existing(r.on_existing).map_err(|e| fail(RPC, &peer, e))?;
         let (job, started) = self
             .backups
-            .restore_retained(&r.backup_id, &r.source_tenant, &r.target_tenant)
+            .restore_retained(&r.backup_id, &r.source_tenant, &r.target_tenant, mode)
             .await
             .map_err(|e| fail(RPC, &peer, e))?;
         Ok(Response::new(pb::StartJobResponse {
             job: Some(job_to(&job)),
             started,
         }))
+    }
+}
+
+/// The caller's choice for existing files; there is no default.
+fn on_existing(raw: i32) -> Result<OnExisting, Error> {
+    match pb::OnExisting::try_from(raw) {
+        Ok(pb::OnExisting::Overwrite) => Ok(OnExisting::Overwrite),
+        Ok(pb::OnExisting::Keep) => Ok(OnExisting::Keep),
+        _ => Err(Error::invalid(
+            "on_existing",
+            "choose ON_EXISTING_OVERWRITE or ON_EXISTING_KEEP",
+        )),
     }
 }
 
@@ -727,6 +741,12 @@ fn backup_to(rec: &BackupRecord) -> pb::Backup {
         domains: rec.domains.clone(),
         retain_until: (rec.retain_until_unix != 0).then(|| timestamp(rec.retain_until_unix)),
         tenant_deleted: rec.tenant_deleted,
+        exclude_rules: crate::backup::EXCLUDE_RULES
+            .iter()
+            .map(|r| (*r).to_owned())
+            .collect(),
+        excluded: rec.excluded.clone(),
+        excluded_count: rec.excluded_count,
     }
 }
 
@@ -750,6 +770,23 @@ fn job_to(rec: &JobRecord) -> pb::Job {
         output: rec.output.clone(),
         started_at: Some(timestamp(rec.started_at_unix)),
         finished_at: (rec.finished_at_unix != 0).then(|| timestamp(rec.finished_at_unix)),
+        on_existing: match rec.on_existing {
+            None => pb::OnExisting::Unspecified,
+            Some(OnExisting::Overwrite) => pb::OnExisting::Overwrite,
+            Some(OnExisting::Keep) => pb::OnExisting::Keep,
+        }
+        .into(),
+        restored_entries: rec.restored_entries,
+        skipped_entries: rec.skipped_entries,
+        sites: rec
+            .sites
+            .iter()
+            .map(|s| pb::JobSiteResult {
+                domain: s.domain.clone(),
+                succeeded: s.succeeded,
+                detail: s.detail.clone(),
+            })
+            .collect(),
     }
 }
 

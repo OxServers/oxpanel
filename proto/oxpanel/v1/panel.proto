@@ -62,10 +62,12 @@ service OxPanelEngine {
   rpc CreateBackup(CreateBackupRequest) returns (StartJobResponse);
   rpc ListBackups(ListBackupsRequest) returns (ListBackupsResponse);
   rpc DeleteBackup(DeleteBackupRequest) returns (DeleteBackupResponse);
-  // Restore a tenant's files from one of that tenant's own backups, over the
-  // current content of its home: what is in the backup replaces what is
-  // there, files that are not in the backup are kept. PHP and applications of
-  // the tenant are stopped for the duration. Returns at once with a job.
+  // Restore a tenant's files from one of that tenant's own backups into its
+  // home. The caller must choose what happens to files that already exist
+  // (`on_existing`, no default); files that are not in the backup are always
+  // kept. PHP and applications of the tenant are stopped for the duration;
+  // applications get their virtualenv and dependencies reinstalled (backups
+  // leave them out) before they start again. Returns at once with a job.
   rpc RestoreBackup(RestoreBackupRequest) returns (StartJobResponse);
   // State of a backup or restore job.
   rpc GetJob(GetJobRequest) returns (Job);
@@ -454,6 +456,35 @@ message Backup {
   // The tenant this backup was taken from has been deleted; the backup is
   // only reachable through the retained-backup operations.
   bool tenant_deleted = 9;
+  // What the home archive leaves out, by rule (node_modules, Python
+  // virtualenvs, download caches) ...
+  repeated string exclude_rules = 10;
+  // ... and the directories (relative to the home; "." is the home itself)
+  // those rules matched when the backup was started: at most 200 are named,
+  // `excluded_count` counts them all. A directory a tenant marked with a
+  // pyvenv.cfg is listed here, so nothing is left out silently.
+  repeated string excluded = 11;
+  uint64 excluded_count = 12;
+}
+
+// What a restore does with files that already exist in the home.
+enum OnExisting {
+  // Refused: the caller must choose.
+  ON_EXISTING_UNSPECIFIED = 0;
+  // Files in the backup replace existing ones (never written through: an
+  // existing file or symlink is replaced, not opened).
+  ON_EXISTING_OVERWRITE = 1;
+  // Existing files, symlinks and directories are left untouched; only what
+  // is missing is restored.
+  ON_EXISTING_KEEP = 2;
+}
+
+// What happened to one application site after a restore.
+message JobSiteResult {
+  string domain = 1;
+  // Virtualenv (Python) and dependencies reinstalled, or nothing to install.
+  bool succeeded = 2;
+  string detail = 3;
 }
 
 enum JobKind {
@@ -487,6 +518,15 @@ message Job {
   google.protobuf.Timestamp started_at = 8;
   // Unset while RUNNING.
   google.protobuf.Timestamp finished_at = 9;
+  // Restores: the caller's choice, archive entries written, and entries
+  // left alone because they existed (directories count as entries).
+  OnExisting on_existing = 10;
+  uint64 restored_entries = 11;
+  uint64 skipped_entries = 12;
+  // Restores: per application site, whether its dependencies could be
+  // reinstalled. A failure here does not make the restore FAILED; `message`
+  // names the sites.
+  repeated JobSiteResult sites = 13;
 }
 
 message CreateBackupRequest {
@@ -529,6 +569,8 @@ message RestoreBackupRequest {
   // another tenant's backup is NOT_FOUND here.
   string tenant = 1;
   string backup_id = 2;
+  // Required: UNSPECIFIED is INVALID_ARGUMENT.
+  OnExisting on_existing = 3;
 }
 
 message GetJobRequest {
@@ -550,4 +592,6 @@ message RestoreRetainedBackupRequest {
   string source_tenant = 2;
   // The existing tenant whose home receives the files, as that tenant.
   string target_tenant = 3;
+  // Required: UNSPECIFIED is INVALID_ARGUMENT.
+  OnExisting on_existing = 4;
 }

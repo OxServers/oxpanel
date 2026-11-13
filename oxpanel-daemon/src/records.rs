@@ -155,6 +155,15 @@ pub struct BackupRecord {
     /// it); only the operator RPCs for retained backups reach it.
     #[serde(default)]
     pub tenant_deleted: bool,
+    /// Directories left out of the home archive by the exclusion rules
+    /// (`backup::EXCLUDE_RULES`), relative to the home ("." is the home
+    /// itself), as found when the backup was started; at most
+    /// `backup::EXCLUDED_LISTED` of them.
+    #[serde(default)]
+    pub excluded: Vec<String>,
+    /// How many there were in all.
+    #[serde(default)]
+    pub excluded_count: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -171,6 +180,36 @@ impl JobKind {
             Self::Restore => "restore",
         }
     }
+}
+
+/// What a restore does with a file that already exists in the home. There is
+/// no default: the caller must choose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnExisting {
+    /// Files in the backup replace the current ones.
+    Overwrite,
+    /// Existing files (and directories, symlinks) are left untouched; only
+    /// what is missing is restored.
+    Keep,
+}
+
+impl OnExisting {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Overwrite => "overwrite",
+            Self::Keep => "keep",
+        }
+    }
+}
+
+/// What happened to one application site after a restore.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SiteResult {
+    pub domain: String,
+    pub succeeded: bool,
+    /// One line: what was done, or why it failed.
+    pub detail: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -201,6 +240,19 @@ pub struct JobRecord {
     pub started_at_unix: u64,
     /// 0 while running.
     pub finished_at_unix: u64,
+    /// Restores: the caller's choice for files that already exist.
+    #[serde(default)]
+    pub on_existing: Option<OnExisting>,
+    /// Restores: archive entries written, and entries skipped because they
+    /// already existed (`Keep`). Directories count as entries.
+    #[serde(default)]
+    pub restored_entries: u64,
+    #[serde(default)]
+    pub skipped_entries: u64,
+    /// Restores: per application site, the virtualenv and dependency
+    /// reinstallation (dependencies are not in backups).
+    #[serde(default)]
+    pub sites: Vec<SiteResult>,
 }
 
 /// Seconds since the UNIX epoch, saturating at 0 if the clock is before 1970.

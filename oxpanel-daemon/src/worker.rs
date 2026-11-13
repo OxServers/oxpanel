@@ -23,7 +23,7 @@
 
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -34,8 +34,10 @@ use sha2::{Digest, Sha256};
 
 use crate::error::{Error, Result};
 use crate::fsutil;
+use crate::records::OnExisting;
 use crate::system::real::spawn_streaming;
 use crate::system::{bin, CommandSpec};
+use crate::validate::RelPath;
 
 /// First argument that selects worker mode.
 pub const SUBCOMMAND: &str = "worker";
@@ -57,6 +59,11 @@ const BUFFER: usize = 128 * 1024;
 
 /// Member kind of the tenant's home archive.
 pub const KIND_HOME: &str = "home";
+
+/// Prefix of the line with which a restore worker reports its counts (the
+/// daemon reads it back from the journal). `tar`'s own lines start with
+/// its program name, so a file name in the archive cannot forge it.
+pub const RESTORE_RESULT: &str = "oxpanel-restore-result";
 
 /// What a worker reports about the member it wrote. Its presence next to the
 /// member is the worker's statement that the member is complete.
@@ -98,13 +105,16 @@ fn write_result(member: &Path, result: &MemberResult) -> Result<()> {
 /// What one worker invocation does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Task {
-    /// Archive `home` as `uid:gid` into `output`, at most `max_bytes` long.
+    /// Archive `home` as `uid:gid` into `output`, at most `max_bytes` long,
+    /// leaving out the applications' virtualenvs `venvs` (relative to the
+    /// home) besides what [`tar_create`] always leaves out.
     Backup {
         uid: u32,
         gid: u32,
         home: PathBuf,
         output: PathBuf,
         max_bytes: u64,
+        venvs: Vec<String>,
     },
     /// Verify `input` against `sha256` and `size`, then extract it into
     /// `home` as `uid:gid`.
@@ -115,6 +125,7 @@ pub enum Task {
         input: PathBuf,
         sha256: String,
         size: u64,
+        on_existing: OnExisting,
     },
 }
 
@@ -134,12 +145,19 @@ impl Task {
                 home,
                 output,
                 max_bytes,
+                venvs,
             } => {
                 pair("backup", uid.to_string().into());
                 pair("--gid", gid.to_string().into());
                 pair("--home", home.clone().into());
                 pair("--output", output.clone().into());
                 pair("--max-bytes", max_bytes.to_string().into());
+                let venvs = if venvs.is_empty() {
+                    "-".to_owned()
+                } else {
+                    venvs.join(",")
+                };
+                pair("--venvs", venvs.into());
             }
             Self::Restore {
                 uid,
@@ -148,6 +166,7 @@ impl Task {
                 input,
                 sha256,
                 size,
+                on_existing,
             } => {
                 pair("restore", uid.to_string().into());
                 pair("--gid", gid.to_string().into());
@@ -155,6 +174,7 @@ impl Task {
                 pair("--input", input.clone().into());
                 pair("--sha256", sha256.clone().into());
                 pair("--size", size.to_string().into());
+                pair("--existing", on_existing.as_str().into());
             }
         }
         out
@@ -205,6 +225,13 @@ impl Task {
                 home,
                 output: absolute(take("--output")?, "--output")?,
                 max_bytes: number("--max-bytes", take("--max-bytes")?)?,
+                venvs: match take("--venvs")? {
+                    "-" => Vec::new(),
+                    list => list
+                        .split(',')
+                        .map(|v| RelPath::parse_field(v, "--venvs").map(|p| p.as_str().to_owned()))
+                        .collect::<Result<_>>()?,
+                },
             },
             "restore" => {
                 let sha256 = take("--sha256")?;
@@ -218,6 +245,11 @@ impl Task {
                     input: absolute(take("--input")?, "--input")?,
                     sha256: sha256.to_ascii_lowercase(),
                     size: number("--size", take("--size")?)?,
+                    on_existing: match take("--existing")? {
+                        "overwrite" => OnExisting::Overwrite,
+                        "keep" => OnExisting::Keep,
+                        _ => return Err(bad("'--existing' must be overwrite or keep".into())),
+                    },
                 }
             }
             other => return Err(bad(format!("unknown mode '{other}'"))),
@@ -259,14 +291,18 @@ fn absolute(raw: &str, flag: &str) -> Result<PathBuf> {
 ///   to someone else, or has mode 000) is reported and skipped instead of
 ///   failing the whole backup. Nobody reads it *for* the tenant;
 /// - `--mode=u-s,g-s`: set-uid and set-gid bits are not recorded;
-/// - `./.cache` and `./.npm`, the package managers' download caches, are left
-///   out. Virtualenvs and `node_modules` are *included*: a backup that needs
-///   the network and today's package versions to become a working site again
-///   is not a backup of that site;
+/// - left out (owner decision: large, and rebuilt after a restore): `./.cache`
+///   and `./.npm` (download caches), every `node_modules` at any depth, every
+///   directory that contains a `pyvenv.cfg` (a Python virtualenv, recognised
+///   by what it is — `--exclude-tag-all` drops the directory with its tag),
+///   and the `.venv` of each Python application by path (`venvs`), even if
+///   its `pyvenv.cfg` is gone. A tenant who plants a `pyvenv.cfg` can only
+///   make its own directory be left out; the daemon lists every such
+///   directory in the manifest;
 /// - FIFOs and device nodes are recorded as such without being opened;
 ///   sockets are skipped.
-pub fn tar_create(uid: u32, gid: u32, home: &Path) -> CommandSpec {
-    CommandSpec::new(bin::TAR, Duration::ZERO)
+pub fn tar_create(uid: u32, gid: u32, home: &Path, venvs: &[String]) -> CommandSpec {
+    let spec = CommandSpec::new(bin::TAR, Duration::ZERO)
         .args(["--create", "--file=-", "--format=gnu"])
         .arg(format!("--use-compress-program={}", bin::GZIP))
         .arg("--directory")
@@ -284,9 +320,15 @@ pub fn tar_create(uid: u32, gid: u32, home: &Path) -> CommandSpec {
             "--anchored",
             "--exclude=./.cache",
             "--exclude=./.npm",
-            "--",
-            ".",
-        ])
+            "--no-anchored",
+            "--exclude=node_modules",
+            "--exclude-tag-all=pyvenv.cfg",
+            "--anchored",
+        ]);
+    venvs
+        .iter()
+        .fold(spec, |spec, v| spec.arg(format!("--exclude=./{v}")))
+        .args(["--", "."])
         .as_user(uid, gid)
 }
 
@@ -307,8 +349,15 @@ pub fn tar_create(uid: u32, gid: u32, home: &Path) -> CommandSpec {
 /// `--same-permissions`: modes are restored as archived instead of being
 /// narrowed by the umask — the web server reads a site through its "other"
 /// permission bits.
-pub fn tar_extract(uid: u32, gid: u32, home: &Path) -> CommandSpec {
-    CommandSpec::new(bin::TAR, Duration::ZERO)
+///
+/// Existing files: with [`OnExisting::Overwrite`] tar's default applies (an
+/// existing file or symlink is unlinked and replaced, never written
+/// through); with [`OnExisting::Keep`], `--skip-old-files` leaves every
+/// existing entry — file, symlink, directory — as it is. `--verbose` names
+/// every member on standard output and `--warning=existing-file` reports
+/// each skipped one, which is how the worker counts them.
+pub fn tar_extract(uid: u32, gid: u32, home: &Path, on_existing: OnExisting) -> CommandSpec {
+    let spec = CommandSpec::new(bin::TAR, Duration::ZERO)
         .args(["--extract", "--file=-"])
         .arg(format!("--use-compress-program={}", bin::GZIP))
         .arg("--directory")
@@ -319,8 +368,14 @@ pub fn tar_extract(uid: u32, gid: u32, home: &Path) -> CommandSpec {
             "--no-acls",
             "--no-selinux",
             "--no-xattrs",
-        ])
-        .as_user(uid, gid)
+            "--verbose",
+            "--warning=existing-file",
+        ]);
+    match on_existing {
+        OnExisting::Overwrite => spec,
+        OnExisting::Keep => spec.arg("--skip-old-files"),
+    }
+    .as_user(uid, gid)
 }
 
 /// Why a stream could not be stored.
@@ -387,7 +442,8 @@ pub fn run(task: &Task) -> std::result::Result<(), Failure> {
             home,
             output,
             max_bytes,
-        } => backup(*uid, *gid, home, output, *max_bytes),
+            venvs,
+        } => backup(&tar_create(*uid, *gid, home, venvs), output, *max_bytes),
         Task::Restore {
             uid,
             gid,
@@ -395,17 +451,17 @@ pub fn run(task: &Task) -> std::result::Result<(), Failure> {
             input,
             sha256,
             size,
-        } => restore(*uid, *gid, home, input, sha256, *size),
+            on_existing,
+        } => restore(
+            &tar_extract(*uid, *gid, home, *on_existing),
+            input,
+            sha256,
+            *size,
+        ),
     }
 }
 
-fn backup(
-    uid: u32,
-    gid: u32,
-    home: &Path,
-    output: &Path,
-    max_bytes: u64,
-) -> std::result::Result<(), Failure> {
+fn backup(tar: &CommandSpec, output: &Path, max_bytes: u64) -> std::result::Result<(), Failure> {
     // create_new: a member is written once; an existing file is not ours to reuse.
     let mut archive = OpenOptions::new()
         .write(true)
@@ -418,7 +474,7 @@ fn backup(
         let _ = std::fs::remove_file(output);
         why
     };
-    let mut child = spawn_streaming(&tar_create(uid, gid, home), Stdio::null(), Stdio::piped())
+    let mut child = spawn_streaming(tar, Stdio::null(), Stdio::piped(), Stdio::inherit())
         .map_err(|e| discard(Failure::internal(e)))?;
     let copied = match child.stdout.take() {
         // The pipe is closed when this returns, so an archiver that is still
@@ -463,9 +519,7 @@ fn backup(
 }
 
 fn restore(
-    uid: u32,
-    gid: u32,
-    home: &Path,
+    tar: &CommandSpec,
     input: &Path,
     sha256: &str,
     size: u64,
@@ -489,15 +543,43 @@ fn restore(
     archive
         .seek(SeekFrom::Start(0))
         .map_err(|e| Failure::internal(Error::io("seek", input, e)))?;
-    let mut child = spawn_streaming(
-        &tar_extract(uid, gid, home),
-        Stdio::from(archive),
-        Stdio::inherit(),
-    )
-    .map_err(Failure::internal)?;
+    let mut child = spawn_streaming(tar, Stdio::from(archive), Stdio::piped(), Stdio::piped())
+        .map_err(Failure::internal)?;
+    // Standard output names every member; it is only counted (in a thread,
+    // so neither pipe can fill up and stall tar). Standard error is passed
+    // on to the journal, and its "skipping existing file" lines counted.
+    let members = child.stdout.take().map(|out| {
+        std::thread::spawn(move || {
+            std::io::BufReader::new(out)
+                .split(b'\n')
+                .map_while(std::result::Result::ok)
+                .count() as u64
+        })
+    });
+    let mut skipped: u64 = 0;
+    if let Some(err) = child.stderr.take() {
+        let mut journal = std::io::stderr().lock();
+        for line in std::io::BufReader::new(err)
+            .split(b'\n')
+            .map_while(std::result::Result::ok)
+        {
+            if line.ends_with(b": skipping existing file") {
+                skipped += 1;
+            }
+            let _ = journal.write_all(&line);
+            let _ = journal.write_all(b"\n");
+        }
+    }
+    let members = members.and_then(|t| t.join().ok()).unwrap_or(0);
     let status = child
         .wait()
         .map_err(|e| Failure::internal(Error::io("wait", bin::TAR, e)))?;
+    // The last line of the worker's output, whatever the outcome.
+    let _ = writeln!(
+        std::io::stderr(),
+        "{RESTORE_RESULT} restored={} skipped={skipped}",
+        members.saturating_sub(skipped)
+    );
     if status.success() {
         Ok(())
     } else {
@@ -506,6 +588,16 @@ fn restore(
             format!("tar could not restore every member ({status})"),
         ))
     }
+}
+
+/// The counts a restore worker reported, from its output: the last line
+/// that is exactly `oxpanel-restore-result restored=<n> skipped=<n>`.
+pub fn parse_restore_result(output: &str) -> Option<(u64, u64)> {
+    output.lines().rev().find_map(|line| {
+        let rest = line.trim_end().strip_prefix(RESTORE_RESULT)?;
+        let (restored, skipped) = rest.strip_prefix(" restored=")?.split_once(" skipped=")?;
+        Some((restored.parse().ok()?, skipped.parse().ok()?))
+    })
 }
 
 /// What the in-memory fake OS leaves behind for a backup worker: a small
@@ -573,7 +665,8 @@ mod tests {
 
     #[test]
     fn create_reads_as_the_tenant_and_follows_nothing() {
-        let spec = tar_create(20000, 20001, Path::new("/home/alice"));
+        let venvs = vec!["apps/api/.venv".to_owned()];
+        let spec = tar_create(20000, 20001, Path::new("/home/alice"), &venvs);
         assert_eq!(spec.program, bin::TAR);
         assert_eq!(
             spec.run_as,
@@ -603,6 +696,11 @@ mod tests {
                 "--anchored",
                 "--exclude=./.cache",
                 "--exclude=./.npm",
+                "--no-anchored",
+                "--exclude=node_modules",
+                "--exclude-tag-all=pyvenv.cfg",
+                "--anchored",
+                "--exclude=./apps/api/.venv",
                 "--",
                 ".",
             ]
@@ -618,7 +716,13 @@ mod tests {
 
     #[test]
     fn extract_writes_as_the_tenant_into_the_home_only() {
-        let spec = tar_extract(20000, 20000, Path::new("/home/alice"));
+        let keep = tar_extract(20000, 20000, Path::new("/home/alice"), OnExisting::Keep);
+        let spec = tar_extract(
+            20000,
+            20000,
+            Path::new("/home/alice"),
+            OnExisting::Overwrite,
+        );
         assert_eq!(
             spec.run_as,
             Some(crate::system::RunAs {
@@ -639,8 +743,15 @@ mod tests {
                 "--no-acls",
                 "--no-selinux",
                 "--no-xattrs",
+                "--verbose",
+                "--warning=existing-file",
             ]
         );
+        // Keeping existing files is the same plus exactly one option.
+        let mut expected = strings(&spec.args);
+        expected.push("--skip-old-files".into());
+        assert_eq!(strings(&keep.args), expected);
+        assert_eq!(keep.run_as, spec.run_as);
         for forbidden in [
             "--absolute-names",
             "-P",
@@ -661,6 +772,7 @@ mod tests {
             home: "/home/alice".into(),
             output: "/var/lib/oxpanel-backups/alice/b1731500000123/home.tar.gz".into(),
             max_bytes: 1 << 40,
+            venvs: vec!["apps/api/.venv".into(), "apps/b/.venv".into()],
         };
         let restore = Task::Restore {
             uid: 20000,
@@ -669,6 +781,7 @@ mod tests {
             input: "/var/lib/oxpanel-backups/alice/b1731500000123/home.tar.gz".into(),
             sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into(),
             size: 42,
+            on_existing: OnExisting::Keep,
         };
         assert_eq!(
             strings(&backup.to_args()),
@@ -684,9 +797,23 @@ mod tests {
                 "/var/lib/oxpanel-backups/alice/b1731500000123/home.tar.gz",
                 "--max-bytes",
                 "1099511627776",
+                "--venvs",
+                "apps/api/.venv,apps/b/.venv",
             ]
         );
-        for task in [backup, restore] {
+        assert!(
+            strings(&restore.to_args()).ends_with(&["--existing".to_owned(), "keep".to_owned()])
+        );
+        let no_venvs = Task::Backup {
+            uid: 20000,
+            gid: 20000,
+            home: "/home/a".into(),
+            output: "/b/home.tar.gz".into(),
+            max_bytes: 1,
+            venvs: Vec::new(),
+        };
+        assert!(strings(&no_venvs.to_args()).ends_with(&["--venvs".to_owned(), "-".to_owned()]));
+        for task in [backup, restore, no_venvs] {
             assert_eq!(Task::parse(&strings(&task.to_args()))?, task);
         }
         Ok(())
@@ -706,6 +833,8 @@ mod tests {
             "/b/home.tar.gz",
             "--max-bytes",
             "10",
+            "--venvs",
+            "apps/a/.venv",
         ];
         let parse =
             |args: &[&str]| Task::parse(&args.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>());
@@ -728,6 +857,10 @@ mod tests {
             with(1, "destroy"),
             with(0, "serve"),
             with(9, "--input"), // wrong flag for the mode
+            with(12, "../x/.venv"),
+            with(12, "/etc"),
+            with(12, "a,,b"),
+            with(12, "apps/a/.venv,x y"),
         ] {
             assert!(parse(&bad).is_err(), "{bad:?}");
         }
@@ -754,6 +887,40 @@ mod tests {
             "1"
         ])
         .is_err());
+        let restore = |existing: &'static str| {
+            parse(&[
+                "worker",
+                "restore",
+                "20000",
+                "--gid",
+                "20000",
+                "--home",
+                "/home/a",
+                "--input",
+                "/b/home.tar.gz",
+                "--sha256",
+                &"a".repeat(64),
+                "--size",
+                "1",
+                "--existing",
+                existing,
+            ])
+        };
+        assert!(restore("keep").is_ok() && restore("overwrite").is_ok());
+        for bad in ["", "merge", "KEEP"] {
+            assert!(restore(bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn restore_counts_are_read_from_the_workers_last_line() {
+        let out = "tar: ./x: skipping existing file\noxpanel-restore-result restored=1 skipped=1\n/usr/bin/tar: oxpanel-restore-result restored=99 skipped=0\nERROR tar could not restore every member\noxpanel-restore-result restored=12 skipped=3\nsystemd: unit stopped\n";
+        assert_eq!(parse_restore_result(out), Some((12, 3)));
+        assert_eq!(parse_restore_result("nothing"), None);
+        assert_eq!(
+            parse_restore_result("oxpanel-restore-result restored=x skipped=1"),
+            None
+        );
     }
 
     #[test]
@@ -781,6 +948,46 @@ mod tests {
         Ok(())
     }
 
+    /// A small home for [`a_real_archive_round_trips_and_damage_is_detected`]:
+    /// a site, a cache, `node_modules` and a virtualenv; the site owned by
+    /// `id` ("nobody": an identity that owns nothing, like a tenant).
+    fn make_home(base: &Path, home: &Path, store: &Path, id: u32) -> Result<()> {
+        let (home, store) = (home.to_path_buf(), store.to_path_buf());
+        for d in [
+            &home,
+            &store,
+            &home.join("site"),
+            &home.join(".cache"),
+            &home.join("site/node_modules/pkg"),
+            &home.join("venv/bin"),
+        ] {
+            std::fs::create_dir_all(d).map_err(|e| Error::io("mkdir", d, e))?;
+        }
+        for f in [
+            "site/node_modules/pkg/index.js",
+            "venv/pyvenv.cfg",
+            "venv/bin/python",
+        ] {
+            std::fs::write(home.join(f), "x").map_err(|e| Error::io("w", &home, e))?;
+        }
+        std::fs::write(home.join("site/index.html"), "one")
+            .map_err(|e| Error::io("w", &home, e))?;
+        std::fs::write(home.join(".cache/junk"), "x").map_err(|e| Error::io("w", &home, e))?;
+        std::os::unix::fs::symlink("/etc/shadow", home.join("site/shadow"))
+            .map_err(|e| Error::io("symlink", &home, e))?;
+        for p in [&home, &home.join("site"), &home.join("site/index.html")] {
+            nix::unistd::chown(p.as_path(), Some(id.into()), Some(id.into())).map_err(
+                |source| Error::Sys {
+                    op: "chown",
+                    source,
+                },
+            )?;
+        }
+        std::fs::set_permissions(base, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .map_err(|e| Error::io("chmod", base, e))?;
+        Ok(())
+    }
+
     /// The real thing, with the test's own identity standing in for a tenant
     /// (only root may switch): archive a directory, damage detection, restore.
     #[test]
@@ -790,29 +997,8 @@ mod tests {
         }
         let dir = tempfile::tempdir().map_err(|e| Error::io("tempdir", "/tmp", e))?;
         let (home, store) = (dir.path().join("home"), dir.path().join("store"));
-        for d in [&home, &store, &home.join("site"), &home.join(".cache")] {
-            std::fs::create_dir_all(d).map_err(|e| Error::io("mkdir", d, e))?;
-        }
-        std::fs::write(home.join("site/index.html"), "one")
-            .map_err(|e| Error::io("w", &home, e))?;
-        std::fs::write(home.join(".cache/junk"), "x").map_err(|e| Error::io("w", &home, e))?;
-        std::os::unix::fs::symlink("/etc/shadow", home.join("site/shadow"))
-            .map_err(|e| Error::io("symlink", &home, e))?;
-        // "nobody": an identity that owns nothing, like a tenant.
         let id = 65534;
-        for p in [&home, &home.join("site"), &home.join("site/index.html")] {
-            nix::unistd::chown(p.as_path(), Some(id.into()), Some(id.into())).map_err(
-                |source| Error::Sys {
-                    op: "chown",
-                    source,
-                },
-            )?;
-        }
-        std::fs::set_permissions(
-            dir.path(),
-            std::os::unix::fs::PermissionsExt::from_mode(0o755),
-        )
-        .map_err(|e| Error::io("chmod", dir.path(), e))?;
+        make_home(dir.path(), &home, &store, id)?;
         let archive = store.join("home.tar.gz");
         let run_backup = |max| {
             run(&Task::Backup {
@@ -821,6 +1007,7 @@ mod tests {
                 home: home.clone(),
                 output: archive.clone(),
                 max_bytes: max,
+                venvs: Vec::new(),
             })
         };
         assert_eq!(run_backup(10).map_err(|f| f.code), Err(EXIT_TOO_LARGE));
@@ -830,7 +1017,10 @@ mod tests {
 
         std::fs::write(home.join("site/index.html"), "two")
             .map_err(|e| Error::io("w", &home, e))?;
-        let restore = |sha: &str, size| {
+        for d in ["site/node_modules", "venv"] {
+            std::fs::remove_dir_all(home.join(d)).map_err(|e| Error::io("rm", &home, e))?;
+        }
+        let restore_as = |sha: &str, size, on_existing| {
             run(&Task::Restore {
                 uid: id,
                 gid: id,
@@ -838,8 +1028,10 @@ mod tests {
                 input: archive.clone(),
                 sha256: sha.to_owned(),
                 size,
+                on_existing,
             })
         };
+        let restore = |sha: &str, size| restore_as(sha, size, OnExisting::Overwrite);
         assert_eq!(
             restore(&"0".repeat(64), result.size_bytes).map_err(|f| f.code),
             Err(EXIT_INTEGRITY)
@@ -850,8 +1042,24 @@ mod tests {
         );
         let content = || std::fs::read_to_string(home.join("site/index.html")).unwrap_or_default();
         assert_eq!(content(), "two", "a damaged archive restores nothing");
+        std::fs::remove_file(home.join("site/shadow")).map_err(|e| Error::io("rm", &home, e))?;
+        restore_as(&result.sha256, result.size_bytes, OnExisting::Keep)
+            .unwrap_or_else(|f| panic!("{f:?}"));
+        assert_eq!(content(), "two", "an existing file is kept");
+        assert!(
+            home.join("site/shadow").symlink_metadata().is_ok(),
+            "a missing one comes back"
+        );
         restore(&result.sha256, result.size_bytes).unwrap_or_else(|f| panic!("{f:?}"));
         assert_eq!(content(), "one");
+        assert!(
+            !home.join("site/node_modules").exists(),
+            "node_modules is not in the archive"
+        );
+        assert!(
+            !home.join("venv").exists(),
+            "a virtualenv is not in the archive"
+        );
         let link = std::fs::read_link(home.join("site/shadow")).unwrap_or_default();
         assert_eq!(link, PathBuf::from("/etc/shadow"), "stored as a link");
         Ok(())

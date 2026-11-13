@@ -615,6 +615,8 @@ enum BackupCmd {
         /// The existing tenant that receives the files.
         #[arg(long)]
         to: String,
+        #[command(flatten)]
+        existing: ExistingArg,
         /// Wait for the job to finish; exits with status 5 if it failed.
         #[arg(long)]
         wait: bool,
@@ -629,11 +631,13 @@ enum BackupCmd {
         #[arg(long)]
         tenant_deleted: bool,
     },
-    /// Restore the tenant's home from one of its own backups (merges over
-    /// the current files); prints the job.
+    /// Restore the tenant's home from one of its own backups; prints the job.
+    /// One of --overwrite / --keep-existing is required.
     Restore {
         tenant: String,
         backup_id: String,
+        #[command(flatten)]
+        existing: ExistingArg,
         /// Wait for the job to finish; exits with status 5 if it failed.
         #[arg(long)]
         wait: bool,
@@ -645,6 +649,28 @@ enum BackupCmd {
         #[arg(long)]
         wait: bool,
     },
+}
+
+/// What a restore does with files that already exist: a required choice.
+#[derive(Args, Debug)]
+#[group(required = true, multiple = false)]
+struct ExistingArg {
+    /// Files in the backup replace existing ones.
+    #[arg(long)]
+    overwrite: bool,
+    /// Existing files are left untouched; only missing ones are restored.
+    #[arg(long)]
+    keep_existing: bool,
+}
+
+impl ExistingArg {
+    fn value(&self) -> i32 {
+        if self.keep_existing {
+            pb::OnExisting::Keep.into()
+        } else {
+            pb::OnExisting::Overwrite.into()
+        }
+    }
 }
 
 /// Exit status of `backup … --wait` when the job failed.
@@ -678,7 +704,7 @@ fn print_backup(b: &pb::Backup) {
         .map(|m| format!("{}:{}:{}", m.kind, m.name, m.size_bytes))
         .collect();
     say!(
-        "backup={} tenant={}{} state={} created_at={} retain_until={} size={} domains={} members={}",
+        "backup={} tenant={}{} state={} created_at={} retain_until={} size={} domains={} members={} excluded={}",
         b.id,
         b.tenant,
         if b.tenant_deleted { " tenant_deleted=true" } else { "" },
@@ -696,6 +722,7 @@ fn print_backup(b: &pb::Backup) {
         } else {
             members.join(",")
         },
+        b.excluded_count,
     );
 }
 
@@ -721,6 +748,21 @@ async fn follow_job(
     for line in job.output.lines() {
         say!("{line}");
     }
+    if job.kind == i32::from(pb::JobKind::Restore) && !running(&job) {
+        say!(
+            "restored_entries={} skipped_entries={}",
+            job.restored_entries,
+            job.skipped_entries
+        );
+        for site in &job.sites {
+            say!(
+                "site={} dependencies_ok={} detail={}",
+                site.domain,
+                site.succeeded,
+                site.detail
+            );
+        }
+    }
     print_job(&job);
     if job.state == i32::from(pb::JobState::Failed) {
         return Ok(ExitCode::from(EXIT_JOB_FAILED));
@@ -741,50 +783,12 @@ async fn follow_start(
     }
 }
 
-async fn run_backup(
+/// The operator's commands for retained backups.
+async fn run_retained(
     c: &mut OxPanelEngineClient<Channel>,
     cmd: BackupCmd,
 ) -> Result<ExitCode, tonic::Status> {
     match cmd {
-        BackupCmd::Create {
-            tenant,
-            retain_months,
-            wait,
-        } => {
-            let r = c
-                .create_backup(pb::CreateBackupRequest {
-                    tenant,
-                    retain_months,
-                })
-                .await?
-                .into_inner();
-            return follow_start(c, r, wait).await;
-        }
-        BackupCmd::Restore {
-            tenant,
-            backup_id,
-            wait,
-        } => {
-            let r = c
-                .restore_backup(pb::RestoreBackupRequest { tenant, backup_id })
-                .await?
-                .into_inner();
-            return follow_start(c, r, wait).await;
-        }
-        BackupCmd::Job { job_id, wait } => {
-            let job = c.get_job(pb::GetJobRequest { job_id }).await?.into_inner();
-            return follow_job(c, job, wait).await;
-        }
-        BackupCmd::List { tenant } => {
-            for b in &c
-                .list_backups(pb::ListBackupsRequest { tenant })
-                .await?
-                .into_inner()
-                .backups
-            {
-                print_backup(b);
-            }
-        }
         BackupCmd::Retain {
             tenant,
             backup_id,
@@ -814,6 +818,7 @@ async fn run_backup(
             backup_id,
             from,
             to,
+            existing,
             wait,
         } => {
             let r = c
@@ -821,11 +826,69 @@ async fn run_backup(
                     backup_id,
                     source_tenant: from,
                     target_tenant: to,
+                    on_existing: existing.value(),
                 })
                 .await?
                 .into_inner();
             return follow_start(c, r, wait).await;
         }
+        _ => {}
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn run_backup(
+    c: &mut OxPanelEngineClient<Channel>,
+    cmd: BackupCmd,
+) -> Result<ExitCode, tonic::Status> {
+    match cmd {
+        BackupCmd::Create {
+            tenant,
+            retain_months,
+            wait,
+        } => {
+            let r = c
+                .create_backup(pb::CreateBackupRequest {
+                    tenant,
+                    retain_months,
+                })
+                .await?
+                .into_inner();
+            return follow_start(c, r, wait).await;
+        }
+        BackupCmd::Restore {
+            tenant,
+            backup_id,
+            existing,
+            wait,
+        } => {
+            let r = c
+                .restore_backup(pb::RestoreBackupRequest {
+                    tenant,
+                    backup_id,
+                    on_existing: existing.value(),
+                })
+                .await?
+                .into_inner();
+            return follow_start(c, r, wait).await;
+        }
+        BackupCmd::Job { job_id, wait } => {
+            let job = c.get_job(pb::GetJobRequest { job_id }).await?.into_inner();
+            return follow_job(c, job, wait).await;
+        }
+        BackupCmd::List { tenant } => {
+            for b in &c
+                .list_backups(pb::ListBackupsRequest { tenant })
+                .await?
+                .into_inner()
+                .backups
+            {
+                print_backup(b);
+            }
+        }
+        cmd @ (BackupCmd::Retain { .. }
+        | BackupCmd::ListRetained
+        | BackupCmd::RestoreRetained { .. }) => return run_retained(c, cmd).await,
         BackupCmd::Delete {
             tenant,
             backup_id,

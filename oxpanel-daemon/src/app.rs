@@ -290,17 +290,7 @@ pub async fn ensure_app(ctx: &Ctx, tenant: &TenantRecord, vhost: &VHostRecord) -
         )
         .await?;
     ctx.sys.verify_owned_dir(&root, tenant.uid).await?;
-    if app.runtime == AppRuntime::Python && !root.join(".venv/bin/python").exists() {
-        // Created by the tenant, for the tenant: needs no network and no root.
-        ctx.sys
-            .run_ok(
-                CommandSpec::new(bin::PYTHON3, timeout)
-                    .args(["-m", "venv", "--"])
-                    .arg(root.join(".venv"))
-                    .as_user(tenant.uid, tenant.gid),
-            )
-            .await?;
-    }
+    ensure_venv(ctx, tenant, app).await?;
     let unit = unit_name(&domain);
     let changed = fsutil::write_atomic(
         &unit_path(&cfg.systemd_unit_dir, &domain),
@@ -327,6 +317,34 @@ pub async fn ensure_app(ctx: &Ctx, tenant: &TenantRecord, vhost: &VHostRecord) -
             .await?;
     }
     Ok(changed)
+}
+
+/// A Python application's virtualenv (`<root>/.venv`), created if it is
+/// missing — after `ConfigureVirtualHost`, and after a restore (backups
+/// leave virtualenvs out). Nothing for other runtimes.
+pub async fn ensure_venv(ctx: &Ctx, tenant: &TenantRecord, app: &AppRecord) -> Result<()> {
+    let root = app_root(tenant, app);
+    if app.runtime == AppRuntime::Python && !root.join(".venv/bin/python").exists() {
+        // Created by the tenant, for the tenant: needs no network and no root.
+        ctx.sys
+            .run_ok(
+                CommandSpec::new(bin::PYTHON3, ctx.config.command_timeout)
+                    .args(["-m", "venv", "--"])
+                    .arg(root.join(".venv"))
+                    .as_user(tenant.uid, tenant.gid),
+            )
+            .await?;
+    }
+    Ok(())
+}
+
+/// The file `InstallAppDependencies` installs from: `package.json` or
+/// `requirements.txt`, relative to the application directory.
+pub fn dependency_manifest(runtime: AppRuntime) -> &'static str {
+    match runtime {
+        AppRuntime::Node => "package.json",
+        AppRuntime::Python => "requirements.txt",
+    }
 }
 
 /// Stop the application and remove its unit. The application directory is the
@@ -387,11 +405,25 @@ pub async fn restart(ctx: &Ctx, vhost: &VHostRecord) -> Result<()> {
     Ok(())
 }
 
+/// Install the application's dependencies (see [`run_installer`]), then
+/// restart it if that succeeded and the tenant is not suspended.
+pub async fn install_dependencies(
+    ctx: &Ctx,
+    tenant: &TenantRecord,
+    vhost: &VHostRecord,
+) -> Result<(bool, String)> {
+    let (succeeded, output) = run_installer(ctx, tenant, vhost).await?;
+    if succeeded && !tenant.suspended {
+        restart(ctx, vhost).await?;
+    }
+    Ok((succeeded, output))
+}
+
 /// Install the application's dependencies as the tenant. Runs in a transient
 /// unit (the daemon has no network), sandboxed like the application itself and
 /// inside the tenant's slice. Returns whether the installer succeeded and the
 /// end of its output; a failing installer is a result, not an error.
-pub async fn install_dependencies(
+pub async fn run_installer(
     ctx: &Ctx,
     tenant: &TenantRecord,
     vhost: &VHostRecord,
@@ -470,9 +502,6 @@ pub async fn install_dependencies(
             output.push('\n');
         }
         output.push_str(&own);
-    }
-    if succeeded && !tenant.suspended {
-        restart(ctx, vhost).await?;
     }
     Ok((succeeded, output))
 }

@@ -3,8 +3,8 @@
 //! A backup is a directory `<backup_dir>/<tenant>/<backup id>/`, root-only,
 //! outside every tenant's reach. It holds *members* and a manifest:
 //!
-//! - `home.tar.gz` (kind `home`) — the tenant's home, written by `tar` running
-//!   as the tenant;
+//! - `home.tar.gz` (kind `home`) — the tenant's home without what can be
+//!   rebuilt ([`EXCLUDE_RULES`]), written by `tar` running as the tenant;
 //! - `records.json` (kind `records`) — the engine's records of the tenant and
 //!   its virtual hosts, so the backup says what it is a backup of;
 //! - `manifest.json` — the list of members with size and SHA-256. It is
@@ -28,8 +28,11 @@
 //! ([`BackupService::resume_all`]).
 //!
 //! Decisions (see `docs/superpowers/specs/2026-11-13-backup-design.md`):
-//! restore merges over the home; PHP and applications are stopped while it
-//! runs; a tenant with backups cannot be deleted; one job per tenant at a time.
+//! node_modules and virtualenvs are left out (and listed); a restore needs an
+//! explicit choice for existing files, stops PHP and applications while it
+//! runs and rebuilds the applications' dependencies afterwards; a tenant
+//! with backups that are not retained cannot be deleted; one job per tenant
+//! at a time.
 
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -42,8 +45,8 @@ use crate::error::{Error, Result};
 use crate::fsutil;
 use crate::nginx::safe_path_str;
 use crate::records::{
-    now_unix, BackupMember, BackupRecord, BackupState, JobKind, JobRecord, JobState, TenantRecord,
-    TenantState, VHostRecord, RECORD_VERSION,
+    now_unix, AppRuntime, BackupMember, BackupRecord, BackupState, JobKind, JobRecord, JobState,
+    OnExisting, SiteResult, TenantRecord, TenantState, VHostRecord, RECORD_VERSION,
 };
 use crate::system::{bin, CommandSpec};
 use crate::validate::{retain_months, BackupId, JobId, Username};
@@ -76,7 +79,22 @@ const EXPIRY_INTERVAL: Duration = Duration::from_secs(3600);
 /// Consecutive faults after which a driver stops looking at its job.
 const MAX_DRIVER_FAULTS: u32 = 30;
 
-/// What `manifest.json` holds.
+/// What the home archive always leaves out (owner decision: large, and
+/// rebuilt after a restore), in words, for the manifest and the API. The
+/// options that implement them are in [`worker::tar_create`].
+pub const EXCLUDE_RULES: [&str; 5] = [
+    "./.cache (download caches)",
+    "./.npm (npm cache)",
+    "node_modules, at any depth",
+    "every directory that contains a pyvenv.cfg (Python virtualenvs)",
+    "<application root>/.venv of every Python application",
+];
+/// Excluded directories named in a record and the manifest; the count is
+/// always complete.
+pub const EXCLUDED_LISTED: usize = 200;
+
+/// What `manifest.json` holds. The exclusion fields were added within format
+/// 1 (readers must tolerate fields they do not know).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Manifest {
     pub format: u32,
@@ -85,6 +103,58 @@ pub struct Manifest {
     pub created_at_unix: u64,
     pub engine_version: String,
     pub members: Vec<BackupMember>,
+    /// What the home archive leaves out, by rule.
+    pub exclude_rules: Vec<String>,
+    /// The directories that rule matched when the backup was started
+    /// (relative to the home; "." is the home itself), at most
+    /// [`EXCLUDED_LISTED`], and how many there were.
+    pub excluded: Vec<String>,
+    pub excluded_count: u64,
+}
+
+/// The `.venv` of every Python application of the tenant, relative to its
+/// home: left out of the archive by path, besides by their `pyvenv.cfg`.
+pub fn app_venvs(tenant: &str, vhosts: &[VHostRecord]) -> Vec<String> {
+    vhosts
+        .iter()
+        .filter(|v| v.tenant == tenant)
+        .filter_map(|v| v.app.as_ref())
+        .filter(|a| a.runtime == AppRuntime::Python)
+        .map(|a| format!("{}/.venv", a.root))
+        .collect()
+}
+
+/// Turn the pre-scan's NUL-separated output into the excluded directories,
+/// relative to `home`: deduplicated, without those inside another excluded
+/// one, sorted. ("." — a `pyvenv.cfg` in the home itself — swallows all.)
+pub fn excluded_dirs(home: &str, scan: &[u8]) -> Vec<String> {
+    let prefix = format!("{home}/");
+    let mut dirs: Vec<String> = scan
+        .split(|b| *b == 0)
+        .filter(|e| !e.is_empty())
+        .map(|e| String::from_utf8_lossy(e).into_owned())
+        .map(|e| {
+            if e == home {
+                ".".to_owned()
+            } else {
+                e.strip_prefix(&prefix)
+                    .map_or_else(|| e.clone(), str::to_owned)
+            }
+        })
+        .collect();
+    dirs.sort();
+    dirs.dedup();
+    if dirs.iter().any(|d| d == ".") {
+        return vec![".".to_owned()];
+    }
+    let mut out: Vec<String> = Vec::new();
+    for d in dirs {
+        // Sorted: an enclosing directory comes before what it contains.
+        if !out.iter().any(|o| d.starts_with(&format!("{o}/"))) {
+            out.push(d);
+        }
+    }
+    out
 }
 
 /// What `records.json` holds.
@@ -119,6 +189,9 @@ pub fn render_manifest(rec: &BackupRecord) -> Result<Vec<u8>> {
         created_at_unix: rec.created_at_unix,
         engine_version: env!("CARGO_PKG_VERSION").to_owned(),
         members: rec.members.clone(),
+        exclude_rules: EXCLUDE_RULES.iter().map(|r| (*r).to_owned()).collect(),
+        excluded: rec.excluded.clone(),
+        excluded_count: rec.excluded_count,
     };
     let mut bytes = serde_json::to_vec_pretty(&manifest)
         .map_err(|e| Error::Internal(format!("serialise manifest: {e}")))?;
@@ -208,6 +281,13 @@ fn tail(text: &str) -> String {
     text.get(start..).unwrap_or_default().trim().to_owned()
 }
 
+/// What [`BackupService::measure`] found.
+struct Measured {
+    needed: u64,
+    excluded: Vec<String>,
+    excluded_count: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct BackupService {
     ctx: Ctx,
@@ -286,30 +366,107 @@ impl BackupService {
         }
     }
 
-    /// Space the home occupies, measured as the tenant (so nothing is looked
-    /// at that the tenant could not look at). Sparse files count for what
-    /// they occupy, which is also what `tar --sparse` stores.
-    async fn home_usage(&self, tenant: &TenantRecord) -> Result<u64> {
+    /// What a backup of the home will leave out, and the space the rest
+    /// occupies. Both are measured as the tenant (nothing is looked at that
+    /// the tenant could not look at, no symlink is followed), on one file
+    /// system like the archiver. Sparse files count for what they occupy,
+    /// which is also what `tar --sparse` stores.
+    async fn measure(&self, tenant: &TenantRecord, venvs: &[String]) -> Result<Measured> {
+        let home = safe_path_str(&tenant.home)?;
+        // Mirrors `worker::tar_create`: caches pruned silently; node_modules
+        // and the applications' .venv printed relative to the home;
+        // directories holding a pyvenv.cfg printed absolute.
+        let mut find = CommandSpec::new(bin::FIND, MEASURE_TIMEOUT)
+            .arg(&tenant.home)
+            .args(["-xdev", "(", "-path"])
+            .arg(format!("{home}/.cache"))
+            .args(["-o", "-path"])
+            .arg(format!("{home}/.npm"))
+            .args([")", "-prune", "-o", "(", "-name", "node_modules"]);
+        for v in venvs {
+            find = find.args(["-o", "-path"]).arg(format!("{home}/{v}"));
+        }
+        let find = find.args([
+            ")",
+            "-prune",
+            "-printf",
+            "%P\\0",
+            "-o",
+            "-name",
+            "pyvenv.cfg",
+            "-printf",
+            "%h\\0",
+        ]);
+        // A non-zero status only means some directory was unreadable.
+        let scan = self
+            .ctx
+            .sys
+            .run(find.as_user(tenant.uid, tenant.gid))
+            .await?;
+        let all = excluded_dirs(home, &scan.stdout);
+        let excluded_count = all.len() as u64;
+        let excluded: Vec<String> = all.into_iter().take(EXCLUDED_LISTED).collect();
+
+        let mut du = CommandSpec::new(bin::DU, MEASURE_TIMEOUT)
+            .args(["--summarize", "--one-file-system", "--block-size=1"])
+            .arg("--exclude=node_modules")
+            .arg(format!("--exclude={home}/.cache"))
+            .arg(format!("--exclude={home}/.npm"));
+        // du takes these as patterns: a name with pattern characters is
+        // simply counted (the estimate errs on the large side).
+        for d in excluded
+            .iter()
+            .filter(|d| *d != "." && !d.contains(['*', '?', '[', '\\']))
+        {
+            du = du.arg(format!("--exclude={home}/{d}"));
+        }
         let out = self
             .ctx
             .sys
             .run(
-                CommandSpec::new(bin::DU, MEASURE_TIMEOUT)
-                    .args(["--summarize", "--one-file-system", "--block-size=1", "--"])
+                du.arg("--")
                     .arg(&tenant.home)
                     .as_user(tenant.uid, tenant.gid),
             )
             .await?;
-        // A non-zero status only means some directory was unreadable; the
-        // total of the rest is still printed.
-        out.stdout_lossy()
+        // As above: the total of what could be read is still printed.
+        let needed = out
+            .stdout_lossy()
             .lines()
             .last()
             .and_then(|l| l.split_whitespace().next())
             .and_then(|n| n.parse::<u64>().ok())
             .ok_or_else(|| {
                 Error::Internal(format!("unexpected du output for '{}'", tenant.username))
-            })
+            })?;
+        Ok(Measured {
+            needed,
+            excluded,
+            excluded_count,
+        })
+    }
+
+    /// How large an archive may grow: refused before anything is created
+    /// unless `needed` fits and the reserve survives it.
+    async fn room_for(&self, needed: u64) -> Result<u64> {
+        let cfg = &self.ctx.config;
+        fsutil::ensure_dir(&cfg.backup_dir, DIR_MODE)?;
+        let free = self
+            .ctx
+            .sys
+            .host_stats(&cfg.backup_dir)
+            .await?
+            .disk_free_bytes;
+        let reserve = cfg.backup_min_free_bytes;
+        if free < needed.saturating_add(reserve) {
+            return Err(Error::BackupNoSpace {
+                needed,
+                reserve,
+                free,
+            });
+        }
+        // The archive may not grow into the reserve even if the home does.
+        Ok(free - reserve)
     }
 
     /// The `systemd-run` invocation for a job: the worker in the tenant's
@@ -392,7 +549,8 @@ impl BackupService {
         };
         self.archiver_available().await?;
         // Measured before the lock is taken: it can take a while.
-        let needed = self.home_usage(&self.ready_tenant(&name)?).await?;
+        let venvs = app_venvs(name.as_str(), &self.ctx.store.list_vhosts()?);
+        let measured = self.measure(&self.ready_tenant(&name)?, &venvs).await?;
 
         let guard = self.ctx.lock.lock().await;
         let cfg = &self.ctx.config;
@@ -406,23 +564,7 @@ impl BackupService {
                 }),
             };
         }
-        fsutil::ensure_dir(&cfg.backup_dir, DIR_MODE)?;
-        // Refused before anything is created: the archive can be as large as
-        // the home, and the reserve must survive it.
-        let free = self
-            .ctx
-            .sys
-            .host_stats(&cfg.backup_dir)
-            .await?
-            .disk_free_bytes;
-        let reserve = cfg.backup_min_free_bytes;
-        if free < needed.saturating_add(reserve) {
-            return Err(Error::BackupNoSpace {
-                needed,
-                reserve,
-                free,
-            });
-        }
+        let room = self.room_for(measured.needed).await?;
 
         let (id, job_id) = self.new_ids()?;
         let dir = backup_path(&cfg.backup_dir, &name, &id);
@@ -445,6 +587,8 @@ impl BackupService {
             domains: vhosts.iter().map(|v| v.domain.clone()).collect(),
             retain_until_unix,
             tenant_deleted: false,
+            excluded: measured.excluded,
+            excluded_count: measured.excluded_count,
         };
         let job = JobRecord {
             version: RECORD_VERSION,
@@ -458,6 +602,10 @@ impl BackupService {
             output: String::new(),
             started_at_unix: backup.created_at_unix,
             finished_at_unix: 0,
+            on_existing: None,
+            restored_entries: 0,
+            skipped_entries: 0,
+            sites: Vec::new(),
         };
         // Records first: whatever happens next, a restarted daemon knows
         // there is a job to finish and a directory to account for.
@@ -469,7 +617,8 @@ impl BackupService {
             home: tenant_rec.home.clone(),
             output: dir.join(HOME_MEMBER),
             // The archive may not grow into the reserve even if the home does.
-            max_bytes: free - reserve,
+            max_bytes: room,
+            venvs,
         };
         let started = self
             .prepare_backup_dir(&name, &dir, &tenant_rec, &vhosts)
@@ -508,7 +657,12 @@ impl BackupService {
 
     /// Start restoring `tenant` from its backup `backup_id`. Returns the job
     /// and whether it was started now.
-    pub async fn restore(&self, tenant: &str, backup_id: &str) -> Result<(JobRecord, bool)> {
+    pub async fn restore(
+        &self,
+        tenant: &str,
+        backup_id: &str,
+        on_existing: OnExisting,
+    ) -> Result<(JobRecord, bool)> {
         let name = Username::parse_field(tenant, "tenant")?;
         let id = BackupId::parse(backup_id)?;
         self.archiver_available().await?;
@@ -524,7 +678,9 @@ impl BackupService {
                 backup.uid, tenant_rec.uid
             )));
         }
-        let started = self.start_restore(&tenant_rec, &backup).await?;
+        let started = self
+            .start_restore(&tenant_rec, &backup, on_existing)
+            .await?;
         drop(guard);
         Ok(started)
     }
@@ -538,6 +694,7 @@ impl BackupService {
         backup_id: &str,
         source_tenant: &str,
         target_tenant: &str,
+        on_existing: OnExisting,
     ) -> Result<(JobRecord, bool)> {
         let id = BackupId::parse(backup_id)?;
         let source = Username::parse_field(source_tenant, "source_tenant")?;
@@ -546,7 +703,9 @@ impl BackupService {
         let guard = self.ctx.lock.lock().await;
         let backup = self.retained_of_deleted(&source, &id)?;
         let tenant_rec = self.ready_tenant(&target)?;
-        let started = self.start_restore(&tenant_rec, &backup).await?;
+        let started = self
+            .start_restore(&tenant_rec, &backup, on_existing)
+            .await?;
         drop(guard);
         Ok(started)
     }
@@ -558,6 +717,7 @@ impl BackupService {
         &self,
         tenant_rec: &TenantRecord,
         backup: &BackupRecord,
+        on_existing: OnExisting,
     ) -> Result<(JobRecord, bool)> {
         let name = Username::parse_field(&tenant_rec.username, "tenant")?;
         let id = BackupId::parse(&backup.id)?;
@@ -565,7 +725,10 @@ impl BackupService {
             return Err(Error::BackupNotReady(id.to_string()));
         }
         if let Some(job) = self.job_in_flight(&name)? {
-            return if job.kind == JobKind::Restore && job.backup_id == backup.id {
+            return if job.kind == JobKind::Restore
+                && job.backup_id == backup.id
+                && job.on_existing == Some(on_existing)
+            {
                 Ok((job, false))
             } else {
                 Err(Error::JobRunning {
@@ -594,6 +757,10 @@ impl BackupService {
             output: String::new(),
             started_at_unix: now_unix(),
             finished_at_unix: 0,
+            on_existing: Some(on_existing),
+            restored_entries: 0,
+            skipped_entries: 0,
+            sites: Vec::new(),
         };
         let task = Task::Restore {
             uid: tenant_rec.uid,
@@ -602,6 +769,7 @@ impl BackupService {
             input: backup_path(&self.ctx.config.backup_dir, &source, &id).join(&home.name),
             sha256: home.sha256.clone(),
             size: home.size_bytes,
+            on_existing,
         };
         let cmd = self.job_command(&job, tenant_rec, &tenant_rec.home, &task)?;
         self.ctx.store.save_job(&job)?;
@@ -1041,25 +1209,54 @@ impl BackupService {
     /// into service. The caller holds the mutation lock.
     async fn conclude_restore(
         &self,
-        job: JobRecord,
+        mut job: JobRecord,
         outcome: std::result::Result<(), String>,
         output: &str,
     ) -> Result<JobRecord> {
         let name = Username::parse_field(&job.tenant, "tenant")?;
+        let reported = worker::parse_restore_result(output);
+        if let Some((restored, skipped)) = reported {
+            job.restored_entries = restored;
+            job.skipped_entries = skipped;
+        }
         // Whatever the archiver did or did not do, the home must be private
         // and the sites must be servable and running again.
         let service = match self.ctx.store.load_tenant(&name)? {
             Some(tenant) if tenant.state == TenantState::Ready => {
-                self.back_into_service(&tenant).await
+                let (service, sites) = self.back_into_service(&tenant).await;
+                job.sites = sites;
+                service
             }
             _ => Ok(()),
+        };
+        let counts = if reported.is_some() {
+            format!(
+                "{} entries restored, {} kept because they already existed",
+                job.restored_entries, job.skipped_entries
+            )
+        } else {
+            "the worker reported no entry counts".to_owned()
+        };
+        let failed_sites: Vec<&str> = job
+            .sites
+            .iter()
+            .filter(|s| !s.succeeded)
+            .map(|s| s.domain.as_str())
+            .collect();
+        let apps = if failed_sites.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "; application dependencies could NOT be reinstalled for {} (see sites)",
+                failed_sites.join(", ")
+            )
         };
         let (state, message) = match (outcome, service) {
             (Ok(()), Ok(())) => (
                 JobState::Succeeded,
-                format!("restored from backup {}", job.backup_id),
+                format!("restored from backup {} ({counts}){apps}", job.backup_id),
             ),
-            (Err(reason), Ok(())) => (JobState::Failed, reason),
+            (Err(reason), Ok(())) => (JobState::Failed, format!("{reason} ({counts}){apps}")),
             (outcome, Err(e)) => {
                 error!(job = %job.id, tenant = %name, error = %e, "could not put the tenant back into service after a restore");
                 let files = match outcome {
@@ -1068,7 +1265,7 @@ impl BackupService {
                 };
                 (
                     JobState::Failed,
-                    format!("{files}, but the sites could not be put back into service; see the oxpanel-daemon journal"),
+                    format!("{files} ({counts}), but the sites could not be put back into service; see the oxpanel-daemon journal"),
                 )
             }
         };
@@ -1082,9 +1279,11 @@ impl BackupService {
 
     /// What a restore may have undone, done again: the home closed to
     /// others, default labels, the web server's access to every document
-    /// root (as `ConfigureVirtualHost` grants it), and the tenant's services.
-    /// Every step is attempted; the first error is returned.
-    async fn back_into_service(&self, tenant: &TenantRecord) -> Result<()> {
+    /// root (as `ConfigureVirtualHost` grants it), the applications'
+    /// virtualenvs and dependencies (backups leave them out), and the
+    /// tenant's services. Every step is attempted; the first error is
+    /// returned, with the per-application results.
+    async fn back_into_service(&self, tenant: &TenantRecord) -> (Result<()>, Vec<SiteResult>) {
         let private = self
             .ctx
             .sys
@@ -1106,8 +1305,72 @@ impl BackupService {
         let access = VHostService::new(self.ctx.clone())
             .restore_web_access(tenant)
             .await;
+        let sites = self.rebuild_apps(tenant).await;
         let services = self.set_services(tenant, true).await;
-        private.and(labels).and(access).and(services)
+        (private.and(labels).and(access).and(services), sites)
+    }
+
+    /// For every application site of the tenant, before it is started
+    /// again: the Python virtualenv, then the dependencies, installed exactly
+    /// as `InstallAppDependencies` does (as the tenant, in a transient unit
+    /// that may use the network — this daemon and the job's worker may not).
+    /// A failure is reported per site and never fails the restore of the
+    /// files.
+    async fn rebuild_apps(&self, tenant: &TenantRecord) -> Vec<SiteResult> {
+        let vhosts = match self.ctx.store.list_vhosts() {
+            Ok(v) => v,
+            Err(e) => {
+                return vec![SiteResult {
+                    domain: String::new(),
+                    succeeded: false,
+                    detail: format!("the sites could not be listed: {e}"),
+                }]
+            }
+        };
+        let mut out = Vec::new();
+        for v in vhosts.iter().filter(|v| v.tenant == tenant.username) {
+            let Some(app) = &v.app else { continue };
+            let result = self.rebuild_app(tenant, v, app).await;
+            let (succeeded, detail) = match result {
+                Ok(done) => (true, done),
+                Err(e) => (false, e),
+            };
+            if !succeeded {
+                warn!(domain = %v.domain, tenant = %tenant.username, %detail, "application not rebuilt after a restore");
+            }
+            out.push(SiteResult {
+                domain: v.domain.clone(),
+                succeeded,
+                detail,
+            });
+        }
+        out
+    }
+
+    async fn rebuild_app(
+        &self,
+        tenant: &TenantRecord,
+        vhost: &VHostRecord,
+        app: &crate::records::AppRecord,
+    ) -> std::result::Result<String, String> {
+        crate::app::ensure_venv(&self.ctx, tenant, app)
+            .await
+            .map_err(|e| format!("the virtualenv could not be created: {e}"))?;
+        let manifest = crate::app::dependency_manifest(app.runtime);
+        let root = crate::app::app_root(tenant, app);
+        if !std::fs::symlink_metadata(root.join(manifest)).is_ok_and(|m| m.is_file()) {
+            return Ok(format!("no {manifest}; nothing to install"));
+        }
+        // Not `install_dependencies`: that restarts the application, which
+        // is started later, with the tenant's other services.
+        match crate::app::run_installer(&self.ctx, tenant, vhost).await {
+            Ok((true, _)) => Ok(format!("dependencies reinstalled from {manifest}")),
+            Ok((false, output)) => Err(format!(
+                "the dependency installation failed: {}",
+                output.lines().last().unwrap_or("no output")
+            )),
+            Err(e) => Err(format!("the dependency installation could not run: {e}")),
+        }
     }
 
     fn finish_job(
@@ -1214,6 +1477,7 @@ pub fn forget_tenant_jobs(ctx: &Ctx, tenant: &Username) -> Result<()> {
 mod tests {
     use super::*;
     use crate::config::Config;
+    use crate::records::AppRuntime;
     use crate::system::{FakeSystem, RunAs};
     use crate::tenant::TenantService;
     use crate::validate::Limits;
@@ -1351,6 +1615,53 @@ mod tests {
         );
     }
 
+    /// The exclusion scan of a home without applications.
+    fn expected_scan(home: &str) -> Vec<String> {
+        [
+            home,
+            "-xdev",
+            "(",
+            "-path",
+            &format!("{home}/.cache"),
+            "-o",
+            "-path",
+            &format!("{home}/.npm"),
+            ")",
+            "-prune",
+            "-o",
+            "(",
+            "-name",
+            "node_modules",
+            ")",
+            "-prune",
+            "-printf",
+            "%P\\0",
+            "-o",
+            "-name",
+            "pyvenv.cfg",
+            "-printf",
+            "%h\\0",
+        ]
+        .map(str::to_owned)
+        .to_vec()
+    }
+
+    /// The size estimate of a home without applications.
+    fn expected_du(home: &str) -> Vec<String> {
+        [
+            "--summarize",
+            "--one-file-system",
+            "--block-size=1",
+            "--exclude=node_modules",
+            &format!("--exclude={home}/.cache"),
+            &format!("--exclude={home}/.npm"),
+            "--",
+            home,
+        ]
+        .map(str::to_owned)
+        .to_vec()
+    }
+
     #[tokio::test]
     async fn create_starts_a_sandboxed_worker_in_the_tenants_slice() -> Result<()> {
         let h = harness(false).await;
@@ -1362,16 +1673,19 @@ mod tests {
         let dir = h.dir(&job);
         let dir_str = dir.to_string_lossy();
 
-        // Measured as the tenant.
+        // Measured as the tenant: first what will be left out, then the
+        // rest.
+        let tenant = Some(RunAs {
+            uid: 20000,
+            gid: 20000,
+        });
+        let find = h.sys.calls_to(bin::FIND);
+        assert_eq!(find.first().and_then(|c| c.run_as), tenant);
+        assert_eq!(find.first().map(args), Some(expected_scan(&home)));
         let du = h.sys.calls_to(bin::DU);
         assert_eq!(du.len(), 1);
-        assert_eq!(
-            du.first().and_then(|c| c.run_as),
-            Some(RunAs {
-                uid: 20000,
-                gid: 20000
-            })
-        );
+        assert_eq!(du.first().and_then(|c| c.run_as), tenant);
+        assert_eq!(du.first().map(args), Some(expected_du(&home)));
 
         let run = h.sys.calls_to(bin::SYSTEMD_RUN);
         assert_eq!(run.len(), 1);
@@ -1428,6 +1742,8 @@ mod tests {
                 &format!("{dir_str}/home.tar.gz"),
                 "--max-bytes",
                 &max_bytes,
+                "--venvs",
+                "-",
             ]
             .map(str::to_owned),
         );
@@ -1440,7 +1756,9 @@ mod tests {
             .first()
             .is_some_and(|b| b.state == BackupState::Creating && b.domains == ["example.com"]));
         assert!(matches!(
-            h.backups.restore("alice", &job.backup_id).await,
+            h.backups
+                .restore("alice", &job.backup_id, OnExisting::Overwrite)
+                .await,
             Err(Error::BackupNotReady(_))
         ));
         assert!(matches!(
@@ -1671,7 +1989,9 @@ mod tests {
         let without_gzip =
             BackupService::new(Ctx::new((*h.ctx.config).clone(), Arc::new(fresh), false));
         assert!(matches!(
-            without_gzip.restore("alice", "b1731500000123").await,
+            without_gzip
+                .restore("alice", "b1731500000123", OnExisting::Overwrite)
+                .await,
             Err(Error::RuntimeUnavailable(_))
         ));
         let h = harness(false).await;
@@ -1695,7 +2015,8 @@ mod tests {
         let (job, _) = h.backups.create("alice", 0).await?;
         let run = h.sys.calls_to(bin::SYSTEMD_RUN);
         let argv = run.first().map(args).unwrap_or_default();
-        assert_eq!(argv.last().map(String::as_str), Some("8192"));
+        let max = argv.iter().skip_while(|a| *a != "--max-bytes").nth(1);
+        assert_eq!(max.map(String::as_str), Some("8192"));
         h.finish(&job).await?;
 
         for bad in [
@@ -1706,7 +2027,7 @@ mod tests {
             "b1731500000123/x",
         ] {
             assert!(matches!(
-                h.backups.restore("alice", bad).await,
+                h.backups.restore("alice", bad, OnExisting::Overwrite).await,
                 Err(Error::InvalidInput { .. })
             ));
             assert!(matches!(
@@ -1803,7 +2124,10 @@ mod tests {
             .unwrap_or_else(|| panic!("no home member"));
         h.sys.clear_calls();
 
-        let (job, started) = h.backups.restore("alice", &made.backup_id).await?;
+        let (job, started) = h
+            .backups
+            .restore("alice", &made.backup_id, OnExisting::Overwrite)
+            .await?;
         assert!(started);
         assert_eq!((job.kind, job.state), (JobKind::Restore, JobState::Running));
         let home = h.ctx.config.home_base.join("alice");
@@ -1853,6 +2177,8 @@ mod tests {
                 &home_member.sha256,
                 "--size",
                 &home_member.size_bytes.to_string(),
+                "--existing",
+                "overwrite",
             ]
         );
         // One job per tenant; the same request returns the same job.
@@ -1860,7 +2186,12 @@ mod tests {
             h.backups.create("alice", 0).await,
             Err(Error::JobRunning { .. })
         ));
-        assert!(!h.backups.restore("alice", &made.backup_id).await?.1);
+        assert!(
+            !h.backups
+                .restore("alice", &made.backup_id, OnExisting::Overwrite)
+                .await?
+                .1
+        );
         assert!(matches!(
             h.backups.delete("alice", &made.backup_id).await,
             Err(Error::JobRunning { .. })
@@ -1871,7 +2202,10 @@ mod tests {
         assert_eq!(done.state, JobState::Succeeded);
         assert_eq!(
             done.message,
-            format!("restored from backup {}", made.backup_id)
+            format!(
+                "restored from backup {} (the worker reported no entry counts)",
+                made.backup_id
+            )
         );
         // Afterwards: labels, the web server's ACLs as ConfigureVirtualHost
         // sets them, and PHP running again.
@@ -1893,7 +2227,10 @@ mod tests {
         let h = harness(false).await;
         let made = h.backup("alice").await?;
         // Damaged archive.
-        let (job, _) = h.backups.restore("alice", &made.backup_id).await?;
+        let (job, _) = h
+            .backups
+            .restore("alice", &made.backup_id, OnExisting::Overwrite)
+            .await?;
         h.sys
             .script_stdout(bin::SYSTEMCTL, &failed("exit-code", worker::EXIT_INTEGRITY));
         h.sys.clear_calls();
@@ -1906,13 +2243,19 @@ mod tests {
             .iter()
             .any(|c| args(c) == ["enable", "--now", "--", "oxpanel-php-alice.service"]));
         // The host restarted in the middle.
-        let (job, _) = h.backups.restore("alice", &made.backup_id).await?;
+        let (job, _) = h
+            .backups
+            .restore("alice", &made.backup_id, OnExisting::Overwrite)
+            .await?;
         h.sys.script_stdout(bin::SYSTEMCTL, GONE);
         let done = h.finish(&job).await?;
         assert_eq!(done.state, JobState::Failed);
         assert!(done.message.contains("repeat the restore"));
         // A hostile archive: tar refused members.
-        let (job, _) = h.backups.restore("alice", &made.backup_id).await?;
+        let (job, _) = h
+            .backups
+            .restore("alice", &made.backup_id, OnExisting::Overwrite)
+            .await?;
         h.sys
             .script_stdout(bin::SYSTEMCTL, &failed("exit-code", worker::EXIT_ARCHIVER));
         assert!(h
@@ -1923,7 +2266,11 @@ mod tests {
         // The worker could not be started: services come back at once.
         h.sys.script_failure(bin::SYSTEMD_RUN, 1, "nope");
         h.sys.clear_calls();
-        assert!(h.backups.restore("alice", &made.backup_id).await.is_err());
+        assert!(h
+            .backups
+            .restore("alice", &made.backup_id, OnExisting::Overwrite)
+            .await
+            .is_err());
         let verbs: Vec<String> = h
             .sys
             .calls_to(bin::SYSTEMCTL)
@@ -1949,7 +2296,10 @@ mod tests {
         let made = h.backup("alice").await?;
         assert_eq!(made.state, JobState::Succeeded);
         h.sys.clear_calls();
-        let (job, _) = h.backups.restore("alice", &made.backup_id).await?;
+        let (job, _) = h
+            .backups
+            .restore("alice", &made.backup_id, OnExisting::Overwrite)
+            .await?;
         assert_eq!(h.finish(&job).await?.state, JobState::Succeeded);
         let touched_php = h
             .sys
@@ -1969,7 +2319,9 @@ mod tests {
         let made = h.backup("alice").await?;
         h.sys.clear_calls();
         assert!(matches!(
-            h.backups.restore("bob", &made.backup_id).await,
+            h.backups
+                .restore("bob", &made.backup_id, OnExisting::Overwrite)
+                .await,
             Err(Error::BackupNotFound { .. })
         ));
         assert!(!h.backups.delete("bob", &made.backup_id).await?);
@@ -1987,7 +2339,9 @@ mod tests {
         rec.uid = 29999;
         h.ctx.store.save_backup(&rec)?;
         assert!(matches!(
-            h.backups.restore("alice", &made.backup_id).await,
+            h.backups
+                .restore("alice", &made.backup_id, OnExisting::Overwrite)
+                .await,
             Err(Error::Internal(_))
         ));
         assert!(h.sys.calls_to(bin::SYSTEMD_RUN).is_empty());
@@ -2169,7 +2523,9 @@ mod tests {
         h.tenants.create("bob", Limits::default(), "").await?;
         assert!(h.backups.list("bob").await?.is_empty());
         assert!(matches!(
-            h.backups.restore("bob", &fin.backup_id).await,
+            h.backups
+                .restore("bob", &fin.backup_id, OnExisting::Overwrite)
+                .await,
             Err(Error::BackupNotFound { .. })
         ));
         assert!(matches!(
@@ -2201,20 +2557,20 @@ mod tests {
         h.sys.clear_calls();
         assert!(matches!(
             h.backups
-                .restore_retained(&fin.backup_id, "alice", "bob")
+                .restore_retained(&fin.backup_id, "alice", "bob", OnExisting::Overwrite)
                 .await,
             Err(Error::BackupNotFound { .. })
         ));
         assert!(matches!(
             h.backups
-                .restore_retained(&fin.backup_id, "bob", "carol")
+                .restore_retained(&fin.backup_id, "bob", "carol", OnExisting::Overwrite)
                 .await,
             Err(Error::TenantNotFound(_))
         ));
         assert!(h.sys.calls_to(bin::SYSTEMD_RUN).is_empty());
         let (job, started) = h
             .backups
-            .restore_retained(&fin.backup_id, "bob", "alice")
+            .restore_retained(&fin.backup_id, "bob", "alice", OnExisting::Overwrite)
             .await?;
         assert!(started && job.tenant == "alice");
         let argv = h
@@ -2266,6 +2622,193 @@ mod tests {
         assert!(lapsed
             .iter()
             .any(|b| b.id == alices.backup_id && b.retain_until_unix == 0));
+        Ok(())
+    }
+
+    #[test]
+    fn excluded_directories_are_relative_deduplicated_and_outermost() {
+        let scan = b"apps/api/.venv\0/h/a\0/h/a/b\0/h/apps/api/.venv\0site/node_modules\0\0/h/z\0";
+        assert_eq!(
+            excluded_dirs("/h", scan),
+            vec!["a", "apps/api/.venv", "site/node_modules", "z"]
+        );
+        // A pyvenv.cfg planted in the home itself: the whole home is left
+        // out, and the manifest says so.
+        assert_eq!(excluded_dirs("/h", b"/h\0x/node_modules\0"), vec!["."]);
+        assert!(excluded_dirs("/h", b"").is_empty());
+    }
+
+    /// bob with a Python and a Node.js application, and one backup taken
+    /// with the exclusion scan finding three directories.
+    async fn bob_with_apps_backed_up() -> Result<(Harness, JobRecord)> {
+        let h = harness(false).await;
+        for (domain, runtime) in [
+            ("api.example", AppRuntime::Python),
+            ("node.example", AppRuntime::Node),
+        ] {
+            h.vhosts
+                .configure(VHostRequest {
+                    domain: domain.into(),
+                    tenant: "bob".into(),
+                    app: Some(crate::vhost::AppRequest {
+                        runtime,
+                        root: String::new(),
+                        entry: String::new(),
+                    }),
+                    ..VHostRequest::default()
+                })
+                .await?;
+        }
+        let home = h.ctx.config.home_base.join("bob");
+        let home_s = home.to_string_lossy().into_owned();
+        h.sys.script_stdout(
+            bin::FIND,
+            &format!("apps/api.example/.venv\0apps/node.example/node_modules\0{home_s}/old-venv\0"),
+        );
+        h.sys.clear_calls();
+        let made = h.backup("bob").await?;
+        // The applications' .venv is excluded by path, and left out of the
+        // estimate like every directory the scan found.
+        let run = h.sys.calls_to(bin::SYSTEMD_RUN);
+        let argv = run.first().map(args).unwrap_or_default();
+        assert!(argv.ends_with(&["--venvs".to_owned(), "apps/api.example/.venv".to_owned()]));
+        let find = h
+            .sys
+            .calls_to(bin::FIND)
+            .first()
+            .map(args)
+            .unwrap_or_default();
+        assert!(find
+            .windows(3)
+            .any(|w| w == ["-o", "-path", &format!("{home_s}/apps/api.example/.venv")]));
+        let du = h
+            .sys
+            .calls_to(bin::DU)
+            .first()
+            .map(args)
+            .unwrap_or_default();
+        for d in [
+            "apps/api.example/.venv",
+            "apps/node.example/node_modules",
+            "old-venv",
+        ] {
+            assert!(du.contains(&format!("--exclude={home_s}/{d}")), "{du:?}");
+        }
+        let backup = h.backups.list("bob").await?.remove(0);
+        assert_eq!(
+            backup.excluded,
+            vec![
+                "apps/api.example/.venv",
+                "apps/node.example/node_modules",
+                "old-venv"
+            ]
+        );
+        assert_eq!(backup.excluded_count, 3);
+        let manifest: Manifest = serde_json::from_slice(
+            &std::fs::read(h.dir(&made).join(MANIFEST)).map_err(|e| Error::io("read", &home, e))?,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(
+            (manifest.excluded, manifest.excluded_count),
+            (backup.excluded.clone(), 3)
+        );
+        assert_eq!(manifest.exclude_rules.len(), EXCLUDE_RULES.len());
+        Ok((h, made))
+    }
+
+    #[tokio::test]
+    async fn exclusions_are_recorded_in_the_record_and_the_manifest() -> Result<()> {
+        bob_with_apps_backed_up().await.map(|_| ())
+    }
+
+    #[tokio::test]
+    async fn restores_report_counts_and_rebuild_the_applications() -> Result<()> {
+        let (h, made) = bob_with_apps_backed_up().await?;
+        let home = h.ctx.config.home_base.join("bob");
+        let home_s = home.to_string_lossy().into_owned();
+
+        // Restore keeping existing files; the Python app has a requirements
+        // file whose installation fails, the Node.js app has nothing to install.
+        let api = home.join("apps/api.example");
+        std::fs::create_dir_all(&api).map_err(|e| Error::io("mkdir", &api, e))?;
+        std::fs::write(api.join("requirements.txt"), "flask\n")
+            .map_err(|e| Error::io("w", &api, e))?;
+        h.sys.clear_calls();
+        let (job, _) = h
+            .backups
+            .restore("bob", &made.backup_id, OnExisting::Keep)
+            .await?;
+        assert_eq!(job.on_existing, Some(OnExisting::Keep));
+        let argv = h
+            .sys
+            .calls_to(bin::SYSTEMD_RUN)
+            .first()
+            .map(args)
+            .unwrap_or_default();
+        assert!(argv.ends_with(&["--existing".to_owned(), "keep".to_owned()]));
+        h.sys.script_stdout(
+            bin::JOURNALCTL,
+            "tar: ./a: skipping existing file\noxpanel-restore-result restored=7 skipped=2\n",
+        );
+        h.sys.script_failure(bin::SYSTEMD_RUN, 1, "pip: no network");
+        h.sys.clear_calls();
+        let done = h.finish(&job).await?;
+        assert_eq!(done.state, JobState::Succeeded, "the files were restored");
+        assert_eq!((done.restored_entries, done.skipped_entries), (7, 2));
+        assert!(
+            done.message
+                .contains("7 entries restored, 2 kept because they already existed"),
+            "{}",
+            done.message
+        );
+        assert!(
+            done.message
+                .contains("could NOT be reinstalled for api.example"),
+            "{}",
+            done.message
+        );
+        let sites: Vec<(&str, bool)> = done
+            .sites
+            .iter()
+            .map(|s| (s.domain.as_str(), s.succeeded))
+            .collect();
+        assert_eq!(sites, vec![("api.example", false), ("node.example", true)]);
+        assert!(done
+            .sites
+            .iter()
+            .any(|s| s.detail == "no package.json; nothing to install"));
+        // The virtualenv is recreated as the tenant, dependencies are
+        // installed in a transient unit, and only then do the apps start.
+        let calls = h.sys.calls();
+        let venv = calls.iter().position(|c| {
+            c.program == bin::PYTHON3
+                && args(c)
+                    == [
+                        "-m",
+                        "venv",
+                        "--",
+                        &format!("{home_s}/apps/api.example/.venv"),
+                    ]
+                && c.run_as
+                    == Some(RunAs {
+                        uid: 20001,
+                        gid: 20001,
+                    })
+        });
+        let deps = calls
+            .iter()
+            .position(|c| c.program == bin::SYSTEMD_RUN && args(c).iter().any(|a| a == "--wait"));
+        let start = calls.iter().position(|c| {
+            c.program == bin::SYSTEMCTL
+                && args(c)
+                    .iter()
+                    .any(|a| a == "oxpanel-app-api.example.service")
+                && args(c).first().is_some_and(|a| a == "enable")
+        });
+        assert!(
+            venv.is_some() && venv < deps && deps < start,
+            "{venv:?} {deps:?} {start:?}"
+        );
         Ok(())
     }
 
