@@ -13,6 +13,22 @@ use crate::error::{Error, Result};
 pub const MIN_MEMORY_MAX_BYTES: u64 = 16 * 1024 * 1024;
 /// systemd's inclusive range for `CPUWeight=` / `IOWeight=`.
 pub const MAX_WEIGHT: u32 = 10_000;
+/// Smallest accepted disk limit. Less than this cannot even hold a site.
+pub const MIN_DISK_MAX_BYTES: u64 = 1024 * 1024;
+/// Smallest accepted inode limit (a fresh home already holds a handful of files).
+pub const MIN_INODES_MAX: u64 = 100;
+/// Shortest SFTP password the engine accepts; further policy is the panel's.
+pub const MIN_SFTP_PASSWORD_CHARS: usize = 12;
+/// Longest accepted SFTP password (characters).
+pub const MAX_SFTP_PASSWORD_CHARS: usize = 256;
+/// Most SSH public keys one tenant may hold.
+pub const MAX_SFTP_KEYS: usize = 20;
+/// Longest accepted public-key line (a 16384-bit RSA key is about 2.8 kB).
+const SSH_KEY_LINE_MAX: usize = 8 * 1024;
+const SSH_KEY_LABEL_MAX: usize = 64;
+/// RSA moduli OpenSSH on the target accepts.
+const RSA_MIN_BITS: usize = 2048;
+const RSA_MAX_BITS: usize = 16384;
 const USERNAME_MIN: usize = 3;
 const USERNAME_MAX: usize = 32; // useradd's limit
 const DOMAIN_MAX: usize = 253;
@@ -316,6 +332,14 @@ pub struct Limits {
     pub cpu_weight: Option<u32>,
     pub io_weight: Option<u32>,
     pub tasks_max: Option<u32>,
+    /// Disk space the tenant's files may occupy on the file system holding
+    /// the homes (kernel user quota). Absent in records written before
+    /// quotas existed.
+    #[serde(default)]
+    pub disk_max_bytes: Option<u64>,
+    /// Number of files and directories the tenant may own there.
+    #[serde(default)]
+    pub inodes_max: Option<u64>,
 }
 
 impl Limits {
@@ -355,7 +379,322 @@ impl Limits {
             } else {
                 Some(tasks_max)
             },
+            disk_max_bytes: None,
+            inodes_max: None,
         })
+    }
+
+    /// Add the disk-quota part of the limits (raw wire values, 0 = unlimited).
+    /// Whether the host can enforce them is checked by the workflow.
+    pub fn with_disk(mut self, disk_max_bytes: u64, inodes_max: u64) -> Result<Self> {
+        self.disk_max_bytes = match disk_max_bytes {
+            0 => None,
+            b if b < MIN_DISK_MAX_BYTES => {
+                return Err(Error::invalid(
+                    "limits.disk_max_bytes",
+                    format!("must be 0 (unlimited) or at least {MIN_DISK_MAX_BYTES} bytes"),
+                ))
+            }
+            b => Some(b),
+        };
+        self.inodes_max = match inodes_max {
+            0 => None,
+            n if n < MIN_INODES_MAX => {
+                return Err(Error::invalid(
+                    "limits.inodes_max",
+                    format!("must be 0 (unlimited) or at least {MIN_INODES_MAX}"),
+                ))
+            }
+            n => Some(n),
+        };
+        Ok(self)
+    }
+
+    /// Whether any kernel disk quota is requested.
+    pub fn has_disk_quota(&self) -> bool {
+        self.disk_max_bytes.is_some() || self.inodes_max.is_some()
+    }
+}
+
+/// An SFTP password: 12..=256 characters, none of them control characters
+/// (a newline would start a second `user:password` line for `chpasswd`).
+/// `Debug` never shows it; it is handed to `chpasswd` on stdin only.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SftpPassword(String);
+
+impl SftpPassword {
+    pub fn parse(raw: &str) -> Result<Self> {
+        let chars = raw.chars().count();
+        if !(MIN_SFTP_PASSWORD_CHARS..=MAX_SFTP_PASSWORD_CHARS).contains(&chars) {
+            return Err(Error::invalid(
+                "password",
+                format!("must be {MIN_SFTP_PASSWORD_CHARS}..={MAX_SFTP_PASSWORD_CHARS} characters"),
+            ));
+        }
+        if raw.chars().any(char::is_control) {
+            return Err(Error::invalid(
+                "password",
+                "must not contain control characters (newlines, tabs, NUL, …)",
+            ));
+        }
+        Ok(Self(raw.to_owned()))
+    }
+
+    /// The password, for the one place that writes it to `chpasswd`.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SftpPassword {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SftpPassword([redacted])")
+    }
+}
+
+/// A label for an SSH key (e.g. `laptop`, `deploy@ci`): `^[A-Za-z0-9@._+-]{1,64}$`.
+/// It is written into the tenant's authorized-keys file, so nothing that
+/// could start a new line or a new field is accepted.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct KeyLabel(String);
+
+impl KeyLabel {
+    pub fn parse(raw: &str) -> Result<Self> {
+        if raw.is_empty() || raw.len() > SSH_KEY_LABEL_MAX {
+            return Err(Error::invalid(
+                "label",
+                format!("must be 1..={SSH_KEY_LABEL_MAX} characters"),
+            ));
+        }
+        if !raw
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'@' | b'.' | b'_' | b'+' | b'-'))
+        {
+            return Err(Error::invalid(
+                "label",
+                "only A-Z, a-z, 0-9, '@', '.', '_', '+' and '-' are allowed",
+            ));
+        }
+        Ok(Self(raw.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// The SHA-256 fingerprint of an SSH public key as OpenSSH prints it:
+/// `SHA256:` followed by 43 base64 characters (no padding).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct KeyFingerprint(String);
+
+impl KeyFingerprint {
+    pub fn parse(raw: &str) -> Result<Self> {
+        let ok = raw.strip_prefix("SHA256:").is_some_and(|rest| {
+            rest.len() == 43
+                && rest
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/'))
+        });
+        if !ok {
+            return Err(Error::invalid(
+                "fingerprint",
+                "must be 'SHA256:' followed by 43 base64 characters, as ssh-keygen -l prints it",
+            ));
+        }
+        Ok(Self(raw.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A validated SSH public key.
+///
+/// Accepted: one line in the format of an `id_*.pub` file — key type, base64
+/// key, optional comment — and nothing in front of the type (no `command=`,
+/// `from=` or other options: the engine decides the options, see
+/// [`crate::sftp`]). The key type must be one of Ed25519, ECDSA (NIST P-256,
+/// P-384, P-521), RSA of at least 2048 bits, or the FIDO variants of Ed25519
+/// and ECDSA; DSA is refused. The base64 part is decoded and must be exactly
+/// one well-formed key of the declared type.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SshPublicKey {
+    key_type: &'static str,
+    /// Canonical (re-encoded, padded) base64 of the key blob.
+    blob: String,
+    fingerprint: String,
+    /// The comment of the line, if it is usable as a label.
+    comment: Option<KeyLabel>,
+}
+
+/// Key types OxPanel accepts, by their name on the wire.
+const SSH_KEY_TYPES: &[&str] = &[
+    "ssh-ed25519",
+    "ecdsa-sha2-nistp256",
+    "ecdsa-sha2-nistp384",
+    "ecdsa-sha2-nistp521",
+    "ssh-rsa",
+    "sk-ssh-ed25519@openssh.com",
+    "sk-ecdsa-sha2-nistp256@openssh.com",
+];
+
+/// Reads the length-prefixed fields of an SSH key blob (RFC 4253 §6.6).
+struct BlobReader<'a>(&'a [u8]);
+
+impl<'a> BlobReader<'a> {
+    fn string(&mut self) -> Option<&'a [u8]> {
+        let (len, rest) = self.0.split_first_chunk::<4>()?;
+        let len = usize::try_from(u32::from_be_bytes(*len)).ok()?;
+        let (field, rest) = rest.split_at_checked(len)?;
+        self.0 = rest;
+        Some(field)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+/// Size in bits of a positive multi-precision integer (RFC 4251 `mpint`).
+fn mpint_bits(m: &[u8]) -> Option<usize> {
+    // Negative numbers have the top bit of the first byte set.
+    if m.first().is_some_and(|b| b & 0x80 != 0) {
+        return None;
+    }
+    let first = m.iter().position(|b| *b != 0)?;
+    let top = m.get(first)?;
+    let significant = m.len().checked_sub(first)?;
+    significant
+        .checked_mul(8)?
+        .checked_sub(usize::try_from(top.leading_zeros()).ok()?)
+}
+
+/// An uncompressed elliptic-curve point (`0x04 || X || Y`) on the named curve.
+fn ecdsa_point(r: &mut BlobReader<'_>, curve: &str, len: usize) -> Option<()> {
+    if r.string()? != curve.as_bytes() {
+        return None;
+    }
+    let point = r.string()?;
+    (point.len() == len && point.first() == Some(&0x04)).then_some(())
+}
+
+/// `Some(())` when `blob` is exactly one well-formed public key of `key_type`.
+fn check_key_blob(key_type: &str, blob: &[u8]) -> Option<()> {
+    let mut r = BlobReader(blob);
+    if r.string()? != key_type.as_bytes() {
+        return None;
+    }
+    match key_type {
+        "ssh-ed25519" => (r.string()?.len() == 32).then_some(())?,
+        "sk-ssh-ed25519@openssh.com" => {
+            (r.string()?.len() == 32).then_some(())?;
+            r.string()?; // application
+        }
+        "ecdsa-sha2-nistp256" => ecdsa_point(&mut r, "nistp256", 65)?,
+        "ecdsa-sha2-nistp384" => ecdsa_point(&mut r, "nistp384", 97)?,
+        "ecdsa-sha2-nistp521" => ecdsa_point(&mut r, "nistp521", 133)?,
+        "sk-ecdsa-sha2-nistp256@openssh.com" => {
+            ecdsa_point(&mut r, "nistp256", 65)?;
+            r.string()?; // application
+        }
+        "ssh-rsa" => {
+            let exponent = mpint_bits(r.string()?)?;
+            let modulus = mpint_bits(r.string()?)?;
+            (exponent >= 2 && (RSA_MIN_BITS..=RSA_MAX_BITS).contains(&modulus)).then_some(())?;
+        }
+        _ => return None,
+    }
+    r.is_empty().then_some(())
+}
+
+impl SshPublicKey {
+    /// Parse one `authorized_keys`-style line without options.
+    pub fn parse(raw: &str) -> Result<Self> {
+        const FIELD: &str = "public_key";
+        let line = raw.trim_matches([' ', '\t', '\n', '\r']);
+        if line.is_empty() {
+            return Err(Error::invalid(FIELD, "must not be empty"));
+        }
+        if line.len() > SSH_KEY_LINE_MAX {
+            return Err(Error::invalid(
+                FIELD,
+                format!("must be at most {SSH_KEY_LINE_MAX} bytes"),
+            ));
+        }
+        if !line.bytes().all(|b| b == b' ' || b.is_ascii_graphic()) {
+            return Err(Error::invalid(
+                FIELD,
+                "must be a single line of printable ASCII (exactly one key)",
+            ));
+        }
+        let mut parts = line.splitn(3, ' ');
+        let (declared, encoded) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
+        let Some(key_type) = SSH_KEY_TYPES.iter().copied().find(|t| *t == declared) else {
+            return Err(Error::invalid(
+                FIELD,
+                "must start with a supported key type (ssh-ed25519, ecdsa-sha2-nistp256/384/521, ssh-rsa, sk-ssh-ed25519@openssh.com, sk-ecdsa-sha2-nistp256@openssh.com); key options are not accepted",
+            ));
+        };
+        Self::from_parts(key_type, encoded, parts.next().unwrap_or("").trim())
+    }
+
+    /// Build from the stored form (type and base64 blob), validating it again.
+    pub fn from_stored(key_type: &str, blob: &str) -> Result<Self> {
+        let Some(key_type) = SSH_KEY_TYPES.iter().copied().find(|t| *t == key_type) else {
+            return Err(Error::invalid("public_key", "unsupported key type"));
+        };
+        Self::from_parts(key_type, blob, "")
+    }
+
+    fn from_parts(key_type: &'static str, encoded: &str, comment: &str) -> Result<Self> {
+        use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD};
+        use base64::Engine as _;
+        use sha2::Digest as _;
+        const FIELD: &str = "public_key";
+        let blob = STANDARD
+            .decode(encoded)
+            .map_err(|_| Error::invalid(FIELD, "the key is not valid base64"))?;
+        if check_key_blob(key_type, &blob).is_none() {
+            return Err(Error::invalid(
+                FIELD,
+                if key_type == "ssh-rsa" {
+                    format!("not a well-formed RSA key of {RSA_MIN_BITS}..={RSA_MAX_BITS} bits")
+                } else {
+                    format!("not a well-formed {key_type} key")
+                },
+            ));
+        }
+        let fingerprint = format!(
+            "SHA256:{}",
+            STANDARD_NO_PAD.encode(sha2::Sha256::digest(&blob))
+        );
+        Ok(Self {
+            key_type,
+            blob: STANDARD.encode(&blob),
+            fingerprint,
+            comment: KeyLabel::parse(comment).ok(),
+        })
+    }
+
+    pub fn key_type(&self) -> &'static str {
+        self.key_type
+    }
+
+    /// Canonical base64 of the key blob.
+    pub fn blob(&self) -> &str {
+        &self.blob
+    }
+
+    /// `SHA256:…`, as `ssh-keygen -l` prints it.
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+
+    /// The comment of the parsed line when it is a valid [`KeyLabel`].
+    pub fn comment(&self) -> Option<&KeyLabel> {
+        self.comment.as_ref()
     }
 }
 
@@ -541,11 +880,176 @@ mod tests {
                 memory_max_bytes: Some(MIN_MEMORY_MAX_BYTES),
                 cpu_weight: Some(1),
                 io_weight: Some(MAX_WEIGHT),
-                tasks_max: Some(50)
+                tasks_max: Some(50),
+                ..Limits::default()
             })
         );
         assert!(is_invalid(Limits::parse(MIN_MEMORY_MAX_BYTES - 1, 0, 0, 0)));
         assert!(is_invalid(Limits::parse(0, MAX_WEIGHT + 1, 0, 0)));
         assert!(is_invalid(Limits::parse(0, 0, MAX_WEIGHT + 1, 0)));
+    }
+
+    #[test]
+    fn disk_limits_parse_and_bounds() -> Result<()> {
+        let base = Limits::default();
+        assert_eq!(base.with_disk(0, 0)?, base);
+        assert!(!base.has_disk_quota());
+        let l = base.with_disk(MIN_DISK_MAX_BYTES, MIN_INODES_MAX)?;
+        assert_eq!(
+            (l.disk_max_bytes, l.inodes_max),
+            (Some(MIN_DISK_MAX_BYTES), Some(MIN_INODES_MAX))
+        );
+        assert!(l.has_disk_quota());
+        assert!(base.with_disk(0, 5000)?.has_disk_quota());
+        assert!(is_invalid(base.with_disk(MIN_DISK_MAX_BYTES - 1, 0)));
+        assert!(is_invalid(base.with_disk(0, MIN_INODES_MAX - 1)));
+        // Records written before quotas existed still load.
+        let old: Limits = serde_json::from_str(
+            r#"{"memory_max_bytes":null,"cpu_weight":5,"io_weight":null,"tasks_max":null}"#,
+        )
+        .map_err(|e| Error::Internal(e.to_string()))?;
+        assert_eq!((old.cpu_weight, old.disk_max_bytes), (Some(5), None));
+        Ok(())
+    }
+
+    // Throwaway keys generated with `ssh-keygen`; fingerprints from `ssh-keygen -l`.
+    const ED25519_BLOB: &str =
+        "AAAAC3NzaC1lZDI1NTE5AAAAIGNQ8nctDOzq4yQ8Bix4hfkkqCQw0kkYzl6hc7hg7rRo";
+    const ED25519_FP: &str = "SHA256:d61vVJ9GcopAzh14aZ3bTeCz+981/iT/jSIxXFS8pjQ";
+    const RSA2048: &str = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQCgqXDlUFWAX9AH//+b+nL28dRjcv1LcY9olh0gS4CyAj2mx9bHPnjCBzNksuAY8XWXjMJPRCe4SpnFsoRTDNHs3PmtRuo/4B6KtXodSSKPWpNdblemnG32j8csnzPVmGfQbTuk5W0bBQA5nxsRENVjh5K5kNrSO5SqpLAduOOG/OEEaLvF6PswEZuHfBTRYiNF9FgasniKt/qYkEgtJ3nwwzTaybf0L111ELP/CIHMT1EBja+ceFnoo2wcg0+FYGAvjkdcLyZONcHEXsGFD+URBv2sG8cL5aekTeFENrB/0y61w/vNKTn7H3vXA0eKkju41I2EghfbUBhwDHjemujL rsa2048";
+    const RSA1024: &str = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAAAgQC8hAmgV+3wrL6AhqlLfB48OnQYBum5QCCBuW75++8tK6SVSf04pjgy3jvpiaoIlislmOF4p/PTqkQfkwGppaRE4BO0GsQr5TsuPHZ8VkwHWV+NvScf0N2uj/Oyteid28Lb+rZWbqt8x5MvVQTUesROtEuunjwellM3G+hK0D7yEw== rsa1024";
+    const ECDSA256: &str = "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBCPCQ5RPJL6Of0dEwqmMxFaxsEIMTgTuoqdjIkhuKJBRxt4u5xxce+n8yuTHQ+EVvhVfmIFaBrQ9IenhTvA47u8= ec";
+
+    #[test]
+    fn ssh_key_accepts_plain_keys_and_computes_the_openssh_fingerprint() -> Result<()> {
+        let k = SshPublicKey::parse(&format!("ssh-ed25519 {ED25519_BLOB} alice@laptop"))?;
+        assert_eq!(k.key_type(), "ssh-ed25519");
+        assert_eq!(k.fingerprint(), ED25519_FP);
+        assert_eq!(k.comment().map(KeyLabel::as_str), Some("alice@laptop"));
+        assert_eq!(k.blob(), ED25519_BLOB);
+        // Surrounding white space and a missing or unusable comment are fine.
+        let bare = SshPublicKey::parse(&format!("  ssh-ed25519 {ED25519_BLOB}\n"))?;
+        assert_eq!(bare.comment(), None);
+        let odd = SshPublicKey::parse(&format!("ssh-ed25519 {ED25519_BLOB} my key (old)"))?;
+        assert_eq!(odd.comment(), None, "an unusable comment is dropped");
+        assert_eq!(odd.fingerprint(), ED25519_FP);
+        assert_eq!(
+            SshPublicKey::from_stored(k.key_type(), k.blob())?.fingerprint(),
+            ED25519_FP
+        );
+        assert_eq!(
+            SshPublicKey::parse(RSA2048)?.fingerprint(),
+            "SHA256:H1e19kwLaC4z2PEcd8wTFLZs15jrHfkNQ5fV9OE0Jlc"
+        );
+        assert_eq!(
+            SshPublicKey::parse(ECDSA256)?.fingerprint(),
+            "SHA256:WXfDgbyQ6VkZ+BgiCeSpzsvA1bZVLsX3/n4u1ddioxE"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn ssh_key_rejects_options_other_types_and_malformed_blobs() {
+        let key = format!("ssh-ed25519 {ED25519_BLOB}");
+        let two_lines = format!("{key}\n{key}");
+        let with_options = format!("command=\"/bin/sh\" {key}");
+        let with_flag = format!("no-port-forwarding {key}");
+        let wrong_type = format!("ecdsa-sha2-nistp256 {ED25519_BLOB}");
+        let truncated = format!("ssh-ed25519 {}", ED25519_BLOB.get(..40).unwrap_or(""));
+        let trailing = format!("ssh-ed25519 {ED25519_BLOB}AAAA");
+        let huge = format!("ssh-ed25519 {}", "A".repeat(SSH_KEY_LINE_MAX));
+        let tab = format!("ssh-ed25519\t{ED25519_BLOB}");
+        let nul = format!("{key} a\0b");
+        for bad in [
+            "",
+            "   ",
+            "ssh-ed25519",
+            "ssh-ed25519 ",
+            "ssh-ed25519 not*base64",
+            "ssh-dss AAAAB3NzaC1kc3MAAACBAJ x",
+            RSA1024,
+            two_lines.as_str(),
+            with_options.as_str(),
+            with_flag.as_str(),
+            wrong_type.as_str(),
+            truncated.as_str(),
+            trailing.as_str(),
+            huge.as_str(),
+            tab.as_str(),
+            nul.as_str(),
+        ] {
+            assert!(is_invalid(SshPublicKey::parse(bad)), "{bad:?}");
+        }
+        assert!(is_invalid(SshPublicKey::from_stored(
+            "ssh-dss",
+            ED25519_BLOB
+        )));
+        assert!(is_invalid(SshPublicKey::from_stored(
+            "ssh-ed25519",
+            "AAAA\nssh-ed25519 AAAA"
+        )));
+    }
+
+    #[test]
+    fn rsa_size_is_read_from_the_key_itself() {
+        assert_eq!(mpint_bits(&[0x01, 0x00, 0x01]), Some(17));
+        assert_eq!(mpint_bits(&[0x00, 0x80]), Some(8));
+        assert_eq!(mpint_bits(&[0x80]), None, "negative");
+        assert_eq!(mpint_bits(&[]), None);
+        assert_eq!(mpint_bits(&[0, 0]), None, "zero");
+    }
+
+    #[test]
+    fn sftp_passwords_have_a_minimum_length_and_no_control_characters() {
+        for ok in [
+            "correct horse",
+            "x".repeat(12).as_str(),
+            "pässwörd-ünïcode",
+            "with:colon:s and spaces",
+        ] {
+            assert!(SftpPassword::parse(ok).is_ok(), "{ok}");
+        }
+        let long = "y".repeat(MAX_SFTP_PASSWORD_CHARS + 1);
+        for bad in [
+            "",
+            "elevenchars",
+            "two\nlines-here",
+            "tab\there-and-more",
+            "nul\0-in-the-middle",
+            long.as_str(),
+        ] {
+            assert!(is_invalid(SftpPassword::parse(bad)), "{bad:?}");
+        }
+        let p = SftpPassword::parse("hunter2-hunter2").unwrap_or_else(|e| panic!("{e}"));
+        assert!(!format!("{p:?}").contains("hunter2"));
+        // The error message never echoes the password either.
+        let e = SftpPassword::parse("short-pw")
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(!e.contains("short-pw"), "{e}");
+    }
+
+    #[test]
+    fn key_labels_and_fingerprints() {
+        for ok in ["laptop", "deploy@ci", "a", "Work.Mac-2_x+y"] {
+            assert!(KeyLabel::parse(ok).is_ok(), "{ok}");
+        }
+        for bad in ["", "two words", "a\nb", "a,b", "a\"b", "ü", &"a".repeat(65)] {
+            assert!(is_invalid(KeyLabel::parse(bad)), "{bad:?}");
+        }
+        assert!(KeyFingerprint::parse(ED25519_FP).is_ok());
+        let padded = format!("{ED25519_FP}=");
+        let newline = format!("{}\n", ED25519_FP.get(..49).unwrap_or(""));
+        for bad in [
+            "",
+            "SHA256:",
+            "MD5:aa:bb",
+            "SHA256:short",
+            padded.as_str(),
+            newline.as_str(),
+        ] {
+            assert!(is_invalid(KeyFingerprint::parse(bad)), "{bad:?}");
+        }
     }
 }

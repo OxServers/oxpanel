@@ -41,7 +41,12 @@ PrivateTmp=yes
 PrivateDevices=yes
 DevicePolicy=closed
 ProtectSystem=strict
-# /etc:      useradd/userdel rewrite passwd/shadow/group via rename; nginx and systemd unit files
+# /etc:      useradd/userdel/gpasswd/usermod/chpasswd rewrite passwd/shadow/group via rename
+#            (chpasswd gets SFTP passwords on stdin, never in argv); nginx and systemd
+#            unit files (including the mount units of SFTP chroots); the sshd drop-in and the
+#            tenants' SFTP keys files (/etc/oxpanel-sftp). `sshd -t`/`-T` only read /etc/ssh.
+#            xfs_quota needs the block device, which PrivateDevices hides: it runs in a
+#            transient unit (systemd-run) and writes its report to /run/oxpanel/scratch.
 # /home:     tenant homes
 # /var/lib:  nginx -t temp dirs (/var/lib/nginx), the semanage policy store (/var/lib/selinux),
 #            the sssd cache (/var/lib/sss). Listed as the parent on purpose: /var/lib/selinux is

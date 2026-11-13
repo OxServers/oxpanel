@@ -30,6 +30,44 @@ pub fn escape_unit_component(name: &str) -> String {
     name.replace('-', "\\x2d")
 }
 
+/// The unit name systemd requires for a mount at `path` (`systemd-escape
+/// --path --suffix=mount`): components joined by `-`, with a literal `-`
+/// written as `\x2d` and a leading `.` as `\x2e`. Refuses anything but the
+/// characters validated paths consist of, so nothing else ever needs escaping.
+pub fn mount_unit_name(path: &Path) -> Result<String> {
+    use std::path::Component;
+    let refuse = || {
+        crate::Error::Internal(format!(
+            "{} cannot be used as a mount point",
+            path.display()
+        ))
+    };
+    crate::nginx::safe_path_str(path)?;
+    let mut name = String::new();
+    for component in path.components() {
+        let part = match component {
+            Component::RootDir => continue,
+            Component::Normal(part) => part.to_str().ok_or_else(refuse)?,
+            _ => return Err(refuse()),
+        };
+        if !name.is_empty() {
+            name.push('-');
+        }
+        for (i, c) in part.chars().enumerate() {
+            match c {
+                '-' => name.push_str("\\x2d"),
+                '.' if i == 0 && name.is_empty() => name.push_str("\\x2e"),
+                c => name.push(c),
+            }
+        }
+    }
+    if name.is_empty() {
+        return Err(refuse());
+    }
+    name.push_str(".mount");
+    Ok(name)
+}
+
 /// `oxpanel-tenant-<escaped name>.slice`
 pub fn slice_unit_name(name: &Username) -> String {
     format!(
@@ -161,6 +199,7 @@ mod tests {
             cpu_weight: Some(50),
             io_weight: None,
             tasks_max: Some(200),
+            ..Limits::default()
         };
         let unit = render_slice_unit(&alice(), &limits);
         assert!(unit.starts_with(HEADER));
@@ -182,6 +221,29 @@ mod tests {
         );
         assert_eq!(slice_unit_name(&alice()), "oxpanel-tenant-alice.slice");
         assert_eq!(escape_unit_component("a_b"), "a_b");
+    }
+
+    #[test]
+    fn mount_unit_names_follow_systemd_escaping() -> Result<()> {
+        // Expected values are the output of `systemd-escape --path --suffix=mount`.
+        for (path, unit) in [
+            (
+                "/var/lib/oxpanel/sftp/alice/home/alice",
+                "var-lib-oxpanel-sftp-alice-home-alice.mount",
+            ),
+            (
+                "/var/lib/oxpanel/sftp/foo-bar/srv/web-homes_v2/foo-bar",
+                "var-lib-oxpanel-sftp-foo\\x2dbar-srv-web\\x2dhomes_v2-foo\\x2dbar.mount",
+            ),
+            ("/.hidden/a.b", "\\x2ehidden-a.b.mount"),
+            ("/srv//x/", "srv-x.mount"),
+        ] {
+            assert_eq!(mount_unit_name(Path::new(path))?, unit, "{path}");
+        }
+        for bad in ["/", "relative/x", "/a b", "/a/../b", "/a\nb"] {
+            assert!(mount_unit_name(Path::new(bad)).is_err(), "{bad:?}");
+        }
+        Ok(())
     }
 
     #[test]

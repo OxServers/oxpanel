@@ -91,6 +91,20 @@ pub enum Error {
     /// The host is not set up for requesting certificates.
     #[error("ACME is not available on this host: {0}")]
     AcmeUnavailable(String),
+    /// SFTP access cannot be given on this host as it is; the text says why.
+    #[error("SFTP is not available on this host: {0}")]
+    SftpUnavailable(String),
+
+    #[error("tenant '{tenant}' has no SSH key with fingerprint {fingerprint}")]
+    SftpKeyNotFound { tenant: String, fingerprint: String },
+
+    #[error("tenant '{0}' already has the maximum number of SSH keys ({max})", max = crate::validate::MAX_SFTP_KEYS)]
+    TooManySftpKeys(String),
+
+    /// A disk limit was requested but the kernel would not enforce it; the
+    /// text tells the operator what to change on the host.
+    #[error("disk quotas are not available: {0}")]
+    DiskQuotaUnavailable(String),
 
     #[error("{program} exited with {status}")]
     CommandFailed {
@@ -169,6 +183,10 @@ impl Error {
                 | Self::CertificateInvalid(_)
                 | Self::TlsUnavailable
                 | Self::AcmeUnavailable(_)
+                | Self::SftpUnavailable(_)
+                | Self::SftpKeyNotFound { .. }
+                | Self::TooManySftpKeys(_)
+                | Self::DiskQuotaUnavailable(_)
         )
     }
 }
@@ -189,7 +207,9 @@ impl From<Error> for Status {
                 Status::failed_precondition(message)
             }
             Error::TenantExists(_) | Error::SpecMismatch(_) => Status::already_exists(message),
-            Error::TenantNotFound(_) | Error::VHostNotFound(_) => Status::not_found(message),
+            Error::TenantNotFound(_) | Error::VHostNotFound(_) | Error::SftpKeyNotFound { .. } => {
+                Status::not_found(message)
+            }
             Error::NotManaged(_)
             | Error::TenantNotReady(_)
             | Error::TenantHasVHosts(_)
@@ -199,8 +219,12 @@ impl From<Error> for Status {
             | Error::NoApp(_)
             | Error::RuntimeTooOld { .. }
             | Error::AppPolicyMissing
+            | Error::SftpUnavailable(_)
+            | Error::DiskQuotaUnavailable(_)
             | Error::NginxInvalid(_) => Status::failed_precondition(message),
-            Error::UidExhausted { .. } => Status::resource_exhausted(message),
+            Error::UidExhausted { .. } | Error::TooManySftpKeys(_) => {
+                Status::resource_exhausted(message)
+            }
             Error::Unauthorised => Status::permission_denied(message),
             Error::CommandTimeout { .. } => Status::deadline_exceeded(message),
             Error::CommandFailed { .. }

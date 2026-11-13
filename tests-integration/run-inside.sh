@@ -649,13 +649,278 @@ JSON
 fi
 check "certificate removed with the last HTTPS check" grep -q '^removed=true' <(oxpanel-ctl cert remove example.test)
 
+echo "== sftp access"
+# Needs sshd and the ssh client; the AlmaLinux images have both.
+if [ -x /usr/sbin/sshd ] && command -v sftp >/dev/null; then
+  systemctl -q is-active sshd || systemctl start sshd
+  export SFTPDIR; SFTPDIR="$(mktemp -d /root/sftp-it.XXXXXX)"
+  export SSH_O="-o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o ConnectTimeout=10 -o LogLevel=ERROR"
+  # sftp_as <key> <user>, sftp batch commands on stdin
+  # shellcheck disable=SC2086
+  sftp_as() { sftp $SSH_O -i "$SFTPDIR/$1" -b - "$2@127.0.0.1"; }
+  # A login expected to succeed right after one that was refused: OpenSSH 9.8+
+  # penalises a source address for a few seconds after a failed authentication
+  # (PerSourcePenalties) and drops its connections meanwhile, so retry.
+  sftp_ok() { local i; for i in $(seq 1 40); do echo pwd | sftp_as "$1" "$2" >/dev/null 2>&1 && return 0; sleep 1; done; return 1; }
+  # A refused login must be refused by authentication ("Permission denied"), not
+  # merely dropped by that penalty.
+  sftp_denied() { local i out; for i in $(seq 1 40); do out="$(echo pwd | sftp_as "$1" "$2" 2>&1)" && return 1; grep -q "Permission denied" <<<"$out" && return 0; sleep 1; done; return 1; }
+  export -f sftp_as sftp_ok sftp_denied
+  # Ending sessions relies on logind (pam_systemd puts every login into the
+  # tenant's user slice); the container has no logind, the real host does.
+  LOGIND=0; systemctl -q is-active systemd-logind && LOGIND=1
+  ssh-keygen -q -t ed25519 -N '' -C sftpa@test -f "$SFTPDIR/ka"
+  ssh-keygen -q -t ed25519 -N '' -f "$SFTPDIR/kb"
+  ssh-keygen -q -t rsa -b 1024 -N '' -f "$SFTPDIR/weak"
+
+  check "the sshd drop-in is installed, root-only" test "$(stat -c '%U %a' /etc/ssh/sshd_config.d/60-oxpanel.conf)" = "root 600"
+  check "sshd accepts the whole configuration" /usr/sbin/sshd -t
+  check "host info reports sftp=true" grep -q ' sftp=true ' <(oxpanel-ctl host info)
+  check "root's own SSH is unaffected (no forced command, no chroot)" bash -c '/usr/sbin/sshd -T -C user=root,host=localhost,addr=127.0.0.1 | grep -qx "forcecommand none" && /usr/sbin/sshd -T -C user=root,host=localhost,addr=127.0.0.1 | grep -qx "chrootdirectory none"'
+  check "create tenant sftpa" grep -q '^created=true' <(oxpanel-ctl tenant create sftpa)
+  check "create tenant sftpb" grep -q '^created=true' <(oxpanel-ctl tenant create sftpb)
+  check "every tenant is in the tenant group" bash -c 'id -nG sftpa | grep -qw oxpanel-tenants && id -nG sftpb | grep -qw oxpanel-tenants'
+  check "a tenant without keys is confined all the same" bash -c '/usr/sbin/sshd -T -C user=sftpb,host=localhost,addr=127.0.0.1 | grep -qx "forcecommand internal-sftp"'
+  check "site sftpa.test with PHP" grep -q '^changed=true' <(oxpanel-ctl vhost set sftpa.test --tenant sftpa --php)
+  check_not "a weak RSA key is refused" oxpanel-ctl sftp add-key sftpa --key-file "$SFTPDIR/weak.pub"
+  check_not "key options are refused" oxpanel-ctl sftp add-key sftpa --key "command=\"/bin/sh\" $(cat "$SFTPDIR/ka.pub")"
+  check "no key, no login" sftp_denied ka sftpa
+  out="$(oxpanel-ctl sftp add-key sftpa --key-file "$SFTPDIR/ka.pub")"; echo "$out"
+  check "add-key changed=true, labelled with the key's comment" bash -c 'grep -q "^changed=true" <<<"$1" && grep -q " label=sftpa@test " <<<"$1"' _ "$out"
+  FPA="$(ssh-keygen -lf "$SFTPDIR/ka.pub" | awk '{print $2}')"
+  check "the fingerprint is OpenSSH's" grep -q "fingerprint=$FPA " <<<"$out"
+  check "add-key again is a no-op" grep -q '^changed=false' <(oxpanel-ctl sftp add-key sftpa --key-file "$SFTPDIR/ka.pub")
+  check "get shows the key count" grep -q ' sftp_keys=1 ' <(oxpanel-ctl tenant get sftpa)
+  check "keys file is root-owned, not writable by the tenant" test "$(stat -c '%U:%G %a' /etc/oxpanel-sftp/sftpa)" = "root:root 640"
+  check "only this tenant may read its keys file" bash -c 'getfacl -p /etc/oxpanel-sftp/sftpa | grep -qx "user:sftpa:r--" && ! setpriv --reuid=sftpb --regid=sftpb --clear-groups -- cat /etc/oxpanel-sftp/sftpa >/dev/null 2>&1'
+  check_not "the tenant cannot add a key itself" setpriv --reuid=sftpa --regid=sftpa --clear-groups -- sh -c 'echo x >> /etc/oxpanel-sftp/sftpa'
+  check "chroot directory is root-owned 0755" test "$(stat -c '%U %a' /var/lib/oxpanel/sftp/sftpa)" = "root 755"
+  check "the home is mounted into the chroot" findmnt -n /var/lib/oxpanel/sftp/sftpa/home/sftpa
+  MNT="$(systemd-escape --path --suffix=mount /var/lib/oxpanel/sftp/sftpa/home/sftpa)"
+  check "mount unit is active and enabled" bash -c 'systemctl -q is-active "$1" && systemctl -q is-enabled "$1"' _ "$MNT"
+  check "the home itself is unchanged (tenant-owned, closed to group and others)" bash -c 'test "$(stat -c %U /home/sftpa)" = sftpa && getfacl -p /home/sftpa | grep -qx "group::---" && getfacl -p /home/sftpa | grep -qx "other::---"'
+
+  echo "uploaded-over-sftp" > "$SFTPDIR/up.html"
+  printf '<?php file_put_contents(__DIR__ . "/from-php.txt", "written-by-php"); echo "php-read:" . file_get_contents(__DIR__ . "/up.html");\n' > "$SFTPDIR/rw.php"
+  check "first login with the key" sftp_ok ka sftpa
+  check "sftp login, upload into the document root" bash -c 'printf "%s\n" "pwd" "put $1/up.html public_html/up.html" "put $1/rw.php public_html/rw.php" | sftp_as ka sftpa' _ "$SFTPDIR"
+  check "the session starts in the home, at its real path" bash -c 'echo pwd | sftp_as ka sftpa | grep -q "/home/sftpa"'
+  check "uploaded file belongs to the tenant" test "$(stat -c '%U:%G' /home/sftpa/public_html/up.html)" = "sftpa:sftpa"
+  check "uploaded file inherits the web server's ACL" bash -c 'getfacl -p /home/sftpa/public_html/up.html | grep -q "^user:nginx:r"'
+  if selinuxenabled 2>/dev/null; then
+    check "SELinux: uploaded file is httpd_sys_content_t" grep -q ':httpd_sys_content_t:' <(ls -Z /home/sftpa/public_html/up.html)
+  fi
+  check "nginx serves the uploaded file" body_eventually sftpa.test /up.html uploaded-over-sftp
+  check "PHP reads the uploaded file and writes its own" body_eventually sftpa.test /rw.php "php-read:uploaded-over-sftp"
+  check "the file PHP wrote can be downloaded and removed over SFTP" bash -c 'printf "%s\n" "get public_html/from-php.txt $1/from-php.txt" "rm public_html/from-php.txt" | sftp_as ka sftpa && test "$(cat "$1/from-php.txt")" = written-by-php && test ! -e /home/sftpa/public_html/from-php.txt' _ "$SFTPDIR"
+  check "the tenant sees only its own home" bash -c 'test "$(echo "ls -1 /" | sftp_as ka sftpa | grep -v "^sftp>")" = "/home" && test "$(echo "ls -1 /home" | sftp_as ka sftpa | grep -v "^sftp>")" = "/home/sftpa"'
+  check_not "no /etc in the chroot" bash -c 'echo "ls /etc" | sftp_as ka sftpa'
+  check_not "another tenant's home is not reachable" bash -c 'echo "ls /home/sftpb" | sftp_as ka sftpa'
+  check_not "not even by its absolute path one level up" bash -c 'echo "get /home/../../etc/passwd /dev/null" | sftp_as ka sftpa'
+  # shellcheck disable=SC2086
+  out="$(ssh $SSH_O -i "$SFTPDIR/ka" sftpa@127.0.0.1 'echo shell-ran; touch /home/sftpa/shell-ran' </dev/null 2>&1 || true)"
+  check "no shell: a command is never run" bash -c '! grep -q shell-ran <<<"$1" && test ! -e /home/sftpa/shell-ran' _ "$out"
+  check "no terminal, no forwarding of any kind (sshd's effective settings)" bash -c 'e="$(/usr/sbin/sshd -T -C user=sftpa,host=localhost,addr=127.0.0.1)"; for kv in "permittty no" "disableforwarding yes" "allowtcpforwarding no" "allowagentforwarding no" "x11forwarding no" "permittunnel no" "allowstreamlocalforwarding no"; do grep -qx "$kv" <<<"$e" || { echo "missing: $kv"; exit 1; }; done'
+  check_not "no TCP forwarding (ssh -W to the web server)" bash -c 'printf "GET / HTTP/1.0\r\n\r\n" | timeout 20 ssh $SSH_O -i "$SFTPDIR/ka" -W 127.0.0.1:80 sftpa@127.0.0.1 2>/dev/null | grep -q "^HTTP/"'
+  check_not "no remote forwarding" bash -c 'timeout 20 ssh $SSH_O -i "$SFTPDIR/ka" -o ExitOnForwardFailure=yes -R 127.0.0.1:18022:127.0.0.1:22 sftpa@127.0.0.1 true </dev/null' 
+  check "the key does not work for another tenant" sftp_denied ka sftpb
+
+  # A session that stays open: where does it live, and does suspension end it?
+  check "log in again (after the refusals above)" sftp_ok ka sftpa
+  # shellcheck disable=SC2086
+  ( sleep 60 | ssh $SSH_O -i "$SFTPDIR/ka" -s sftpa@127.0.0.1 sftp >/dev/null 2>&1 ) &
+  HOLD=$!
+  # The session process is sshd's (sshd-session on newer OpenSSH), running as the tenant.
+  check "an open SFTP session runs as the tenant" bash -c 'for i in $(seq 1 50); do pgrep -u sftpa sshd >/dev/null && exit 0; sleep 0.2; done; exit 1'
+  if [ "$LOGIND" = 1 ]; then
+    check "the session lands in the tenant's user slice (its limits apply)" bash -c 'for p in $(pgrep -u sftpa sshd); do grep -q "/user.slice/user-$(id -u sftpa).slice/" /proc/$p/cgroup || exit 1; done'
+  fi
+  check "suspend" grep -q '^changed=true' <(oxpanel-ctl tenant suspend sftpa)
+  if [ "$LOGIND" = 1 ]; then
+    check "suspension ends the open session" bash -c 'for i in $(seq 1 50); do pgrep -u sftpa sshd >/dev/null || exit 0; sleep 0.2; done; exit 1'
+  fi
+  check "suspension withdraws the keys file" test ! -e /etc/oxpanel-sftp/sftpa
+  check "no login while suspended" sftp_denied ka sftpa
+  check "resume" grep -q '^changed=true' <(oxpanel-ctl tenant resume sftpa)
+  check "login works again after resume" sftp_ok ka sftpa
+  # Without logind (the container) suspension could not end it; end it here.
+  pkill -P "$HOLD" 2>/dev/null || true; kill "$HOLD" 2>/dev/null || true; wait "$HOLD" 2>/dev/null || true
+  pkill -u sftpa sshd 2>/dev/null || true
+
+  check "a second key" grep -q '^changed=true' <(oxpanel-ctl sftp add-key sftpa --key-file "$SFTPDIR/kb.pub" --label ci)
+  check "list-keys shows both" test "$(oxpanel-ctl sftp list-keys sftpa | wc -l)" = 2
+  check "no drift with SFTP in use" grep -q '^drifts=0$' <(oxpanel-ctl host reconcile)
+  check "removing one key" grep -q 'remaining=1' <(oxpanel-ctl sftp remove-key sftpa "$FPA")
+  check "the removed key no longer logs in" sftp_denied ka sftpa
+  check "the other key still does" sftp_ok kb sftpa
+  check_not "removing it again is NOT_FOUND" oxpanel-ctl sftp remove-key sftpa "$FPA"
+  FPB="$(ssh-keygen -lf "$SFTPDIR/kb.pub" | awk '{print $2}')"
+  check "removing the last key" grep -q 'remaining=0' <(oxpanel-ctl sftp remove-key sftpa "$FPB" --end-sessions)
+  check "no keys file, mount, unit or chroot left" bash -c 'test ! -e /etc/oxpanel-sftp/sftpa && ! findmnt -n /var/lib/oxpanel/sftp/sftpa/home/sftpa && test ! -e "/etc/systemd/system/$1" && test ! -e /var/lib/oxpanel/sftp/sftpa' _ "$MNT"
+  check "the tenant's files are untouched" test -f /home/sftpa/public_html/up.html
+  check "access again, then delete the tenant with it" bash -c 'oxpanel-ctl sftp add-key sftpa --key-file "$1/ka.pub" >/dev/null && sftp_ok ka sftpa' _ "$SFTPDIR"
+  check "remove sftpa.test" grep -q '^removed=true' <(oxpanel-ctl vhost remove sftpa.test)
+  check "delete sftpa (with SFTP access)" grep -q '^deleted=true' <(oxpanel-ctl tenant delete sftpa --remove-home)
+  check "deletion removed keys file, mount, unit and chroot" bash -c 'test ! -e /etc/oxpanel-sftp/sftpa && ! findmnt -n /var/lib/oxpanel/sftp/sftpa/home/sftpa && test ! -e "/etc/systemd/system/$1" && test ! -e /var/lib/oxpanel/sftp/sftpa && test ! -e /home/sftpa' _ "$MNT"
+  check "delete sftpb" grep -q '^deleted=true' <(oxpanel-ctl tenant delete sftpb --remove-home)
+  check "no drift after SFTP teardown" grep -q '^drifts=0$' <(oxpanel-ctl host reconcile)
+  rm -rf "$SFTPDIR"
+else
+  echo "skip - sshd or the sftp client is not installed"
+fi
+
+echo "== sftp passwords, end_sessions"
+if [ -x /usr/sbin/sshd ] && command -v sftp >/dev/null; then
+  export PWDIR; PWDIR="$(mktemp -d /root/sftp-pw.XXXXXX)"; chmod 700 "$PWDIR"
+  export PW='correct horse battery staple'
+  printf '%s\n' "$PW" > "$PWDIR/pw"; printf 'wrong horse battery staple\n' > "$PWDIR/bad"
+  # The client reads the password from a file through SSH_ASKPASS: never in an argv.
+  printf '#!/bin/sh\ncat "$PWFILE"\n' > "$PWDIR/askpass"; chmod 700 "$PWDIR/askpass"
+  export PW_O="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o LogLevel=ERROR -o PubkeyAuthentication=no -o PreferredAuthentications=password -o NumberOfPasswordPrompts=1"
+  # pw_sftp <user> <password file>, sftp batch commands on stdin
+  # shellcheck disable=SC2086
+  pw_sftp() { PWFILE="$2" SSH_ASKPASS="$PWDIR/askpass" SSH_ASKPASS_REQUIRE=force setsid -w sftp $PW_O -o BatchMode=no -b - "$1@127.0.0.1"; }
+  pw_ok() { local i; for i in $(seq 1 40); do echo pwd | pw_sftp "$1" "$2" >/dev/null 2>&1 && return 0; sleep 1; done; return 1; }
+  pw_denied() { local i out; for i in $(seq 1 40); do out="$(echo pwd | pw_sftp "$1" "$2" 2>&1)" && return 1; grep -q "Permission denied" <<<"$out" && return 0; sleep 1; done; return 1; }
+  export -f pw_sftp pw_ok pw_denied
+  key_session_count() { pgrep -u "$1" sshd 2>/dev/null | wc -l; }
+
+  check "host info reports sftp_passwords=true (the default)" grep -q ' sftp_passwords=true ' <(oxpanel-ctl host info)
+  check "create tenant pwa" grep -q '^created=true' <(oxpanel-ctl tenant create pwa)
+  check "create tenant pwb" grep -q '^created=true' <(oxpanel-ctl tenant create pwb)
+  check_not "a password shorter than 12 characters is refused" bash -c 'echo short-pw | oxpanel-ctl sftp set-password pwa'
+  check "a tenant without a password is not offered password login" bash -c '/usr/sbin/sshd -T -C user=pwa,host=x,addr=127.0.0.1 | grep -qx "passwordauthentication no"'
+  check "set-password (read from stdin)" bash -c 'oxpanel-ctl sftp set-password pwa < "$PWDIR/pw" | grep -q "^password=set" && oxpanel-ctl tenant get pwa | grep -q " sftp_password=true "'
+  check "the shadow file holds a hash, not the password" bash -c 'f="$(getent shadow pwa | cut -d: -f2)"; [ "${f#\$}" != "$f" ] && ! grep -qF "$PW" /etc/shadow'
+  check "the password is in no record and not in the journal" bash -c '! grep -rqF "$PW" /var/lib/oxpanel && ! journalctl -u oxpanel-daemon --no-pager | grep -qF "$PW"'
+  check "the account is in the password group" bash -c 'id -nG pwa | grep -qw oxpanel-sftp-password'
+  check "password tenants are confined exactly like key tenants" bash -c 'e="$(/usr/sbin/sshd -T -C user=pwa,host=x,addr=127.0.0.1)"; for kv in "passwordauthentication yes" "authenticationmethods publickey password" "maxauthtries 3" "forcecommand internal-sftp" "chrootdirectory /var/lib/oxpanel/sftp/%u" "permittty no" "disableforwarding yes" "allowtcpforwarding no" "x11forwarding no" "permittunnel no" "kbdinteractiveauthentication no"; do grep -qx "$kv" <<<"$e" || { echo "missing: $kv"; exit 1; }; done'
+  check "password login works and lands in the home" bash -c 'pw_ok pwa "$PWDIR/pw" && echo pwd | pw_sftp pwa "$PWDIR/pw" | grep -q "/home/pwa"'
+  echo "uploaded-with-a-password" > "$PWDIR/up.txt"
+  check "upload with a password; the file belongs to the tenant" bash -c 'echo "put $PWDIR/up.txt up.txt" | pw_sftp pwa "$PWDIR/pw" && test "$(stat -c %U /home/pwa/up.txt)" = pwa'
+  check "the tenant sees only its own home (password login)" bash -c 'test "$(echo "ls -1 /" | pw_sftp pwa "$PWDIR/pw" | grep -v "^sftp>")" = "/home" && ! echo "ls /etc" | pw_sftp pwa "$PWDIR/pw" >/dev/null 2>&1'
+  check "a wrong password is refused" pw_denied pwa "$PWDIR/bad"
+  check "the password does not work for another tenant" pw_denied pwb "$PWDIR/pw"
+  # shellcheck disable=SC2086
+  out="$(PWFILE="$PWDIR/pw" SSH_ASKPASS="$PWDIR/askpass" SSH_ASKPASS_REQUIRE=force setsid -w ssh $PW_O pwa@127.0.0.1 'echo shell-ran; touch /home/pwa/shell-ran' </dev/null 2>&1 || true)"
+  check "no shell with a password either" bash -c '! grep -q shell-ran <<<"$1" && test ! -e /home/pwa/shell-ran' _ "$out"
+  check_not "no TCP forwarding with a password (ssh -W)" bash -c 'printf "GET / HTTP/1.0\r\n\r\n" | PWFILE="$PWDIR/pw" SSH_ASKPASS="$PWDIR/askpass" SSH_ASKPASS_REQUIRE=force timeout 20 setsid -w ssh $PW_O -W 127.0.0.1:80 pwa@127.0.0.1 2>/dev/null | grep -q "^HTTP/"'
+  check "no drift with a password" grep -q '^drifts=0$' <(oxpanel-ctl host reconcile)
+
+  # Suspension locks the hash (no plaintext kept) and ends sessions; resume unlocks it.
+  check "log in again before the session test" pw_ok pwa "$PWDIR/pw"
+  ( sleep 60 | PWFILE="$PWDIR/pw" SSH_ASKPASS="$PWDIR/askpass" SSH_ASKPASS_REQUIRE=force setsid -w ssh $PW_O -s pwa@127.0.0.1 sftp >/dev/null 2>&1 ) &
+  HOLD=$!
+  check "an open password session" bash -c 'for i in $(seq 1 50); do pgrep -u pwa sshd >/dev/null && exit 0; sleep 0.2; done; exit 1'
+  check "suspend pwa" grep -q '^changed=true' <(oxpanel-ctl tenant suspend pwa)
+  check "the hash is locked while suspended (kept, prefixed with !)" bash -c 'getent shadow pwa | cut -d: -f2 | grep -qE "^![^!*]"'
+  if [ "$LOGIND" = 1 ]; then
+    check "suspension ends the password session" bash -c 'for i in $(seq 1 50); do pgrep -u pwa sshd >/dev/null || exit 0; sleep 0.2; done; exit 1'
+  fi
+  check "no password login while suspended" pw_denied pwa "$PWDIR/pw"
+  check "resume pwa" grep -q '^changed=true' <(oxpanel-ctl tenant resume pwa)
+  check "the same password works again after resume" pw_ok pwa "$PWDIR/pw"
+  pkill -P "$HOLD" 2>/dev/null || true; kill "$HOLD" 2>/dev/null || true; wait "$HOLD" 2>/dev/null || true
+  pkill -u pwa sshd 2>/dev/null || true
+
+  # end_sessions: without it a live session continues; with it, it ends.
+  ssh-keygen -q -t ed25519 -N '' -f "$PWDIR/k"
+  check "pwa also gets a key" grep -q '^changed=true' <(oxpanel-ctl sftp add-key pwa --key-file "$PWDIR/k.pub")
+  FPK="$(ssh-keygen -lf "$PWDIR/k.pub" | awk '{print $2}')"
+  # shellcheck disable=SC2086
+  hold_key_session() { ( sleep 60 | ssh $SSH_O -i "$PWDIR/k" -s pwa@127.0.0.1 sftp >/dev/null 2>&1 ) & HOLD=$!; for i in $(seq 1 50); do pgrep -u pwa sshd >/dev/null && return 0; sleep 0.2; done; return 1; }
+  check "key login (after the refusals above)" bash -c 'for i in $(seq 1 40); do echo pwd | sftp $SSH_O -i "$PWDIR/k" -b - pwa@127.0.0.1 >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1'
+  check "an open key session" hold_key_session
+  check "clear-password without --end-sessions" grep -q '^cleared=true' <(oxpanel-ctl sftp clear-password pwa)
+  check "the open session continues" bash -c 'sleep 1; pgrep -u pwa sshd >/dev/null'
+  check "but the password no longer logs in" pw_denied pwa "$PWDIR/pw"
+  check "the hash is gone and so is the group membership" bash -c 'test "$(getent shadow pwa | cut -d: -f2)" = "!!" && ! id -nG pwa | grep -qw oxpanel-sftp-password'
+  check "remove-key without --end-sessions: the session still continues" bash -c 'oxpanel-ctl sftp remove-key pwa "$1" | grep -q remaining=0 && sleep 1 && pgrep -u pwa sshd >/dev/null' _ "$FPK"
+  if [ "$LOGIND" = 1 ]; then
+    check "its mount is kept while it is open (reported until the daemon tidies it up)" bash -c 'findmnt -n /var/lib/oxpanel/sftp/pwa/home/pwa >/dev/null && oxpanel-ctl host reconcile | grep -q "kind=DRIFT_KIND_ORPHAN_SFTP_ACCESS"'
+  fi
+  pkill -P "$HOLD" 2>/dev/null || true; kill "$HOLD" 2>/dev/null || true; wait "$HOLD" 2>/dev/null || true
+  pkill -u pwa sshd 2>/dev/null || true
+  check "after the session ended, a daemon restart removes the kept mount" bash -c 'for i in $(seq 1 40); do systemctl -q is-active "user-$(id -u pwa).slice" || break; sleep 0.5; done; systemctl restart oxpanel-daemon && test ! -e /var/lib/oxpanel/sftp/pwa && oxpanel-ctl host reconcile | grep -qx "drifts=0"'
+  check "key again" grep -q '^changed=true' <(oxpanel-ctl sftp add-key pwa --key-file "$PWDIR/k.pub")
+  check "key login works" bash -c 'for i in $(seq 1 40); do echo pwd | sftp $SSH_O -i "$PWDIR/k" -b - pwa@127.0.0.1 >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1'
+  check "an open key session (2)" hold_key_session
+  if [ "$LOGIND" = 1 ]; then
+    check "remove-key --end-sessions ends it" bash -c 'oxpanel-ctl sftp remove-key pwa "$1" --end-sessions | grep -q remaining=0 && for i in $(seq 1 50); do pgrep -u pwa sshd >/dev/null || exit 0; sleep 0.2; done; exit 1' _ "$FPK"
+  else
+    check "remove-key --end-sessions" bash -c 'oxpanel-ctl sftp remove-key pwa "$1" --end-sessions | grep -q remaining=0' _ "$FPK"
+  fi
+  pkill -P "$HOLD" 2>/dev/null || true; kill "$HOLD" 2>/dev/null || true; wait "$HOLD" 2>/dev/null || true
+
+  # Reconcile notices password state that differs from the record, both ways.
+  check "a password set behind OxPanel's back is drift" bash -c 'printf "pwb:%s\n" "$PW" | chpasswd && oxpanel-ctl host reconcile | grep -q "kind=DRIFT_KIND_SFTP_ACCESS_DRIFT subject=pwb"'
+  check "set-password pwa again" bash -c 'oxpanel-ctl sftp set-password pwa < "$PWDIR/pw" | grep -q "^password=set"'
+  check "a recorded password that vanished is drift" bash -c 'printf "pwa:!!\n" | chpasswd -e && oxpanel-ctl host reconcile | grep -q "subject=pwa detail=.*set the password again"'
+  check "a daemon restart removes the stray password; the lost one must be set again" bash -c 'systemctl restart oxpanel-daemon && test "$(getent shadow pwb | cut -d: -f2)" = "!!" && oxpanel-ctl host reconcile | grep -q "subject=pwa" && ! oxpanel-ctl host reconcile | grep -q "subject=pwb"'
+  check "set it again: no drift" bash -c 'oxpanel-ctl sftp set-password pwa < "$PWDIR/pw" >/dev/null && oxpanel-ctl host reconcile | grep -qx "drifts=0"'
+
+  # The host-wide switch.
+  systemctl set-environment OXPANEL_SFTP_PASSWORDS=false; systemctl restart oxpanel-daemon
+  check "with OXPANEL_SFTP_PASSWORDS=false host info says so" grep -q ' sftp_passwords=false ' <(oxpanel-ctl host info)
+  check_not "and set-password is refused" bash -c 'oxpanel-ctl sftp set-password pwb < "$PWDIR/pw"'
+  check "sshd offers no tenant password login" bash -c '/usr/sbin/sshd -T -C user=pwa,host=x,addr=127.0.0.1 | grep -qx "passwordauthentication no"'
+  check "a recorded password is refused by sshd" pw_denied pwa "$PWDIR/pw"
+  check "and reported" bash -c 'oxpanel-ctl host reconcile | grep -q "subject=pwa detail=.*forbids"'
+  systemctl unset-environment OXPANEL_SFTP_PASSWORDS; systemctl restart oxpanel-daemon
+  check "allowed again: the password works" pw_ok pwa "$PWDIR/pw"
+  check "delete pwa (with a password)" grep -q '^deleted=true' <(oxpanel-ctl tenant delete pwa --remove-home)
+  check "no shadow entry, chroot or mount left" bash -c '! getent shadow pwa && test ! -e /var/lib/oxpanel/sftp/pwa && ! findmnt -n /var/lib/oxpanel/sftp/pwa/home/pwa'
+  check "delete pwb" grep -q '^deleted=true' <(oxpanel-ctl tenant delete pwb --remove-home)
+  check "no drift after the password tests" grep -q '^drifts=0$' <(oxpanel-ctl host reconcile)
+  rm -rf "$PWDIR"
+else
+  echo "skip - sshd or the sftp client is not installed"
+fi
+
+echo "== disk quotas"
+if grep -q ' disk_quota=true ' <(oxpanel-ctl host info); then
+  info_line="$(oxpanel-ctl host info | grep '^disk_quota_detail=')"; echo "$info_line"
+  check "create tenant quotaa with 5M / 200 files" grep -q '^created=true' <(oxpanel-ctl tenant create quotaa --disk 5M --inodes 200)
+  QUID="$(id -u quotaa)"; QFS="$(findmnt -no TARGET -T /home)"
+  check "the kernel holds the limit" bash -c 'xfs_quota -x -c "report -u -n -N -b -i -L $1 -U $1" "$2" | grep -qE "^#$1 +[0-9]+ +5120 +5120 .* 200 +200 "' _ "$QUID" "$QFS"
+  check "writing beyond the limit fails with EDQUOT" bash -c 'as_out="$(setpriv --reuid=quotaa --regid=quotaa --clear-groups -- dd if=/dev/zero of=/home/quotaa/big bs=1M count=8 2>&1)"; rc=$?; echo "$as_out" | tail -1; test $rc -ne 0 && grep -q "Disk quota exceeded" <<<"$as_out"'
+  check "usage comes from the quota system and is at the limit" bash -c 'u="$(oxpanel-ctl tenant usage quotaa | sed -n "s/.* disk_usage=\([0-9]*\).*/\1/p")"; test "$u" -ge $((4 << 20)) && test "$u" -le $((5 << 20))'
+  # Only the inode limit now (a shell redirection error would end `sh` itself, hence touch).
+  check "too many files fail too" bash -c 'oxpanel-ctl tenant set-limits quotaa --inodes 200 >/dev/null && setpriv --reuid=quotaa --regid=quotaa --clear-groups -- sh -c "rm -f /home/quotaa/big; i=0; while [ \$i -lt 400 ]; do i=\$((i+1)); touch /home/quotaa/f\$i 2>/dev/null || { echo refused at file \$i; exit 0; }; done; exit 1"'
+  check "no drift with quotas set" grep -q '^drifts=0$' <(oxpanel-ctl host reconcile)
+  check "raising the limit through set-limits" grep -q '^changed=true' <(oxpanel-ctl tenant set-limits quotaa --disk 64M)
+  check "the write now succeeds" setpriv --reuid=quotaa --regid=quotaa --clear-groups -- dd if=/dev/zero of=/home/quotaa/big bs=1M count=8 status=none
+  if [ -x /usr/sbin/sshd ] && command -v sftp >/dev/null; then
+    QDIR="$(mktemp -d /root/quota-it.XXXXXX)"
+    ssh-keygen -q -t ed25519 -N '' -f "$QDIR/k"
+    head -c $((12 << 20)) /dev/zero > "$QDIR/blob"
+    check "set-limits back to 16M" grep -q '^changed=true' <(oxpanel-ctl tenant set-limits quotaa --disk 16M)
+    oxpanel-ctl sftp add-key quotaa --key-file "$QDIR/k.pub" >/dev/null
+    QSFTP="sftp -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o LogLevel=ERROR -i $QDIR/k -b - quotaa@127.0.0.1"
+    check "the quota tenant logs in over SFTP" bash -c 'for i in $(seq 1 40); do echo pwd | $1 >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1' _ "$QSFTP"
+    check "an SFTP upload beyond the limit fails with a quota error" bash -c 'out="$(echo "put $2/blob big2" | $1 2>&1)"; rc=$?; echo "$out" | tail -2; test $rc -ne 0 && grep -qiE "quota|failure" <<<"$out"' _ "$QSFTP" "$QDIR"
+    rm -rf "$QDIR"
+  fi
+  check "dropping the limit" grep -q '^changed=true' <(oxpanel-ctl tenant set-limits quotaa)
+  check "the kernel limit is gone" bash -c '! xfs_quota -x -c "report -u -n -N -b -i -L $1 -U $1" "$2" | grep -qE "^#$1 +[0-9]+ +[1-9]"' _ "$QUID" "$QFS"
+  check "delete quotaa" grep -q '^deleted=true' <(oxpanel-ctl tenant delete quotaa --remove-home)
+else
+  echo "info - $(oxpanel-ctl host info | grep '^disk_quota_detail=')"
+  out="$(oxpanel-ctl tenant create quotab --disk 1G 2>&1 || true)"; echo "$out"
+  check "a disk limit is refused, saying what to do" bash -c 'grep -q "FailedPrecondition" <<<"$1" && grep -q "uquota" <<<"$1"' _ "$out"
+  check_not "and nothing was created" id quotab
+fi
+
 echo "== dry-run mode: the whole daemon against a fake OS, as an unprivileged user"
 DRY=/tmp/oxpanel-dry; rm -rf "$DRY"; install -d -o panelapi -g panelapi -m 0700 "$DRY"
 dry() { setpriv --reuid=panelapi --regid=panelapi --clear-groups --no-new-privs -- env \
   OXPANEL_STATE_DIR="$DRY/state" OXPANEL_HOME_BASE="$DRY/home" OXPANEL_SYSTEMD_UNIT_DIR="$DRY/systemd" \
   OXPANEL_NGINX_CONF_DIR="$DRY/nginx/oxpanel.d" OXPANEL_NGINX_INCLUDE_FILE="$DRY/nginx/00-oxpanel.conf" \
   OXPANEL_NGINX_LOG_DIR="$DRY/log" OXPANEL_PHP_CONF_DIR="$DRY/php" OXPANEL_SOCKET_PATH="$DRY/sock" \
+  OXPANEL_TLS_DIR="$DRY/pki" OXPANEL_ACME_DIR="$DRY/acme" \
+  OXPANEL_SSHD_DROPIN_FILE="$DRY/sshd_config.d/60-oxpanel.conf" OXPANEL_SFTP_KEYS_DIR="$DRY/sftp-keys" \
   OXPANEL_SOCKET_GROUP= OXPANEL_ALLOWED_UIDS="$(id -u panelapi)" "$@"; }
+real_dropin="$(sha256sum /etc/ssh/sshd_config.d/60-oxpanel.conf 2>/dev/null || true)"
 dry /usr/sbin/oxpanel-daemon --dry-run > /root/dry-run.log 2>&1 &
 DRYPID=$!
 for _ in $(seq 1 50); do [ -S "$DRY/sock" ] && break; sleep 0.1; done
@@ -668,6 +933,7 @@ check_not "no real account was created" id dryt
 check "no real unit or Nginx file was written" bash -c '! ls /etc/systemd/system/oxpanel-tenant-dryt.slice /etc/nginx/oxpanel.d/dry.test.conf 2>/dev/null | grep -q .'
 kill "$DRYPID"; wait "$DRYPID" 2>/dev/null || true
 check "the real daemon was not disturbed" systemctl -q is-active oxpanel-daemon
+check "the real sshd drop-in was not touched" test "$(sha256sum /etc/ssh/sshd_config.d/60-oxpanel.conf 2>/dev/null || true)" = "$real_dropin"
 rm -rf "$DRY"
 
 echo "== preflight refusals"

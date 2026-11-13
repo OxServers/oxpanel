@@ -16,6 +16,13 @@ eventually "bootphp.test serves PHP after reboot" 60 0.5 http_body_is bootphp.te
 eventually "Node app came back by itself after reboot" 60 0.5 systemctl -q is-active oxpanel-app-bootnode.test.service
 eventually "bootnode.test serves after reboot" 60 0.5 http_body_is bootnode.test / node-42
 check "PHP pool is in the tenant slice after reboot" bash -c "systemctl show -p ControlGroup --value oxpanel-php-bootb.service | grep -q oxpanel-tenant-bootb.slice"
+eventually "SFTP chroot mount came back by itself" 60 0.5 findmnt -n /var/lib/oxpanel/sftp/boota/home/boota
+check "SFTP login works after reboot" bash -c 'echo "get public_html/index.html boota.sftp" | sftp -q -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o LogLevel=ERROR -i boot_sftp_key -b - boota@127.0.0.1 && test "$(cat boota.sftp)" = boota'
+printf '#!/bin/sh\ncat /root/acc/boot_sftp_pw\n' > boot_askpass; chmod 700 boot_askpass
+check "SFTP password login works after reboot" bash -c 'for i in $(seq 1 30); do echo pwd | SSH_ASKPASS=/root/acc/boot_askpass SSH_ASKPASS_REQUIRE=force setsid -w sftp -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -o PubkeyAuthentication=no -o PreferredAuthentications=password -o BatchMode=no -b - bootb@127.0.0.1 2>/dev/null | grep -q "/home/bootb" && exit 0; sleep 1; done; exit 1'
+if grep -q ' disk_max=67108864 ' tenants.pre; then
+  check "bootb's disk limit is enforced after reboot" bash -c 'u=$(id -u bootb); xfs_quota -x -c "report -u -n -N -b -L $u -U $u" "$(findmnt -no TARGET -T /home)" | grep -qE "^#$u +[0-9]+ +65536 +65536 "'
+fi
 check "no drift after reboot" bash -c "oxpanel-ctl host reconcile | grep -q '^drifts=0$'"
 check "boota slice loaded with its MemoryMax" test "$(systemctl show -p MemoryMax --value oxpanel-tenant-boota.slice)" = 268435456
 check "boota slice CPUWeight" test "$(systemctl show -p CPUWeight --value oxpanel-tenant-boota.slice)" = 40

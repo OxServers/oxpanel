@@ -64,6 +64,52 @@ enum Cmd {
     /// HTTPS certificates of virtual hosts.
     #[command(subcommand)]
     Cert(CertCmd),
+    /// SFTP access of tenants (SSH public keys).
+    #[command(subcommand)]
+    Sftp(SftpCmd),
+}
+
+#[derive(Subcommand, Debug)]
+enum SftpCmd {
+    /// Let a public key log in over SFTP as the tenant (idempotent).
+    AddKey {
+        username: String,
+        /// The key line, e.g. "ssh-ed25519 AAAA… comment".
+        #[arg(
+            long,
+            conflicts_with = "key_file",
+            required_unless_present = "key_file"
+        )]
+        key: Option<String>,
+        /// Read the key line from a file (e.g. ~/.ssh/id_ed25519.pub).
+        #[arg(long)]
+        key_file: Option<PathBuf>,
+        /// Name for the key; default: the key's own comment.
+        #[arg(long, default_value = "")]
+        label: String,
+    },
+    /// Remove a key by its fingerprint (SHA256:…). Running sessions continue
+    /// unless --end-sessions is given.
+    RemoveKey {
+        username: String,
+        fingerprint: String,
+        /// Also end the tenant's running SFTP sessions.
+        #[arg(long)]
+        end_sessions: bool,
+    },
+    /// Set or replace the tenant's SFTP password, read from standard input
+    /// (one line; never pass it as an argument).
+    SetPassword { username: String },
+    /// Remove the tenant's SFTP password. Running sessions continue unless
+    /// --end-sessions is given.
+    ClearPassword {
+        username: String,
+        /// Also end the tenant's running SFTP sessions.
+        #[arg(long)]
+        end_sessions: bool,
+    },
+    /// The tenant's keys.
+    ListKeys { username: String },
 }
 
 #[derive(Subcommand, Debug)]
@@ -139,6 +185,12 @@ struct LimitArgs {
     /// systemd TasksMax (0 = default).
     #[arg(long, default_value_t = 0)]
     tasks_max: u32,
+    /// Disk space (kernel quota), e.g. 5G. 0 = unlimited.
+    #[arg(long, value_parser = parse_size, default_value = "0")]
+    disk: u64,
+    /// Number of files and directories (kernel quota). 0 = unlimited.
+    #[arg(long, default_value_t = 0)]
+    inodes: u64,
 }
 
 #[derive(Subcommand, Debug)]
@@ -287,6 +339,8 @@ impl From<LimitArgs> for pb::ResourceLimits {
             cpu_weight: l.cpu_weight,
             io_weight: l.io_weight,
             tasks_max: l.tasks_max,
+            disk_max_bytes: l.disk,
+            inodes_max: l.inodes,
         }
     }
 }
@@ -305,7 +359,7 @@ fn print_tenant(t: &pb::Tenant) {
     let l = t.limits.unwrap_or_default();
     let state = pb::TenantState::try_from(t.state).map_or("unknown", |s| s.as_str_name());
     say!(
-        "tenant={} owner={} uid={} gid={} home={} state={} suspended={} slice={} memory_max={} cpu_weight={} io_weight={} tasks_max={} created_at={}",
+        "tenant={} owner={} uid={} gid={} home={} state={} suspended={} slice={} memory_max={} cpu_weight={} io_weight={} tasks_max={} disk_max={} inodes_max={} sftp_keys={} sftp_password={} created_at={}",
         t.username,
         if t.owner.is_empty() { "-" } else { t.owner.as_str() },
         t.uid,
@@ -318,6 +372,10 @@ fn print_tenant(t: &pb::Tenant) {
         l.cpu_weight,
         l.io_weight,
         l.tasks_max,
+        l.disk_max_bytes,
+        l.inodes_max,
+        t.sftp_key_count,
+        t.sftp_password,
         t.created_at.as_ref().map_or(0, |ts| ts.seconds),
     );
 }
@@ -356,6 +414,7 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
         Cmd::Vhost(cmd) => run_vhost(&mut c, cmd).await?,
         Cmd::Host(cmd) => run_host(&mut c, cmd).await?,
         Cmd::Cert(cmd) => run_cert(&mut c, cmd).await?,
+        Cmd::Sftp(cmd) => run_sftp(&mut c, cmd).await?,
     })
 }
 
@@ -794,7 +853,7 @@ async fn run_host(
                 .await?
                 .into_inner();
             say!(
-                "version={} selinux={} php={} node={} node_version={} python={} dry_run={} tenants={} vhosts={} uid_range={}-{} load={:.2},{:.2},{:.2} memory_total={} memory_free={} home_disk_total={} home_disk_free={} uptime={} tls={} acme={} acme_directory={} auto_https={}",
+                "version={} selinux={} php={} node={} node_version={} python={} sftp={} sftp_passwords={} disk_quota={} dry_run={} tenants={} vhosts={} uid_range={}-{} load={:.2},{:.2},{:.2} memory_total={} memory_free={} home_disk_total={} home_disk_free={} uptime={} tls={} acme={} acme_directory={} auto_https={}",
                 i.daemon_version,
                 i.selinux_enabled,
                 i.php_available,
@@ -805,6 +864,9 @@ async fn run_host(
                     i.node_version.as_str()
                 },
                 i.python_available,
+                i.sftp_available,
+                i.sftp_passwords_allowed,
+                i.disk_quota_available,
                 i.dry_run,
                 i.tenant_count,
                 i.vhost_count,
@@ -823,6 +885,7 @@ async fn run_host(
                 i.acme_directory_url,
                 i.auto_https_enabled,
             );
+            say!("disk_quota_detail={}", i.disk_quota_detail);
         }
         HostCmd::Reconcile => {
             let r = c.reconcile(pb::ReconcileRequest {}).await?.into_inner();
@@ -833,6 +896,108 @@ async fn run_host(
             }
             if !r.drifts.is_empty() {
                 return Ok(ExitCode::from(EXIT_DRIFT));
+            }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn print_sftp_key(k: &pb::SftpKey) {
+    say!(
+        "fingerprint={} type={} label={} added_at={}",
+        k.fingerprint,
+        k.key_type,
+        if k.label.is_empty() {
+            "-"
+        } else {
+            k.label.as_str()
+        },
+        k.added_at.as_ref().map_or(0, |ts| ts.seconds),
+    );
+}
+
+async fn run_sftp(
+    c: &mut OxPanelEngineClient<Channel>,
+    cmd: SftpCmd,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    match cmd {
+        SftpCmd::AddKey {
+            username,
+            key,
+            key_file,
+            label,
+        } => {
+            let public_key = match (key, key_file) {
+                (Some(k), _) => k,
+                (None, Some(path)) => std::fs::read_to_string(&path)
+                    .map_err(|e| format!("{}: {e}", path.display()))?,
+                (None, None) => return Err("--key or --key-file is required".into()),
+            };
+            let r = c
+                .add_sftp_key(pb::AddSftpKeyRequest {
+                    username,
+                    public_key,
+                    label,
+                })
+                .await?
+                .into_inner();
+            say!("changed={}", r.changed);
+            if let Some(k) = &r.key {
+                print_sftp_key(k);
+            }
+        }
+        SftpCmd::RemoveKey {
+            username,
+            fingerprint,
+            end_sessions,
+        } => {
+            let r = c
+                .remove_sftp_key(pb::RemoveSftpKeyRequest {
+                    username,
+                    fingerprint,
+                    end_sessions,
+                })
+                .await?
+                .into_inner();
+            say!("removed=true remaining={}", r.remaining);
+        }
+        SftpCmd::SetPassword { username } => {
+            let mut input = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)
+                .map_err(|e| format!("reading the password from stdin: {e}"))?;
+            // One line: its terminating newline is not part of the password.
+            let line = input.strip_suffix('\n').unwrap_or(&input);
+            let password = line.strip_suffix('\r').unwrap_or(line).to_owned();
+            let r = c
+                .set_sftp_password(pb::SetSftpPasswordRequest { username, password })
+                .await?
+                .into_inner();
+            say!("password=set");
+            if let Some(t) = &r.tenant {
+                print_tenant(t);
+            }
+        }
+        SftpCmd::ClearPassword {
+            username,
+            end_sessions,
+        } => {
+            let r = c
+                .clear_sftp_password(pb::ClearSftpPasswordRequest {
+                    username,
+                    end_sessions,
+                })
+                .await?
+                .into_inner();
+            say!("cleared={}", r.cleared);
+        }
+        SftpCmd::ListKeys { username } => {
+            for k in &c
+                .list_sftp_keys(pb::ListSftpKeysRequest { username })
+                .await?
+                .into_inner()
+                .keys
+            {
+                print_sftp_key(k);
             }
         }
     }

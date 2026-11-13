@@ -20,7 +20,7 @@ use oxpanel_daemon::ctx::Ctx;
 use oxpanel_daemon::server::Engine;
 use oxpanel_daemon::system::{bin, CommandSpec, FakeSystem, OsUser, RealSystem, System};
 use oxpanel_daemon::tls::TlsService;
-use oxpanel_daemon::{fsutil, nginx, vhost};
+use oxpanel_daemon::{fsutil, nginx, quota, sftp, vhost};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const USAGE: &str = "\
@@ -182,14 +182,7 @@ async fn run(cli: Cli) -> Result<(), Fatal> {
     .map_err(|e| Fatal::Runtime(format!("nginx include: {e}")))?;
 
     if !cli.check_config {
-        // Files written by an older version are re-rendered from the records.
-        match vhost::converge_all(&ctx).await {
-            Ok(0) => {}
-            Ok(n) => info!(tenants = n, "virtual-host configuration brought up to date"),
-            Err(e) => {
-                warn!(error = %e, "could not bring virtual-host configuration up to date; see `oxpanel-ctl host reconcile`");
-            }
-        }
+        converge_at_start(&ctx).await;
     }
 
     if cli.check_config {
@@ -282,6 +275,31 @@ async fn auto_https_periodically(tls: TlsService) {
     }
 }
 
+/// Bring what the records describe up to date with this version of the
+/// daemon. Failures are logged and left to `Reconcile`; they never stop it.
+async fn converge_at_start(ctx: &Ctx) {
+    // Files written by an older version are re-rendered from the records.
+    match vhost::converge_all(ctx).await {
+        Ok(0) => {}
+        Ok(n) => info!(tenants = n, "virtual-host configuration brought up to date"),
+        Err(e) => {
+            warn!(error = %e, "could not bring virtual-host configuration up to date; see `oxpanel-ctl host reconcile`");
+        }
+    }
+    // SFTP: the sshd drop-in confines every tenant account, also those
+    // without keys, so it is installed whenever sshd is.
+    match sftp::converge_all(ctx).await {
+        Ok(n) => info!(tenants_with_sftp = n, "sftp access converged"),
+        Err(e) => {
+            warn!(error = %e, "could not converge SFTP access; see `oxpanel-ctl host reconcile`");
+        }
+    }
+    match quota::availability(ctx).await {
+        Ok(a) => info!(available = a.available, detail = %a.detail, "disk quotas"),
+        Err(e) => warn!(error = %e, "could not determine disk-quota support"),
+    }
+}
+
 /// The real OS, or the in-memory fake for `--dry-run`.
 fn make_system(config: &mut Config) -> Result<Arc<dyn System>, Fatal> {
     if config.dry_run {
@@ -323,6 +341,9 @@ async fn preflight(config: &Config, sys: &dyn System) -> Result<bool, Fatal> {
         bin::SETFACL,
         bin::MKDIR,
         bin::DU,
+        bin::GPASSWD,
+        bin::CHPASSWD,
+        bin::USERMOD,
     ] {
         if !is_executable(Path::new(b)) {
             return Err(Fatal::Unavailable(format!(
@@ -390,6 +411,7 @@ async fn preflight(config: &Config, sys: &dyn System) -> Result<bool, Fatal> {
     };
     // The web user receives ACL grants on every document root: it must never
     // be root or a tenant.
+    require_groups(config, sys).await?;
     if web.uid == 0 {
         return Err(Fatal::Config("OXPANEL_WEB_USER must not be root".into()));
     }
@@ -400,6 +422,26 @@ async fn preflight(config: &Config, sys: &dyn System) -> Result<bool, Fatal> {
         )));
     }
     Ok(selinux)
+}
+
+/// The groups the package creates for the sshd drop-in must exist.
+async fn require_groups(config: &Config, sys: &dyn System) -> Result<(), Fatal> {
+    for (key, group) in [
+        ("OXPANEL_TENANT_GROUP", &config.tenant_group),
+        ("OXPANEL_SFTP_PASSWORD_GROUP", &config.sftp_password_group),
+    ] {
+        if sys
+            .group_by_name(group)
+            .await
+            .map_err(|e| Fatal::Runtime(e.to_string()))?
+            .is_none()
+        {
+            return Err(Fatal::Config(format!(
+                "{key} '{group}' does not exist (the package creates it with systemd-sysusers)"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn is_executable(p: &Path) -> bool {

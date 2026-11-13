@@ -33,6 +33,10 @@ struct TestServer {
     config: Config,
 }
 
+const KEY: &str =
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGNQ8nctDOzq4yQ8Bix4hfkkqCQw0kkYzl6hc7hg7rRo";
+const FINGERPRINT: &str = "SHA256:d61vVJ9GcopAzh14aZ3bTeCz+981/iT/jSIxXFS8pjQ";
+
 async fn start(policy: PeerPolicy) -> TestServer {
     start_scoped(policy, &[]).await
 }
@@ -55,6 +59,8 @@ async fn start_scoped(policy: PeerPolicy, scopes: &[Scope]) -> TestServer {
     cfg.socket_path = dir.path().join("oxpanel.sock");
     cfg.tls_dir = dir.path().join("pki");
     cfg.acme_dir = dir.path().join("acme");
+    cfg.sftp_keys_dir = dir.path().join("sftp-keys");
+    cfg.sshd_dropin_file = dir.path().join("sshd_config.d").join("60-oxpanel.conf");
     if !scopes.is_empty() {
         cfg.peer_scopes.insert(
             nix::unistd::geteuid().as_raw(),
@@ -65,12 +71,18 @@ async fn start_scoped(policy: PeerPolicy, scopes: &[Scope]) -> TestServer {
         &cfg.home_base,
         &cfg.systemd_unit_dir,
         &dir.path().join("nginx").join("conf.d"),
+        &dir.path().join("sshd_config.d"),
     ] {
         std::fs::create_dir_all(d).expect("mkdir");
     }
     let sys = Arc::new(FakeSystem::new());
     let ctx = Ctx::new(cfg.clone(), sys.clone(), false);
     ctx.store.init().expect("store init");
+    // As the daemon does at start: install the sshd drop-in.
+    oxpanel_daemon::sftp::converge_all(&ctx)
+        .await
+        .expect("sftp converge");
+    sys.clear_calls();
     let listener = UnixListener::bind(&cfg.socket_path).expect("bind");
     let incoming = auth::gate(listener, Arc::new(policy), ctx.sys.clone());
     let engine = Engine::new(ctx);
@@ -120,6 +132,7 @@ async fn full_tenant_and_vhost_lifecycle_over_uds() {
                 cpu_weight: 200,
                 io_weight: 0,
                 tasks_max: 100,
+                ..pb::ResourceLimits::default()
             }),
         })
         .await
@@ -145,6 +158,7 @@ async fn full_tenant_and_vhost_lifecycle_over_uds() {
                 cpu_weight: 200,
                 io_weight: 0,
                 tasks_max: 100,
+                ..pb::ResourceLimits::default()
             }),
         })
         .await
@@ -311,6 +325,7 @@ async fn validation_errors_surface_as_invalid_argument_with_message() {
                 cpu_weight: 0,
                 io_weight: 0,
                 tasks_max: 0,
+                ..pb::ResourceLimits::default()
             }),
         })
         .await
@@ -409,6 +424,7 @@ async fn management_rpcs_over_uds() {
         cpu_weight: 50,
         io_weight: 0,
         tasks_max: 0,
+        ..pb::ResourceLimits::default()
     };
     let r = client
         .update_tenant_limits(pb::UpdateTenantLimitsRequest {
@@ -518,6 +534,125 @@ async fn management_rpcs_over_uds() {
     assert_eq!(d.kind, i32::from(pb::DriftKind::VhostConfigDrift));
     assert_eq!(d.subject, "example.com");
 
+    // SFTP keys
+    let added = client
+        .add_sftp_key(pb::AddSftpKeyRequest {
+            username: "alice".into(),
+            public_key: format!("{KEY} alice@laptop"),
+            label: String::new(),
+        })
+        .await
+        .expect("add key")
+        .into_inner();
+    assert!(added.changed);
+    let key = added.key.expect("key");
+    assert_eq!(key.fingerprint, FINGERPRINT);
+    assert_eq!(
+        (key.label.as_str(), key.public_key.as_str()),
+        ("alice@laptop", KEY)
+    );
+    let tenant = client
+        .get_tenant(pb::GetTenantRequest {
+            username: "alice".into(),
+        })
+        .await
+        .expect("get")
+        .into_inner();
+    assert_eq!(tenant.sftp_key_count, 1);
+    let listed = client
+        .list_sftp_keys(pb::ListSftpKeysRequest {
+            username: "alice".into(),
+        })
+        .await
+        .expect("list keys")
+        .into_inner()
+        .keys;
+    assert_eq!(listed, vec![key]);
+    let bad = client
+        .add_sftp_key(pb::AddSftpKeyRequest {
+            username: "alice".into(),
+            public_key: format!("command=\"/bin/sh\" {KEY}"),
+            label: String::new(),
+        })
+        .await
+        .expect_err("options are refused");
+    assert_eq!(bad.code(), Code::InvalidArgument);
+    let removed = client
+        .remove_sftp_key(pb::RemoveSftpKeyRequest {
+            username: "alice".into(),
+            fingerprint: FINGERPRINT.into(),
+            end_sessions: false,
+        })
+        .await
+        .expect("remove key")
+        .into_inner();
+    assert_eq!(removed.remaining, 0);
+    let gone = client
+        .remove_sftp_key(pb::RemoveSftpKeyRequest {
+            username: "alice".into(),
+            fingerprint: FINGERPRINT.into(),
+            end_sessions: false,
+        })
+        .await
+        .expect_err("already removed");
+    assert_eq!(gone.code(), Code::NotFound);
+
+    // SFTP password: validated, recorded as a flag, never returned.
+    let short = client
+        .set_sftp_password(pb::SetSftpPasswordRequest {
+            username: "alice".into(),
+            password: "too-short".into(),
+        })
+        .await
+        .expect_err("12 characters at least");
+    assert_eq!(short.code(), Code::InvalidArgument);
+    assert!(
+        !short.message().contains("too-short"),
+        "{}",
+        short.message()
+    );
+    let set = client
+        .set_sftp_password(pb::SetSftpPasswordRequest {
+            username: "alice".into(),
+            password: "correct horse battery".into(),
+        })
+        .await
+        .expect("set password")
+        .into_inner();
+    assert!(set.tenant.is_some_and(|t| t.sftp_password));
+    let chpasswd = srv.sys.calls_to(oxpanel_daemon::system::bin::CHPASSWD);
+    assert!(chpasswd.iter().all(|c| c
+        .args
+        .iter()
+        .all(|a| !a.to_string_lossy().contains("horse"))));
+    let cleared = client
+        .clear_sftp_password(pb::ClearSftpPasswordRequest {
+            username: "alice".into(),
+            end_sessions: false,
+        })
+        .await
+        .expect("clear password")
+        .into_inner();
+    assert!(cleared.cleared && cleared.tenant.is_some_and(|t| !t.sftp_password));
+
+    // Disk limits on a host without quotas are refused, with what to do.
+    let refused = client
+        .update_tenant_limits(pb::UpdateTenantLimitsRequest {
+            username: "alice".into(),
+            limits: Some(pb::ResourceLimits {
+                disk_max_bytes: 1 << 30,
+                ..pb::ResourceLimits::default()
+            }),
+        })
+        .await
+        .expect_err("no quotas here");
+    assert_eq!(refused.code(), Code::FailedPrecondition);
+    assert!(
+        refused.message().contains("uquota"),
+        "{}",
+        refused.message()
+    );
+
     // Unknown tenants
     let nf = client
         .suspend_tenant(pb::SuspendTenantRequest {
@@ -603,6 +738,52 @@ async fn a_scoped_peer_can_only_call_its_scopes() {
         srv.sys.calls().is_empty(),
         "denied requests never reach the OS"
     );
+
+    // Customers manage their own SFTP access: with the vhost scope these
+    // get past the gate (and then fail on the missing tenant, not on
+    // permissions); listing needs only `read`.
+    let sftp_calls = [
+        client
+            .add_sftp_key(pb::AddSftpKeyRequest {
+                username: "alice".into(),
+                public_key: KEY.into(),
+                label: String::new(),
+            })
+            .await
+            .map(|_| ()),
+        client
+            .remove_sftp_key(pb::RemoveSftpKeyRequest {
+                username: "alice".into(),
+                fingerprint: FINGERPRINT.into(),
+                end_sessions: true,
+            })
+            .await
+            .map(|_| ()),
+        client
+            .set_sftp_password(pb::SetSftpPasswordRequest {
+                username: "alice".into(),
+                password: "correct horse battery".into(),
+            })
+            .await
+            .map(|_| ()),
+        client
+            .clear_sftp_password(pb::ClearSftpPasswordRequest {
+                username: "alice".into(),
+                end_sessions: false,
+            })
+            .await
+            .map(|_| ()),
+        client
+            .list_sftp_keys(pb::ListSftpKeysRequest {
+                username: "alice".into(),
+            })
+            .await
+            .map(|_| ()),
+    ];
+    for (i, r) in sftp_calls.into_iter().enumerate() {
+        let e = r.expect_err("no such tenant");
+        assert_eq!(e.code(), Code::NotFound, "sftp rpc #{i}: {}", e.message());
+    }
 
     // The vhost scope is honoured: the call gets past the gate (and then
     // fails on the missing tenant, not on permissions).

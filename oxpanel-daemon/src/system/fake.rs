@@ -7,10 +7,14 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsString;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use super::{bin, CommandOutput, CommandSpec, HostStats, OsUser, System};
+use super::{
+    bin, shadow_password_state, CommandOutput, CommandSpec, HostStats, OsUser, PasswordState,
+    QuotaState, System,
+};
 use crate::error::{Error, Result};
 
 #[derive(Debug, Default)]
@@ -35,6 +39,84 @@ struct Inner {
     acme_lifetime: Option<u64>,
     /// The fake certificate authority refuses every order.
     acme_refuses: bool,
+    /// User quotas are enforced on the (one) fake file system.
+    quota_enforced: bool,
+    /// Per-uid quota state of the fake file system.
+    quotas: BTreeMap<u32, FakeQuota>,
+    ssh: FakeSsh,
+    /// Password field per account, as `/etc/shadow` would hold it.
+    shadow: BTreeMap<String, String>,
+}
+
+/// sshd and login sessions on the fake host.
+#[derive(Debug, Default)]
+struct FakeSsh {
+    /// The sshd drop-in is not in effect (`sshd -T` shows the defaults).
+    unconfined: bool,
+    /// Every tenant has an open login session (`user-<uid>.slice` active).
+    sessions_open: bool,
+}
+
+/// Commands of the SFTP workflows: group membership, the shadow database,
+/// `sshd -T` and the session check. `None` for anything else.
+fn fake_ssh_and_accounts(i: &mut Inner, spec: &CommandSpec) -> Option<CommandOutput> {
+    let args = &spec.args;
+    let program = spec.program;
+    let first = |s: &str| args.first().is_some_and(|a| a == s);
+    Some(match program {
+        bin::GPASSWD => fake_gpasswd(i, args),
+        bin::CHPASSWD => fake_chpasswd(i, spec),
+        bin::USERMOD => fake_usermod(i, args),
+        // `systemd-run … -- rmdir -- <dir>…`: non-recursive, as the real one.
+        bin::SYSTEMD_RUN if args.iter().any(|a| a == bin::RMDIR) => {
+            let dirs = args.iter().skip_while(|a| *a != bin::RMDIR).skip(2);
+            for dir in dirs {
+                if let Err(e) = std::fs::remove_dir(dir) {
+                    return Some(output(
+                        program,
+                        1,
+                        "",
+                        &format!("rmdir: {}: {e}", dir.to_string_lossy()),
+                    ));
+                }
+            }
+            output(program, 0, "", "")
+        }
+        // `sshd -T -C user=…`: the effective settings for one account.
+        bin::SSHD if first("-T") => {
+            let effective = if i.ssh.unconfined {
+                "forcecommand none\nchrootdirectory none\nauthorizedkeysfile .ssh/authorized_keys\n"
+            } else {
+                "forcecommand internal-sftp\nchrootdirectory /fake/%u\nauthorizedkeysfile /fake/%u\ndisableforwarding yes\n"
+            };
+            output(program, 0, effective, "")
+        }
+        // `systemctl show --property=ActiveState --value -- user-<uid>.slice`
+        bin::SYSTEMCTL
+            if first("show")
+                && has_flag(args, "--value")
+                && args
+                    .iter()
+                    .any(|a| a.to_string_lossy().starts_with("user-")) =>
+        {
+            let state = if i.ssh.sessions_open {
+                "active\n"
+            } else {
+                "inactive\n"
+            };
+            output(program, 0, state, "")
+        }
+        _ => return None,
+    })
+}
+
+/// One user's row in the fake quota table (blocks in KiB, as `xfs_quota` prints).
+#[derive(Debug, Default, Clone, Copy)]
+struct FakeQuota {
+    blocks_used: u64,
+    blocks_hard: u64,
+    inodes_used: u64,
+    inodes_hard: u64,
 }
 
 #[derive(Debug, Default)]
@@ -42,9 +124,76 @@ pub struct FakeSystem {
     inner: Mutex<Inner>,
 }
 
+/// Block device of the fake file system that holds tenant homes.
+pub const FAKE_DEVICE: &str = "/dev/fake0";
+/// The group every tenant is put in (the default `OXPANEL_TENANT_GROUP`),
+/// which exists on a fake host just as the package creates it on a real one.
+pub const FAKE_TENANT_GROUP: (&str, u32) = ("oxpanel-tenants", 989);
+/// The group of tenants with an SFTP password (the default
+/// `OXPANEL_SFTP_PASSWORD_GROUP`), likewise created by the package.
+pub const FAKE_PASSWORD_GROUP: (&str, u32) = ("oxpanel-sftp-password", 988);
+
 impl FakeSystem {
     pub fn new() -> Self {
-        Self::default()
+        let fake = Self::default();
+        fake.add_group(FAKE_TENANT_GROUP.0, FAKE_TENANT_GROUP.1);
+        fake.add_group(FAKE_PASSWORD_GROUP.0, FAKE_PASSWORD_GROUP.1);
+        fake
+    }
+
+    /// Turn kernel-enforced user quotas on the fake file system on or off.
+    pub fn set_quota_enforced(&self, on: bool) {
+        if let Ok(mut i) = self.inner.lock() {
+            i.quota_enforced = on;
+        }
+    }
+
+    /// Pretend `uid` owns this much on the fake file system.
+    pub fn set_quota_usage(&self, uid: u32, blocks_kib: u64, inodes: u64) {
+        if let Ok(mut i) = self.inner.lock() {
+            let q = i.quotas.entry(uid).or_default();
+            q.blocks_used = blocks_kib;
+            q.inodes_used = inodes;
+        }
+    }
+
+    /// Change a limit behind the daemon's back (KiB, inodes).
+    pub fn set_quota_limits(&self, uid: u32, blocks_hard_kib: u64, inodes_hard: u64) {
+        if let Ok(mut i) = self.inner.lock() {
+            let q = i.quotas.entry(uid).or_default();
+            q.blocks_hard = blocks_hard_kib;
+            q.inodes_hard = inodes_hard;
+        }
+    }
+
+    /// The `(block limit in KiB, inode limit)` the fake kernel holds for `uid`.
+    pub fn quota_limits(&self, uid: u32) -> (u64, u64) {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|i| i.quotas.get(&uid).map(|q| (q.blocks_hard, q.inodes_hard)))
+            .unwrap_or_default()
+    }
+
+    /// Pretend every tenant has (or has not) an open login session.
+    pub fn set_sessions_open(&self, open: bool) {
+        if let Ok(mut i) = self.inner.lock() {
+            i.ssh.sessions_open = open;
+        }
+    }
+
+    /// Overwrite an account's shadow password field behind the daemon's back.
+    pub fn set_shadow_field(&self, user: &str, field: &str) {
+        if let Ok(mut i) = self.inner.lock() {
+            i.shadow.insert(user.to_owned(), field.to_owned());
+        }
+    }
+
+    /// Make `sshd -T` report an sshd that ignores the OxPanel drop-in.
+    pub fn set_sshd_unconfined(&self, on: bool) {
+        if let Ok(mut i) = self.inner.lock() {
+            i.ssh.unconfined = on;
+        }
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Inner>> {
@@ -175,6 +324,218 @@ fn output(program: &'static str, code: i32, stdout: &str, stderr: &str) -> Comma
     }
 }
 
+/// `gpasswd --add|--delete <user> <group>` on the fake account database.
+fn fake_gpasswd(i: &mut Inner, args: &[OsString]) -> CommandOutput {
+    let program = bin::GPASSWD;
+    let arg = |n: usize| args.get(n).map(|a| a.to_string_lossy().into_owned());
+    let (Some(verb), Some(user), Some(group)) = (arg(0), arg(1), arg(2)) else {
+        return output(program, 2, "", "gpasswd: usage");
+    };
+    let Some(gid) = i.groups.get(&group).copied() else {
+        return output(
+            program,
+            3,
+            "",
+            &format!("gpasswd: group '{group}' does not exist in /etc/group"),
+        );
+    };
+    if !i.users.contains_key(&user) {
+        return output(
+            program,
+            3,
+            "",
+            &format!("gpasswd: user '{user}' does not exist"),
+        );
+    }
+    let members = i.memberships.entry(user.clone()).or_default();
+    match verb.as_str() {
+        "--add" => {
+            if !members.contains(&gid) {
+                members.push(gid);
+            }
+            output(program, 0, "", "")
+        }
+        "--delete" if members.contains(&gid) => {
+            members.retain(|g| *g != gid);
+            output(program, 0, "", "")
+        }
+        "--delete" => output(
+            program,
+            3,
+            "",
+            &format!("gpasswd: user '{user}' is not a member of '{group}'"),
+        ),
+        _ => output(program, 2, "", "gpasswd: usage"),
+    }
+}
+
+/// `chpasswd [-e]` reading `user:password` lines from stdin. Without `-e` the
+/// fake stores a stand-in hash, never the password.
+fn fake_chpasswd(i: &mut Inner, spec: &CommandSpec) -> CommandOutput {
+    let program = bin::CHPASSWD;
+    let encrypted = has_flag(&spec.args, "-e");
+    let Some(input) = spec.stdin.as_ref() else {
+        return output(program, 1, "", "chpasswd: no input");
+    };
+    let text = String::from_utf8_lossy(input.expose()).into_owned();
+    for line in text.lines() {
+        let Some((user, password)) = line.split_once(':') else {
+            return output(program, 1, "", "chpasswd: line 1: missing new password");
+        };
+        if !i.users.contains_key(user) {
+            return output(
+                program,
+                1,
+                "",
+                &format!("chpasswd: line 1: user '{user}' does not exist"),
+            );
+        }
+        let field = if encrypted {
+            password.to_owned()
+        } else {
+            format!("$6$fake${}", password.len())
+        };
+        i.shadow.insert(user.to_owned(), field);
+    }
+    output(program, 0, "", "")
+}
+
+/// `usermod --lock|--unlock <user>` on the fake shadow database.
+fn fake_usermod(i: &mut Inner, args: &[OsString]) -> CommandOutput {
+    let program = bin::USERMOD;
+    let Some(user) = args.last().map(|a| a.to_string_lossy().into_owned()) else {
+        return output(program, 2, "", "usermod: usage");
+    };
+    let Some(field) = i.shadow.get(&user).cloned() else {
+        return output(
+            program,
+            6,
+            "",
+            &format!("usermod: user '{user}' does not exist"),
+        );
+    };
+    let new = if has_flag(args, "--lock") {
+        if field.starts_with('!') {
+            field
+        } else {
+            format!("!{field}")
+        }
+    } else if has_flag(args, "--unlock") {
+        let rest = field.strip_prefix('!').unwrap_or(&field).to_owned();
+        if rest.is_empty() || rest.starts_with('!') || rest.starts_with('*') {
+            return output(
+                program,
+                1,
+                "",
+                "usermod: unlocking the user's password would result in a passwordless account.",
+            );
+        }
+        rest
+    } else {
+        return output(program, 2, "", "usermod: usage");
+    };
+    i.shadow.insert(user, new);
+    output(program, 0, "", "")
+}
+
+/// The value of `key=` inside an `xfs_quota` `limit` command, in the unit it
+/// was given (`5120k` → 5120).
+fn limit_value(command: &str, key: &str) -> Option<u64> {
+    command
+        .split(' ')
+        .find_map(|w| w.strip_prefix(key)?.strip_prefix('='))
+        .and_then(|v| v.trim_end_matches('k').parse().ok())
+}
+
+/// `systemd-run … -- xfs_quota -x -c <command>… <device>`: apply `limit`
+/// commands to the fake quota table and write what `report` commands print to
+/// the file the transient unit's standard output is directed to.
+/// Commands of the HTTPS and disk-quota workflows: OpenSSL, the ACME client
+/// and `xfs_quota` in their transient units. `None` for anything else.
+fn fake_tls_and_quota(i: &mut Inner, spec: &CommandSpec) -> Option<CommandOutput> {
+    let args = &spec.args;
+    let program = spec.program;
+    Some(match program {
+        bin::OPENSSL => {
+            let (code, stdout, stderr) = super::fake_tls::openssl(args, &mut i.generated_keys);
+            output(program, code, &stdout, &stderr)
+        }
+        // The ACME client in its transient unit (other uses of systemd-run just succeed).
+        bin::SYSTEMD_RUN if args.iter().any(|a| a == bin::OXPANEL_ACME) => {
+            let (code, stderr) = if i.acme_refuses && !args.iter().any(|a| a == "precheck") {
+                (1, "no certificate: the authority refused (429): too many certificates (urn:ietf:params:acme:error:rateLimited)".to_owned())
+            } else {
+                super::fake_tls::acme_client(args, i.acme_lifetime.unwrap_or(90 * 86_400))
+            };
+            output(program, code, "", &stderr)
+        }
+        bin::SYSTEMD_RUN if args.iter().any(|a| a == bin::XFS_QUOTA) => fake_xfs_quota(i, args),
+        _ => return None,
+    })
+}
+
+fn fake_xfs_quota(i: &mut Inner, args: &[OsString]) -> CommandOutput {
+    let program = bin::SYSTEMD_RUN;
+    let args: Vec<String> = args
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    let Some(out_path) = args
+        .iter()
+        .find_map(|a| a.strip_prefix("--property=StandardOutput=truncate:"))
+    else {
+        return output(program, 1, "", "fake: no StandardOutput file");
+    };
+    let mut text = String::new();
+    if !i.quota_enforced || args.last().map(String::as_str) != Some(FAKE_DEVICE) {
+        // What the real tool does on a file system without quotas: nothing.
+        return match std::fs::write(out_path, text) {
+            Ok(()) => output(program, 0, "", ""),
+            Err(e) => output(program, 1, "", &format!("fake: {e}")),
+        };
+    }
+    let commands = args
+        .iter()
+        .zip(args.iter().skip(1))
+        .filter(|(flag, _)| *flag == "-c")
+        .map(|(_, command)| command.as_str());
+    for command in commands {
+        let uid = command
+            .rsplit(' ')
+            .next()
+            .and_then(|w| w.parse::<u32>().ok());
+        if command.starts_with("limit ") {
+            let Some(uid) = uid else {
+                return output(program, 1, "", "fake: limit without a uid");
+            };
+            let q = i.quotas.entry(uid).or_default();
+            q.blocks_hard = limit_value(command, "bhard").unwrap_or(q.blocks_hard);
+            q.inodes_hard = limit_value(command, "ihard").unwrap_or(q.inodes_hard);
+        } else if command.starts_with("report ") {
+            // `-L <uid> -U <uid>` restricts the report to one user.
+            let only = command
+                .split(' ')
+                .skip_while(|w| *w != "-L")
+                .nth(1)
+                .and_then(|w| w.parse::<u32>().ok());
+            for (uid, q) in &i.quotas {
+                if only.is_none_or(|o| o == *uid) {
+                    let _ = writeln!(
+                        text,
+                        "#{uid:<10} {:>10} {:>10} {:>10}     00 [--------] {:>10} {:>10} {:>10}     00 [--------]",
+                        q.blocks_used, q.blocks_hard, q.blocks_hard, q.inodes_used, q.inodes_hard, q.inodes_hard
+                    );
+                }
+            }
+            text.push('\n');
+        }
+    }
+    match std::fs::write(out_path, text) {
+        Ok(()) => output(program, 0, "", ""),
+        Err(e) => output(program, 1, "", &format!("fake: {e}")),
+    }
+}
+
 fn create_private_dir(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(path)?;
@@ -192,6 +553,12 @@ impl System for FakeSystem {
             .and_then(VecDeque::pop_front)
         {
             return Ok(output(spec.program, code, "", &stderr));
+        }
+        if let Some(out) = fake_ssh_and_accounts(&mut i, &spec) {
+            return Ok(out);
+        }
+        if let Some(out) = fake_tls_and_quota(&mut i, &spec) {
+            return Ok(out);
         }
         let args = &spec.args;
         let program = spec.program;
@@ -222,6 +589,7 @@ impl System for FakeSystem {
                 }
                 let shell = PathBuf::from(arg_value(args, "--shell").unwrap_or_else(|| "/bin/bash".to_owned()));
                 i.groups.insert(name.clone(), uid);
+                i.shadow.insert(name.clone(), "!!".to_owned());
                 i.users.insert(name.clone(), OsUser { name, uid, gid: uid, home, shell });
                 output(program, 0, "", "")
             }
@@ -234,6 +602,8 @@ impl System for FakeSystem {
                     return Ok(output(program, 6, "", &format!("userdel: user '{name}' does not exist")));
                 };
                 i.groups.remove(&name);
+                i.memberships.remove(&name);
+                i.shadow.remove(&name);
                 if has_flag(args, "--remove") || has_flag(args, "-r") {
                     let _ = std::fs::remove_dir_all(&user.home);
                     i.removed_homes.push(user.home);
@@ -271,19 +641,6 @@ impl System for FakeSystem {
             bin::SYSTEMCTL if args.first().is_some_and(|a| a == "show") => {
                 // Two units are queried; only the first has anything running.
                 output(program, 0, "MemoryCurrent=1048576\nCPUUsageNSec=5000000\nTasksCurrent=3\n\nMemoryCurrent=[not set]\nCPUUsageNSec=[not set]\nTasksCurrent=[not set]\n", "")
-            }
-            bin::OPENSSL => {
-                let (code, stdout, stderr) = super::fake_tls::openssl(args, &mut i.generated_keys);
-                output(program, code, &stdout, &stderr)
-            }
-            // The ACME client in its transient unit (other uses of systemd-run just succeed).
-            bin::SYSTEMD_RUN if args.iter().any(|a| a == bin::OXPANEL_ACME) => {
-                let (code, stderr) = if i.acme_refuses && !args.iter().any(|a| a == "precheck") {
-                    (1, "no certificate: the authority refused (429): too many certificates (urn:ietf:params:acme:error:rateLimited)".to_owned())
-                } else {
-                    super::fake_tls::acme_client(args, i.acme_lifetime.unwrap_or(90 * 86_400))
-                };
-                output(program, code, "", &stderr)
             }
             // systemctl, restorecon, setfacl and anything else: succeed silently.
             _ => output(program, 0, "", ""),
@@ -357,6 +714,21 @@ impl System for FakeSystem {
             uptime_secs: 3600,
             disk_total_bytes: 100 << 30,
             disk_free_bytes: 80 << 30,
+        })
+    }
+
+    async fn password_state(&self, user: &str) -> Result<PasswordState> {
+        let i = self.lock()?;
+        Ok(i.shadow.get(user).map_or(PasswordState::Missing, |field| {
+            shadow_password_state(&format!("{user}:{field}:"), user)
+        }))
+    }
+
+    async fn quota_state(&self, _path: &Path) -> Result<QuotaState> {
+        Ok(QuotaState {
+            fs_type: "xfs".to_owned(),
+            device: PathBuf::from(FAKE_DEVICE),
+            user_quota_enforced: self.lock()?.quota_enforced,
         })
     }
 }

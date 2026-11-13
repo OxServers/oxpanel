@@ -74,6 +74,26 @@ service OxPanelEngine {
   rpc RunAutoHttps(RunAutoHttpsRequest) returns (RunAutoHttpsResponse);
   // Automatic HTTPS: what it has done and will do for one or all sites.
   rpc GetAutoHttpsStatus(GetAutoHttpsStatusRequest) returns (GetAutoHttpsStatusResponse);
+  // SFTP access. A tenant with at least one key can log in over SFTP — SFTP
+  // only (no shell, no forwarding of any kind), confined to its own home.
+  // Adding a key the tenant already has changes nothing but its label.
+  // FAILED_PRECONDITION if sshd is missing or would not confine the tenant.
+  rpc AddSftpKey(AddSftpKeyRequest) returns (AddSftpKeyResponse);
+  // Remove one key: it cannot start a new session. Running sessions continue
+  // unless `end_sessions` is set. Removing the last key (with no password
+  // either) removes SFTP access altogether. NOT_FOUND if the tenant has no
+  // such key.
+  rpc RemoveSftpKey(RemoveSftpKeyRequest) returns (RemoveSftpKeyResponse);
+  rpc ListSftpKeys(ListSftpKeysRequest) returns (ListSftpKeysResponse);
+  // Give the tenant an SFTP password, or replace it. Same confinement as a
+  // key (SFTP only, chrooted, no forwarding). Stored only as the system's
+  // password hash; never returned. FAILED_PRECONDITION if the host forbids
+  // SFTP passwords (HostInfo.sftp_passwords_allowed) or cannot confine the
+  // tenant.
+  rpc SetSftpPassword(SetSftpPasswordRequest) returns (SetSftpPasswordResponse);
+  // Remove the tenant's SFTP password: it cannot start a new session.
+  // Running sessions continue unless `end_sessions` is set.
+  rpc ClearSftpPassword(ClearSftpPasswordRequest) returns (ClearSftpPasswordResponse);
 }
 
 // Per-tenant resource limits, applied through systemd (cgroups v2).
@@ -87,6 +107,15 @@ message ResourceLimits {
   uint32 io_weight = 3;
   // systemd TasksMax=. 0 = default.
   uint32 tasks_max = 4;
+  // Disk space the tenant's files may occupy on the file system holding the
+  // homes, enforced by the kernel (XFS user quota): a write beyond it fails.
+  // 0 = unlimited; otherwise at least 1 MiB (rounded down to whole KiB).
+  // FAILED_PRECONDITION if the host does not enforce quotas (see
+  // HostInfo.disk_quota_available).
+  uint64 disk_max_bytes = 5;
+  // Number of files and directories the tenant may own there. 0 = unlimited;
+  // otherwise at least 100. Same precondition as disk_max_bytes.
+  uint64 inodes_max = 6;
 }
 
 message Tenant {
@@ -104,6 +133,10 @@ message Tenant {
   string owner = 9;
   // True while the tenant is suspended (its sites answer 503).
   bool suspended = 10;
+  // Number of SSH keys that may log in over SFTP.
+  uint32 sftp_key_count = 11;
+  // The tenant has an SFTP password. (SFTP access: a key or a password.)
+  bool sftp_password = 12;
 }
 
 enum TenantState {
@@ -291,7 +324,9 @@ message TenantUsage {
   // Total CPU time consumed since the slices were started.
   uint64 cpu_usage_nsec = 3;
   uint64 tasks_current = 4;
-  // Disk space allocated under the tenant home (one file system).
+  // Disk space in use. Where disk quotas are enforced this is the quota
+  // system's figure (everything the tenant's uid owns on the file system
+  // holding the homes); elsewhere, the space allocated under the home.
   uint64 disk_usage_bytes = 5;
   google.protobuf.Timestamp measured_at = 6;
 }
@@ -334,6 +369,19 @@ message HostInfo {
   string acme_directory_url = 22;
   // Automatic HTTPS is switched on for the host (OXPANEL_AUTO_HTTPS).
   bool auto_https_enabled = 23;
+  // sshd is installed and OxPanel's drop-in is in place, so tenants can be
+  // given SFTP access.
+  bool sftp_available = 24;
+  // The file system holding tenant homes enforces user quotas, so tenants
+  // can be given disk limits.
+  bool disk_quota_available = 25;
+  // What was found about quotas, and when they are not available, what the
+  // operator has to change.
+  string disk_quota_detail = 26;
+  // Tenants may be given SFTP passwords (OXPANEL_SFTP_PASSWORDS, default
+  // true). When false, SetSftpPassword is refused and sshd offers password
+  // authentication to no tenant.
+  bool sftp_passwords_allowed = 27;
 }
 
 message ReconcileRequest {}
@@ -374,6 +422,16 @@ enum DriftKind {
   DRIFT_KIND_ORPHAN_TLS_FILE = 15;
   // Automatic HTTPS state kept for a virtual host that does not exist.
   DRIFT_KIND_ORPHAN_AUTO_HTTPS_STATE = 16;
+  // A tenant's SFTP keys file or home mount unit is missing or differs from
+  // the record, or the account is not in the tenant group.
+  DRIFT_KIND_SFTP_ACCESS_DRIFT = 18;
+  // A keys file, mount unit or chroot directory that no tenant accounts for.
+  DRIFT_KIND_ORPHAN_SFTP_ACCESS = 19;
+  // OxPanel's sshd drop-in is missing or edited.
+  DRIFT_KIND_SSHD_CONFIG_DRIFT = 20;
+  // The kernel's disk quota for a tenant differs from its recorded limit,
+  // or the host no longer enforces quotas.
+  DRIFT_KIND_DISK_QUOTA_DRIFT = 21;
 }
 
 message Drift {
@@ -561,4 +619,79 @@ message GetAutoHttpsStatusRequest {
 
 message GetAutoHttpsStatusResponse {
   repeated AutoHttpsStatus sites = 1;
+}
+
+// An SSH public key that may log in over SFTP as a tenant. All of it is public.
+message SftpKey {
+  // "SHA256:…" as `ssh-keygen -l` prints it; identifies the key.
+  string fingerprint = 1;
+  // e.g. "ssh-ed25519".
+  string key_type = 2;
+  // The key in authorized_keys form: "<type> <base64>" (no comment).
+  string public_key = 3;
+  string label = 4;
+  google.protobuf.Timestamp added_at = 5;
+}
+
+message AddSftpKeyRequest {
+  string username = 1;
+  // One line as in an id_*.pub file: "<type> <base64> [comment]". Accepted
+  // types: ssh-ed25519, ecdsa-sha2-nistp256/384/521, ssh-rsa (2048..=16384
+  // bits), sk-ssh-ed25519@openssh.com, sk-ecdsa-sha2-nistp256@openssh.com.
+  // Key options (command=, from=, …) are refused: the engine sets them.
+  string public_key = 2;
+  // ^[A-Za-z0-9@._+-]{1,64}$ or empty (= the key's own comment, if it is
+  // such a string).
+  string label = 3;
+}
+
+message AddSftpKeyResponse {
+  SftpKey key = 1;
+  // false when the tenant already had this key with this label.
+  bool changed = 2;
+}
+
+message RemoveSftpKeyRequest {
+  string username = 1;
+  string fingerprint = 2;
+  // Also end the tenant's running SFTP sessions (all of them: sshd cannot
+  // tell which credential a session used). Default: they continue.
+  bool end_sessions = 3;
+}
+
+message RemoveSftpKeyResponse {
+  // Keys the tenant still has.
+  uint32 remaining = 1;
+}
+
+message ListSftpKeysRequest {
+  string username = 1;
+}
+
+message ListSftpKeysResponse {
+  // Oldest first.
+  repeated SftpKey keys = 1;
+}
+
+message SetSftpPasswordRequest {
+  string username = 1;
+  // 12..=256 characters, no control characters. Further policy (strength,
+  // reuse) is the panel's. Never logged, never in an argv, never returned.
+  string password = 2;
+}
+
+message SetSftpPasswordResponse {
+  Tenant tenant = 1;
+}
+
+message ClearSftpPasswordRequest {
+  string username = 1;
+  // Also end the tenant's running SFTP sessions. Default: they continue.
+  bool end_sessions = 2;
+}
+
+message ClearSftpPasswordResponse {
+  // false when the tenant had no SFTP password.
+  bool cleared = 1;
+  Tenant tenant = 2;
 }

@@ -517,6 +517,8 @@ mod tests {
             state: TenantState::Ready,
             owner: String::new(),
             suspended: false,
+            sftp_keys: Vec::new(),
+            sftp_password: false,
         }
     }
 

@@ -61,3 +61,9 @@ RUN rustup component add llvm-tools-preview \
     && curl -sSfL "https://github.com/taiki-e/cargo-llvm-cov/releases/download/v${CARGO_LLVM_COV_VERSION}/cargo-llvm-cov-x86_64-unknown-linux-musl.tar.gz" \
       | tar -xz -C /usr/local/cargo/bin cargo-llvm-cov \
     && cargo llvm-cov --version
+
+# SFTP access for tenants (sshd with OxPanel's drop-in; the client for the
+# integration test) and xfsprogs (xfs_quota, for disk quotas on XFS hosts).
+RUN dnf -y install --setopt=install_weak_deps=False openssh-server openssh-clients xfsprogs \
+    && dnf clean all && rm -rf /var/cache/dnf \
+    && systemctl enable sshd

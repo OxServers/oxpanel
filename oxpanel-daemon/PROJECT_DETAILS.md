@@ -64,6 +64,13 @@ open-core:
   nest. The daemon never writes `/sys/fs/cgroup`; systemd is the single writer.
 - **Web serving:** server blocks are generated, never hand-edited; `disable_symlinks
   if_not_owner`, dot-files denied, `autoindex off`, `server_tokens off`.
+- **File access:** SFTP only (no shell, no forwarding), through one sshd
+  drop-in OxPanel owns that applies to the group `oxpanel-tenants` (every
+  tenant). Keys live in root-owned files outside the home; the tenant is
+  chrooted into a root-owned directory holding only its home, bind-mounted by
+  a systemd mount unit. See `src/sftp.rs` and the M2c design record.
+- **Disk:** XFS user quotas per tenant uid (`src/quota.rs`), when the host
+  mounts the homes' file system with `uquota`; refused, never ignored, when not.
 - **SELinux:** document roots get a persistent `httpd_sys_content_t` file-context
   rule and `restorecon`; homes are relabelled after creation.
 
@@ -121,6 +128,6 @@ not per object; per-owner confinement is a possible later refinement.
 1. ~~Per-peer scopes; `UpdateTenantLimits` / `UpdateTenantOwner`; suspend/resume; usage; host info; `Reconcile`~~ — done (management milestone).
 2. Confined SELinux domain (`oxpanel_t`) and a capability *allow*-list for the unit; a confining policy for `oxpanel_app_t` (today it only labels applications so the web server can be allowed to reach exactly them).
 3. ~~Per-tenant PHP-FPM in the tenant slice; per-vhost logs~~ — done (hosting milestone 2a). Node.js and Python applications likewise (one sandboxed service per site, UNIX socket, own SELinux domain). Next: runtime version choice, per-tenant PHP settings, application environment variables.
-4. ~~TLS for virtual hosts (ACME)~~ — done (M2b): uploaded and ACME (HTTP-01) certificates; the ACME client `oxpanel-acme` runs unprivileged outside the daemon. Next: DNS-01 / wildcard certificates.
+4. ~~TLS for virtual hosts (ACME)~~ — done (M2b): uploaded and ACME (HTTP-01) certificates; the ACME client `oxpanel-acme` runs unprivileged outside the daemon. Next: DNS-01 / wildcard certificates. SFTP access and disk quotas: done (M2c).
 5. Repair mode for `Reconcile` (today it reports only).
 6. Split privileged helper behind the `System` trait.

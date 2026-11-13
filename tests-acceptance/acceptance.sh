@@ -7,7 +7,7 @@ HERE=/work/tests-acceptance; WORK=/work
 source "$HERE/lib.sh"
 
 OUT="${OUT:-/out}"; CACHE="${CACHE:-/cache}"
-INSTALL="${INSTALL:-git}"; PHASES="${PHASES:-10 20 30 40 50 60 70 80 90}"; SOAK_N="${SOAK_N:-20}"
+INSTALL="${INSTALL:-git}"; PHASES="${PHASES:-10 15 20 30 40 50 60 70 80 90}"; SOAK_N="${SOAK_N:-20}"
 ACCEL="${ACCEL:-kvm}"; CONTINUE="${CONTINUE:-0}"; KEEP="${KEEP:-0}"; REFRESH_IMAGE="${REFRESH_IMAGE:-0}"
 GIT_URL="${GIT_URL:-}"; GIT_REF="${GIT_REF:-}"; RPM_DIR="${RPM_DIR:-/work/dist/rpms}"
 TARGET="${TARGET:-}"; TARGET_PORT="${TARGET_PORT:-22}"; TARGET_KEY="${TARGET_KEY:-}"; I_UNDERSTAND="${I_UNDERSTAND:-0}"
@@ -137,6 +137,12 @@ run_phase() { # <NN> → script name
   local n="$1" script rc=0
   case "$n" in
     10) run_remote 10-install "$INSTALL_TIMEOUT" "cd /root/acc && $(phase_env) bash phases/10-install.sh" || rc=$?;;
+    15) run_remote 15-quota-pre "$PHASE_TIMEOUT" "cd /root/acc && $(phase_env) bash phases/15-quota-pre.sh" || rc=$?
+        if [ "$rc" = 0 ]; then
+          log "rebooting VM (disk quotas)"; vm_ssh 'systemctl reboot' >/dev/null 2>&1 || true; sleep 8
+          if vm_wait_ssh 300; then run_remote 15-quota-post "$PHASE_TIMEOUT" "cd /root/acc && $(phase_env) bash phases/15-quota-post.sh" || rc=$?
+          else P_NUM+=(15); P_NAME+=(quota-post); P_STATUS+=(NO-SSH); P_SECS+=(300); P_OK+=(0); P_FAIL+=("VM did not come back after reboot"); rc=1; fi
+        fi;;
     20) run_remote 20-integration "$PHASE_TIMEOUT" "cd /root/acc && $(phase_env) bash phases/20-integration.sh" || rc=$?;;
     30) run_remote 30-selinux "$PHASE_TIMEOUT" "cd /root/acc && $(phase_env) bash phases/30-selinux.sh" || rc=$?;;
     40) run_remote 40-sandbox "$PHASE_TIMEOUT" "cd /root/acc && $(phase_env) bash phases/40-sandbox.sh" || rc=$?;;
@@ -210,7 +216,7 @@ report() {
 log "oxpanel acceptance · install=$INSTALL · phases=[$PHASES] · keep=$KEEP"
 if [ -n "$TARGET" ]; then
   SSH_USER="${TARGET%@*}"; SSH_HOST="${TARGET#*@}"; SSH_PORT="$TARGET_PORT"; KEY="$TARGET_KEY"
-  for p in $PHASES; do case "$p" in 60|70|80|90) [ "$I_UNDERSTAND" = 1 ] || die "phases 60/70/80/90 reboot or load $TARGET and create accounts on it; set I_UNDERSTAND=1 to allow";; esac; done
+  for p in $PHASES; do case "$p" in 15|60|70|80|90) [ "$I_UNDERSTAND" = 1 ] || die "phases 15/60/70/80/90 reboot or load $TARGET and create accounts on it; set I_UNDERSTAND=1 to allow";; esac; done
   vm_wait_ssh 30 || die "cannot reach $TARGET"
   log "using $TARGET: $(vm_ssh 'echo "$(cat /etc/almalinux-release 2>/dev/null || uname -o) · $(uname -r) · SELinux $(getenforce 2>/dev/null || echo n/a)"')"
 else

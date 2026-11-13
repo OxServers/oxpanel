@@ -17,6 +17,13 @@ as_user boota sh -c 'echo boota > /home/boota/public_html/index.html'
 as_user bootb sh -c 'echo bootb > /home/bootb/www/site/index.html'
 eventually "boota.test serves" 30 0.2 http_body_is boota.test / boota
 eventually "bootb.test serves" 30 0.2 http_body_is bootb.test / bootb
+rm -f boot_sftp_key boot_sftp_key.pub; ssh-keygen -q -t ed25519 -N '' -f boot_sftp_key
+check "SFTP key for boota" ctl_ok '^changed=true' oxpanel-ctl sftp add-key boota --key-file boot_sftp_key.pub
+printf 'boot password stays put\n' > boot_sftp_pw; chmod 600 boot_sftp_pw
+check "SFTP password for bootb" ctl_ok '^password=set' oxpanel-ctl sftp set-password bootb < boot_sftp_pw
+if oxpanel-ctl host info | grep -q ' disk_quota=true '; then
+  check "disk limit for bootb" ctl_ok '^changed=true' oxpanel-ctl tenant set-limits bootb --memory 128M --disk 64M
+fi
 cat /proc/sys/kernel/random/boot_id > boot_id.pre
 oxpanel-ctl tenant list > tenants.pre
 oxpanel-ctl vhost list > vhosts.pre
