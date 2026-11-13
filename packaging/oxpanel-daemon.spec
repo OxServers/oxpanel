@@ -1,7 +1,7 @@
 Name:           oxpanel-daemon
-Version:        0.1.0
+Version:        0.2.0
 Release:        1%{?dist}
-Summary:        OxPanel system engine: tenant provisioning and Nginx virtual hosts over an authenticated UNIX-socket gRPC API
+Summary:        OxPanel engine: tenants, Nginx sites, apps and databases over a local gRPC API
 License:        Apache-2.0
 URL:            https://github.com/OxServers/oxpanel
 Source0:        %{name}-%{version}.tar.gz
@@ -70,6 +70,7 @@ install -D -m 0644 packaging/tmpfiles.d/oxpanel.conf %{buildroot}%{_tmpfilesdir}
 install -D -m 0640 packaging/daemon.env %{buildroot}%{_sysconfdir}/oxpanel/daemon.env
 install -D -m 0644 packaging/logrotate.d/oxpanel %{buildroot}%{_sysconfdir}/logrotate.d/oxpanel
 install -D -m 0644 packaging/selinux/oxpanel.cil %{buildroot}%{_datadir}/oxpanel/selinux/oxpanel.cil
+install -D -m 0644 packaging/fail2ban/oxpanel-sshd.local %{buildroot}%{_datadir}/oxpanel/fail2ban/oxpanel-sshd.local
 
 %pre
 %sysusers_create_compat packaging/sysusers.d/oxpanel.conf
@@ -112,7 +113,26 @@ if [ "$1" -eq 0 ] && /usr/sbin/selinuxenabled 2>/dev/null; then /usr/sbin/semodu
 %dir %{_datadir}/oxpanel
 %dir %{_datadir}/oxpanel/selinux
 %{_datadir}/oxpanel/selinux/oxpanel.cil
+%dir %{_datadir}/oxpanel/fail2ban
+%{_datadir}/oxpanel/fail2ban/oxpanel-sshd.local
 
 %changelog
+* Fri Nov 13 2026 OxPanel contributors - 0.2.0-1
+- HTTPS: certificates (uploaded, or from an ACME authority through the new
+  oxpanel-acme client), Automatic HTTPS for every site, HTTP-to-HTTPS
+  redirect and HSTS, External Account Binding (ZeroSSL, Google).
+- PHP-FPM per tenant, Node.js (22 or newer) and Python applications behind
+  Nginx, per-site access and error logs with rotation.
+- SFTP access for tenants (keys, opt-in passwords) confined by an sshd
+  drop-in; XFS user disk quotas (disk and inode limits).
+- Tenant databases and database users on MariaDB, with grants.
+- Backup and restore jobs; retained backups of deleted tenants.
+- Engine: more drift kinds in Reconcile, per-peer API scopes, the OxPanel
+  SELinux module (oxpanel_app_t), a fail2ban jail template under
+  /usr/share/oxpanel/fail2ban. The one-command installer (install.sh)
+  ships beside the package, not in it.
+- Upgrade from 0.1.0: records written by 0.1.0 load unchanged and the daemon
+  re-renders its configuration when it starts.
+
 * Sat Sep 05 2026 OxPanel contributors - 0.1.0-1
 - Initial packaging.

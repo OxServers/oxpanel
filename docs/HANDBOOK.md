@@ -1,6 +1,6 @@
 # OxPanel engine handbook
 
-Installation, configuration and operation of `oxpanel-daemon` v0.1.0 on
+Installation, configuration and operation of `oxpanel-daemon` v0.2.0 on
 AlmaLinux 9. Every command in this handbook has been run as written; where a
 step is only verifiable on a real host (SELinux, `PrivateNetwork`) that is said.
 
@@ -58,11 +58,137 @@ not touch an account, unit or Nginx file it has no record for.
 | Ports | Nginx on 80, and on 443 for sites with a certificate. OxPanel does not manage the firewall: open both (`sudo firewall-cmd --permanent --add-service=http --add-service=https && sudo firewall-cmd --reload`). ACME HTTP-01 validation needs port 80 reachable from the internet. |
 | SFTP (optional) | `openssh-server` with the stock `/etc/ssh/sshd_config`, which includes `/etc/ssh/sshd_config.d/*.conf` (the AlmaLinux default). OxPanel adds one drop-in there and never edits `sshd_config`. Without sshd, `host info` shows `sftp=false` and adding a key is refused. |
 | Disk quotas (optional) | Tenant homes on **XFS mounted with user quotas** (`uquota`), and `xfsprogs`. This is a mount option the operator sets once (§9.1); without it `host info` shows `disk_quota=false` and a disk limit is refused with the change to make. |
-| Databases (optional) | `mariadb-server` 10.4 or newer (AlmaLinux 9 ships 10.5) and, for PHP sites, `php-mysqlnd`. Not installed by the RPM: see §3.5. Without them the database RPCs refuse cleanly. |
+| Databases (optional) | `mariadb-server` 10.4 or newer (AlmaLinux 9 ships 10.5) and, for PHP sites, `php-mysqlnd`. Not installed by the RPM: the installer does it (§3.0), or see §3.5. Without them the database RPCs refuse cleanly. |
 
 ## 3. Installation
 
-### 3.1 From the RPM (recommended)
+### 3.0 The installer (recommended)
+
+On a fresh AlmaLinux 9 host (x86_64, SELinux enforcing recommended) one command
+does everything §3.1 to §3.5 and §9.1 describe by hand. The release is a directory
+(`make dist` builds it; see §11): the engine RPM, `install.sh`, this handbook and a
+`SHA256SUMS` file.
+
+```sh
+cd oxpanel-0.2.0-release                 # the directory with install.sh and the RPM
+sha256sum -c SHA256SUMS                  # catches a damaged copy (it is not a signature)
+sudo ./install.sh                        # interactive: asks the few questions it has
+sudo ./install.sh --yes                  # unattended, with the safe defaults
+sudo ./install.sh --help                 # every option
+```
+
+The script is plain bash: read it before you run it as root. It downloads nothing
+by itself. The engine RPM is taken from the command line, else from beside the
+script; a dnf repository can be configured in the script (`OXPANEL_REPO_BASEURL`
+and `OXPANEL_REPO_GPGKEY`, empty until a release repository exists) or given with
+`--repo-url`.
+
+**Stages.** Each is announced, logged to `/var/log/oxpanel-install.log` and says
+whether it changed anything. The manual equivalent is in the section named.
+
+| Stage | What it does | By hand |
+|---|---|---|
+| preflight | root, AlmaLinux 9, x86_64, SELinux mode, 2 GiB free on `/var`; stops if Apache `httpd` is enabled/running or something other than Nginx owns port 80 (`--force` overrides); notes an existing Nginx `default_server` and turns the engine's own off | §2 |
+| nodejs | enables the `nodejs:22` module stream, installs `nodejs` and `npm` (an older Node.js already installed is left alone unless `--switch-nodejs`) | §3.2 |
+| engine | `dnf install` of the RPM (an upgrade if one is installed; never a downgrade), plus `openssh-server` and `xfsprogs` | §3.1 |
+| selinux | the booleans `httpd_enable_homedirs`, `httpd_read_user_content`, `httpd_unified`; loads the `oxpanel` policy module | §3.2 |
+| nginx | `nginx -t`, then enable and start | §3.1 |
+| mariadb | installs `mariadb-server`, starts it, removes anonymous accounts and the `test` database, writes `/etc/my.cnf.d/oxpanel-local.cnf` (`skip-networking`), restarts; checks there is no listener on 3306. **An already-installed MariaDB is left exactly as it is** (`--harden-existing-mariadb` to harden it) | §3.5 |
+| php | `php-fpm` and `php-mysqlnd`; masks the shared `php-fpm.service` unless it is running (then it warns; `--mask-php-fpm`) | §9 (PHP) |
+| panel | optional hook, see below | §5 |
+| daemon | enable and start `oxpanel-daemon`; waits for the socket | §3.1 |
+| firewall | only if `firewalld` is running: opens `http` and `https` in the default zone, permanent and runtime. A firewall is never stopped or disabled; other firewalls are yours | §2 |
+| fail2ban | optional, see below | §9 |
+| quota | optional, see below | §9.1 |
+| verify | `oxpanel-daemon --check-config`, `oxpanel-ctl host info`, `oxpanel-ctl host reconcile` | §3.4 |
+
+**Idempotent and resumable.** Run it twice and the second run changes nothing and
+says so (`RESULT: ok changes=0 …`). If a stage fails (no network, a broken Nginx
+configuration) fix the cause and run the same command again: finished stages find
+nothing to do and the run resumes at the failure. The outcome of the last run is in
+`/var/lib/oxpanel-installer/status` (`result=`, `changes=`, `warnings=`,
+`reboot_required=`).
+
+**Questions and unattended use.** Interactive runs ask the questions below. Every
+one can be answered on the command line or in an answers file (`--answers FILE`,
+lines `key=value`, `#` comments; the keys are `fail2ban`, `epel`, `quota`, `reboot`,
+`mariadb`, `php`, `nodejs`, `ignore_ip`, `home_base`, `panel_rpm`, `panel_account`,
+`panel_scopes`, `harden_existing_mariadb`, `mask_php_fpm`, `switch_nodejs`; options on
+the command line win). `--yes` (or running without a terminal) asks nothing and
+takes the safe defaults: **no EPEL, no fail2ban, no change of the boot
+configuration, no reboot**, nothing destructive.
+
+```sh
+sudo ./install.sh --yes --fail2ban --enable-epel --quota --reboot
+printf 'fail2ban=yes\nepel=yes\nquota=yes\nreboot=no\nignore_ip=203.0.113.5\n' > answers
+sudo ./install.sh --yes --answers answers
+```
+
+**Login banning with fail2ban (optional).** Guards tenants' SFTP passwords and
+every other SSH login against guessing. fail2ban is not in AlmaLinux's own
+repositories but in **EPEL** (Extra Packages for Enterprise Linux), a community
+repository run by the Fedora project. Enabling it adds a package source dnf will
+use from then on, for packages Red Hat and AlmaLinux do not vouch for; OxPanel
+installs only `fail2ban-server` (and its firewall and SELinux companions) from it,
+but the repository stays enabled so fail2ban receives updates
+(`dnf config-manager --set-disabled epel` turns it off again). The installer
+therefore asks, and without `--enable-epel` (or `epel=yes`) it refuses to install
+fail2ban rather than assume. The jail it writes
+(`/etc/fail2ban/jail.d/50-oxpanel-sshd.local`, template
+`/usr/share/oxpanel/fail2ban/oxpanel-sshd.local`) reads sshd's messages from the
+**journal** (no log file, so nothing to label for SELinux), bans an address for an
+hour (longer for repeat offenders, up to a week) after 5 failed logins in 10
+minutes, and uses firewalld's rich rules when firewalld is running, nftables
+otherwise.
+
+*It must never ban you.* The jail's `ignoreip` always contains loopback and the
+address of the session that runs the installer (read from sshd's environment of the
+installer's process tree; the installer warns if it cannot tell). Add every other
+address you administer the host from with `--ignore-ip 203.0.113.5,198.51.100.0/24`
+(or edit the `ignoreip =` line in the jail file and `systemctl reload fail2ban`). An
+address on the list is never banned, so keep it short. To lift a ban: `fail2ban-client
+set sshd unbanip ADDRESS`; to look: `fail2ban-client status sshd`.
+
+**Disk quotas and the reboot (optional).** Per-customer disk limits need XFS user
+quotas on the file system that holds the homes (§9.1). XFS turns them on only at
+mount time, so the installer must change the boot configuration and a reboot is
+unavoidable. It detects which case applies: on the default layout (`/home` on the
+root file system) it runs `grubby --update-kernel=ALL --args=rootflags=uquota`; when
+the homes are on a file system of their own it adds `uquota` to that file system's
+`/etc/fstab` line (a copy is kept as `/etc/fstab.oxpanel-installer.bak`). Nothing is
+reformatted or lost. With `--reboot` the installer finishes everything else first
+and then reboots; otherwise it prints exactly what remains and records
+`reboot_required=yes`:
+
+```
+What remains: a reboot, so that disk quotas take effect. Everything else is installed and running.
+  1. reboot when it suits you:   sudo systemctl reboot
+  2. afterwards run again:       sudo ./install.sh --quota
+```
+
+After the reboot run the same command again: it notices that quotas are active,
+confirms `disk_quota=true` through the engine and finishes. On a host whose homes
+are not on XFS it says so and changes nothing.
+
+**Installing the panel (optional hook).** The panel is a separate product. If you
+have its RPM: `sudo ./install.sh --panel-rpm oxpanel-panel-X.rpm`. The installer
+installs it and makes sure the `panelapi` account exists and is a member of group
+`oxpanel` (§5; the panel's own package normally creates it, the installer repairs or
+creates it otherwise). `--panel-account` does only the account. The panel needs all
+engine scopes, so none are set; for a deployment that wants fewer,
+`--panel-scopes read+vhost` writes `OXPANEL_PEER_SCOPES=<panelapi uid>:read+vhost`
+in the installer's block of `/etc/oxpanel/daemon.env` (§5). That block, between the
+`# BEGIN oxpanel-installer` and `# END oxpanel-installer` lines, is the only part of
+the file the installer writes.
+
+**Upgrading** is the same command with a newer RPM beside the script:
+`sudo ./install.sh --yes`. Tenants, sites, limits and records survive (§12).
+**Uninstalling:** `sudo ./install.sh --uninstall` (§12).
+
+The sections below are the same steps by hand, and the reference for what the
+installer does.
+
+### 3.1 From the RPM
 
 Build the package once on any AlmaLinux 9 machine (or in the project's
 container image) and install it on the hosting nodes.
@@ -77,16 +203,16 @@ source ~/.cargo/env
 
 git clone https://github.com/OxServers/oxpanel.git && cd oxpanel
 mkdir -p ~/rpmbuild/{SOURCES,SPECS}
-git archive --prefix=oxpanel-0.1.0/ -o ~/rpmbuild/SOURCES/oxpanel-daemon-0.1.0.tar.gz HEAD
+git archive --prefix=oxpanel-0.2.0/ -o ~/rpmbuild/SOURCES/oxpanel-daemon-0.2.0.tar.gz HEAD
 cp packaging/oxpanel-daemon.spec ~/rpmbuild/SPECS/
 rpmbuild -bb ~/rpmbuild/SPECS/oxpanel-daemon.spec
-ls ~/rpmbuild/RPMS/x86_64/          # oxpanel-daemon-0.1.0-1.el9.x86_64.rpm (+ debuginfo)
+ls ~/rpmbuild/RPMS/x86_64/          # oxpanel-daemon-0.2.0-1.el9.x86_64.rpm (+ debuginfo)
 ```
 
 **Install on a hosting node**
 
 ```sh
-sudo dnf install ./oxpanel-daemon-0.1.0-1.el9.x86_64.rpm   # pulls nginx, acl, policycoreutils-python-utils, …
+sudo dnf install ./oxpanel-daemon-0.2.0-1.el9.x86_64.rpm   # pulls nginx, acl, policycoreutils-python-utils, …
 sudo systemctl enable --now nginx
 sudo systemctl enable --now oxpanel-daemon
 ```
@@ -937,9 +1063,16 @@ while after failed logins (`PerSourcePenalties`, default
 `authfail:5 … max:600 min:15`), limits unauthenticated connections
 (`MaxStartups 10:30:100`) and closes a login after `LoginGraceTime 120`.
 OxPanel's drop-in sets `MaxAuthTries 3` for tenants (stock: 6). Everything
-global stays yours; for longer, cross-address bans install fail2ban and enable
-its `sshd` jail (`dnf install fail2ban-server`, then `[sshd] enabled = true` in
-`/etc/fail2ban/jail.d/sshd.local`). `pam_faillock` (`authselect
+global stays yours; for longer, cross-address bans use fail2ban, which the
+installer offers (§3.0: `install.sh --fail2ban --enable-epel`; EPEL is where
+fail2ban lives, so enabling it is your decision). Its jail,
+`/etc/fail2ban/jail.d/50-oxpanel-sshd.local`, reads the journal (`backend =
+systemd`), bans after 5 failures in 10 minutes for an hour, growing to a week, and
+lists in `ignoreip` loopback, the installing session's address and whatever you
+add: put every address you administer from there, or a typo can lock you out
+(`fail2ban-client set sshd unbanip ADDRESS` lifts a ban). By hand: install EPEL
+and `fail2ban-server`, copy `/usr/share/oxpanel/fail2ban/oxpanel-sshd.local` to
+that path and replace its `@…@` placeholders. `pam_faillock` (`authselect
 enable-feature with-faillock`) also works but locks every account after
 failures, your own included. Watch `journalctl -u sshd` for
 "Failed password for <tenant>".
@@ -948,7 +1081,7 @@ failures, your own included. Watch `journalctl -u sshd` for
 
 Disk limits are XFS user quotas on the file system that holds `/home`. XFS
 decides at mount time whether quotas are enforced, so this is a one-time host
-change that OxPanel does not make for you. On the AlmaLinux default layout
+change that the installer makes only when asked (`--quota`, §3.0) and the daemon never makes. By hand, on the AlmaLinux default layout
 `/home` is on the root file system, which needs a kernel argument:
 
 ```sh
@@ -1014,14 +1147,17 @@ with a disk limit (`DISK_QUOTA_DRIFT`).
 
 ```sh
 make image         # AlmaLinux 9 dev/test image (one-time)
-make check         # rustfmt --check, clippy pedantic -D warnings, tests, cargo-deny, feature traceability
+make check         # rustfmt --check, clippy pedantic -D warnings, tests, cargo-deny, feature traceability, shellcheck of install.sh
 make test          # 288 tests (fake OS, no root): unit, property, gRPC surface, crash safety, perf budgets
 make traceability  # every row of docs/FEATURES.md maps to tests that exist (docs/traceability.map)
 make coverage      # line coverage of the daemon (cargo-llvm-cov; run `make image` once first)
 make bench         # engine benchmark against the fake OS (docs/PERFORMANCE.md); never part of `make check`
 make integration   # boots systemd in a container, installs from packaging/, runs 681 assertions
                    # (HTTPS/ACME against a local Pebble downloaded at test time; OXPANEL_IT_SKIP_ACME=1 skips it)
-make rpm           # build the RPM from the working tree into dist/rpms/
+make rpm           # build the engine RPM (with oxpanel-acme) from the working tree into dist/rpms/
+make rpmlint       # rpm -qpR and rpmlint of that RPM
+make dist          # dist/release/: RPM + install.sh + HANDBOOK.md + SHA256SUMS (no tag, no signing, no upload)
+make rpm-old       # RPM of an older commit (OLD_REF=d38bae2) for the upgrade acceptance run
 make acceptance    # REAL AlmaLinux 9 VM (KVM, SELinux enforcing): install like a user, run all phases
 ./scripts/dev.sh cargo <anything>   # run cargo inside the image
 ```
@@ -1038,6 +1174,8 @@ workstation; you only need `/dev/kvm` to be readable — and drives it over SSH.
 |---|---|---|
 | `INSTALL=git` | *(default)* | The VM runs this handbook's §3.2 "From source" block **verbatim** (cloned from GitHub), then the §3.4 verification block. This is the "user installing from git" test; it exercises what is on the remote, not your working tree. |
 | `INSTALL=rpm` | | Builds the RPM from your working tree and `dnf install`s it in the VM. Fast path for uncommitted changes and for the packaging. |
+| `INSTALL=installer` | | Builds the release (`make dist`), copies `dist/release` into the VM, installs firewalld (a host that has a firewall) and runs `install.sh --yes --quota --no-reboot --fail2ban --enable-epel`; asserts the second run changes nothing; phase 15 reboots and runs the installer again. Default phases add 16 (fail2ban) and 95 (uninstall). |
+| `INSTALL=upgrade` | | Installs the 0.1.0 RPM (built from `OLD_REF`, default `d38bae2`, by `make rpm-old`) by hand, creates tenants and sites, then upgrades with the release's `install.sh` (phase 12). Default phases `10 12 20 30`. |
 | `GIT_REF=<branch or sha>` | current branch | Which commit the git install checks out. CI passes the pushed SHA. |
 | `PHASES="10 15 20 30 40 50 60 70 80 90"` | all | Subset of phases (below). |
 | `KEEP=1` | | Leave the VM running afterwards; the report prints the `ssh` line (`make acceptance-destroy` removes it). |
@@ -1046,7 +1184,9 @@ workstation; you only need `/dev/kvm` to be readable — and drives it over SSH.
 | `TARGET=user@host` | | Use a machine you provide instead of a VM (`TARGET_KEY=path` for the key). Phases 15/60/70/80/90 reboot it, create accounts and attack them, so this needs `I_UNDERSTAND=1`. |
 
 Phases: **10** install (`dnf install` of the RPM or the handbook's source install; MariaDB set up as in §3.5; services start; `--check-config`) ·
-**15** host preparation for disk quotas: runs §9.1's block, reboots, checks the quota option is on ·
+**12** (upgrade mode) upgrade 0.1.0 to the current release with `install.sh`: tenants, sites and limits survive ·
+**15** host preparation for disk quotas: runs §9.1's block (in installer mode the installer already did it, and is run again after the reboot), reboots, checks the quota option is on ·
+**16** (installer mode) fail2ban: wrong SFTP passwords from one address of a network namespace get it banned, a correct login from another address works, an address on the ignore list is never banned, no AVC denials ·
 **20** the 703-check integration suite on the real host (`tests-integration/run-inside.sh`: everything above plus HTTPS and ACME against a local test CA, SFTP, quotas, databases and backups) ·
 **30** SELinux: enforcing, docroot labels, `semanage` rule lifecycle, site serves, **zero AVC denials** ·
 **40** sandbox: private network/UTS/mount namespaces, seccomp, capability bounding set, read-only `/usr` ·
@@ -1057,7 +1197,8 @@ Phases: **10** install (`dnf install` of the RPM or the handbook's source instal
 other tenants and the engine, escape through planted links, exhaust memory, tasks and `/tmp`, outlive
 suspension or deletion, smuggle requests; every attempt must fail (`docs/SECURITY.md`) ·
 **90** performance on the real host: 100 tenants with a site each, time per step and its growth, Nginx reload time, daemon memory
-(`docs/PERFORMANCE.md`).
+(`docs/PERFORMANCE.md`) ·
+**95** (installer mode) `install.sh --uninstall` keeps a tenant's account, home, database, backup and site, and installing again finds the tenant.
 
 Results land in `dist/acceptance/<UTC stamp>/` (`latest` symlink): `report.md`
 with a per-phase table and failure context, `phases/*.log`, the VM's journals,
@@ -1092,12 +1233,27 @@ architecture in `oxpanel-daemon/PROJECT_DETAILS.md`.
 
 ## 12. Upgrading and uninstalling
 
-**Upgrade:** install the new RPM (`dnf upgrade ./oxpanel-daemon-*.rpm`); the
-unit restarts automatically, records are versioned (`version` field) and older
+**Upgrade:** put the new RPM beside `install.sh` and run `sudo ./install.sh --yes`
+(§3.0), or install the RPM by hand (`dnf upgrade ./oxpanel-daemon-*.rpm`). The
+acceptance rig proves the first path for 0.1.0 to 0.2.0 (`INSTALL=upgrade`: tenants
+with a static, a PHP and a Node.js site made with the old engine keep their
+accounts, limits and sites, `host reconcile` is clean, and the new features work on
+them). The unit restarts automatically and the daemon re-renders its configuration
+when it starts, records are versioned (`version` field) and older
 records load with defaults for new fields. Backup and restore jobs that are
 running keep running in their own units and are picked up by the new daemon.
 
-**Uninstall the engine, keep the tenants:**
+**Uninstall the engine, keep the tenants:** `sudo ./install.sh --uninstall` (asks first;
+`--yes` to skip the question). It removes the engine package (and the panel package, if
+installed) and what the installer itself added (the fail2ban jail file, the repository
+file), and **never** touches customers' accounts, homes, databases or backups. It prints
+what it left, in short: tenant accounts and homes, `/var/lib/oxpanel` (so installing again
+finds every tenant), MariaDB with its data and its hardening file, `/var/lib/oxpanel-backups`,
+`/etc/pki/oxpanel`, the Nginx files of the sites (they keep being served), the sshd drop-in
+and the SFTP keys, per-tenant slices, PHP and application units (still running, no longer
+manageable; Node.js and Python applications need the OxPanel SELinux module that the
+package removal takes out, so they stop until you install again), and all other packages
+and firewall rules. By hand:
 
 ```sh
 sudo systemctl disable --now oxpanel-daemon

@@ -4,6 +4,9 @@
 #
 #   make acceptance                      install from git (handbook §3.2) at the current branch
 #   INSTALL=rpm make acceptance          build + install the RPM from the working tree
+#   INSTALL=installer make acceptance    build the release (make dist) and run its install.sh unattended
+#   INSTALL=upgrade make acceptance      hand-install the 0.1.0 RPM (OLD_REF, default d38bae2), create
+#                                        tenants and sites, then upgrade with the release's install.sh
 #   KEEP=1 make acceptance               leave the VM running afterwards
 #   PHASES="30 60" SOAK_N=50 GIT_REF=<branch|sha> TARGET=user@host I_UNDERSTAND=1 …
 set -euo pipefail
@@ -11,7 +14,12 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RIG="${OXPANEL_RIG_IMAGE:-localhost/oxpanel-rig:alma9}"
 DEV="${OXPANEL_DEV_IMAGE:-localhost/oxpanel-dev:alma9}"
 export INSTALL="${INSTALL:-git}" KEEP="${KEEP:-0}" ACCEL="${ACCEL:-kvm}" TARGET="${TARGET:-}" CONTINUE="${CONTINUE:-0}"
-export PHASES="${PHASES:-10 15 20 30 40 50 60 70 80 90}" SOAK_N="${SOAK_N:-20}" I_UNDERSTAND="${I_UNDERSTAND:-0}" REFRESH_IMAGE="${REFRESH_IMAGE:-0}"
+case "${INSTALL:-git}" in
+  installer) DEFAULT_PHASES="10 15 16 17 20 30 40 50 60 70 80 90 95";;
+  upgrade) DEFAULT_PHASES="10 12 20 30";;
+  *) DEFAULT_PHASES="10 15 20 30 40 50 60 70 80 90";;
+esac
+export PHASES="${PHASES:-$DEFAULT_PHASES}" SOAK_N="${SOAK_N:-20}" I_UNDERSTAND="${I_UNDERSTAND:-0}" REFRESH_IMAGE="${REFRESH_IMAGE:-0}"
 export GIT_URL="${GIT_URL:-}" GIT_REF="${GIT_REF:-}" VM_CPUS="${VM_CPUS:-}" VM_MEM="${VM_MEM:-}"
 export PHASE_TIMEOUT="${PHASE_TIMEOUT:-900}" INSTALL_TIMEOUT="${INSTALL_TIMEOUT:-2400}" TARGET_PORT="${TARGET_PORT:-22}"
 say() { echo "[acceptance] $*" >&2; }
@@ -31,6 +39,12 @@ case "$INSTALL" in
       say "building RPM from the working tree"; (cd "$ROOT" && ./scripts/dev.sh ./scripts/build-rpm.sh >/dev/null)
     fi
     say "RPM: $(ls "$ROOT"/dist/rpms/oxpanel-daemon-[0-9]*.rpm | grep -vE 'debuginfo|debugsource' | xargs -n1 basename)";;
+  installer|upgrade)
+    podman image exists "$DEV" || { say "building dev image $DEV"; podman build -t "$DEV" -f "$ROOT/tests-integration/Containerfile" "$ROOT/tests-integration" >/dev/null; }
+    say "building the release (make dist) from the working tree"
+    (cd "$ROOT" && ./scripts/dev.sh ./scripts/build-rpm.sh >/dev/null && ./scripts/make-dist.sh >/dev/null)
+    if [ "$INSTALL" = upgrade ]; then say "building the old RPM (${OLD_REF:-d38bae2})"; (cd "$ROOT" && ./scripts/build-old-rpm.sh "${OLD_REF:-d38bae2}" >/dev/null); fi
+    say "release: $(cd "$ROOT/dist/release" && ls | tr '\n' ' ')";;
   git)
     if [ -z "$GIT_REF" ]; then
       branch="$(git -C "$ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)"
@@ -44,7 +58,7 @@ case "$INSTALL" in
       say "WARNING: local HEAD is not pushed to origin/$ref; the VM will test $(git -C "$ROOT" rev-parse --short "origin/$ref")"
     fi
     say "git install: ${GIT_URL:-https://github.com/OxServers/oxpanel.git} @ ${GIT_REF:-main}";;
-  *) die "INSTALL must be git or rpm";;
+  *) die "INSTALL must be git, rpm, installer or upgrade";;
 esac
 
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"; OUT="$ROOT/dist/acceptance/$STAMP"; mkdir -p "$OUT"; ln -sfn "$STAMP" "$ROOT/dist/acceptance/latest"

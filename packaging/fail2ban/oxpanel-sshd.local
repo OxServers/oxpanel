@@ -1,0 +1,35 @@
+# OxPanel: ban addresses that guess SSH and SFTP passwords.
+#
+# Installed by `install.sh` as /etc/fail2ban/jail.d/50-oxpanel-sshd.local, with
+# the @PLACEHOLDERS@ filled in. The package itself does not install it:
+# fail2ban lives in EPEL, and enabling EPEL is the operator's decision.
+#
+# What it does: reads sshd's lines from the systemd journal (nothing is read
+# from /var/log/secure, so it needs no file access and works with SELinux
+# enforcing), and when one address produces `maxretry` failed logins within
+# `findtime` - a wrong password for a tenant's SFTP account, an unknown user,
+# a failed key - blocks that address from the SSH port for `bantime`. Repeat
+# offenders are banned for longer each time, up to a week.
+#
+# What it never does: ban `ignoreip`. Put every address you administer the
+# host from there (space or comma separated; networks like 203.0.113.0/24
+# work). install.sh adds loopback and, when it can tell, the address of the
+# session it runs in; edit this line afterwards for anything else, then
+# `systemctl reload fail2ban`. An address that is listed is never banned, so
+# list as little as you need.
+#
+# Lift a ban by hand:  fail2ban-client set sshd unbanip 203.0.113.9
+# See what it did:     fail2ban-client status sshd
+
+[sshd]
+enabled   = true
+backend   = systemd
+journalmatch = _SYSTEMD_UNIT=sshd.service + _COMM=sshd
+port      = @SSH_PORT@
+maxretry  = 5
+findtime  = 10m
+bantime   = 1h
+bantime.increment = true
+bantime.maxtime   = 1w
+ignoreip  = @IGNORE_IP@
+banaction = @BAN_ACTION@

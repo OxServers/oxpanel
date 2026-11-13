@@ -631,6 +631,37 @@
 [Operations] Packaging
   sh tests-acceptance/phases/10-install.sh rpm -V is clean
   sh tests-acceptance/phases/10-install.sh socket is root:oxpanel 0660
+[Operations] Release and installer
+  sh tests-acceptance/phases/10-install.sh install.sh --yes ran clean
+  sh tests-acceptance/phases/10-install.sh the second run changes nothing
+  sh tests-acceptance/phases/10-install.sh every stage ran
+  sh tests-acceptance/phases/10-install.sh MariaDB has no anonymous accounts
+  sh tests-acceptance/phases/10-install.sh MariaDB has no network listener
+  sh tests-acceptance/phases/10-install.sh --check runs the preflight only
+  sh tests-acceptance/phases/10-install.sh the release directory is intact (SHA256SUMS)
+  sh tests-acceptance/phases/17-installer-options.sh an answers file is accepted
+  sh tests-acceptance/phases/17-installer-options.sh --panel-account creates panelapi in group oxpanel
+  sh tests-acceptance/phases/17-installer-options.sh --panel-scopes writes the peer scope for panelapi
+[Operations] Login banning (fail2ban)
+  sh tests-acceptance/phases/16-fail2ban.sh got banned
+  sh tests-acceptance/phases/16-fail2ban.sh the ban is a real firewall rule
+  sh tests-acceptance/phases/16-fail2ban.sh the correct login from $GOOD still works
+  sh tests-acceptance/phases/16-fail2ban.sh NOT banned (ignore list)
+  sh tests-acceptance/phases/16-fail2ban.sh zero AVC denials (fail2ban, firewalld, sshd)
+[Operations] Disk-quota boot setting
+  sh tests-acceptance/phases/15-quota-pre.sh install.sh printed exactly what remains
+  sh tests-acceptance/phases/15-quota-post.sh install.sh notices that quotas are active
+  sh tests-acceptance/phases/15-quota-post.sh install.sh no longer asks for a reboot
+  sh tests-acceptance/phases/17-installer-options.sh the fstab line gained uquota
+  sh tests-acceptance/phases/17-installer-options.sh then the installer reports quotas active on it
+[Operations] Uninstall and upgrade
+  sh tests-acceptance/phases/12-upgrade.sh the tenant is still there with the same uid
+  sh tests-acceptance/phases/12-upgrade.sh Node.js site still answers
+  sh tests-acceptance/phases/12-upgrade.sh host reconcile is clean after the upgrade
+  sh tests-acceptance/phases/95-uninstall.sh its database and data are still there
+  sh tests-acceptance/phases/95-uninstall.sh its backup is still there
+  sh tests-acceptance/phases/95-uninstall.sh Nginx is still installed and running
+  sh tests-acceptance/phases/95-uninstall.sh the engine knows the tenant again
 [Operations] Dry-run mode
   sh tests-integration/run-inside.sh an unprivileged client creates a tenant in it
   sh tests-integration/run-inside.sh no real account was created

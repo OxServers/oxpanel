@@ -71,3 +71,10 @@ RUN dnf -y install --setopt=install_weak_deps=False openssh-server openssh-clien
 # MariaDB (tenant databases) and the PHP driver for it, for the integration test.
 RUN dnf -y install --setopt=install_weak_deps=False mariadb-server php-mysqlnd \
     && dnf clean all && rm -rf /var/cache/dnf
+
+# Installer stream: shellcheck for install.sh and rpmlint for the package
+# (both from EPEL, which is enabled only for this layer and removed again).
+RUN dnf -y install epel-release \
+    && dnf -y install --setopt=install_weak_deps=False ShellCheck rpmlint \
+    && dnf -y remove epel-release \
+    && dnf clean all && rm -rf /var/cache/dnf

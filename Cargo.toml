@@ -3,7 +3,7 @@ resolver = "2"
 members = ["oxpanel-proto", "oxpanel-daemon", "oxpanel-ctl", "oxpanel-bench", "oxpanel-acme"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 # The oldest compiler the locked dependency tree builds with (zip 9, tonic
 # 0.14 and proptest declare 1.88); rust-toolchain.toml pins the tested one.
