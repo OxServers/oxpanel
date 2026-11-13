@@ -176,8 +176,9 @@ cleared again.
 connections dropped at random beyond 10, all beyond 100), `LoginGraceTime
 120`, and `PerSourcePenalties` (new in 9.8, on by default: an address that
 fails authentication is refused for a while — `authfail` 5 s, growing, at
-most 600 s, enforced once it reaches 15 s). `pam_faillock` is not enabled by
-the default authselect profile. OxPanel's drop-in sets `MaxAuthTries 3` for
+most 600 s, enforced once it reaches 15 s). `pam_faillock` is, as far as I know,
+not enabled by AlmaLinux's default authselect profile (not checked on the
+VM). OxPanel's drop-in sets `MaxAuthTries 3` for
 both tenant blocks (the directive is allowed in `Match`; `MaxStartups`,
 `LoginGraceTime` and `PerSourcePenalties` are global and stay the
 operator's). Left to the operator, documented in the handbook: fail2ban (its
@@ -288,7 +289,17 @@ periods and warnings.
 
 ## Verification
 
-132 unit tests and 6 gRPC end-to-end tests (fake OS, exact argv), the root
+After the revision: 141 unit tests and 6 gRPC end-to-end tests, 337
+integration checks in the container, and an acceptance run with all phases
+green (phase 20: 357 checks) and zero AVC denials, which adds: password login
+confined exactly like keys (no shell, no `-W` forward, only the home
+visible), the password absent from records, journal and `/etc/shadow` in
+plain text, suspension locking the hash and ending a live password session,
+resume restoring the same password, `end_sessions` false/true on a live
+session, Reconcile catching a password set or lost behind OxPanel's back,
+the host-wide switch, and a password login surviving a reboot.
+
+Before the revision: 132 unit tests and 6 gRPC end-to-end tests (fake OS, exact argv), the root
 integration suite in the systemd container (SFTP end to end with a real sshd;
 quotas only as the refusal path, the container has no XFS), and
 `INSTALL=rpm make acceptance` on AlmaLinux 9.8 with SELinux enforcing: all
