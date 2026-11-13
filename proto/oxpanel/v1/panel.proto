@@ -254,6 +254,40 @@ service OxPanelEngine {
   rpc SetBackupSchedule(SetBackupScheduleRequest) returns (BackupSchedule);
   // The tenant's effective backup schedule, next run and last result.
   rpc GetBackupSchedule(GetBackupScheduleRequest) returns (BackupSchedule);
+  // --- DNS hosting ----------------------------------------------------------
+  // This host as the authoritative DNS server of its tenants' domains (see
+  // HostInfo.dns). A zone belongs to exactly one tenant; every request that
+  // names a zone also names the tenant, and another tenant's zone is
+  // NOT_FOUND. FAILED_PRECONDITION on every call below except the reads
+  // when DNS hosting is off or the DNS server is not installed.
+  //
+  // Create a zone explicitly (sites get one by themselves). The zone may not
+  // be a public suffix, overlap another zone, or contain another tenant's
+  // sites.
+  rpc CreateDnsZone(CreateDnsZoneRequest) returns (CreateDnsZoneResponse);
+  rpc ListDnsZones(ListDnsZonesRequest) returns (ListDnsZonesResponse);
+  // One zone with every record, the engine's own (protected) included, and
+  // its DNSSEC state with the DS records for the registrar.
+  rpc GetDnsZone(GetDnsZoneRequest) returns (DnsZone);
+  // Delete a zone with all its records. The DNS server stops answering for it.
+  rpc DeleteDnsZone(DeleteDnsZoneRequest) returns (DeleteDnsZoneResponse);
+  // Add a record. Adding a record the zone already has changes nothing.
+  rpc AddDnsRecord(AddDnsRecordRequest) returns (DnsRecordResponse);
+  // Replace a record (by id) with new contents.
+  rpc UpdateDnsRecord(UpdateDnsRecordRequest) returns (DnsRecordResponse);
+  rpc RemoveDnsRecord(RemoveDnsRecordRequest) returns (RemoveDnsRecordResponse);
+  // Remove every record the tenant added; the engine's records stay.
+  rpc ResetDnsZone(ResetDnsZoneRequest) returns (DnsZone);
+  // Look at the zone from outside (through an unprivileged helper, the
+  // engine has no network): is the domain delegated to this host's name
+  // servers, is a DS record published at the parent, and which serial does
+  // each name server serve. Takes a few seconds.
+  rpc CheckDnsZone(CheckDnsZoneRequest) returns (DnsZoneCheck);
+  // Switch DNSSEC signing of a zone on or off. Switching it off is refused
+  // while the parent still publishes a DS record for the zone (the domain
+  // would stop resolving for validating resolvers) and, unless `force` is
+  // set, when that cannot be checked.
+  rpc SetDnssec(SetDnssecRequest) returns (DnsZone);
 }
 
 // Per-tenant resource limits, applied through systemd (cgroups v2).
@@ -402,6 +436,12 @@ message VirtualHost {
   // What applies: the settings clamped to the tenant's caps, with
   // post_max_size filled in when only upload_max_filesize was given.
   PhpSettings php_settings_effective = 13;
+  // DNS hosting: the site's names get no records from the engine.
+  bool dns_opt_out = 14;
+  // DNS hosting: the zone on this host that holds the address records of the
+  // site's domain; empty when there is none (DNS hosting off, the site opted
+  // out, or the name is inside another tenant's zone).
+  string dns_zone = 15;
 }
 
 enum AppRuntime {
@@ -455,6 +495,11 @@ message ConfigureVirtualHostRequest {
   // Exclude this site from Automatic HTTPS. Default (false): when Automatic
   // HTTPS is on for the host, the site gets a certificate by itself.
   bool auto_https_opt_out = 9;
+  // Keep the site's names out of DNS hosting (its domain's DNS is hosted
+  // elsewhere). Default (false): when DNS hosting is on, the site's names
+  // get address records pointing at this host, in a zone created for the
+  // registrable domain if the tenant has none covering them yet.
+  bool dns_opt_out = 10;
 }
 
 message ConfigureVirtualHostResponse {
@@ -602,6 +647,8 @@ message HostInfo {
   // tenants without a choice of their own get (OXPANEL_BACKUP_SCHEDULE_DEFAULT).
   bool backup_schedules_enabled = 41;
   BackupFrequency backup_schedule_default = 42;
+  // DNS hosting: configuration and state.
+  DnsHostInfo dns = 43;
 }
 
 // Database engines OxPanel can manage. More will follow (PostgreSQL,
@@ -707,6 +754,20 @@ enum DriftKind {
   DRIFT_KIND_ORPHAN_TASK_UNIT = 33;
   // A backup schedule record for a tenant that does not exist.
   DRIFT_KIND_ORPHAN_BACKUP_SCHEDULE = 34;
+  // DNS: a zone file that is missing or differs from what the records
+  // render, or a zone the DNS server does not serve at the recorded serial.
+  DRIFT_KIND_DNS_ZONE_DRIFT = 35;
+  // DNS: a file in OxPanel's DNS directories that no zone record accounts for.
+  DRIFT_KIND_ORPHAN_DNS_FILE = 36;
+  // DNS: OxPanel's DNS server configuration differs from what it renders,
+  // or the DNS server is not running while DNS hosting is on.
+  DRIFT_KIND_DNS_SERVER_DRIFT = 37;
+  // DNS: a secondary name server serves an older serial than the primary,
+  // or does not serve the zone at all.
+  DRIFT_KIND_DNS_SECONDARY_DRIFT = 38;
+  // DNSSEC: a signed zone without signing keys, or keys left behind for a
+  // zone that is not signed.
+  DRIFT_KIND_DNSSEC_DRIFT = 39;
 }
 
 message Drift {
@@ -1939,4 +2000,245 @@ message BackupSchedule {
   string last_message = 13;
   // Scheduled backups run on this host at all.
   bool enabled_on_host = 14;
+}
+
+// --- DNS hosting ------------------------------------------------------------
+
+// DNS hosting as configured on this host (OXPANEL_DNS_*).
+message DnsHostInfo {
+  // OXPANEL_DNS: the operator switched DNS hosting on.
+  bool enabled = 1;
+  // Enabled, and the DNS server and the public suffix list are installed.
+  bool available = 2;
+  // In plain words: what is missing, or what is wrong.
+  string detail = 3;
+  // The name servers every zone is delegated to (NS records), in order.
+  repeated string nameservers = 4;
+  string soa_contact = 5;
+  // Addresses the engine's address records point at.
+  string ipv4 = 6;
+  string ipv6 = 7;
+  // Secondary name servers that receive NOTIFY and may transfer zones (TSIG).
+  repeated string secondaries = 8;
+  uint32 default_ttl = 9;
+  // Things the operator should know: one name server only, no secondary
+  // (every name-server name answered by this host alone: no redundancy), a
+  // stock named.service competing for port 53.
+  repeated string warnings = 10;
+  uint32 zone_count = 11;
+  // The DNS server's version as installed (queries never reveal it).
+  string server_version = 12;
+  bool server_running = 13;
+}
+
+enum DnsRecordType {
+  DNS_RECORD_TYPE_UNSPECIFIED = 0;
+  DNS_RECORD_TYPE_A = 1;
+  DNS_RECORD_TYPE_AAAA = 2;
+  DNS_RECORD_TYPE_CNAME = 3;
+  DNS_RECORD_TYPE_MX = 4;
+  DNS_RECORD_TYPE_TXT = 5;
+  DNS_RECORD_TYPE_SRV = 6;
+  DNS_RECORD_TYPE_CAA = 7;
+  // Delegation of a name below the apex to other name servers.
+  DNS_RECORD_TYPE_NS = 8;
+  // Read-only: the engine's own start of authority.
+  DNS_RECORD_TYPE_SOA = 9;
+}
+
+// One resource record. Which fields carry the data depends on `type`:
+//   A, AAAA       value = the address
+//   CNAME, NS     value = the target host name
+//   MX            priority = preference, value = mail server host name
+//                 ("." with priority 0: the domain receives no mail)
+//   TXT           value = the text, printable ASCII, up to 4000 characters;
+//                 the engine splits it into 255-byte strings and quotes it
+//   SRV           priority, weight, port, value = target host name ("." =
+//                 no such service)
+//   CAA           caa_flags (0 or 128), caa_tag (issue, issuewild, iodef),
+//                 value = the property value
+// Host names are absolute (a trailing dot is optional). `name` is relative to
+// the zone: "@" for the apex, "www", "_dmarc", "*.dev" (a wildcard, leftmost
+// label only).
+message DnsRecord {
+  // 0 for the engine's own records; stable for the tenant's.
+  uint64 id = 1;
+  string name = 2;
+  DnsRecordType type = 3;
+  // 0 = the zone's default TTL.
+  uint32 ttl = 4;
+  string value = 5;
+  uint32 priority = 6;
+  uint32 weight = 7;
+  uint32 port = 8;
+  uint32 caa_flags = 9;
+  string caa_tag = 10;
+  // Maintained by the engine (SOA, the apex NS records, the address records
+  // of sites): read-only through this API.
+  bool protected = 11;
+  // Why a protected record exists: "zone", or "site:<domain>".
+  string origin = 12;
+}
+
+enum DnssecState {
+  DNSSEC_STATE_UNSPECIFIED = 0;
+  DNSSEC_STATE_OFF = 1;
+  // Switched on; the DNS server is generating keys and signing.
+  DNSSEC_STATE_SIGNING = 2;
+  // Signed: give the DS record(s) to the registrar.
+  DNSSEC_STATE_SIGNED = 3;
+}
+
+message DnssecInfo {
+  DnssecState state = 1;
+  // "<zone>. IN DS <key tag> 13 2 <digest>": what the registrar needs.
+  repeated string ds_records = 2;
+  // The key-signing key(s), for registrars that ask for the key instead.
+  repeated string dnskey_records = 3;
+  string algorithm = 4;
+  // How non-existence is proven: NSEC3 (no salt, no extra iterations).
+  string denial_of_existence = 5;
+}
+
+message DnsZone {
+  string zone = 1;
+  string tenant = 2;
+  // Created for a site, not explicitly.
+  bool automatic = 3;
+  // The serial of the zone as last rendered (a signed zone is served with
+  // the DNS server's own, higher serial).
+  uint32 serial = 4;
+  google.protobuf.Timestamp created_at = 5;
+  // Every record, the engine's included (GetDnsZone, ResetDnsZone,
+  // SetDnssec); empty in listings.
+  repeated DnsRecord records = 6;
+  DnssecInfo dnssec = 7;
+  // Sites whose names have address records in this zone.
+  repeated string sites = 8;
+  // Records the tenant added.
+  uint32 record_count = 9;
+}
+
+message CreateDnsZoneRequest {
+  string tenant = 1;
+  // The apex, e.g. "example.com".
+  string zone = 2;
+}
+
+message CreateDnsZoneResponse {
+  DnsZone zone = 1;
+  bool created = 2;
+}
+
+message ListDnsZonesRequest {
+  // Empty = every tenant.
+  string tenant = 1;
+}
+
+message ListDnsZonesResponse {
+  repeated DnsZone zones = 1;
+}
+
+message GetDnsZoneRequest {
+  string tenant = 1;
+  string zone = 2;
+}
+
+message DeleteDnsZoneRequest {
+  string tenant = 1;
+  string zone = 2;
+}
+
+message DeleteDnsZoneResponse {
+  bool deleted = 1;
+}
+
+message AddDnsRecordRequest {
+  string tenant = 1;
+  string zone = 2;
+  // `id`, `protected` and `origin` are ignored.
+  DnsRecord record = 3;
+}
+
+message UpdateDnsRecordRequest {
+  string tenant = 1;
+  string zone = 2;
+  uint64 id = 3;
+  DnsRecord record = 4;
+}
+
+message DnsRecordResponse {
+  DnsRecord record = 1;
+  // false when the zone already held exactly this record.
+  bool changed = 2;
+  uint32 serial = 3;
+}
+
+message RemoveDnsRecordRequest {
+  string tenant = 1;
+  string zone = 2;
+  uint64 id = 3;
+}
+
+message RemoveDnsRecordResponse {
+  bool removed = 1;
+  uint32 serial = 2;
+}
+
+message ResetDnsZoneRequest {
+  string tenant = 1;
+  string zone = 2;
+}
+
+message CheckDnsZoneRequest {
+  string tenant = 1;
+  string zone = 2;
+}
+
+enum DelegationState {
+  DELEGATION_STATE_UNSPECIFIED = 0;
+  // The public DNS names exactly the configured name servers for the domain.
+  DELEGATION_STATE_DELEGATED = 1;
+  // Some of the configured name servers, but not all, or others as well.
+  DELEGATION_STATE_PARTIAL = 2;
+  // The domain's name servers are others: this host's zone is not used.
+  DELEGATION_STATE_ELSEWHERE = 3;
+  // The domain does not exist in the public DNS (not registered?).
+  DELEGATION_STATE_NOT_FOUND = 4;
+  // The check could not be made (no resolver, no network, no answer).
+  DELEGATION_STATE_UNKNOWN = 5;
+}
+
+message NameServerSerial {
+  // "primary" (this host) or the secondary's address.
+  string server = 1;
+  // 0 when the server did not answer authoritatively.
+  uint32 serial = 2;
+  // "ok", "behind", "not serving the zone", "no answer".
+  string status = 3;
+}
+
+message DnsZoneCheck {
+  string zone = 1;
+  DelegationState delegation = 2;
+  // The name servers the public DNS names for the domain.
+  repeated string nameservers_seen = 3;
+  // What to do, in plain words.
+  string guidance = 4;
+  // DS records the parent publishes for the zone (empty: none).
+  repeated string ds_at_parent = 5;
+  // The parent's DS matches one of the zone's keys.
+  bool ds_matches = 6;
+  repeated NameServerSerial serials = 7;
+  // Whether the parent's DS records could be looked up at all.
+  bool ds_checked = 8;
+}
+
+message SetDnssecRequest {
+  string tenant = 1;
+  string zone = 2;
+  bool enabled = 3;
+  // Switch off although the parent could not be checked for a DS record.
+  // (A DS record that IS published still refuses.)
+  bool force = 4;
 }

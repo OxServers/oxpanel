@@ -56,6 +56,7 @@ pub struct Engine {
     tasks: crate::task::TaskService,
     schedules: crate::backup_schedule::ScheduleService,
     ctx: Ctx,
+    dns: crate::dns::DnsService,
 }
 
 /// Interceptor type used by [`Engine::into_service`].
@@ -79,6 +80,7 @@ impl Engine {
                 ctx.clone(),
                 BackupService::new(ctx.clone()),
             ),
+            dns: crate::dns::DnsService::new(ctx.clone()),
             host: HostService::new(ctx.clone()),
             ctx,
         }
@@ -203,6 +205,11 @@ fn drift_to(d: &Drift) -> pb::Drift {
         DriftKind::TaskUnitDrift => pb::DriftKind::TaskUnitDrift,
         DriftKind::OrphanTaskUnit => pb::DriftKind::OrphanTaskUnit,
         DriftKind::OrphanBackupSchedule => pb::DriftKind::OrphanBackupSchedule,
+        DriftKind::DnsZoneDrift => pb::DriftKind::DnsZoneDrift,
+        DriftKind::OrphanDnsFile => pb::DriftKind::OrphanDnsFile,
+        DriftKind::DnsServerDrift => pb::DriftKind::DnsServerDrift,
+        DriftKind::DnsSecondaryDrift => pb::DriftKind::DnsSecondaryDrift,
+        DriftKind::DnssecDrift => pb::DriftKind::DnssecDrift,
     };
     pb::Drift {
         kind: kind.into(),
@@ -267,6 +274,13 @@ fn fail(rpc: &'static str, peer: &str, err: Error) -> Status {
         | Error::TaskNotFound { .. }
         | Error::TaskLimitReached { .. }
         | Error::PhpNotEnabled(_)
+        | Error::DnsUnavailable(_)
+        | Error::DnsZoneNotFound(_)
+        | Error::DnsRecordNotFound { .. }
+        | Error::DnsConflict(_)
+        | Error::DnsLimitReached(_)
+        | Error::DnsZoneRejected(_)
+        | Error::TenantHasDnsZones(_)
         | Error::NginxInvalid(_) => {
             warn!(rpc, peer, error = %err, "request refused");
             err.into()
@@ -371,6 +385,9 @@ fn vhost_to(rec: &VHostRecord) -> pb::VirtualHost {
         php_settings: essentials::php_settings_to(&rec.php_settings),
         // Needs the tenant's caps: filled in by Engine::vhosts_out.
         php_settings_effective: None,
+        dns_opt_out: !rec.dns.is_on(),
+        // Filled in where the zone store is at hand (see `with_dns_zone`).
+        dns_zone: String::new(),
     }
 }
 
@@ -571,6 +588,7 @@ impl OxPanelEngine for Engine {
                 redirect_https: r.redirect_https,
                 hsts: r.hsts,
                 auto_https: crate::records::AutoHttpsChoice::from_opt_out(r.auto_https_opt_out),
+                dns: crate::records::DnsChoice::from_opt_out(r.dns_opt_out),
             })
             .await
             .map_err(|e| fail("ConfigureVirtualHost", &peer, e))?;
@@ -818,6 +836,7 @@ impl OxPanelEngine for Engine {
             backup_disk_free_bytes: i.backup_disk_free_bytes,
             backup_keep: i.backup_keep,
             database_trash_days: i.db_trash_days,
+            dns: Some(self.dns_host_info(i.dns)),
             ..pb::HostInfo::default()
         };
         self.essentials_info(&mut info, i.php_cli);
@@ -1883,6 +1902,183 @@ impl OxPanelEngine for Engine {
     ) -> Result<Response<pb::BackupSchedule>, Status> {
         self.get_backup_schedule_rpc(req).await
     }
+
+    // --- DNS hosting ----------------------------------------------------------
+
+    async fn create_dns_zone(
+        &self,
+        req: Request<pb::CreateDnsZoneRequest>,
+    ) -> Result<Response<pb::CreateDnsZoneResponse>, Status> {
+        const RPC: &str = "CreateDnsZone";
+        let peer = self.authorise(&req, RPC, Scope::VHost)?;
+        let r = req.into_inner();
+        info!(rpc = RPC, peer, tenant = %r.tenant, zone = %r.zone, "request");
+        let (z, created) = self
+            .dns
+            .create_zone(&r.tenant, &r.zone)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(pb::CreateDnsZoneResponse {
+            zone: Some(dns_zone_to(&z)),
+            created,
+        }))
+    }
+
+    async fn list_dns_zones(
+        &self,
+        req: Request<pb::ListDnsZonesRequest>,
+    ) -> Result<Response<pb::ListDnsZonesResponse>, Status> {
+        const RPC: &str = "ListDnsZones";
+        let peer = self.authorise(&req, RPC, Scope::Read)?;
+        let r = req.into_inner();
+        let zones = self
+            .dns
+            .list_zones(&r.tenant)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(pb::ListDnsZonesResponse {
+            zones: zones.iter().map(dns_zone_to).collect(),
+        }))
+    }
+
+    async fn get_dns_zone(
+        &self,
+        req: Request<pb::GetDnsZoneRequest>,
+    ) -> Result<Response<pb::DnsZone>, Status> {
+        const RPC: &str = "GetDnsZone";
+        let peer = self.authorise(&req, RPC, Scope::Read)?;
+        let r = req.into_inner();
+        let z = self
+            .dns
+            .get_zone(&r.tenant, &r.zone)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(dns_zone_to(&z)))
+    }
+
+    async fn delete_dns_zone(
+        &self,
+        req: Request<pb::DeleteDnsZoneRequest>,
+    ) -> Result<Response<pb::DeleteDnsZoneResponse>, Status> {
+        const RPC: &str = "DeleteDnsZone";
+        let peer = self.authorise(&req, RPC, Scope::VHost)?;
+        let r = req.into_inner();
+        info!(rpc = RPC, peer, tenant = %r.tenant, zone = %r.zone, "request");
+        let deleted = self
+            .dns
+            .delete_zone(&r.tenant, &r.zone)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(pb::DeleteDnsZoneResponse { deleted }))
+    }
+
+    async fn add_dns_record(
+        &self,
+        req: Request<pb::AddDnsRecordRequest>,
+    ) -> Result<Response<pb::DnsRecordResponse>, Status> {
+        const RPC: &str = "AddDnsRecord";
+        let peer = self.authorise(&req, RPC, Scope::VHost)?;
+        let r = req.into_inner();
+        info!(rpc = RPC, peer, tenant = %r.tenant, zone = %r.zone, "request");
+        let raw = raw_rr(r.record).map_err(|e| fail(RPC, &peer, e))?;
+        let (rec, changed, serial) = self
+            .dns
+            .add_record(&r.tenant, &r.zone, &raw)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(pb::DnsRecordResponse {
+            record: Some(dns_record_to(&rec)),
+            changed,
+            serial,
+        }))
+    }
+
+    async fn update_dns_record(
+        &self,
+        req: Request<pb::UpdateDnsRecordRequest>,
+    ) -> Result<Response<pb::DnsRecordResponse>, Status> {
+        const RPC: &str = "UpdateDnsRecord";
+        let peer = self.authorise(&req, RPC, Scope::VHost)?;
+        let r = req.into_inner();
+        info!(rpc = RPC, peer, tenant = %r.tenant, zone = %r.zone, id = r.id, "request");
+        let raw = raw_rr(r.record).map_err(|e| fail(RPC, &peer, e))?;
+        let (rec, changed, serial) = self
+            .dns
+            .update_record(&r.tenant, &r.zone, r.id, &raw)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(pb::DnsRecordResponse {
+            record: Some(dns_record_to(&rec)),
+            changed,
+            serial,
+        }))
+    }
+
+    async fn remove_dns_record(
+        &self,
+        req: Request<pb::RemoveDnsRecordRequest>,
+    ) -> Result<Response<pb::RemoveDnsRecordResponse>, Status> {
+        const RPC: &str = "RemoveDnsRecord";
+        let peer = self.authorise(&req, RPC, Scope::VHost)?;
+        let r = req.into_inner();
+        info!(rpc = RPC, peer, tenant = %r.tenant, zone = %r.zone, id = r.id, "request");
+        let (removed, serial) = self
+            .dns
+            .remove_record(&r.tenant, &r.zone, r.id)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(pb::RemoveDnsRecordResponse {
+            removed,
+            serial,
+        }))
+    }
+
+    async fn reset_dns_zone(
+        &self,
+        req: Request<pb::ResetDnsZoneRequest>,
+    ) -> Result<Response<pb::DnsZone>, Status> {
+        const RPC: &str = "ResetDnsZone";
+        let peer = self.authorise(&req, RPC, Scope::VHost)?;
+        let r = req.into_inner();
+        info!(rpc = RPC, peer, tenant = %r.tenant, zone = %r.zone, "request");
+        let z = self
+            .dns
+            .reset_zone(&r.tenant, &r.zone)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(dns_zone_to(&z)))
+    }
+
+    async fn check_dns_zone(
+        &self,
+        req: Request<pb::CheckDnsZoneRequest>,
+    ) -> Result<Response<pb::DnsZoneCheck>, Status> {
+        const RPC: &str = "CheckDnsZone";
+        let peer = self.authorise(&req, RPC, Scope::Read)?;
+        let r = req.into_inner();
+        let c = self
+            .dns
+            .check_zone(&r.tenant, &r.zone)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(dns_check_to(c)))
+    }
+
+    async fn set_dnssec(
+        &self,
+        req: Request<pb::SetDnssecRequest>,
+    ) -> Result<Response<pb::DnsZone>, Status> {
+        const RPC: &str = "SetDnssec";
+        let peer = self.authorise(&req, RPC, Scope::VHost)?;
+        let r = req.into_inner();
+        info!(rpc = RPC, peer, tenant = %r.tenant, zone = %r.zone, enabled = r.enabled, force = r.force, "request");
+        let dns = self.dns.clone();
+        let z =
+            detached(async move { dns.set_dnssec(&r.tenant, &r.zone, r.enabled, r.force).await })
+                .await
+                .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(dns_zone_to(&z)))
+    }
 }
 
 fn trashed_to(t: &DbTrashRecord) -> pb::TrashedDatabase {
@@ -2003,6 +2199,167 @@ fn file_job_to(rec: &FileJobRecord) -> pb::FileJob {
         entries: rec.entries,
         bytes: rec.bytes,
         skipped: rec.skipped,
+    }
+}
+
+// --- DNS hosting: conversions ---------------------------------------------------
+
+impl Engine {
+    /// The virtual host with the zone that holds its address records.
+    fn dns_host_info(&self, f: crate::dns::DnsFacts) -> pb::DnsHostInfo {
+        let c = self.dns.config();
+        pb::DnsHostInfo {
+            enabled: f.enabled,
+            available: f.available,
+            detail: f.detail,
+            nameservers: c.nameservers.iter().map(ToString::to_string).collect(),
+            soa_contact: c.soa_contact.clone(),
+            ipv4: c.ipv4.map(|a| a.to_string()).unwrap_or_default(),
+            ipv6: c.ipv6.map(|a| a.to_string()).unwrap_or_default(),
+            secondaries: c.secondaries.iter().map(ToString::to_string).collect(),
+            default_ttl: c.default_ttl,
+            warnings: f.warnings,
+            zone_count: f.zone_count,
+            server_version: f.server_version,
+            server_running: f.server_running,
+        }
+    }
+}
+
+fn rr_type_from(t: i32) -> Result<crate::dns::rr::RrType, Error> {
+    use crate::dns::rr::RrType;
+    Ok(match pb::DnsRecordType::try_from(t) {
+        Ok(pb::DnsRecordType::A) => RrType::A,
+        Ok(pb::DnsRecordType::Aaaa) => RrType::Aaaa,
+        Ok(pb::DnsRecordType::Cname) => RrType::Cname,
+        Ok(pb::DnsRecordType::Mx) => RrType::Mx,
+        Ok(pb::DnsRecordType::Txt) => RrType::Txt,
+        Ok(pb::DnsRecordType::Srv) => RrType::Srv,
+        Ok(pb::DnsRecordType::Caa) => RrType::Caa,
+        Ok(pb::DnsRecordType::Ns) => RrType::Ns,
+        _ => {
+            return Err(Error::invalid(
+                "record.type",
+                "must be A, AAAA, CNAME, MX, TXT, SRV, CAA or NS",
+            ))
+        }
+    })
+}
+
+fn rr_type_to(t: crate::dns::rr::RrType) -> pb::DnsRecordType {
+    use crate::dns::rr::RrType;
+    match t {
+        RrType::A => pb::DnsRecordType::A,
+        RrType::Aaaa => pb::DnsRecordType::Aaaa,
+        RrType::Cname => pb::DnsRecordType::Cname,
+        RrType::Mx => pb::DnsRecordType::Mx,
+        RrType::Txt => pb::DnsRecordType::Txt,
+        RrType::Srv => pb::DnsRecordType::Srv,
+        RrType::Caa => pb::DnsRecordType::Caa,
+        RrType::Ns => pb::DnsRecordType::Ns,
+    }
+}
+
+fn raw_rr(r: Option<pb::DnsRecord>) -> Result<crate::dns::rr::RawRr, Error> {
+    let r = r.ok_or_else(|| Error::invalid("record", "a record is required"))?;
+    Ok(crate::dns::rr::RawRr {
+        name: r.name,
+        rtype: Some(rr_type_from(r.r#type)?),
+        ttl: r.ttl,
+        value: r.value,
+        priority: r.priority,
+        weight: r.weight,
+        port: r.port,
+        caa_flags: r.caa_flags,
+        caa_tag: r.caa_tag,
+    })
+}
+
+fn dns_record_to(v: &crate::dns::RecordView) -> pb::DnsRecord {
+    let raw = v.rr.to_raw();
+    pb::DnsRecord {
+        id: v.id,
+        name: raw.name,
+        r#type: raw
+            .rtype
+            .map_or(pb::DnsRecordType::Unspecified, rr_type_to)
+            .into(),
+        ttl: raw.ttl,
+        value: raw.value,
+        priority: raw.priority,
+        weight: raw.weight,
+        port: raw.port,
+        caa_flags: raw.caa_flags,
+        caa_tag: raw.caa_tag,
+        protected: v.protected,
+        origin: v.origin.clone(),
+    }
+}
+
+fn dns_zone_to(z: &crate::dns::ZoneView) -> pb::DnsZone {
+    use crate::dns::DnssecState;
+    let mut records = Vec::new();
+    if !z.records.is_empty() {
+        records.push(pb::DnsRecord {
+            name: "@".to_owned(),
+            r#type: pb::DnsRecordType::Soa.into(),
+            value: z.soa.clone(),
+            protected: true,
+            origin: "zone".to_owned(),
+            ..pb::DnsRecord::default()
+        });
+    }
+    records.extend(z.records.iter().map(dns_record_to));
+    pb::DnsZone {
+        zone: z.record.zone.clone(),
+        tenant: z.record.tenant.clone(),
+        automatic: z.record.automatic,
+        serial: z.record.serial,
+        created_at: Some(timestamp(z.record.created_at_unix)),
+        records,
+        dnssec: Some(pb::DnssecInfo {
+            state: match z.dnssec.state {
+                DnssecState::Off => pb::DnssecState::Off,
+                DnssecState::Signing => pb::DnssecState::Signing,
+                DnssecState::Signed => pb::DnssecState::Signed,
+            }
+            .into(),
+            ds_records: z.dnssec.ds.clone(),
+            dnskey_records: z.dnssec.dnskey.clone(),
+            algorithm: crate::dns::dnssec::ALGORITHM_NAME.to_owned(),
+            denial_of_existence: crate::dns::dnssec::DENIAL.to_owned(),
+        }),
+        sites: z.sites.clone(),
+        record_count: u32::try_from(z.record.records.len()).unwrap_or(u32::MAX),
+    }
+}
+
+fn dns_check_to(c: crate::dns::ZoneCheck) -> pb::DnsZoneCheck {
+    use crate::dns::Delegation;
+    pb::DnsZoneCheck {
+        zone: c.zone,
+        delegation: match c.delegation {
+            Delegation::Delegated => pb::DelegationState::Delegated,
+            Delegation::Partial => pb::DelegationState::Partial,
+            Delegation::Elsewhere => pb::DelegationState::Elsewhere,
+            Delegation::NotFound => pb::DelegationState::NotFound,
+            Delegation::Unknown => pb::DelegationState::Unknown,
+        }
+        .into(),
+        nameservers_seen: c.nameservers_seen,
+        guidance: c.guidance,
+        ds_at_parent: c.ds_at_parent,
+        ds_matches: c.ds_matches,
+        serials: c
+            .serials
+            .into_iter()
+            .map(|s| pb::NameServerSerial {
+                server: s.server,
+                serial: s.serial,
+                status: s.status,
+            })
+            .collect(),
+        ds_checked: c.ds_checked,
     }
 }
 

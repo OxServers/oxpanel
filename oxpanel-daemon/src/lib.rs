@@ -30,6 +30,8 @@
 //! - [`task`]     — scheduled tasks (systemd timers running as the tenant);
 //!   [`php_settings`] — per-site PHP settings; [`backup_schedule`] —
 //!   backups the engine starts by itself.
+//! - [`dns`]      — DNS hosting: zones of tenants on OxPanel's own BIND
+//!   instance, records, secondaries, DNSSEC.
 //! - [`host`]     — host information and record ↔ OS reconciliation.
 //! - [`auth`]     — peer-credential gate for the UNIX socket.
 //! - [`server`]   — gRPC ↔ domain mapping.
@@ -54,6 +56,7 @@ pub mod backup_schedule;
 pub mod config;
 pub mod ctx;
 pub mod db;
+pub mod dns;
 pub mod error;
 pub mod files;
 pub mod files_archive;

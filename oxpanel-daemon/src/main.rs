@@ -134,6 +134,14 @@ fn main() -> ExitCode {
     {
         return run_files_worker(mode == files_worker::JOB_SUBCOMMAND, args.len());
     }
+    // `oxpanel-daemon dns-probe …` asks name servers what the daemon itself
+    // cannot (it has no network); it runs unprivileged in a transient unit.
+    if args
+        .first()
+        .is_some_and(|a| a == oxpanel_daemon::dns::probe::SUBCOMMAND)
+    {
+        return ExitCode::from(oxpanel_daemon::dns::probe::main(&args));
+    }
     match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -418,6 +426,9 @@ async fn converge_at_start(ctx: &Ctx) {
         Ok(a) => info!(available = a.available, detail = %a.detail, "disk quotas"),
         Err(e) => warn!(error = %e, "could not determine disk-quota support"),
     }
+    // DNS hosting: interrupted zone work, zones for sites that have none,
+    // every zone and the server configuration re-rendered.
+    oxpanel_daemon::dns::converge(ctx).await;
 }
 
 /// The real OS, or the in-memory fake for `--dry-run`.

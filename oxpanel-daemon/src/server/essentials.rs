@@ -215,6 +215,7 @@ impl Engine {
         recs.iter()
             .map(|rec| {
                 let mut v = vhost_to(rec);
+                v.dns_zone = self.dns.zone_of_site(rec);
                 v.php_settings = php_settings_to(&rec.php_settings);
                 if rec.php && !rec.php_settings.is_empty() {
                     let caps = Username::parse(&rec.tenant)

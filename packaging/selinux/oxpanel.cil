@@ -57,3 +57,12 @@
 ; daemon's own, unconfined domain. Allowing it runs chpasswd confined, as
 ; it would be without NoNewPrivileges. Nothing else may enter passwd_t this way.
 (allow unconfined_service_t passwd_t (process2 (nnp_transition)))
+
+; DNS hosting: OxPanel's BIND instance (oxpanel-dns.service, the packaged
+; named_t domain) writes the signed copies and journals of zones next to the
+; zone files, its signing keys and its working files under
+; /var/lib/oxpanel-dns: the type the stock policy gives the server's own
+; writable directories (/var/named/dynamic, /var/named/data). Its
+; configuration in /etc/named/oxpanel is named_conf_t by the stock rule for
+; /etc/named.
+(filecon "/var/lib/oxpanel-dns(/.*)?" any (system_u object_r named_cache_t ((s0) (s0))))

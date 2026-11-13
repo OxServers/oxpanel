@@ -122,6 +122,8 @@ pub struct Config {
     pub files_job_timeout: Duration,
     /// Scheduled tasks, PHP settings and scheduled backups (see [`Essentials`]).
     pub essentials: Essentials,
+    /// DNS hosting (`OXPANEL_DNS_*`), see [`crate::dns::DnsConfig`].
+    pub dns: crate::dns::DnsConfig,
 }
 
 /// Settings of scheduled tasks, per-site PHP settings and scheduled backups.
@@ -315,6 +317,7 @@ impl Default for Config {
             files: crate::files_worker::Limits::default(),
             files_job_timeout: Duration::from_secs(2 * 3600),
             essentials: Essentials::default(),
+            dns: crate::dns::DnsConfig::default(),
         }
     }
 }
@@ -417,6 +420,7 @@ impl Config {
         c.backup_from_lookup(&get)?;
         c.files_from_lookup(&get)?;
         c.essentials.read_env(&get)?;
+        c.dns = crate::dns::DnsConfig::from_lookup(&get)?;
         c.validate()?;
         Ok(c)
     }
@@ -906,6 +910,9 @@ pub(crate) fn sandbox_feature_paths(cfg: &mut Config, dir: &Path) {
     cfg.sshd_dropin_file = dir.join("sshd_config.d").join("60-oxpanel.conf");
     cfg.socket_path = dir.join("run").join("oxpanel.sock");
     cfg.backup_dir = dir.join("backups");
+    cfg.dns.conf_dir = dir.join("named-oxpanel");
+    cfg.dns.data_dir = dir.join("oxpanel-dns");
+    cfg.dns.suffix_list = dir.join("public_suffix_list.dat");
     for d in [dir.join("sshd_config.d"), dir.join("run")] {
         std::fs::create_dir_all(&d).unwrap_or_else(|e| panic!("{}: {e}", d.display()));
     }

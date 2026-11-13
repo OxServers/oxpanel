@@ -58,6 +58,11 @@ pub enum DriftKind {
     TaskUnitDrift,
     OrphanTaskUnit,
     OrphanBackupSchedule,
+    DnsZoneDrift,
+    OrphanDnsFile,
+    DnsServerDrift,
+    DnsSecondaryDrift,
+    DnssecDrift,
 }
 
 /// One difference between a record and the operating system.
@@ -128,6 +133,8 @@ pub struct HostInfo {
     pub facilities: Facilities,
     /// PHP's command-line interpreter is installed (PHP scheduled tasks).
     pub php_cli: bool,
+    /// DNS hosting (see [`crate::dns`]).
+    pub dns: crate::dns::DnsFacts,
 }
 
 /// What tenants can be given on this host beyond web hosting.
@@ -197,6 +204,7 @@ impl HostService {
             },
             databases: crate::db::facts(&self.ctx).await?,
             php_cli: self.ctx.sys.is_installed(bin::PHP_CLI).await,
+            dns: crate::dns::facts(&self.ctx).await?,
         })
     }
 
@@ -254,6 +262,7 @@ impl HostService {
         check_backups(&self.ctx, &mut out)?;
         out.extend(crate::task::drifts(&self.ctx, &tenants)?);
         out.extend(crate::backup_schedule::drifts(cfg, &tenants)?);
+        out.extend(crate::dns::drifts(&self.ctx).await?);
         Ok(out)
     }
 
@@ -1057,6 +1066,7 @@ mod tests {
             tls: None,
             auto_https: crate::records::AutoHttpsChoice::On,
             php_settings: crate::php_settings::PhpSettings::default(),
+            dns: crate::records::DnsChoice::On,
         };
         h.ctx.store.save_vhost(&orphan_site)?;
 

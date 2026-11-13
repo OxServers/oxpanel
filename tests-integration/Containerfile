@@ -80,3 +80,7 @@ RUN dnf -y install epel-release \
     && dnf clean all && rm -rf /var/cache/dnf
 # PHP's command-line interpreter, for scheduled tasks that run PHP scripts.
 RUN dnf -y install --setopt=install_weak_deps=False php-cli && dnf clean all && rm -rf /var/cache/dnf
+# Authoritative DNS (BIND from AppStream, its dig/delv/dnssec tools) and the
+# host's public suffix list, which decides the apex of automatic zones.
+RUN dnf -y install --setopt=install_weak_deps=False bind bind-utils bind-dnssec-utils publicsuffix-list \
+    && dnf clean all && rm -rf /var/cache/dnf

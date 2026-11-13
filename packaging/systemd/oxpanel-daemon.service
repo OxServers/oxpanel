@@ -63,6 +63,12 @@ ProtectSystem=strict
 # ACME signing requests and issued chains to /var/lib/oxpanel-acme (under /var/lib). The ACME
 # client itself never runs in this unit (PrivateNetwork=yes) but in a transient unit started
 # with systemd-run, as the unprivileged account oxpanel-acme.
+# DNS hosting needs no further entries either: the DNS server's configuration and keys go to
+# /etc/named/oxpanel (under /etc), zone files to /var/lib/oxpanel-dns (under /var/lib); the
+# checkers (named-checkconf, named-checkzone) only read. The server itself runs in its own unit
+# (oxpanel-dns.service); rndc (TCP on the loopback) and the DNS probe (which asks the network)
+# run in transient units, because this unit has no network. Signing keys are generated from
+# /dev/urandom, which PrivateDevices keeps.
 ReadWritePaths=/etc /home /var/lib /var/log/nginx
 ProtectHome=no
 ProtectKernelTunables=yes

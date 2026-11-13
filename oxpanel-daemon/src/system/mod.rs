@@ -19,6 +19,7 @@ use crate::error::Result;
 
 pub mod command;
 pub mod fake;
+mod fake_dns;
 mod fake_mariadb;
 pub mod fake_tls;
 pub mod real;
@@ -90,6 +91,13 @@ pub mod bin {
     /// Fetches the URL of a URL scheduled task, in the task's unit as the
     /// tenant (curl-minimal on AlmaLinux 9). Never run by the daemon.
     pub const CURL: &str = "/usr/bin/curl";
+    /// Optional: DNS hosting (BIND). The server itself only runs in its own
+    /// unit; the daemon asks it for its version and validates with the
+    /// checkers, and talks to it with rndc in a transient unit.
+    pub const NAMED: &str = "/usr/sbin/named";
+    pub const NAMED_CHECKCONF: &str = "/usr/sbin/named-checkconf";
+    pub const NAMED_CHECKZONE: &str = "/usr/sbin/named-checkzone";
+    pub const RNDC: &str = "/usr/sbin/rndc";
 }
 
 /// A resolved account from the system user database.

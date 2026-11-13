@@ -210,6 +210,30 @@ pub enum Error {
     /// PHP settings were sent for a site that does not run PHP.
     #[error("virtual host '{0}' does not run PHP; enable PHP first")]
     PhpNotEnabled(String),
+    /// DNS hosting is off, or the DNS server or public suffix list is missing.
+    #[error("DNS hosting is not available on this host: {0}")]
+    DnsUnavailable(String),
+
+    #[error("DNS zone '{0}' not found")]
+    DnsZoneNotFound(String),
+
+    #[error("zone '{zone}' has no record with id {id}")]
+    DnsRecordNotFound { zone: String, id: u64 },
+
+    /// The request conflicts with what exists (zones of other tenants,
+    /// protected records, a published DS record, a suspended tenant).
+    #[error("{0}")]
+    DnsConflict(String),
+
+    #[error("{0}")]
+    DnsLimitReached(String),
+
+    /// The DNS server's own checker rejected the zone; its output says why.
+    #[error("the DNS server rejected the zone: {0}")]
+    DnsZoneRejected(String),
+
+    #[error("tenant '{0}' still owns DNS zones; delete them first")]
+    TenantHasDnsZones(String),
 
     #[error("{program} exited with {status}")]
     CommandFailed {
@@ -316,6 +340,13 @@ impl Error {
                 | Self::TaskNotFound { .. }
                 | Self::TaskLimitReached { .. }
                 | Self::PhpNotEnabled(_)
+                | Self::DnsUnavailable(_)
+                | Self::DnsZoneNotFound(_)
+                | Self::DnsRecordNotFound { .. }
+                | Self::DnsConflict(_)
+                | Self::DnsLimitReached(_)
+                | Self::DnsZoneRejected(_)
+                | Self::TenantHasDnsZones(_)
         )
     }
 }
@@ -329,9 +360,9 @@ impl From<Error> for Status {
             "internal error; see the oxpanel-daemon journal".to_owned()
         };
         match err {
-            Error::InvalidInput { .. } | Error::CertificateInvalid(_) => {
-                Status::invalid_argument(message)
-            }
+            Error::InvalidInput { .. }
+            | Error::CertificateInvalid(_)
+            | Error::DnsZoneRejected(_) => Status::invalid_argument(message),
             Error::TlsUnavailable | Error::AcmeUnavailable(_) => {
                 Status::failed_precondition(message)
             }
@@ -367,8 +398,15 @@ impl From<Error> for Status {
             | Error::TenantSuspended(_)
             | Error::FileJobRunning { .. }
             | Error::PhpNotEnabled(_)
-            | Error::NginxInvalid(_) => Status::failed_precondition(message),
-            Error::UidExhausted { .. }
+            | Error::NginxInvalid(_)
+            | Error::DnsUnavailable(_)
+            | Error::DnsConflict(_)
+            | Error::TenantHasDnsZones(_) => Status::failed_precondition(message),
+            Error::DnsZoneNotFound(_) | Error::DnsRecordNotFound { .. } => {
+                Status::not_found(message)
+            }
+            Error::DnsLimitReached(_)
+            | Error::UidExhausted { .. }
             | Error::TooManySftpKeys(_)
             | Error::DbLimitReached { .. }
             | Error::TooManyJobs

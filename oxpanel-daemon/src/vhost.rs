@@ -59,6 +59,8 @@ pub struct VHostRequest {
     pub hsts: bool,
     /// Whether Automatic HTTPS looks after the site.
     pub auto_https: crate::records::AutoHttpsChoice,
+    /// Whether DNS hosting gives the site's names address records.
+    pub dns: crate::records::DnsChoice,
 }
 
 /// An application as requested on the wire; empty strings mean "default".
@@ -187,6 +189,7 @@ impl VHostService {
                 .as_ref()
                 .map(|e| e.php_settings.clone())
                 .unwrap_or_default(),
+            dns: req.dns,
         };
         // The pool must be listening before Nginx is told to use it.
         let pool_changed = if rec.php {
@@ -204,15 +207,31 @@ impl VHostService {
         if record_changed {
             self.ctx.store.save_vhost(&rec)?;
         }
-        let switched_off = self.drop_switched_off(&tenant_rec, &domain, &rec).await?
-            || self
-                .drop_site_pool(&tenant_rec, existing.as_ref(), &rec)
-                .await?;
+        let switched_off = self
+            .follow_up(&tenant_rec, &domain, existing.as_ref(), &rec)
+            .await?;
         let changed = changed || record_changed || switched_off;
         if changed {
             info!(%domain, %tenant, root = %abs_root.display(), php = rec.php, app = rec.app.as_ref().map_or("-", |a| a.runtime.as_str()), "virtual host configured");
         }
         Ok((rec, changed))
+    }
+
+    /// After a site is configured: what it no longer uses is dropped (the
+    /// tenant's pool or the application, and the site's own PHP pool — both
+    /// always looked at, never one instead of the other), then DNS hosting
+    /// follows its names (best effort). Returns whether anything was removed.
+    async fn follow_up(
+        &self,
+        tenant_rec: &TenantRecord,
+        domain: &Domain,
+        existing: Option<&VHostRecord>,
+        rec: &VHostRecord,
+    ) -> Result<bool> {
+        let switched_off = self.drop_switched_off(tenant_rec, domain, rec).await?;
+        let pool_dropped = self.drop_site_pool(tenant_rec, existing, rec).await?;
+        dns_follows(&self.ctx, domain, existing, Some(rec)).await;
+        Ok(switched_off || pool_dropped)
     }
 
     /// Stop what `rec` does not use: the tenant's PHP pool (if no other site
@@ -420,6 +439,11 @@ impl VHostService {
         // first would strand a running PHP pool or application with nothing
         // left that says OxPanel owns it.
         self.ctx.store.delete_vhost(&domain)?;
+        // Its address records go; a zone created for it goes too unless the
+        // tenant added records to it.
+        if let Err(e) = crate::dns::site_changed(&self.ctx, Some(&rec), None).await {
+            warn!(%domain, error = %e, "the site's DNS records could not be removed; see `oxpanel-ctl host reconcile`");
+        }
         info!(%domain, tenant = %rec.tenant, "virtual host removed");
         Ok(true)
     }
@@ -733,6 +757,20 @@ impl VHostService {
             warn!(path = %root.display(), stderr = %out.stderr_lossy().trim(), "the document root changed while it was being relabelled; its label is left as it is");
         }
         Ok(())
+    }
+}
+
+/// DNS hosting follows a site's names (old and new). The site is served
+/// whatever happens there: a failure is logged and reported by `Reconcile`,
+/// never returned (best effort by design, like Automatic HTTPS).
+async fn dns_follows(
+    ctx: &crate::ctx::Ctx,
+    domain: &Domain,
+    before: Option<&VHostRecord>,
+    after: Option<&VHostRecord>,
+) {
+    if let Err(e) = crate::dns::site_changed(ctx, before, after).await {
+        warn!(%domain, error = %e, "the site's DNS records could not be brought up to date; see `oxpanel-ctl host reconcile`");
     }
 }
 

@@ -120,6 +120,34 @@ pub struct VHostRecord {
         skip_serializing_if = "crate::php_settings::PhpSettings::is_empty"
     )]
     pub php_settings: crate::php_settings::PhpSettings,
+    /// Whether DNS hosting gives the site's names address records.
+    #[serde(default)]
+    pub dns: DnsChoice,
+}
+
+/// A site's DNS hosting setting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DnsChoice {
+    /// The site's names get address records (whenever DNS hosting is on).
+    #[default]
+    On,
+    /// The domain's DNS is hosted elsewhere.
+    Off,
+}
+
+impl DnsChoice {
+    pub fn from_opt_out(opt_out: bool) -> Self {
+        if opt_out {
+            Self::Off
+        } else {
+            Self::On
+        }
+    }
+
+    pub fn is_on(self) -> bool {
+        self == Self::On
+    }
 }
 
 /// A site's Automatic HTTPS setting.
@@ -1120,6 +1148,7 @@ mod tests {
             tls: None,
             auto_https: AutoHttpsChoice::On,
             php_settings: crate::php_settings::PhpSettings::default(),
+            dns: DnsChoice::On,
         };
         assert!(s.save_vhost(&v).is_err());
     }

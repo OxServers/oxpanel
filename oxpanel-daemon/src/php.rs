@@ -510,6 +510,7 @@ php_value[memory_limit] = 256M
                 memory_limit_mb: mb,
                 ..PhpSettings::default()
             },
+            dns: crate::records::DnsChoice::On,
         };
         let stored = vec![
             vhost("b.example", true, Some(512)),

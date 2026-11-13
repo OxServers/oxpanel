@@ -224,6 +224,23 @@ pub fn list_files_with_suffix(dir: &Path, suffix: &str) -> Result<Vec<PathBuf>> 
     Ok(out)
 }
 
+/// Give `path` (never what a symlink there points at) to `uid:gid`. For
+/// files another service must read through its group, such as the DNS
+/// server's configuration (`root:named 0640`).
+pub fn set_owner(path: &Path, uid: u32, gid: u32) -> Result<()> {
+    std::os::unix::fs::lchown(path, Some(uid), Some(gid)).map_err(|e| Error::io("chown", path, e))
+}
+
+/// Owner and group of `path` (not followed), if it exists.
+pub fn owner_of(path: &Path) -> Result<Option<(u32, u32)>> {
+    use std::os::unix::fs::MetadataExt;
+    match fs::symlink_metadata(path) {
+        Ok(md) => Ok(Some((md.uid(), md.gid()))),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(Error::io("lstat", path, e)),
+    }
+}
+
 fn current_mode(path: &Path) -> Result<Option<u32>> {
     match fs::symlink_metadata(path) {
         Ok(md) => Ok(Some(md.permissions().mode() & 0o7777)),
