@@ -1653,6 +1653,9 @@ PY
     lq_used() { xfs_quota -x -c "report -u -n -N -b -L $LQUID -U $LQUID" "$LQFS" | awk -v u="#$LQUID" '$1 == u { print $2 }'; }
     check "8 MiB of data in a database of a tenant limited to 2 MiB" test "$(rootsql "SELECT COUNT(*) FROM lcq_big.b")" = 2
     check "the tenant's quota does not count its database" test "$(lq_used)" -lt 1024
+    # The trash cap defaults to the disk limit: 2 MiB cannot hold this database.
+    check "the default trash cap is the disk limit" bash -c 'out="$(oxpanel-ctl db delete lcq_big 2>&1)"; test $? -ne 0 && grep -q "may hold 2097152 bytes" <<<"$out"'
+    oxpanel-ctl tenant set-limits lcq --disk 2M --db-trash 64M >/dev/null
     oxpanel-ctl db delete lcq_big >/dev/null
     check "nor the database in its trash" bash -c 'test "$1" -lt 1024 && test "$(oxpanel-ctl db trash-list lcq | grep -c " lcq_big ")" = 1' _ "$(lq_used)"
     check "cascade-delete lcq" grep -q 'state=JOB_STATE_SUCCEEDED' <(timeout 300 oxpanel-ctl tenant delete lcq --cascade --confirm lcq --wait)
