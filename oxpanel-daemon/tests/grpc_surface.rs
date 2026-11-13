@@ -64,6 +64,13 @@ fn scope_table() -> BTreeMap<&'static str, Scope> {
         ("GetTenantUsage", Scope::Read),
         ("GetHostInfo", Scope::Read),
         ("Reconcile", Scope::Read),
+        // HTTPS (tls stream)
+        ("InstallCertificate", Scope::VHost),
+        ("RemoveCertificate", Scope::VHost),
+        ("RequestCertificate", Scope::VHost),
+        ("RenewCertificates", Scope::VHost),
+        ("RunAutoHttps", Scope::VHost),
+        ("GetAutoHttpsStatus", Scope::Read),
     ]
     .into_iter()
     .collect()
@@ -450,6 +457,9 @@ async fn random_requests_never_panic_or_corrupt_state() {
                     root: s(),
                     entry: s(),
                 }),
+                redirect_https: i % 3 == 0,
+                hsts: i % 2 == 1,
+                auto_https_opt_out: i % 4 == 0,
             }
             .encode_to_vec(),
             2 => pb::ReadVirtualHostLogRequest {

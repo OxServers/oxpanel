@@ -224,6 +224,88 @@
   unit host reports_app_unit_drift_and_orphans
   sh tests-integration/run-inside.sh applications are not drift
 
+[HTTPS (certificates)] Bring your own certificate
+  unit tls install_verifies_with_openssl_writes_root_only_key_and_serves_https
+  unit tls unusable_certificates_are_refused_before_anything_changes
+  unit tls a_certificate_nginx_rejects_is_rolled_back
+  unit tls wildcards_cover_exactly_one_label
+  sh tests-integration/run-inside.sh a key that does not match is refused
+  sh tests-integration/run-inside.sh an expired certificate is refused
+  sh tests-integration/run-inside.sh a refused certificate leaves nothing behind
+  sh tests-integration/run-inside.sh the certificate served is exactly the uploaded one
+  sh tests-integration/run-inside.sh removing a certificate makes the site HTTP-only again
+[HTTPS (certificates)] Automatic certificates (ACME, HTTP-01)
+  unit tls acme_request_runs_the_client_unprivileged_and_never_shows_it_a_key
+  unit tls acme_failures_are_results_and_preflight_refuses_early
+  unit tls only_due_acme_certificates_of_active_tenants_are_renewed
+  sh tests-integration/run-inside.sh ACME: certificate issued and installed
+  sh tests-integration/run-inside.sh ACME: a certificate expiring within 30 days is renewed
+  sh tests-integration/run-inside.sh ACME: a name the CA cannot validate fails with the reason (exit 4)
+  sh tests-integration/run-inside.sh ACME: a failed request installs nothing
+[HTTPS (certificates)] Automatic HTTPS
+  unit auto_https a_new_site_gets_a_certificate_without_asking
+  unit auto_https names_added_later_are_covered_and_bad_names_are_skipped_and_backed_off
+  unit auto_https nothing_is_ordered_when_the_domain_itself_does_not_validate
+  unit auto_https opt_out_host_switch_and_suspension_leave_sites_alone
+  unit auto_https uploaded_certificates_are_kept_until_they_expire
+  unit auto_https back_off_grows_then_stays_daily
+  sh tests-integration/run-inside.sh a new site gets a certificate with no request at all
+  sh tests-integration/run-inside.sh a name that does not resolve is skipped, the rest stays covered
+  sh tests-integration/run-inside.sh back-off survives a daemon restart
+  sh tests-integration/run-inside.sh after resume the site catches up by itself
+  sh tests-integration/run-inside.sh a valid uploaded certificate is left alone
+[HTTPS (certificates)] Any ACME authority
+  unit auto_https external_account_binding_is_a_credential_never_an_argument
+  sh tests-integration/run-inside.sh host info reports ACME against the test CA
+  sh tests-integration/run-inside.sh EAB: without a binding the CA refuses
+  sh tests-integration/run-inside.sh EAB: a binding file others can read is refused
+  sh tests-integration/run-inside.sh EAB: with the binding the certificate is issued
+  sh tests-integration/run-inside.sh EAB: the HMAC key never reached the journal or a command line
+[HTTPS (certificates)] The daemon stays offline
+  unit tls acme_request_runs_the_client_unprivileged_and_never_shows_it_a_key
+  sh tests-integration/run-inside.sh ACME: the client ran as oxpanel-acme (it owns its account key, 0600)
+  sh tests-integration/run-inside.sh ACME: the client's account cannot read any site key
+[HTTPS (certificates)] Private keys
+  unit tls install_verifies_with_openssl_writes_root_only_key_and_serves_https
+  unit tls pem_is_normalised_and_foreign_blocks_are_refused
+  it grpc_uds certificates_over_uds_never_return_the_key
+  sh tests-integration/run-inside.sh private key is root 0600
+  sh tests-integration/run-inside.sh the key is not in the record
+  sh tests-integration/run-inside.sh the key never appeared on a command line or in the journal
+  sh tests-integration/run-inside.sh a tenant cannot read the key
+[HTTPS (certificates)] Nginx
+  unit tls redirect_hsts_and_reconfiguration_keep_the_certificate
+  sh tests-integration/run-inside.sh HTTP/2 is offered
+  sh tests-integration/run-inside.sh TLS 1.1 is refused
+  sh tests-integration/run-inside.sh a request without SNI gets no certificate
+  sh tests-integration/run-inside.sh an unknown name on 443 never reaches a tenant
+  sh tests-integration/run-inside.sh HTTP redirects to HTTPS
+  sh tests-integration/run-inside.sh ACME challenges are still answered over HTTP while redirecting
+  sh tests-integration/run-inside.sh HSTS is sent over HTTPS when enabled
+  sh tests-integration/run-inside.sh PHP sees HTTPS=on over HTTPS
+  sh tests-integration/run-inside.sh the Node.js app sees X-Forwarded-Proto https over HTTPS
+[HTTPS (certificates)] Status
+  it grpc_uds certificates_over_uds_never_return_the_key
+  sh tests-integration/run-inside.sh cert show reports it
+  sh tests-integration/run-inside.sh host info reports TLS support
+  sh tests-integration/run-inside.sh status: covered
+[HTTPS (certificates)] Lifecycle
+  unit tls suspension_and_removal
+  unit tls redirect_hsts_and_reconfiguration_keep_the_certificate
+  sh tests-integration/run-inside.sh suspend: HTTPS answers 503 with the site's own certificate
+  sh tests-integration/run-inside.sh suspended site answers no ACME challenges
+  sh tests-integration/run-inside.sh removing a site removes its certificate
+[HTTPS (certificates)] SELinux
+  sh tests-acceptance/phases/30-selinux.sh ACME challenge directory is web content
+  sh tests-acceptance/phases/30-selinux.sh the rest of the ACME directory is not
+  sh tests-acceptance/phases/30-selinux.sh certificate directory is cert_t
+[HTTPS (certificates)] Reconciliation
+  unit tls reconcile_covers_certificate_files
+  unit auto_https state_goes_with_the_site_and_strays_are_drift
+  sh tests-integration/run-inside.sh reconcile reports the edited certificate and the opened key
+  sh tests-integration/run-inside.sh reconcile reports the stray file
+  sh tests-integration/run-inside.sh no drift after healing
+
 [API, transport and authentication] gRPC over a UNIX socket only
   it grpc_uds full_tenant_and_vhost_lifecycle_over_uds
   sh tests-integration/run-inside.sh socket is root:oxpanel 0660
