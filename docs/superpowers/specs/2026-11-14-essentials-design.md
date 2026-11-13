@@ -124,7 +124,15 @@ appended to the expression (systemd ≥ 235).
 `DeleteScheduledTask` (`vhost`), `RunScheduledTask` ("run now",
 `systemctl start --no-block`, `vhost`; refused while suspended),
 `ListScheduledTasks` and `ReadScheduledTaskLog` (`read`). `enabled` is part
-of the specification. Status comes from systemd (`systemctl show
+of the specification.
+
+Finding (systemd 252, AlmaLinux 9): `systemctl show --timestamp=unix` prints
+the `ExecMain*Timestamp` properties as `@<seconds>`, but ignores the option
+for a timer's `NextElapseUSecRealtime`, which it always prints as local
+time with a zone abbreviation (`Sat 2026-11-14 01:47:00 PKT`). The daemon
+therefore runs every external command with `TZ=UTC` (only the way tools
+print times changes) and parses the `… UTC` form; any other form is
+reported as "unknown" rather than guessed. Status comes from systemd (`systemctl show
 --timestamp=unix`): running, last start and finish, result (`success`,
 `exit-code`, `timeout`, `signal`), exit status, next elapse. These are
 systemd's in-memory facts: they survive a daemon reload but not a reboot

@@ -1800,14 +1800,14 @@ echo "-- scheduled tasks: a URL of the tenant's own site"
 out="$(oxpanel-ctl vhost set ess.test --tenant ess --php)"
 oxpanel-ctl vhost set essb.test --tenant essb >/dev/null
 as_user ess sh -c 'cat > /home/ess/public_html/hit.php' <<'PHP'
-<?php file_put_contents(__DIR__ . '/../hits.txt', ($_GET['x'] ?? '-') . "\n", FILE_APPEND); echo "hit";
+<?php file_put_contents(__DIR__ . '/hits.txt', ($_GET['x'] ?? '-') . "\n", FILE_APPEND); echo "hit";
 PHP
 check_not "a URL of another tenant's site is refused" oxpanel-ctl task set ess url --url 'http://essb.test/' --schedule 'every 1m'
 check_not "a URL with a port is refused" oxpanel-ctl task set ess url --url 'http://ess.test:8080/' --schedule 'every 1m'
 check_not "a URL with shell or unit syntax is refused" oxpanel-ctl task set ess url --url 'http://ess.test/$(id)' --schedule 'every 1m'
 check "a URL task of its own site is created" grep -q '^changed=true' <(oxpanel-ctl task set ess url --url 'http://ess.test/hit.php?x=a%2Fb' --schedule 'hourly at :07')
 check "run now fetches it through this host's web server" bash -c 'oxpanel-ctl task run ess url | grep -q "^started=true" && task_settled ess url success'
-check "the request reached the tenant's site" grep -qx 'a/b' /home/ess/hits.txt
+check "the request reached the tenant's site" grep -qx 'a/b' /home/ess/public_html/hits.txt
 check "the task reports the status" grep -q 'HTTP 200, 3 bytes' <(oxpanel-ctl task log ess url)
 
 echo "-- scheduled tasks: suspension, reconciliation"
