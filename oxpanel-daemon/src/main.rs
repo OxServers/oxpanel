@@ -208,8 +208,16 @@ async fn resume_jobs(ctx: &Ctx, engine: &Engine) {
             warn!(error = %e, "could not resume running jobs; see `oxpanel-ctl host reconcile`");
         }
     }
+    // Tenant deletions run in the daemon: continue them where they stopped.
+    match engine.lifecycle().resume_all().await {
+        Ok(0) => {}
+        Ok(n) => info!(jobs = n, "resumed tenant deletions"),
+        Err(e) => warn!(error = %e, "could not resume tenant deletions; repeat the requests"),
+    }
     // Retained backups past their date go now, and hourly from here on.
     engine.backups().spawn_expiry();
+    // So do deleted databases past their trash period.
+    oxpanel_daemon::db::trash::spawn_purger(ctx.clone());
 }
 
 async fn run(cli: Cli) -> Result<(), Fatal> {

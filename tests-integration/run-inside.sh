@@ -1078,11 +1078,14 @@ PY
   check "setting the password re-creates it with its grants" test "$(usersql dave_app "$DAVEPW" 'SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = "dave_wp"')" = 1
   check "no drift after healing" grep -q '^drifts=0$' <(oxpanel-ctl host reconcile)
   check_not "a tenant with databases cannot be deleted" oxpanel-ctl tenant delete dave
-  check "deleting a database revokes it and drops it" bash -c 'oxpanel-ctl db delete dave_wp | grep -q "^deleted=true" && ! rootsql "SHOW DATABASES" | grep -qx dave_wp && oxpanel-ctl db user-list --tenant dave | grep -q "databases=- "'
+  check "deleting a database revokes it and moves it to the trash" bash -c 'oxpanel-ctl db delete dave_wp | grep -q "^deleted=true trash_id=t" && ! rootsql "SHOW DATABASES" | grep -qx dave_wp && oxpanel-ctl db user-list --tenant dave | grep -q "databases=- "'
   check "deleting a user drops the account" bash -c 'oxpanel-ctl db user-delete dave_app | grep -q "^deleted=true" && test "$(rootsql "SELECT COUNT(*) FROM mysql.user WHERE User=\"dave_app\"")" = 0'
   oxpanel-ctl vhost remove db.test >/dev/null
   oxpanel-ctl db user-delete carol_app >/dev/null
   oxpanel-ctl db delete carol_wp >/dev/null
+  check_not "a tenant with a database in its trash cannot be deleted" oxpanel-ctl tenant delete dave
+  oxpanel-ctl db trash-purge carol >/dev/null
+  oxpanel-ctl db trash-purge dave >/dev/null
   check "tenants without databases can be deleted" bash -c 'oxpanel-ctl tenant delete carol --remove-home | grep -q "^deleted=true" && oxpanel-ctl tenant delete dave --remove-home | grep -q "^deleted=true"'
   check "nothing of the tenants is left on the server" test "$(rootsql "SELECT (SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME LIKE 'carol%' OR SCHEMA_NAME LIKE 'dave%') + (SELECT COUNT(*) FROM mysql.user WHERE User LIKE 'carol%' OR User LIKE 'dave%')")" = 0
   check "no drift after database teardown" grep -q '^drifts=0$' <(oxpanel-ctl host reconcile)
@@ -1414,6 +1417,269 @@ check "a missing web-server account is refused" bash -c '! OXPANEL_WEB_USER=nosu
 check "root as the web-server account is refused" bash -c '! OXPANEL_WEB_USER=root /usr/sbin/oxpanel-daemon --check-config >/dev/null 2>&1'
 check "a tenant as the web-server account is refused" bash -c '! OXPANEL_WEB_USER=bob /usr/sbin/oxpanel-daemon --check-config >/dev/null 2>&1'
 check "a missing socket group is refused" bash -c '! OXPANEL_SOCKET_GROUP=nosuchgrp1 /usr/sbin/oxpanel-daemon --check-config >/dev/null 2>&1'
+
+echo "== lifecycle: database trash, dumps in backups, cascade deletion"
+if [ -x /usr/bin/mariadb ] && systemctl cat mariadb.service >/dev/null 2>&1; then
+  systemctl -q is-active mariadb || systemctl start mariadb
+  LCPW='Lifecycle-pass-4711'
+  # $1 user, $2 database, $3 SQL: as a tenant's database user, in that database.
+  lcsql() { MYSQL_PWD="$LCPW" mariadb --no-defaults --protocol=socket --user="$1" --batch --skip-column-names "$2" -e "$3"; }
+  trash_of() { sed -n 's/.* trash_id=\([^ ]*\) .*/\1/p' <<<"$1"; }
+  schemas_like() { rootsql "SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME LIKE '$1'"; }
+  # A table with rows and every kind of stored object, in database $1 of the
+  # tenant whose database user is $2. The event is made by root (tenants
+  # have no EVENT privilege), with the tenant's user as its definer.
+  fill_db() {
+    lcsql "$2" "$1" "CREATE TABLE t (id INT AUTO_INCREMENT PRIMARY KEY, a VARCHAR(20)); CREATE TABLE log (msg VARCHAR(64)); INSERT INTO t (a) VALUES ('one'), ('two'), ('three'); CREATE VIEW v AS SELECT id, a FROM t WHERE id > 1"
+    printf 'DELIMITER $$\nCREATE TRIGGER trg BEFORE INSERT ON t FOR EACH ROW BEGIN INSERT INTO log VALUES (CONCAT(%s, NEW.a)); END$$\nCREATE PROCEDURE p(IN x INT) BEGIN SELECT a FROM t WHERE id = x; END$$\nCREATE FUNCTION f(x INT) RETURNS INT DETERMINISTIC RETURN x * 2$$\n' "'ins ;; '" \
+      | MYSQL_PWD="$LCPW" mariadb --no-defaults --protocol=socket --user="$2" "$1"
+    rootsql "CREATE DEFINER=\`$2\`@\`localhost\` EVENT \`$1\`.ev ON SCHEDULE EVERY 1 DAY DISABLE DO INSERT INTO \`$1\`.log VALUES ('event')"
+  }
+  # Every object of fill_db present in database $1.
+  objects_in() { rootsql "SELECT (SELECT COUNT(*) FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA='$1') + (SELECT COUNT(*) FROM information_schema.VIEWS WHERE TABLE_SCHEMA='$1') + (SELECT COUNT(*) FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA='$1') + (SELECT COUNT(*) FROM information_schema.EVENTS WHERE EVENT_SCHEMA='$1')"; }
+  export LCPW
+  export -f lcsql trash_of schemas_like objects_in
+
+  echo "-- the database trash"
+  oxpanel-ctl tenant create lca >/dev/null
+  oxpanel-ctl tenant create lcother >/dev/null
+  oxpanel-ctl db create lca_shop --tenant lca >/dev/null
+  printf '%s\n' "$LCPW" | oxpanel-ctl db user-create lca_app --tenant lca >/dev/null
+  oxpanel-ctl db grant lca_app lca_shop >/dev/null
+  fill_db lca_shop lca_app
+  check "a database with a table, a view, a trigger, a procedure, a function and an event" test "$(objects_in lca_shop)" = 5
+  lcsql lca_app lca_shop 'SELECT SLEEP(30)' >/dev/null 2>&1 &
+  sleeper=$!
+  sleep 0.5
+  out="$(oxpanel-ctl db delete lca_shop)"; echo "$out"
+  LCT="$(trash_of "$out")"
+  check "deleting moves the database to the trash" bash -c 'grep -qE "^deleted=true trash_id=t[0-9]+ purge_at=[0-9]+$" <<<"$1"' _ "$out"
+  check "a session inside the deleted database is ended" bash -c 'for i in $(seq 1 50); do kill -0 "$1" 2>/dev/null || exit 0; sleep 0.1; done; exit 1' _ "$sleeper"
+  wait "$sleeper" 2>/dev/null || true
+  check "the purge date is 30 days ahead" bash -c 'p="$(sed -n "s/.* purge_at=\([0-9]*\)$/\1/p" <<<"$1")"; n="$(date +%s)"; test "$p" -ge $((n + 2592000 - 120)) && test "$p" -le $((n + 2592000))' _ "$out"
+  check "the tables wait in a hidden trash schema" test "$(rootsql "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA='oxpanel_trash_$LCT'")" = 2
+  check "the original name is gone from the server" test "$(schemas_like lca_shop)" = 0
+  check "the trash lists it with its objects" grep -qE "^$LCT lca_shop size=[0-9]+ deleted_at=[0-9]+ purge_at=[0-9]+ objects=5$" <(oxpanel-ctl db trash-list lca)
+  check "the grant on the deleted name is gone" bash -c '! rootsql "SHOW GRANTS FOR '"'"'lca_app'"'"'@'"'"'localhost'"'"'" | grep -q "lca\\\\_shop"'
+  check_not "the tenant's user cannot reach the trash" lcsql lca_app "oxpanel_trash_$LCT" 'SELECT COUNT(*) FROM t'
+  check "the name is free at once" grep -q '^created=true' <(oxpanel-ctl db create lca_shop --tenant lca)
+  check "the new database of that name is empty" test "$(rootsql "SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA='lca_shop'")" = 0
+  check_not "the old user's grant does not apply to the new database of the same name" lcsql lca_app lca_shop 'CREATE TABLE probe (i INT)'
+  check_not "restoring needs a new name: an existing one is refused" oxpanel-ctl db trash-restore lca "$LCT" lca_shop
+  check_not "restoring under another tenant's name is refused" oxpanel-ctl db trash-restore lca "$LCT" lcother_shop
+  check_not "another tenant cannot restore it" oxpanel-ctl db trash-restore lcother "$LCT" lcother_shop
+  check "the refusals changed nothing" grep -q "^$LCT lca_shop " <(oxpanel-ctl db trash-list lca)
+  out="$(oxpanel-ctl db trash-restore lca "$LCT" lca_back)"; echo "$out"
+  check "restored under a new name, every object re-created" bash -c 'grep -qx "restored=lca_back" <<<"$1" && ! grep -q "^not-recreated" <<<"$1"' _ "$out"
+  check "its rows are intact" test "$(rootsql 'SELECT GROUP_CONCAT(a ORDER BY id) FROM lca_back.t')" = "one,two,three"
+  check "its view, trigger, routines and event are back" test "$(objects_in lca_back)" = 5
+  check "the trash schema and the record are gone" bash -c 'test "$(schemas_like "oxpanel_trash_$1")" = 0 && test ! -e "/var/lib/oxpanel/db-trash/$1.json" && ! oxpanel-ctl db trash-list lca | grep -q "^$1 "' _ "$LCT"
+  check_not "a restored database has no grants" lcsql lca_app lca_back 'SELECT COUNT(*) FROM t'
+  oxpanel-ctl db grant lca_app lca_back >/dev/null
+  check "once granted, the view works for its definer" test "$(lcsql lca_app lca_back 'SELECT COUNT(*) FROM v')" = 2
+  check "the procedure and the function work" test "$(lcsql lca_app lca_back 'CALL p(2)')/$(lcsql lca_app lca_back 'SELECT f(21)')" = "two/42"
+  lcsql lca_app lca_back "INSERT INTO t (a) VALUES ('four')"
+  check "the trigger fires" test "$(lcsql lca_app lca_back 'SELECT msg FROM log')" = "ins ;; four"
+  check "the event keeps its definer and schedule" test "$(rootsql "SELECT CONCAT(DEFINER, ' ', INTERVAL_VALUE, ' ', INTERVAL_FIELD) FROM information_schema.EVENTS WHERE EVENT_SCHEMA='lca_back'")" = "lca_app@localhost 1 DAY"
+
+  echo "-- the trash cap, purging"
+  rootsql "USE lca_back; CREATE TABLE big (b BLOB) ENGINE=InnoDB; INSERT INTO big SELECT REPEAT('x', 1000) FROM seq_1_to_4000; ANALYZE TABLE big" >/dev/null
+  oxpanel-ctl tenant set-limits lca --db-trash 1M >/dev/null
+  check "the cap is listed" grep -qx 'total=0 cap=1048576' <(oxpanel-ctl db trash-list lca)
+  out="$(oxpanel-ctl db delete lca_back 2>&1 || true)"; echo "$out"
+  check "a delete over the trash cap is refused" grep -q 'FailedPrecondition.*Empty older trash first' <<<"$out"
+  check "the refused database is untouched, with its grant" bash -c 'test "$(lcsql lca_app lca_back "SELECT COUNT(*) FROM t")" = 4 && oxpanel-ctl db list --tenant lca | grep -q "^database=lca_back "'
+  oxpanel-ctl tenant set-limits lca >/dev/null
+  LCT1="$(trash_of "$(oxpanel-ctl db delete lca_back)")"
+  LCT2="$(trash_of "$(oxpanel-ctl db delete lca_shop)")"
+  check "two databases in the trash" test "$(oxpanel-ctl db trash-list lca | grep -c '^t[0-9]')" = 2
+  check "purge one" grep -qx 'purged=1' <(oxpanel-ctl db trash-purge lca "$LCT1")
+  check "its schema and record are gone" bash -c 'test "$(schemas_like "oxpanel_trash_$1")" = 0 && test ! -e "/var/lib/oxpanel/db-trash/$1.json"' _ "$LCT1"
+  check_not "another tenant cannot purge it" oxpanel-ctl db trash-purge lcother "$LCT2"
+  LCT3="$(trash_of "$(oxpanel-ctl db create lca_tmp --tenant lca >/dev/null; oxpanel-ctl db delete lca_tmp)")"
+  check "purge all" grep -qx 'purged=2' <(oxpanel-ctl db trash-purge lca)
+  check "nothing of the tenant left in the trash" bash -c 'test "$(schemas_like "oxpanel_trash_%")" = 0 && test -z "$(ls /var/lib/oxpanel/db-trash)"'
+
+  echo "-- overdue trash is purged when the daemon starts"
+  oxpanel-ctl db create lca_old --tenant lca >/dev/null
+  LCT="$(trash_of "$(oxpanel-ctl db delete lca_old)")"
+  python3 - "/var/lib/oxpanel/db-trash/$LCT.json" <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1])); r["purge_at_unix"] = 1
+json.dump(r, open(sys.argv[1], "w"), indent=2)
+PY
+  check "an overdue item is drift" grep -q "kind=DRIFT_KIND_DATABASE_TRASH_DRIFT subject=$LCT (lca_old)" <(oxpanel-ctl host reconcile || true)
+  systemctl restart oxpanel-daemon
+  check "an overdue item is purged at start-up" bash -c 'for i in $(seq 1 50); do test ! -e "/var/lib/oxpanel/db-trash/$1.json" && test "$(schemas_like "oxpanel_trash_$1")" = 0 && exit 0; sleep 0.2; done; exit 1' _ "$LCT"
+  rootsql "CREATE DATABASE oxpanel_trash_t0000000000001"
+  check "a trash schema without a record is drift" grep -q 'kind=DRIFT_KIND_ORPHAN_DATABASE_TRASH subject=oxpanel_trash_t0000000000001' <(oxpanel-ctl host reconcile || true)
+  rootsql "DROP DATABASE oxpanel_trash_t0000000000001"
+  check "no drift after the trash checks" grep -q '^drifts=0$' <(oxpanel-ctl host reconcile)
+
+  echo "-- database dumps in backups"
+  oxpanel-ctl tenant create lcb >/dev/null
+  for d in lcb_one lcb_two; do oxpanel-ctl db create "$d" --tenant lcb >/dev/null; done
+  printf '%s\n' "$LCPW" | oxpanel-ctl db user-create lcb_app --tenant lcb >/dev/null
+  oxpanel-ctl db grant lcb_app lcb_one >/dev/null
+  oxpanel-ctl db grant lcb_app lcb_two >/dev/null
+  fill_db lcb_one lcb_app
+  lcsql lcb_app lcb_two "CREATE TABLE notes (n VARCHAR(20)); INSERT INTO notes VALUES ('second')"
+  rootsql 'CREATE DEFINER=`root`@`localhost` PROCEDURE lcb_two.rootp() SELECT 1'
+  # The body that made `mariadb-dump | mariadb` run SQL as root (design record):
+  # one statement for the server, which keeps the trailing comment.
+  printf 'DELIMITER $$\nCREATE PROCEDURE evil() BEGIN SELECT 1; END --\001 ;; CREATE DATABASE lc_pwned ;;\n$$\n' \
+    | MYSQL_PWD="$LCPW" mariadb --no-defaults --protocol=socket --user=lcb_app lcb_two
+  check "the tenant could create the crafted procedure" test "$(rootsql "SELECT COUNT(*) FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA='lcb_two' AND ROUTINE_NAME='evil'")" = 1
+  out="$(timeout 300 oxpanel-ctl backup create lcb --wait)" || true; echo "$out" | tail -2
+  check "a backup of a tenant with two databases succeeds" grep -q 'state=JOB_STATE_SUCCEEDED' <<<"$out"
+  LB="$(backup_of "$out")"
+  listing="$(oxpanel-ctl backup list lcb)"; echo "$listing"
+  check "the backup lists both databases with their members" bash -c 'grep -qE "^  database lcb_one size=[0-9]+ dump=db-lcb_one.sql.gz objects=db-lcb_one.objects.json$" <<<"$1" && grep -qE "^  database lcb_two size=[0-9]+ dump=db-lcb_two.sql.gz objects=db-lcb_two.objects.json$" <<<"$1"' _ "$listing"
+  check "the members are listed with their kinds" bash -c 'grep -q "mariadb:db-lcb_one.sql.gz:" <<<"$1" && grep -q "mariadb-objects:db-lcb_one.objects.json:" <<<"$1"' _ "$listing"
+  check "the dumps are root-only" test "$(stat -c '%U %a' "$BK/lcb/$LB"/db-* | sort -u)" = "root 600"
+  check "the dump holds tables and data, not the routines" bash -c 'zcat "$1" | grep -q "INSERT INTO .t. VALUES" && ! zcat "$1" | grep -q "CREATE DEFINER.*PROCEDURE"' _ "$BK/lcb/$LB/db-lcb_one.sql.gz"
+  check "the manifest lists the databases" grep -q '"dump_member": "db-lcb_two.sql.gz"' "$BK/lcb/$LB/manifest.json"
+  check "no password was passed to the dump" bash -c '! journalctl --no-pager -b | grep -E "mariadb-dump" | grep -q -- "--password"'
+  check_not "a database cannot be restored over an existing one" oxpanel-ctl backup restore-db lcb "$LB" lcb_one lcb_two
+  check_not "a database cannot be restored under another tenant's name" oxpanel-ctl backup restore-db lcb "$LB" lcb_one lca_copy
+  out="$(timeout 300 oxpanel-ctl backup restore-db lcb "$LB" lcb_one lcb_copy --wait)" || true; echo "$out" | tail -4
+  check "a database is restored from a backup under a new name" bash -c 'grep -q "kind=JOB_KIND_RESTORE_DATABASE .* state=JOB_STATE_SUCCEEDED" <<<"$1" && grep -qx "new_name=lcb_copy" <<<"$1" && ! grep -q "^not-recreated" <<<"$1"' _ "$out"
+  check "its rows, view, trigger, routines and event are back" bash -c 'test "$(rootsql "SELECT GROUP_CONCAT(a ORDER BY id) FROM lcb_copy.t")" = "one,two,three" && test "$(objects_in lcb_copy)" = 5'
+  check_not "the restored database has no grants" lcsql lcb_app lcb_copy 'SELECT COUNT(*) FROM t'
+  oxpanel-ctl db grant lcb_app lcb_copy >/dev/null
+  lcsql lcb_app lcb_copy "INSERT INTO t (a) VALUES ('later')"
+  check "the restored trigger fires and the routines work" test "$(lcsql lcb_app lcb_copy 'SELECT msg FROM log')/$(lcsql lcb_app lcb_copy 'SELECT f(4)')" = "ins ;; later/8"
+  out="$(timeout 300 oxpanel-ctl backup restore-db lcb "$LB" lcb_two lcb_copytwo --wait)" || true; echo "$out" | tail -4
+  check "a routine with a foreign definer is not restored, and reported" bash -c 'grep -q "state=JOB_STATE_SUCCEEDED" <<<"$1" && grep -q "^not-recreated kind=procedure name=rootp reason=.*definer" <<<"$1"' _ "$out"
+  check "the routine with root as definer does not exist" test "$(rootsql "SELECT COUNT(*) FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA='lcb_copytwo' AND ROUTINE_NAME='rootp'")" = 0
+  check "the crafted procedure ran nothing as root on restore" test "$(schemas_like lc_pwned)" = 0
+  check "the crafted procedure itself was restored as one statement" test "$(rootsql "SELECT COUNT(*) FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA='lcb_copytwo' AND ROUTINE_NAME='evil'")" = 1
+  check "its data came back" test "$(rootsql 'SELECT n FROM lcb_copytwo.notes')" = second
+  LCT="$(trash_of "$(oxpanel-ctl db delete lcb_two)")"
+  check "the crafted procedure survives the trash without running anything" bash -c 'oxpanel-ctl db trash-restore lcb "$1" lcb_back2 | grep -qx "restored=lcb_back2" && test "$(schemas_like lc_pwned)" = 0' _ "$LCT"
+  check "databases restored from backups are not drift" grep -q '^drifts=0$' <(oxpanel-ctl host reconcile)
+
+  echo "-- deleting a customer in one go"
+  LZ=/root/lc-it; rm -rf "$LZ"; mkdir -p "$LZ"
+  oxpanel-ctl tenant create lcz >/dev/null
+  as_user lcz sh -c 'echo old-customer > /home/lcz/marker.txt'
+  oxpanel-ctl vhost set lcz.test --tenant lcz --php >/dev/null
+  leaf lcz.test site.key "DNS:lcz.test" -days 2
+  cat "$T/lcz.test.crt" "$T/ca.crt" > "$LZ/lcz.chain"
+  oxpanel-ctl cert install lcz.test --chain "$LZ/lcz.chain" --key "$T/site.key" >/dev/null
+  oxpanel-ctl vhost set lczapp.test --tenant lcz --app node >/dev/null
+  SFTP_LC=0
+  if [ -x /usr/sbin/sshd ]; then
+    SFTP_LC=1
+    ssh-keygen -q -t ed25519 -N '' -f "$LZ/k"
+    oxpanel-ctl sftp add-key lcz --key-file "$LZ/k.pub" >/dev/null
+    printf 'lifecycle sftp password\n' | oxpanel-ctl sftp set-password lcz >/dev/null || echo "info - SFTP passwords are not allowed on this host"
+  fi
+  for d in lcz_one lcz_two lcz_old; do oxpanel-ctl db create "$d" --tenant lcz >/dev/null; done
+  printf '%s\n' "$LCPW" | oxpanel-ctl db user-create lcz_app --tenant lcz >/dev/null
+  oxpanel-ctl db grant lcz_app lcz_one >/dev/null
+  lcsql lcz_app lcz_one "CREATE TABLE t (a INT); INSERT INTO t VALUES (7)"
+  LZT="$(trash_of "$(oxpanel-ctl db delete lcz_old)")"
+  out="$(timeout 300 oxpanel-ctl backup create lcz --wait)" || true
+  LZB="$(backup_of "$out")"
+  check "a tenant with every feature is set up" bash -c 'test -f /etc/nginx/oxpanel.d/lcz.test.conf && test -f /etc/pki/oxpanel/lcz.test.key && test -f /etc/systemd/system/oxpanel-php-lcz.service && test -f /etc/systemd/system/oxpanel-app-lczapp.test.service && test -d "$1/lcz/$2" && test "$(schemas_like "oxpanel_trash_$3")" = 1' _ "$BK" "$LZB" "$LZT"
+  check_not "the refusing delete still refuses" oxpanel-ctl tenant delete lcz --remove-home
+  check "a cascade without the confirmation is refused" grep -q 'InvalidArgument.*confirm_username' <(oxpanel-ctl tenant delete lcz --cascade 2>&1 || true)
+  check "a cascade with a wrong confirmation is refused" grep -q 'InvalidArgument.*confirm_username' <(oxpanel-ctl tenant delete lcz --cascade --confirm lcy 2>&1 || true)
+  check_not "a final backup kept longer than 366 days is refused" oxpanel-ctl tenant delete lcz --cascade --confirm lcz --final-backup-days 367
+  check "the refusals touched nothing" bash -c 'oxpanel-ctl tenant get lcz | grep -q " state=TENANT_STATE_READY " && test -f /etc/nginx/oxpanel.d/lcz.test.conf && test "$(schemas_like lcz_one)" = 1'
+  rc=0; out="$(timeout 600 oxpanel-ctl tenant delete lcz --cascade --confirm lcz --final-backup-days 3 --wait)" || rc=$?; echo "$out" | tail -3
+  check "the cascade with a final backup succeeds" bash -c 'test "$1" = 0 && grep -q "kind=JOB_KIND_DELETE_TENANT tenant=lcz .* state=JOB_STATE_SUCCEEDED .*final backup" <<<"$2"' _ "$rc" "$out"
+  LZF="$(sed -n 's/.*the final backup \(b[0-9]*\) .*/\1/p' <<<"$out" | tail -1)"
+  check "the sites are gone with their certificates, logs and Automatic HTTPS state" bash -c 'test ! -e /etc/nginx/oxpanel.d/lcz.test.conf && test ! -e /etc/nginx/oxpanel.d/lczapp.test.conf && test ! -e /etc/pki/oxpanel/lcz.test.crt && test ! -e /etc/pki/oxpanel/lcz.test.key && test ! -e /var/lib/oxpanel/auto-https/lcz.test.json && test -z "$(oxpanel-ctl vhost list --tenant lcz 2>/dev/null)"'
+  check "PHP and the application are gone" bash -c 'test ! -e /etc/systemd/system/oxpanel-php-lcz.service && test ! -e /etc/systemd/system/oxpanel-app-lczapp.test.service && ! systemctl -q is-active oxpanel-php-lcz.service'
+  if [ "$SFTP_LC" = 1 ]; then
+    check "SFTP access is gone" bash -c 'test ! -e /etc/oxpanel-sftp/lcz && ! getent shadow lcz >/dev/null'
+  fi
+  check "databases, users and the trash are dropped at once" test "$(rootsql "SELECT (SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME LIKE 'lcz%' OR SCHEMA_NAME = 'oxpanel_trash_$LZT') + (SELECT COUNT(*) FROM mysql.user WHERE User LIKE 'lcz%')")" = 0
+  check "no database records are left" bash -c '! grep -l "\"tenant\": \"lcz\"" /var/lib/oxpanel/databases/* /var/lib/oxpanel/db-users/* /var/lib/oxpanel/db-trash/* 2>/dev/null | grep -q .'
+  check "the ordinary backup is deleted" test ! -e "$BK/lcz/$LZB"
+  check "the account and its home are gone" bash -c '! id lcz 2>/dev/null && test ! -e /home/lcz && test ! -e /var/lib/oxpanel/tenants/lcz.json'
+  retained="$(oxpanel-ctl backup list-retained)"; echo "$retained"
+  check "the final backup is kept, detached, with both databases" bash -c 'grep -A3 "^backup=$1 tenant=lcz tenant_deleted=true " <<<"$2" | grep -q "^  database lcz_one " && grep -A3 "^backup=$1 " <<<"$2" | grep -q "^  database lcz_two "' _ "$LZF" "$retained"
+  check "it is kept for 3 days" bash -c 'u="$(sed -n "s/^backup=$1 .* retain_until=\([0-9]*\) .*/\1/p" <<<"$2")"; n="$(date +%s)"; test "$u" -ge $((n + 259200 - 700)) && test "$u" -le $((n + 259200))' _ "$LZF" "$retained"
+  check "no drift after the cascade" grep -q '^drifts=0$' <(oxpanel-ctl host reconcile)
+
+  echo "-- a new customer of the same name sees nothing of the old one"
+  oxpanel-ctl tenant create lcz >/dev/null
+  check "no databases, users, trash, backups, sites or keys" bash -c 'test -z "$(oxpanel-ctl db list --tenant lcz)$(oxpanel-ctl db user-list --tenant lcz)$(oxpanel-ctl backup list lcz)$(oxpanel-ctl vhost list --tenant lcz)$(oxpanel-ctl sftp list-keys lcz)" && test "$(oxpanel-ctl db trash-list lcz)" = "total=0 cap=0"'
+  check "a fresh home without the old files" test ! -e /home/lcz/marker.txt
+  check "nothing of the old customer on the database server" test "$(rootsql "SELECT (SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME LIKE 'lcz%') + (SELECT COUNT(*) FROM mysql.user WHERE User LIKE 'lcz%')")" = 0
+  check "the old final backup cannot be restored by the new customer" grep -q 'NotFound' <(oxpanel-ctl backup restore lcz "$LZF" --overwrite 2>&1 || true)
+  check "nor its database" grep -q 'NotFound' <(oxpanel-ctl backup restore-db lcz "$LZF" lcz_one lcz_again 2>&1 || true)
+  out="$(timeout 300 oxpanel-ctl backup restore-retained-db "$LZF" --from lcz --to lcz lcz_one lcz_again --wait)" || true; echo "$out" | tail -2
+  check "the operator restores the old database into the new customer under a new name" bash -c 'grep -q "state=JOB_STATE_SUCCEEDED" <<<"$1" && test "$(rootsql "SELECT a FROM lcz_again.t")" = 7' _ "$out"
+
+  echo "-- cascade without a final backup; the daemon killed mid-cascade; a failed step"
+  oxpanel-ctl tenant create lcy >/dev/null
+  oxpanel-ctl vhost set lcy.test --tenant lcy >/dev/null
+  oxpanel-ctl db create lcy_db --tenant lcy >/dev/null
+  out="$(timeout 300 oxpanel-ctl tenant delete lcy --cascade --confirm lcy --wait)" || true; echo "$out" | tail -2
+  check "a cascade without a final backup succeeds" bash -c 'grep -q "state=JOB_STATE_SUCCEEDED" <<<"$1" && ! id lcy 2>/dev/null && test "$(schemas_like lcy%)" = 0 && ! oxpanel-ctl backup list-retained | grep -q " tenant=lcy "' _ "$out"
+  oxpanel-ctl tenant create lck >/dev/null
+  oxpanel-ctl db create lck_db --tenant lck >/dev/null
+  as_user lck sh -c 'head -c 300M /dev/urandom > /home/lck/big.bin'
+  out="$(oxpanel-ctl tenant delete lck --cascade --confirm lck --final-backup-days 1)"; echo "$out"
+  LKJ="$(job_of "$out")"
+  check "the cascade starts with the final backup" grep -qx 'phase=final-backup' <<<"$out"
+  systemctl kill -s SIGKILL oxpanel-daemon
+  for i in $(seq 1 60); do systemctl -q is-active oxpanel-daemon && break; sleep 0.5; done
+  rc=0; out="$(timeout 600 oxpanel-ctl tenant delete lck --cascade --confirm lck --final-backup-days 1 --wait)" || rc=$?; echo "$out" | tail -3
+  check "repeating the request after the daemon was killed returns the same job and completes it" bash -c 'test "$1" = 0 && grep -qx "started=false" <<<"$2" && grep -q "^job=$3 kind=JOB_KIND_DELETE_TENANT .* state=JOB_STATE_SUCCEEDED" <<<"$2"' _ "$rc" "$out" "$LKJ"
+  check "the killed cascade left nothing behind" bash -c '! id lck 2>/dev/null && test "$(schemas_like lck%)" = 0 && oxpanel-ctl backup list-retained | grep -q " tenant=lck tenant_deleted=true "'
+  oxpanel-ctl tenant create lcf >/dev/null
+  oxpanel-ctl vhost set lcf.test --tenant lcf >/dev/null
+  oxpanel-ctl db create lcf_db --tenant lcf >/dev/null
+  systemctl stop mariadb
+  rc=0; out="$(timeout 300 oxpanel-ctl tenant delete lcf --cascade --confirm lcf --wait)" || rc=$?; echo "$out" | tail -2
+  check "a cascade whose database step fails stops there (exit 5)" bash -c 'test "$1" = 5 && grep -q "repeat DeleteTenant with cascade" <<<"$2"' _ "$rc" "$out"
+  check "the tenant is left deleting, its site already gone" bash -c 'oxpanel-ctl tenant get lcf | grep -q " state=TENANT_STATE_DELETING " && test ! -e /etc/nginx/oxpanel.d/lcf.test.conf'
+  systemctl start mariadb
+  rc=0; out="$(timeout 300 oxpanel-ctl tenant delete lcf --cascade --confirm lcf --wait)" || rc=$?; echo "$out" | tail -2
+  check "repeating the request completes the half-done deletion" bash -c 'test "$1" = 0 && grep -q "state=JOB_STATE_SUCCEEDED" <<<"$2" && ! id lcf 2>/dev/null && test "$(schemas_like lcf%)" = 0' _ "$rc" "$out"
+
+  echo "-- databases and their trash are not on the tenant's disk quota"
+  if grep -q ' disk_quota=true ' <(oxpanel-ctl host info); then
+    oxpanel-ctl tenant create lcq --disk 2M >/dev/null
+    oxpanel-ctl db create lcq_big --tenant lcq >/dev/null
+    rootsql "CREATE TABLE lcq_big.b (x LONGBLOB) ENGINE=InnoDB; INSERT INTO lcq_big.b VALUES (REPEAT('x', 4194304)), (REPEAT('y', 4194304))"
+    LQUID="$(id -u lcq)"; LQFS="$(findmnt -no TARGET -T /home)"
+    # KiB charged to the uid on the file system holding the homes.
+    lq_used() { xfs_quota -x -c "report -u -n -N -b -L $LQUID -U $LQUID" "$LQFS" | awk -v u="#$LQUID" '$1 == u { print $2 }'; }
+    check "8 MiB of data in a database of a tenant limited to 2 MiB" test "$(rootsql "SELECT COUNT(*) FROM lcq_big.b")" = 2
+    check "the tenant's quota does not count its database" test "$(lq_used)" -lt 1024
+    # The trash cap defaults to the disk limit: 2 MiB cannot hold this database.
+    check "the default trash cap is the disk limit" bash -c 'out="$(oxpanel-ctl db delete lcq_big 2>&1)"; test $? -ne 0 && grep -q "may hold 2097152 bytes" <<<"$out"'
+    oxpanel-ctl tenant set-limits lcq --disk 2M --db-trash 64M >/dev/null
+    oxpanel-ctl db delete lcq_big >/dev/null
+    check "nor the database in its trash" bash -c 'test "$1" -lt 1024 && test "$(oxpanel-ctl db trash-list lcq | grep -c " lcq_big ")" = 1' _ "$(lq_used)"
+    check "cascade-delete lcq" grep -q 'state=JOB_STATE_SUCCEEDED' <(timeout 300 oxpanel-ctl tenant delete lcq --cascade --confirm lcq --wait)
+  else
+    echo "info - no disk quotas on this host: the database/quota check is skipped"
+  fi
+
+  echo "-- clean up"
+  for t in lca lcb lcz; do
+    check "cascade-delete $t" grep -q 'state=JOB_STATE_SUCCEEDED' <(timeout 300 oxpanel-ctl tenant delete "$t" --cascade --confirm "$t" --wait)
+  done
+  check "delete lcother" grep -q '^deleted=true' <(oxpanel-ctl tenant delete lcother --remove-home)
+  for line in $(oxpanel-ctl backup list-retained | sed -n 's/^backup=\([^ ]*\) tenant=\([^ ]*\) .*/\1:\2/p'); do
+    oxpanel-ctl backup delete "${line#*:}" "${line%%:*}" --tenant-deleted >/dev/null
+  done
+  check "no retained backup left" test -z "$(oxpanel-ctl backup list-retained)"
+  check "nothing of the lifecycle tenants on the database server" test "$(rootsql "SELECT (SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME LIKE 'lc%' OR SCHEMA_NAME LIKE 'oxpanel_trash_%') + (SELECT COUNT(*) FROM mysql.user WHERE User LIKE 'lc%')")" = 0
+  check "no backup store left over" test -z "$(ls "$BK")"
+  check "no drift after the lifecycle checks" grep -q '^drifts=0$' <(oxpanel-ctl host reconcile)
+  check "no job unit left behind after the lifecycle checks" bash -c '! systemctl list-units --all --no-legend "oxpanel-job-*" | grep -q .'
+  rm -rf "$LZ"
+else
+  echo "skip - MariaDB not installed"
+fi
 
 echo "== teardown"
 check "vhost removed" grep -q '^removed=true' <(oxpanel-ctl vhost remove example.test)

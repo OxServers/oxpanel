@@ -336,6 +336,13 @@ impl VHostService {
     pub async fn remove(&self, domain: &str) -> Result<bool> {
         let domain = Domain::parse(domain)?;
         let _guard = self.ctx.lock.lock().await;
+        self.remove_locked(&domain).await
+    }
+
+    /// [`Self::remove`] for a caller that holds the mutation lock (the
+    /// deletion of a whole tenant).
+    pub(crate) async fn remove_locked(&self, domain: &Domain) -> Result<bool> {
+        let domain = domain.clone();
         let cfg = &self.ctx.config;
         let Some(rec) = self.ctx.store.load_vhost(&domain)? else {
             let stray = nginx::conf_path(&cfg.nginx_conf_dir, &domain);

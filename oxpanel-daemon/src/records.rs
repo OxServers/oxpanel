@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::fsutil;
-use crate::validate::{BackupId, DbName, Domain, JobId, Limits, RelPath, Username};
+use crate::validate::{BackupId, DbName, Domain, JobId, Limits, RelPath, TrashId, Username};
 
 pub const RECORD_VERSION: u32 = 1;
 const RECORD_MODE: u32 = 0o600;
@@ -249,6 +249,91 @@ pub struct DbUserRecord {
     pub grants: Vec<String>,
 }
 
+/// What a programmable object of a database is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DbObjectKind {
+    View,
+    Trigger,
+    Procedure,
+    Function,
+    Event,
+}
+
+impl DbObjectKind {
+    /// The keyword in `SHOW CREATE …` / `DROP …`.
+    pub fn keyword(self) -> &'static str {
+        match self {
+            Self::View => "VIEW",
+            Self::Trigger => "TRIGGER",
+            Self::Procedure => "PROCEDURE",
+            Self::Function => "FUNCTION",
+            Self::Event => "EVENT",
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::View => "view",
+            Self::Trigger => "trigger",
+            Self::Procedure => "procedure",
+            Self::Function => "function",
+            Self::Event => "event",
+        }
+    }
+}
+
+/// The definition of a view, trigger, routine or event, as the server
+/// printed it (`SHOW CREATE …` after `USE` of its database). Written by a
+/// tenant: it is data, re-created only through `db::objects::replay`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DbObjectDef {
+    pub kind: DbObjectKind,
+    pub name: String,
+    /// `user@host` as `information_schema` reports it.
+    pub definer: String,
+    /// The `sql_mode` it was created under (empty for views).
+    #[serde(default)]
+    pub sql_mode: String,
+    /// Events only: the time zone of its schedule.
+    #[serde(default)]
+    pub time_zone: String,
+    /// The complete `CREATE …` statement.
+    pub definition: String,
+}
+
+/// Life cycle of a database in the trash.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrashState {
+    /// Definitions captured; tables being moved into the trash schema.
+    Moving,
+    /// In the trash.
+    Trashed,
+    /// Being restored under this name.
+    Restoring { new_name: String },
+}
+
+/// A tenant's database in the trash: its tables live in the hidden schema
+/// `oxpanel_trash_<id>`, its other objects in `objects`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DbTrashRecord {
+    pub version: u32,
+    pub id: String,
+    /// The name the database had.
+    pub name: String,
+    pub tenant: String,
+    #[serde(default)]
+    pub engine: DbEngine,
+    pub deleted_at_unix: u64,
+    /// Purged automatically at this time.
+    pub purge_at_unix: u64,
+    /// Data plus indexes when it was deleted.
+    pub size_bytes: u64,
+    pub state: TrashState,
+    pub objects: Vec<DbObjectDef>,
+}
+
 impl VHostRecord {
     /// All server names this vhost claims.
     pub fn all_names(&self) -> impl Iterator<Item = &str> {
@@ -275,6 +360,20 @@ pub struct BackupMember {
     pub size_bytes: u64,
     /// Lower-case hexadecimal SHA-256 of the file.
     pub sha256: String,
+}
+
+/// One database in a backup.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupDatabase {
+    pub name: String,
+    #[serde(default)]
+    pub engine: DbEngine,
+    /// Data plus indexes on the server when the backup started.
+    pub size_bytes: u64,
+    /// The member with tables, data and views (`db-<name>.sql.gz`).
+    pub dump_member: String,
+    /// The member with triggers, routines and events (`db-<name>.objects.json`).
+    pub objects_member: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -310,6 +409,10 @@ pub struct BackupRecord {
     /// How many there were in all.
     #[serde(default)]
     pub excluded_count: u64,
+    /// The tenant's databases in this backup. Absent in backups made before
+    /// databases were included.
+    #[serde(default)]
+    pub databases: Vec<BackupDatabase>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -317,6 +420,10 @@ pub struct BackupRecord {
 pub enum JobKind {
     Backup,
     Restore,
+    /// A database restored from a backup under a new name.
+    RestoreDatabase,
+    /// A tenant deleted with everything it has (`DeleteTenant` cascade).
+    DeleteTenant,
 }
 
 impl JobKind {
@@ -324,8 +431,25 @@ impl JobKind {
         match self {
             Self::Backup => "backup",
             Self::Restore => "restore",
+            Self::RestoreDatabase => "database restore",
+            Self::DeleteTenant => "tenant deletion",
         }
     }
+
+    /// Whether the work runs in a transient unit (the others run in the daemon).
+    pub fn has_unit(self) -> bool {
+        !matches!(self, Self::DeleteTenant)
+    }
+}
+
+/// An object that a restore did not re-create, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObjectIssue {
+    pub kind: DbObjectKind,
+    pub name: String,
+    pub reason: String,
+    /// The definition, so that nothing is lost silently.
+    pub definition: String,
 }
 
 /// What a restore does with a file that already exists in the home. There is
@@ -399,6 +523,52 @@ pub struct JobRecord {
     /// reinstallation (dependencies are not in backups).
     #[serde(default)]
     pub sites: Vec<SiteResult>,
+    /// Database restores: the database in the backup and the new name.
+    #[serde(default)]
+    pub database: String,
+    #[serde(default)]
+    pub new_name: String,
+    /// Database restores: objects that were not re-created.
+    #[serde(default)]
+    pub object_issues: Vec<ObjectIssue>,
+    /// Tenant deletions: days the final backup is kept (0 = none) and where
+    /// the deletion stands (`final-backup`, `removing`).
+    #[serde(default)]
+    pub final_backup_retain_days: u32,
+    #[serde(default)]
+    pub phase: String,
+    /// A job started by another (the final backup of a tenant deletion).
+    #[serde(default)]
+    pub parent_job: String,
+}
+
+impl JobRecord {
+    /// A job that starts now, in state `running`, with nothing reported yet.
+    pub fn start(id: &JobId, kind: JobKind, tenant: &str, backup_id: &str, unit: String) -> Self {
+        Self {
+            version: RECORD_VERSION,
+            id: id.to_string(),
+            kind,
+            tenant: tenant.to_owned(),
+            backup_id: backup_id.to_owned(),
+            unit,
+            state: JobState::Running,
+            message: String::new(),
+            output: String::new(),
+            started_at_unix: now_unix(),
+            finished_at_unix: 0,
+            on_existing: None,
+            restored_entries: 0,
+            skipped_entries: 0,
+            sites: Vec::new(),
+            database: String::new(),
+            new_name: String::new(),
+            object_issues: Vec::new(),
+            final_backup_retain_days: 0,
+            phase: String::new(),
+            parent_job: String::new(),
+        }
+    }
 }
 
 /// Seconds since the UNIX epoch, saturating at 0 if the clock is before 1970.
@@ -418,6 +588,7 @@ pub struct Store {
     db_users: PathBuf,
     backup_records: PathBuf,
     job_records: PathBuf,
+    db_trash: PathBuf,
 }
 
 impl Store {
@@ -429,6 +600,7 @@ impl Store {
             db_users: config.db_users_dir(),
             backup_records: config.backup_records_dir(),
             job_records: config.jobs_dir(),
+            db_trash: config.db_trash_dir(),
         }
     }
 
@@ -439,6 +611,7 @@ impl Store {
         fsutil::ensure_dir(&self.db_users, DIR_MODE)?;
         fsutil::ensure_dir(&self.vhosts_dir, DIR_MODE)?;
         fsutil::ensure_dir(&self.backup_records, DIR_MODE)?;
+        fsutil::ensure_dir(&self.db_trash, DIR_MODE)?;
         fsutil::ensure_dir(&self.job_records, DIR_MODE)
     }
 
@@ -589,7 +762,13 @@ impl Store {
     pub fn save_job(&self, rec: &JobRecord) -> Result<()> {
         let id = JobId::parse(&rec.id)?;
         Username::parse_field(&rec.tenant, "tenant")?;
-        BackupId::parse(&rec.backup_id)?;
+        // A tenant deletion without a final backup names none.
+        if !rec.backup_id.is_empty() || rec.kind != JobKind::DeleteTenant {
+            BackupId::parse(&rec.backup_id)?;
+        }
+        if !rec.parent_job.is_empty() {
+            JobId::parse(&rec.parent_job)?;
+        }
         save(&self.job_path(&id), rec)
     }
 
@@ -600,6 +779,34 @@ impl Store {
     /// Every job record, oldest first.
     pub fn list_jobs(&self) -> Result<Vec<JobRecord>> {
         list(&self.job_records)
+    }
+
+    fn trash_path(&self, id: &TrashId) -> PathBuf {
+        self.db_trash.join(format!("{id}.json"))
+    }
+
+    pub fn load_trash(&self, id: &TrashId) -> Result<Option<DbTrashRecord>> {
+        load(&self.trash_path(id))
+    }
+
+    /// The original name is re-validated and must belong to the tenant.
+    pub fn save_trash(&self, rec: &DbTrashRecord) -> Result<()> {
+        let id = TrashId::parse(&rec.id)?;
+        let tenant = Username::parse(&rec.tenant)?;
+        DbName::parse_for(&rec.name, &tenant, "name")?;
+        if let TrashState::Restoring { new_name } = &rec.state {
+            DbName::parse_for(new_name, &tenant, "new_name")?;
+        }
+        save(&self.trash_path(&id), rec)
+    }
+
+    pub fn delete_trash(&self, id: &TrashId) -> Result<bool> {
+        fsutil::remove_if_exists(&self.trash_path(id))
+    }
+
+    /// Every trashed database, oldest first.
+    pub fn list_trash(&self) -> Result<Vec<DbTrashRecord>> {
+        list(&self.db_trash)
     }
 }
 

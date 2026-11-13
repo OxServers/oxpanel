@@ -340,6 +340,11 @@ pub struct Limits {
     /// Number of files and directories the tenant may own there.
     #[serde(default)]
     pub inodes_max: Option<u64>,
+    /// Most bytes the tenant's database trash may hold. `None` = as much as
+    /// the disk limit (unlimited without one); see [`Limits::db_trash_cap`].
+    /// Absent in records written before the trash existed.
+    #[serde(default)]
+    pub db_trash_max_bytes: Option<u64>,
 }
 
 impl Limits {
@@ -381,7 +386,22 @@ impl Limits {
             },
             disk_max_bytes: None,
             inodes_max: None,
+            db_trash_max_bytes: None,
         })
+    }
+
+    /// Add the cap on the tenant's database trash (raw wire value, 0 = the
+    /// default: the disk limit).
+    #[must_use]
+    pub fn with_db_trash(mut self, db_trash_max_bytes: u64) -> Self {
+        self.db_trash_max_bytes = (db_trash_max_bytes != 0).then_some(db_trash_max_bytes);
+        self
+    }
+
+    /// The effective cap on the database trash: the explicit setting, else
+    /// the disk limit, else none.
+    pub fn db_trash_cap(&self) -> Option<u64> {
+        self.db_trash_max_bytes.or(self.disk_max_bytes)
     }
 
     /// Add the disk-quota part of the limits (raw wire values, 0 = unlimited).
@@ -894,6 +914,43 @@ impl fmt::Display for JobId {
     }
 }
 
+/// A validated identifier of a database in a tenant's trash: `^t[0-9]{10,20}$`
+/// (`t` + the deletion time in milliseconds). It becomes part of a schema
+/// name (`oxpanel_trash_<id>`) and of a file name.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct TrashId(String);
+
+impl TrashId {
+    pub fn parse(raw: &str) -> Result<Self> {
+        parse_id(raw, 't', "trash_id").map(Self)
+    }
+
+    /// The identifier for a database moved to the trash at `unix_millis`.
+    pub fn from_millis(unix_millis: u128) -> Self {
+        Self(format!("t{unix_millis:013}"))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The hidden schema that holds the tables: `oxpanel_trash_<id>`. No
+    /// [`DbName`] can be this (tenant names starting with `oxpanel` are
+    /// reserved), so no tenant can create it or be granted it by name.
+    pub fn schema(&self) -> String {
+        format!("{TRASH_SCHEMA_PREFIX}{}", self.0)
+    }
+}
+
+impl fmt::Display for TrashId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Start of every trash schema's name.
+pub const TRASH_SCHEMA_PREFIX: &str = "oxpanel_trash_";
+
 /// Length of a month for retention periods: a twelfth of the Gregorian
 /// year, so that 12 months is one year to the second.
 pub const RETENTION_MONTH_SECS: u64 = 2_629_746;
@@ -907,9 +964,101 @@ pub fn retain_months(months: u32, field: &'static str) -> Result<u64> {
     }
 }
 
+/// Longest retention given in days: a leap year.
+pub const MAX_RETAIN_DAYS: u32 = 366;
+
+/// A retention period in whole days, 1 to 366 (`field` names the API field).
+pub fn retain_days(days: u32, field: &'static str) -> Result<u64> {
+    if (1..=MAX_RETAIN_DAYS).contains(&days) {
+        Ok(u64::from(days) * 86_400)
+    } else {
+        Err(Error::invalid(
+            field,
+            format!("must be between 1 and {MAX_RETAIN_DAYS} days"),
+        ))
+    }
+}
+
+/// A retention period given either in months (1–12) or in days (1–366),
+/// never both; 0 and 0 = none. Returns seconds (0 = none).
+pub fn retention(months: u32, days: u32) -> Result<u64> {
+    match (months, days) {
+        (0, 0) => Ok(0),
+        (m, 0) => retain_months(m, "retain_months"),
+        (0, d) => retain_days(d, "retain_days"),
+        _ => Err(Error::invalid(
+            "retain_days",
+            "give the retention in months or in days, not both",
+        )),
+    }
+}
+
 #[cfg(test)]
 mod id_tests {
     use super::*;
+
+    #[test]
+    fn trash_ids_are_allow_listed_and_name_a_schema_no_tenant_can_own() {
+        let id = TrashId::from_millis(1_731_500_000_123);
+        assert_eq!(id.as_str(), "t1731500000123");
+        assert_eq!(id.schema(), "oxpanel_trash_t1731500000123");
+        assert!(TrashId::parse(id.as_str()).is_ok());
+        for bad in [
+            "",
+            "t",
+            "t123",
+            "b1731500000123",
+            "t1731500000123/..",
+            "t17315000001x3",
+            "T1731500000123",
+            "t1731500000123`",
+        ] {
+            assert!(TrashId::parse(bad).is_err(), "{bad:?}");
+        }
+        // No database name can be a trash schema: its "tenant" is reserved.
+        assert!(DbName::parse(&id.schema(), "name").is_err());
+        assert!(Username::parse("oxpanel_trash").is_err());
+    }
+
+    #[test]
+    fn retention_is_given_in_months_or_days_never_both() -> Result<()> {
+        assert_eq!(retain_days(1, "d")?, 86_400);
+        assert_eq!(retain_days(366, "d")?, 366 * 86_400);
+        for bad in [0, 367, u32::MAX] {
+            assert!(retain_days(bad, "d").is_err(), "{bad}");
+        }
+        assert_eq!(retention(0, 0)?, 0);
+        assert_eq!(retention(2, 0)?, 2 * RETENTION_MONTH_SECS);
+        assert_eq!(retention(0, 10)?, 10 * 86_400);
+        assert!(matches!(
+            retention(1, 1),
+            Err(Error::InvalidInput {
+                field: "retain_days",
+                ..
+            })
+        ));
+        assert!(retention(13, 0).is_err() && retention(0, 367).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn the_trash_cap_defaults_to_the_disk_limit() -> Result<()> {
+        let none = Limits::default();
+        assert_eq!(none.db_trash_cap(), None, "no disk limit, no cap");
+        let disk = Limits::default().with_disk(5 << 30, 0)?;
+        assert_eq!(disk.db_trash_cap(), Some(5 << 30));
+        let explicit = disk.with_db_trash(1 << 20);
+        assert_eq!(explicit.db_trash_cap(), Some(1 << 20));
+        assert_eq!(explicit.with_db_trash(0).db_trash_cap(), Some(5 << 30));
+        assert_eq!(Limits::default().with_db_trash(7).db_trash_cap(), Some(7));
+        // Records written before the setting existed read as "default".
+        let old: Limits = serde_json::from_str(
+            r#"{"memory_max_bytes":null,"cpu_weight":null,"io_weight":null,"tasks_max":null}"#,
+        )
+        .map_err(|e| Error::Internal(e.to_string()))?;
+        assert_eq!(old.db_trash_max_bytes, None);
+        Ok(())
+    }
 
     #[test]
     fn backup_and_job_ids_are_allow_listed() {

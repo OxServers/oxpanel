@@ -132,8 +132,21 @@ pub enum Error {
         max: u32,
     },
 
-    #[error("tenant '{0}' still owns databases or database users; delete them first")]
+    #[error("tenant '{0}' still owns databases, database users or deleted databases in its trash; delete or purge them first")]
     TenantHasDatabases(String),
+
+    /// Moving a database to the trash would make the tenant's trash larger
+    /// than its cap.
+    #[error("the database trash of tenant '{tenant}' may hold {cap} bytes; it holds {held} and this database has {size}. Empty older trash first (purge one or all deleted databases), then delete again")]
+    DbTrashFull {
+        tenant: String,
+        held: u64,
+        size: u64,
+        cap: u64,
+    },
+
+    #[error("deleted database '{id}' of tenant '{tenant}' not found in the trash")]
+    TrashNotFound { tenant: String, id: String },
 
     #[error("backup '{id}' of tenant '{tenant}' not found")]
     BackupNotFound { tenant: String, id: String },
@@ -250,6 +263,8 @@ impl Error {
                 | Self::DbObjectUnusable { .. }
                 | Self::DbLimitReached { .. }
                 | Self::TenantHasDatabases(_)
+                | Self::DbTrashFull { .. }
+                | Self::TrashNotFound { .. }
                 | Self::BackupNotFound { .. }
                 | Self::BackupNotReady(_)
                 | Self::JobNotFound(_)
@@ -282,6 +297,7 @@ impl From<Error> for Status {
             | Error::SftpKeyNotFound { .. }
             | Error::DbObjectNotFound { .. }
             | Error::BackupNotFound { .. }
+            | Error::TrashNotFound { .. }
             | Error::JobNotFound(_) => Status::not_found(message),
             Error::NotManaged(_)
             | Error::TenantNotReady(_)
@@ -298,6 +314,7 @@ impl From<Error> for Status {
             | Error::DbNotManaged { .. }
             | Error::DbObjectUnusable { .. }
             | Error::TenantHasDatabases(_)
+            | Error::DbTrashFull { .. }
             | Error::BackupNotReady(_)
             | Error::JobRunning { .. }
             | Error::TenantHasBackups(_)

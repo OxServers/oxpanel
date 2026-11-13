@@ -74,6 +74,8 @@ creating files and links in its own home, and making network connections.
 | Keep running after suspension, site removal or deletion | the processes live in the unit's cgroup (`KillMode=control-group`), so stopping the unit ends detached children too | phase 80, section 6 |
 | Smuggle a header or path to reach another tenant's site, or a suspended site | Nginx parses and re-serialises every request; one upstream socket per tenant; the suspended block has no document root and no upstream | phase 80, section 3: Host variants, absolute-form requests, duplicate or malformed headers, `Content-Length` with `Transfer-Encoding`, CRLF in the path, traversal encodings |
 | Make the engine misbehave with a hostile name, domain or path | allow-list newtypes; rendered files built only from validated values | `tests/properties.rs` (every validator and renderer), `tests/grpc_surface.rs` |
+| Make root run SQL through a stored object (a routine or trigger body that the `mariadb` client splits differently from the server: `--<control char>`, `\g`; proven to work against `mariadb-dump --routines \| mariadb` on MariaDB 10.5) when a database is moved to the trash and back or restored from a backup | dumps leave triggers, routines and events out; they are captured as text and replayed one per client process with `--binary-mode --sandbox` under a delimiter that does not occur in the text; `\C` and NUL refused; views via `EXECUTE IMMEDIATE` from a hex literal; objects with a definer outside the tenant never created, and dropped after a load | `db::objects` tests (`replay_scripts_are_exact_and_refuse_client_commands`), run-inside "the crafted procedure ran nothing as root on restore" |
+| Keep reaching a deleted database (an open session, or a grant that would apply to the next database of the same name) | grants revoked and the holders' sessions ended before the move; the trash schema `oxpanel_trash_<id>` cannot be named by any tenant; a restored database gets no grants | `deleting_moves_the_database_aside_with_its_objects`; run-inside "a session inside the deleted database is ended", "the old user's grant does not apply to the new database of the same name" |
 
 **What SELinux adds, and how a denial is classified.** Kernel permission
 checks (DAC) run before SELinux, so an AVC denial for tenant code means Unix
@@ -118,6 +120,11 @@ operator granted that uid; arbitrary field values.
 * **Ownership.** The daemon only modifies what a record says it created, so even
   a full-scope peer cannot make it delete `root` or adopt `nginx`
   (`never_adopts_a_foreign_account_or_group`).
+* **Deleting a customer in one go.** `DeleteTenant` with `cascade` needs the
+  `delete` scope *and* the tenant's name repeated in `confirm_username`, so a
+  stray or forged call with only a name wipes nothing
+  (`a_cascade_needs_the_name_twice_and_a_valid_retention`). A `delete`-scoped
+  peer can still delete any tenant on purpose; that is the scope's meaning.
 * **Blast radius it still has.** A `tenant`-scoped peer can create accounts and
   set limits; a `vhost`-scoped peer can point a site's document root and
   application entry anywhere *inside a tenant's own home* and choose which

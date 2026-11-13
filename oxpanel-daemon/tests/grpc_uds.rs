@@ -249,6 +249,7 @@ async fn full_tenant_and_vhost_lifecycle_over_uds() {
         .delete_tenant(pb::DeleteTenantRequest {
             username: "alice".into(),
             remove_home: true,
+            ..Default::default()
         })
         .await
         .expect_err("must be blocked");
@@ -279,7 +280,8 @@ async fn full_tenant_and_vhost_lifecycle_over_uds() {
         client
             .delete_tenant(pb::DeleteTenantRequest {
                 username: "alice".into(),
-                remove_home: true
+                remove_home: true,
+                ..Default::default()
             })
             .await
             .expect("del")
@@ -773,6 +775,7 @@ async fn a_scoped_peer_can_only_call_its_scopes() {
             .delete_tenant(pb::DeleteTenantRequest {
                 username: "alice".into(),
                 remove_home: true,
+                ..Default::default()
             })
             .await
             .map(|_| ()),
@@ -781,6 +784,7 @@ async fn a_scoped_peer_can_only_call_its_scopes() {
             .create_backup(pb::CreateBackupRequest {
                 tenant: "alice".into(),
                 retain_months: 0,
+                ..Default::default()
             })
             .await
             .map(|_| ()),
@@ -789,6 +793,7 @@ async fn a_scoped_peer_can_only_call_its_scopes() {
                 tenant: "alice".into(),
                 backup_id: "b1731500000123".into(),
                 retain_months: 12,
+                ..Default::default()
             })
             .await
             .map(|_| ()),
@@ -1214,6 +1219,7 @@ async fn database_rpcs_over_uds() {
         .delete_tenant(pb::DeleteTenantRequest {
             username: "alice".into(),
             remove_home: true,
+            ..Default::default()
         })
         .await
         .expect_err("tenant has databases");
@@ -1246,6 +1252,7 @@ async fn database_rpcs_over_uds() {
             .into_inner()
             .deleted
     );
+    let mut trashed = Vec::new();
     for name in ["alice_wp", "bob_wp"] {
         let r = client
             .delete_database(pb::DeleteDatabaseRequest { name: name.into() })
@@ -1253,12 +1260,96 @@ async fn database_rpcs_over_uds() {
             .expect("delete database")
             .into_inner();
         assert!(r.deleted, "{name}");
+        assert!(r.trash_id.starts_with('t') && r.purge_at.is_some(), "{r:?}");
+        trashed.push(r.trash_id);
     }
+    let (alice_trash, bob_trash) = (
+        trashed.first().cloned().unwrap_or_default(),
+        trashed.get(1).cloned().unwrap_or_default(),
+    );
+    // The name is free at once; the database waits in the tenant's trash.
+    let trash = client
+        .list_database_trash(pb::ListDatabaseTrashRequest {
+            tenant: "alice".into(),
+        })
+        .await
+        .expect("list trash")
+        .into_inner();
+    assert_eq!(
+        trash
+            .databases
+            .iter()
+            .map(|t| (t.id.as_str(), t.name.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(alice_trash.as_str(), "alice_wp")]
+    );
+    // Restoring needs a new name of the same tenant; another tenant's trash
+    // is not found.
+    let err = client
+        .restore_database_trash(pb::RestoreDatabaseTrashRequest {
+            tenant: "alice".into(),
+            trash_id: alice_trash.clone(),
+            new_name: String::new(),
+        })
+        .await
+        .expect_err("a new name is required");
+    assert_eq!(err.code(), Code::InvalidArgument);
+    let err = client
+        .restore_database_trash(pb::RestoreDatabaseTrashRequest {
+            tenant: "alice".into(),
+            trash_id: bob_trash,
+            new_name: "alice_bobs".into(),
+        })
+        .await
+        .expect_err("bob's trash");
+    assert_eq!(err.code(), Code::NotFound);
+    let restored = client
+        .restore_database_trash(pb::RestoreDatabaseTrashRequest {
+            tenant: "alice".into(),
+            trash_id: alice_trash,
+            new_name: "alice_back".into(),
+        })
+        .await
+        .expect("restore")
+        .into_inner();
+    assert_eq!(
+        restored.database.map(|d| d.name),
+        Some("alice_back".to_owned())
+    );
+    let again = client
+        .delete_database(pb::DeleteDatabaseRequest {
+            name: "alice_back".into(),
+        })
+        .await
+        .expect("delete again")
+        .into_inner();
+    let err = client
+        .delete_tenant(pb::DeleteTenantRequest {
+            username: "alice".into(),
+            remove_home: true,
+            ..Default::default()
+        })
+        .await
+        .expect_err("tenant with trash");
+    assert_eq!(err.code(), Code::FailedPrecondition);
+    assert_eq!(
+        client
+            .purge_database_trash(pb::PurgeDatabaseTrashRequest {
+                tenant: "alice".into(),
+                trash_id: again.trash_id,
+            })
+            .await
+            .expect("purge")
+            .into_inner()
+            .purged,
+        1
+    );
     assert!(
         client
             .delete_tenant(pb::DeleteTenantRequest {
                 username: "alice".into(),
                 remove_home: true,
+                ..Default::default()
             })
             .await
             .expect("tenant without databases")

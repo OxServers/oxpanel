@@ -447,6 +447,7 @@
   sh tests-integration/run-inside.sh resume unlocks them
   sh tests-integration/run-inside.sh a tenant with databases cannot be deleted
 [Databases (MariaDB)] Reconciliation
+  unit db/trash reconcile_reports_orphaned_vanished_overdue_and_reachable_trash
   unit db reconcile_reports_what_was_changed_by_hand
   sh tests-integration/run-inside.sh reconcile reports privileges added by hand
   sh tests-integration/run-inside.sh a missing account is drift
@@ -467,6 +468,7 @@
   sh tests-integration/run-inside.sh the worker outlives the daemon
   sh tests-integration/run-inside.sh the restarted daemon finishes the backup
 [Backups and restores] Contents
+  unit backup backups_include_each_database_as_a_dump_and_its_objects
   unit backup a_finished_backup_is_sealed_with_checksums_and_a_manifest
   sh tests-integration/run-inside.sh listed READY with its members and sites
   sh tests-integration/run-inside.sh the manifest lists the checksum
@@ -539,6 +541,7 @@
   sh tests-integration/run-inside.sh a suspended tenant can be backed up
   sh tests-integration/run-inside.sh a tenant with backups cannot be deleted
 [Backups and restores] Retained backups
+  unit backup retention_can_be_given_in_days
   unit backup retained_backups_skip_the_count_and_outlive_their_tenant
   unit backup retained_backups_are_restored_deleted_and_expired_by_the_operator
   sh tests-integration/run-inside.sh a tenant with only retained backups can be deleted
@@ -639,3 +642,66 @@
   it properties records_round_trip_and_damaged_ones_block_only_themselves
   it properties a_record_cannot_be_saved_outside_the_state_directory
   sh tests-integration/run-inside.sh record is root-only
+
+# Lifecycle (m3): database trash, database dumps in backups, cascade deletion.
+[Tenant accounts] Delete tenant with everything (cascade)
+  unit lifecycle a_cascade_needs_the_name_twice_and_a_valid_retention
+  unit lifecycle a_cascade_removes_everything_in_order
+  unit lifecycle nothing_is_deleted_when_the_final_backup_fails
+  unit lifecycle a_complete_final_backup_is_kept_and_then_everything_goes
+  unit lifecycle one_job_at_a_time_and_the_refusing_delete_waits
+  unit lifecycle a_half_done_deletion_is_completed_by_repeating_the_request
+  unit lifecycle a_deletion_left_running_is_resumed_at_start_up
+  unit validate retention_is_given_in_months_or_days_never_both
+  sh tests-integration/run-inside.sh a cascade without the confirmation is refused
+  sh tests-integration/run-inside.sh the cascade with a final backup succeeds
+  sh tests-integration/run-inside.sh databases, users and the trash are dropped at once
+  sh tests-integration/run-inside.sh the final backup is kept, detached, with both databases
+  sh tests-integration/run-inside.sh repeating the request after the daemon was killed returns the same job and completes it
+  sh tests-integration/run-inside.sh repeating the request completes the half-done deletion
+  sh tests-integration/run-inside.sh nothing of the old customer on the database server
+[Databases (MariaDB)] Database trash
+  unit db/trash deleting_moves_the_database_aside_with_its_objects
+  unit db/trash purging_one_or_all_and_overdue_items
+  unit db/trash an_interrupted_move_or_restore_is_completed_by_repeating_it
+  unit db/trash trash_is_owned_and_a_whole_tenant_is_dropped_at_once
+  unit validate trash_ids_are_allow_listed_and_name_a_schema_no_tenant_can_own
+  it grpc_uds database_rpcs_over_uds
+  sh tests-integration/run-inside.sh deleting moves the database to the trash
+  sh tests-integration/run-inside.sh a session inside the deleted database is ended
+  sh tests-integration/run-inside.sh the old user's grant does not apply to the new database of the same name
+  sh tests-integration/run-inside.sh an overdue item is purged at start-up
+  sh tests-integration/run-inside.sh purge all
+[Databases (MariaDB)] Trash cap
+  unit db/trash a_delete_over_the_trash_cap_is_refused_before_anything_changes
+  unit validate the_trash_cap_defaults_to_the_disk_limit
+  sh tests-integration/run-inside.sh a delete over the trash cap is refused
+  sh tests-integration/run-inside.sh the refused database is untouched, with its grant
+[Databases (MariaDB)] Restore from the trash
+  unit db/trash restoring_needs_a_new_name_and_recreates_the_objects_without_grants
+  sh tests-integration/run-inside.sh restoring needs a new name: an existing one is refused
+  sh tests-integration/run-inside.sh restored under a new name, every object re-created
+  sh tests-integration/run-inside.sh a restored database has no grants
+[Databases (MariaDB)] Stored objects re-created safely
+  unit db/objects replay_scripts_are_exact_and_refuse_client_commands
+  unit db/objects definers_must_be_the_tenants_own_local_accounts
+  unit db/objects the_delimiter_never_occurs_in_the_text
+  unit db/objects show_create_rows_are_parsed_per_kind
+  sh tests-integration/run-inside.sh the crafted procedure ran nothing as root on restore
+  sh tests-integration/run-inside.sh a routine with a foreign definer is not restored, and reported
+[Backups and restores] Database dumps
+  unit backup backups_include_each_database_as_a_dump_and_its_objects
+  unit backup a_missing_dump_fails_the_backup_and_leaves_nothing
+  unit backup without_mariadb_a_tenant_with_databases_is_not_backed_up
+  unit worker dumps_and_loads_run_the_exact_programs_as_root_without_passwords
+  sh tests-integration/run-inside.sh the backup lists both databases with their members
+  sh tests-integration/run-inside.sh the dumps are root-only
+  sh tests-integration/run-inside.sh the dump holds tables and data, not the routines
+[Backups and restores] Restore a database
+  unit backup a_database_is_restored_from_a_backup_only_under_a_new_name
+  unit backup a_database_restore_runs_a_sandboxed_loader_and_replays_the_objects
+  unit backup a_failed_load_removes_the_new_database_again
+  unit backup a_deleted_tenants_database_is_restored_into_its_new_account
+  sh tests-integration/run-inside.sh a database is restored from a backup under a new name
+  sh tests-integration/run-inside.sh a database cannot be restored over an existing one
+  sh tests-integration/run-inside.sh the operator restores the old database into the new customer under a new name

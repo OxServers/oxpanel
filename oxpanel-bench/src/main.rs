@@ -178,6 +178,7 @@ async fn create_tenants(c: &mut Client, from: usize, to: usize) -> Result<f64, B
                 tasks_max: 128,
                 disk_max_bytes: 0,
                 inodes_max: 0,
+                db_trash_max_bytes: 0,
             }),
         })
         .await?;
@@ -472,6 +473,7 @@ async fn scale_run(tenants: usize, vhosts: usize, secs: u64) -> Result<(), BoxEr
                     tasks_max: 128,
                     disk_max_bytes: 0,
                     inodes_max: 0,
+                    db_trash_max_bytes: 0,
                 }),
             })
             .await
@@ -528,6 +530,7 @@ async fn scale_run(tenants: usize, vhosts: usize, secs: u64) -> Result<(), BoxEr
     c.delete_tenant(pb::DeleteTenantRequest {
         username: extra,
         remove_home: true,
+        ..Default::default()
     })
     .await?;
     rows.push(("DeleteTenant", ms(t0.elapsed())));
@@ -575,6 +578,7 @@ async fn scale_run(tenants: usize, vhosts: usize, secs: u64) -> Result<(), BoxEr
                         tasks_max: 128,
                         disk_max_bytes: 0,
                         inodes_max: 0,
+                        db_trash_max_bytes: 0,
                     }),
                 })
                 .await

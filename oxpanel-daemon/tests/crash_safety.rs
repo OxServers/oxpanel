@@ -71,6 +71,7 @@ fn limits(memory_mib: u64) -> Limits {
         // The fake host enforces no quotas: a disk limit would be refused.
         disk_max_bytes: None,
         inodes_max: None,
+        db_trash_max_bytes: None,
     }
 }
 

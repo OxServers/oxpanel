@@ -14,13 +14,15 @@ use crate::auth::{PeerInfo, Scope, ScopePolicy};
 use crate::auto_https;
 use crate::backup::BackupService;
 use crate::ctx::Ctx;
+use crate::db::trash::Deleted;
 use crate::db::DbService;
 use crate::error::Error;
 use crate::host::{Drift, DriftKind, HostService};
+use crate::lifecycle::LifecycleService;
 use crate::records::{
-    AppRuntime, BackupRecord, BackupState, CertSource, DatabaseRecord, DbEngine, DbUserRecord,
-    JobKind, JobRecord, JobState, OnExisting, SftpKeyRecord, TenantRecord, TenantState,
-    VHostRecord,
+    AppRuntime, BackupRecord, BackupState, CertSource, DatabaseRecord, DbEngine, DbTrashRecord,
+    DbUserRecord, JobKind, JobRecord, JobState, ObjectIssue, OnExisting, SftpKeyRecord,
+    TenantRecord, TenantState, VHostRecord,
 };
 use crate::sftp::SftpService;
 use crate::tenant::TenantService;
@@ -41,6 +43,7 @@ pub struct Engine {
     scopes: Arc<ScopePolicy>,
     tls: TlsService,
     backups: BackupService,
+    lifecycle: LifecycleService,
 }
 
 /// Interceptor type used by [`Engine::into_service`].
@@ -56,6 +59,7 @@ impl Engine {
             sftp: SftpService::new(ctx.clone()),
             databases: DbService::new(ctx.clone()),
             backups: BackupService::new(ctx.clone()),
+            lifecycle: LifecycleService::new(ctx.clone(), BackupService::new(ctx.clone())),
             host: HostService::new(ctx),
         }
     }
@@ -70,6 +74,11 @@ impl Engine {
     /// through it at start-up).
     pub fn backups(&self) -> &BackupService {
         &self.backups
+    }
+
+    /// The tenant deletions behind this engine (resumed at start-up).
+    pub fn lifecycle(&self) -> &LifecycleService {
+        &self.lifecycle
     }
 
     /// The tonic service, wrapped so every request must carry a verified peer.
@@ -163,6 +172,8 @@ fn drift_to(d: &Drift) -> pb::Drift {
         DriftKind::BackupArchiveModified => pb::DriftKind::BackupArchiveModified,
         DriftKind::OrphanBackupArchive => pb::DriftKind::OrphanBackupArchive,
         DriftKind::BackupIncomplete => pb::DriftKind::BackupIncomplete,
+        DriftKind::DatabaseTrashDrift => pb::DriftKind::DatabaseTrashDrift,
+        DriftKind::OrphanDatabaseTrash => pb::DriftKind::OrphanDatabaseTrash,
     };
     pb::Drift {
         kind: kind.into(),
@@ -209,6 +220,8 @@ fn fail(rpc: &'static str, peer: &str, err: Error) -> Status {
         | Error::DbObjectUnusable { .. }
         | Error::DbLimitReached { .. }
         | Error::TenantHasDatabases(_)
+        | Error::DbTrashFull { .. }
+        | Error::TrashNotFound { .. }
         | Error::BackupNotFound { .. }
         | Error::BackupNotReady(_)
         | Error::JobNotFound(_)
@@ -230,8 +243,11 @@ fn fail(rpc: &'static str, peer: &str, err: Error) -> Status {
 
 fn limits_from(l: Option<pb::ResourceLimits>) -> Result<Limits, Error> {
     let l = l.unwrap_or_default();
-    Limits::parse(l.memory_max_bytes, l.cpu_weight, l.io_weight, l.tasks_max)?
-        .with_disk(l.disk_max_bytes, l.inodes_max)
+    Ok(
+        Limits::parse(l.memory_max_bytes, l.cpu_weight, l.io_weight, l.tasks_max)?
+            .with_disk(l.disk_max_bytes, l.inodes_max)?
+            .with_db_trash(l.db_trash_max_bytes),
+    )
 }
 
 fn limits_to(l: &Limits) -> pb::ResourceLimits {
@@ -242,6 +258,7 @@ fn limits_to(l: &Limits) -> pb::ResourceLimits {
         tasks_max: l.tasks_max.unwrap_or(0),
         disk_max_bytes: l.disk_max_bytes.unwrap_or(0),
         inodes_max: l.inodes_max.unwrap_or(0),
+        db_trash_max_bytes: l.db_trash_max_bytes.unwrap_or(0),
     }
 }
 
@@ -439,13 +456,39 @@ impl OxPanelEngine for Engine {
     ) -> Result<Response<pb::DeleteTenantResponse>, Status> {
         let peer = self.authorise(&req, "DeleteTenant", Scope::Delete)?;
         let r = req.into_inner();
-        info!(rpc = "DeleteTenant", peer, username = %r.username, remove_home = r.remove_home, "request");
+        info!(rpc = "DeleteTenant", peer, username = %r.username, remove_home = r.remove_home, cascade = r.cascade, final_backup_days = r.final_backup_retain_days, "request");
+        if r.cascade {
+            let started = self
+                .lifecycle
+                .delete_cascade(&r.username, &r.confirm_username, r.final_backup_retain_days)
+                .await
+                .map_err(|e| fail("DeleteTenant", &peer, e))?;
+            return Ok(Response::new(pb::DeleteTenantResponse {
+                deleted: false,
+                started: started.as_ref().is_some_and(|(_, s)| *s),
+                job: started.map(|(job, _)| job_to(&job)),
+            }));
+        }
+        if !r.confirm_username.is_empty() || r.final_backup_retain_days != 0 {
+            return Err(fail(
+                "DeleteTenant",
+                &peer,
+                Error::invalid(
+                    "cascade",
+                    "confirm_username and final_backup_retain_days only apply with cascade",
+                ),
+            ));
+        }
         let deleted = self
             .tenants
             .delete(&r.username, r.remove_home)
             .await
             .map_err(|e| fail("DeleteTenant", &peer, e))?;
-        Ok(Response::new(pb::DeleteTenantResponse { deleted }))
+        Ok(Response::new(pb::DeleteTenantResponse {
+            deleted,
+            job: None,
+            started: false,
+        }))
     }
 
     async fn configure_virtual_host(
@@ -731,6 +774,7 @@ impl OxPanelEngine for Engine {
             backup_disk_total_bytes: i.backup_disk_total_bytes,
             backup_disk_free_bytes: i.backup_disk_free_bytes,
             backup_keep: i.backup_keep,
+            database_trash_days: i.db_trash_days,
         }))
     }
 
@@ -1016,12 +1060,23 @@ impl OxPanelEngine for Engine {
         let peer = self.authorise(&req, RPC, Scope::VHost)?;
         let r = req.into_inner();
         info!(rpc = RPC, peer, database = %r.name, "request");
-        let deleted = self
+        let outcome = self
             .databases
             .delete_database(&r.name)
             .await
             .map_err(|e| fail(RPC, &peer, e))?;
-        Ok(Response::new(pb::DeleteDatabaseResponse { deleted }))
+        Ok(Response::new(match outcome {
+            Deleted::NotFound => pb::DeleteDatabaseResponse::default(),
+            Deleted::Vanished => pb::DeleteDatabaseResponse {
+                deleted: true,
+                ..pb::DeleteDatabaseResponse::default()
+            },
+            Deleted::Trashed(t) => pb::DeleteDatabaseResponse {
+                deleted: true,
+                trash_id: t.id.clone(),
+                purge_at: Some(timestamp(t.purge_at_unix)),
+            },
+        }))
     }
 
     async fn create_database_user(
@@ -1144,7 +1199,7 @@ impl OxPanelEngine for Engine {
         info!(rpc = RPC, peer, tenant = %r.tenant, "request");
         let (job, started) = self
             .backups
-            .create(&r.tenant, r.retain_months)
+            .create(&r.tenant, r.retain_months, r.retain_days)
             .await
             .map_err(|e| fail(RPC, &peer, e))?;
         Ok(Response::new(pb::StartJobResponse {
@@ -1229,7 +1284,7 @@ impl OxPanelEngine for Engine {
         info!(rpc = RPC, peer, tenant = %r.tenant, backup = %r.backup_id, months = r.retain_months, "request");
         let rec = self
             .backups
-            .retain(&r.tenant, &r.backup_id, r.retain_months)
+            .retain(&r.tenant, &r.backup_id, r.retain_months, r.retain_days)
             .await
             .map_err(|e| fail(RPC, &peer, e))?;
         Ok(Response::new(backup_to(&rec)))
@@ -1270,6 +1325,127 @@ impl OxPanelEngine for Engine {
             job: Some(job_to(&job)),
             started,
         }))
+    }
+
+    async fn list_database_trash(
+        &self,
+        req: Request<pb::ListDatabaseTrashRequest>,
+    ) -> Result<Response<pb::ListDatabaseTrashResponse>, Status> {
+        const RPC: &str = "ListDatabaseTrash";
+        let peer = self.authorise(&req, RPC, Scope::Read)?;
+        let r = req.into_inner();
+        let listing = self
+            .databases
+            .list_trash(&r.tenant)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(pb::ListDatabaseTrashResponse {
+            databases: listing.items.iter().map(trashed_to).collect(),
+            total_bytes: listing.total_bytes,
+            cap_bytes: listing.cap_bytes.unwrap_or(0),
+        }))
+    }
+
+    async fn restore_database_trash(
+        &self,
+        req: Request<pb::RestoreDatabaseTrashRequest>,
+    ) -> Result<Response<pb::RestoreDatabaseTrashResponse>, Status> {
+        const RPC: &str = "RestoreDatabaseTrash";
+        let peer = self.authorise(&req, RPC, Scope::VHost)?;
+        let r = req.into_inner();
+        info!(rpc = RPC, peer, tenant = %r.tenant, trash = %r.trash_id, new_name = %r.new_name, "request");
+        let (rec, issues) = self
+            .databases
+            .restore_trash(&r.tenant, &r.trash_id, &r.new_name)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(pb::RestoreDatabaseTrashResponse {
+            database: Some(database_to(&rec, 0)),
+            object_issues: issues.iter().map(issue_to).collect(),
+        }))
+    }
+
+    async fn purge_database_trash(
+        &self,
+        req: Request<pb::PurgeDatabaseTrashRequest>,
+    ) -> Result<Response<pb::PurgeDatabaseTrashResponse>, Status> {
+        const RPC: &str = "PurgeDatabaseTrash";
+        let peer = self.authorise(&req, RPC, Scope::VHost)?;
+        let r = req.into_inner();
+        info!(rpc = RPC, peer, tenant = %r.tenant, trash = %r.trash_id, "request");
+        let purged = self
+            .databases
+            .purge_trash(&r.tenant, &r.trash_id)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(pb::PurgeDatabaseTrashResponse { purged }))
+    }
+
+    async fn restore_backup_database(
+        &self,
+        req: Request<pb::RestoreBackupDatabaseRequest>,
+    ) -> Result<Response<pb::StartJobResponse>, Status> {
+        const RPC: &str = "RestoreBackupDatabase";
+        let peer = self.authorise(&req, RPC, Scope::Tenant)?;
+        let r = req.into_inner();
+        info!(rpc = RPC, peer, tenant = %r.tenant, backup = %r.backup_id, database = %r.database, new_name = %r.new_name, "request");
+        let (job, started) = self
+            .backups
+            .restore_database(&r.tenant, &r.backup_id, &r.database, &r.new_name)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(pb::StartJobResponse {
+            job: Some(job_to(&job)),
+            started,
+        }))
+    }
+
+    async fn restore_retained_backup_database(
+        &self,
+        req: Request<pb::RestoreRetainedBackupDatabaseRequest>,
+    ) -> Result<Response<pb::StartJobResponse>, Status> {
+        const RPC: &str = "RestoreRetainedBackupDatabase";
+        // Data of one (deleted) account into another: the strongest scope.
+        let peer = self.authorise(&req, RPC, Scope::Delete)?;
+        let r = req.into_inner();
+        info!(rpc = RPC, peer, backup = %r.backup_id, from = %r.source_tenant, to = %r.target_tenant, database = %r.database, new_name = %r.new_name, "request");
+        let (job, started) = self
+            .backups
+            .restore_retained_database(
+                &r.backup_id,
+                &r.source_tenant,
+                &r.target_tenant,
+                &r.database,
+                &r.new_name,
+            )
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(pb::StartJobResponse {
+            job: Some(job_to(&job)),
+            started,
+        }))
+    }
+}
+
+fn trashed_to(t: &DbTrashRecord) -> pb::TrashedDatabase {
+    pb::TrashedDatabase {
+        id: t.id.clone(),
+        name: t.name.clone(),
+        tenant: t.tenant.clone(),
+        engine: engine_to(t.engine),
+        deleted_at: Some(timestamp(t.deleted_at_unix)),
+        purge_at: Some(timestamp(t.purge_at_unix)),
+        size_bytes: t.size_bytes,
+        object_count: u32::try_from(t.objects.len()).unwrap_or(u32::MAX),
+    }
+}
+
+fn issue_to(i: &ObjectIssue) -> pb::DatabaseObjectIssue {
+    pb::DatabaseObjectIssue {
+        kind: i.kind.as_str().to_owned(),
+        name: i.name.clone(),
+        reason: i.reason.clone(),
+        definition: i.definition.clone(),
     }
 }
 
@@ -1315,6 +1491,17 @@ fn backup_to(rec: &BackupRecord) -> pb::Backup {
             .collect(),
         excluded: rec.excluded.clone(),
         excluded_count: rec.excluded_count,
+        databases: rec
+            .databases
+            .iter()
+            .map(|d| pb::BackupDatabase {
+                name: d.name.clone(),
+                engine: engine_to(d.engine),
+                size_bytes: d.size_bytes,
+                dump_member: d.dump_member.clone(),
+                objects_member: d.objects_member.clone(),
+            })
+            .collect(),
     }
 }
 
@@ -1324,6 +1511,8 @@ fn job_to(rec: &JobRecord) -> pb::Job {
         kind: match rec.kind {
             JobKind::Backup => pb::JobKind::Backup,
             JobKind::Restore => pb::JobKind::Restore,
+            JobKind::RestoreDatabase => pb::JobKind::RestoreDatabase,
+            JobKind::DeleteTenant => pb::JobKind::DeleteTenant,
         }
         .into(),
         tenant: rec.tenant.clone(),
@@ -1355,6 +1544,10 @@ fn job_to(rec: &JobRecord) -> pb::Job {
                 detail: s.detail.clone(),
             })
             .collect(),
+        database: rec.database.clone(),
+        new_name: rec.new_name.clone(),
+        object_issues: rec.object_issues.iter().map(issue_to).collect(),
+        phase: rec.phase.clone(),
     }
 }
 
@@ -1396,6 +1589,8 @@ mod tests {
             DriftKind::BackupArchiveModified,
             DriftKind::OrphanBackupArchive,
             DriftKind::BackupIncomplete,
+            DriftKind::DatabaseTrashDrift,
+            DriftKind::OrphanDatabaseTrash,
         ] {
             let dbg = format!("{kind:?}");
             let mut snake = String::new();
@@ -1439,6 +1634,7 @@ mod tests {
             tasks_max: Some(3),
             disk_max_bytes: Some(1 << 30),
             inodes_max: Some(10_000),
+            db_trash_max_bytes: None,
         };
         let pbv = limits_to(&l);
         assert_eq!(pbv.disk_max_bytes, 1 << 30);

@@ -60,6 +60,9 @@ pub mod bin {
     pub const OXPANEL_ACME: &str = "/usr/libexec/oxpanel/oxpanel-acme";
     /// Optional: the MariaDB client, only needed once tenants have databases.
     pub const MARIADB: &str = "/usr/bin/mariadb";
+    /// Backups of tenant databases: run as root by the job's worker, over
+    /// the UNIX socket, never with a password.
+    pub const MARIADB_DUMP: &str = "/usr/bin/mariadb-dump";
     /// Backups: the archiver and its compressor, both run as the tenant.
     pub const TAR: &str = "/usr/bin/tar";
     /// Backups: finds what the archive leaves out (run as the tenant).

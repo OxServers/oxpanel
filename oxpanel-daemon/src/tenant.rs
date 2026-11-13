@@ -487,13 +487,28 @@ impl TenantService {
         }
         // Retained backups outlive the tenant, detached from its name.
         crate::backup::detach_retained(&self.ctx, &name)?;
+        self.remove_account(&rec, remove_home, None).await?;
+        Ok(true)
+    }
 
+    /// The end of every deletion: SFTP access, the uid's disk quota, the
+    /// account (and, with `remove_home`, its home), the slice units, the job
+    /// history (except `keep_job`, the deletion's own job) and the record.
+    /// The caller holds the mutation lock and has marked the record
+    /// `deleting`. Idempotent.
+    async fn remove_account(
+        &self,
+        rec: &TenantRecord,
+        remove_home: bool,
+        keep_job: Option<&crate::validate::JobId>,
+    ) -> Result<()> {
+        let name = Username::parse(&rec.username)?;
         let timeout = self.ctx.config.command_timeout;
         // SFTP first: the home must not be removed while it is still mounted
         // into the chroot directory, and userdel refuses an account that has
         // running sessions (`remove_access` ends them). The password and the
         // group memberships go with the account.
-        sftp::remove_access(&self.ctx, &rec, true).await?;
+        sftp::remove_access(&self.ctx, rec, true).await?;
         // The uid will be given to another tenant one day; not its limits.
         quota::clear(&self.ctx, rec.uid).await?;
         if self.ctx.sys.user_by_name(name.as_str()).await?.is_some() {
@@ -514,14 +529,53 @@ impl TenantService {
             timeout,
         )
         .await?;
-        crate::backup::forget_tenant_jobs(&self.ctx, &name)?;
+        crate::backup::forget_tenant_jobs(&self.ctx, &name, keep_job)?;
         self.ctx.store.delete_tenant(&name)?;
-        Ok(true)
+        Ok(())
+    }
+
+    /// Delete a tenant with everything it has, in this order: PHP and
+    /// applications stopped, every site removed (with its certificate,
+    /// Automatic HTTPS state, logs, PHP pool and application unit), SFTP
+    /// access, every database user, database and the database trash
+    /// (dropped at once), the backups that are not retained, then the
+    /// account with its home. Retained backups (a final one among them)
+    /// outlive it, detached from the name. Every step is idempotent and
+    /// driven by records, so repeating this after a crash completes it.
+    /// The caller (`lifecycle`) holds the mutation lock.
+    pub(crate) async fn remove_everything(
+        &self,
+        name: &Username,
+        job: &crate::validate::JobId,
+    ) -> Result<()> {
+        let Some(mut rec) = self.ctx.store.load_tenant(name)? else {
+            return Ok(());
+        };
+        if rec.state != TenantState::Deleting {
+            rec.state = TenantState::Deleting;
+            self.ctx.store.save_tenant(&rec)?;
+            info!(tenant = %name, "deleting the tenant with everything it has");
+        }
+        crate::backup::detach_retained(&self.ctx, name)?;
+        crate::php::set_running(&self.ctx, &rec, false).await?;
+        crate::app::set_running_all(&self.ctx, &rec, false).await?;
+        let vhosts = vhost::VHostService::new(self.ctx.clone());
+        for v in self.ctx.store.list_vhosts()? {
+            if v.tenant == rec.username {
+                vhosts
+                    .remove_locked(&crate::validate::Domain::parse(&v.domain)?)
+                    .await?;
+            }
+        }
+        sftp::remove_access(&self.ctx, &rec, true).await?;
+        crate::db::trash::drop_everything(&self.ctx, &rec).await?;
+        crate::backup::remove_unretained(&self.ctx, name)?;
+        self.remove_account(&rec, true, Some(job)).await
     }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::config::Config;
     use crate::system::{FakeSystem, OsUser, System};
@@ -1046,20 +1100,20 @@ mod tests {
 
     /// A tenant using every feature at once, for
     /// [`one_tenant_with_every_feature_through_suspend_resume_and_delete`].
-    struct Everything {
+    pub(crate) struct Everything {
         _dir: tempfile::TempDir,
-        sys: Arc<FakeSystem>,
-        ctx: Ctx,
-        tenants: TenantService,
-        vhosts: crate::vhost::VHostService,
-        db: crate::db::DbService,
-        backups: crate::backup::BackupService,
-        host: crate::host::HostService,
-        backup_id: String,
+        pub(crate) sys: Arc<FakeSystem>,
+        pub(crate) ctx: Ctx,
+        pub(crate) tenants: TenantService,
+        pub(crate) vhosts: crate::vhost::VHostService,
+        pub(crate) db: crate::db::DbService,
+        pub(crate) backups: crate::backup::BackupService,
+        pub(crate) host: crate::host::HostService,
+        pub(crate) backup_id: String,
     }
 
     /// Every external command since the last `clear_calls`, program first.
-    fn argvs(sys: &FakeSystem) -> Vec<Vec<String>> {
+    pub(crate) fn argvs(sys: &FakeSystem) -> Vec<Vec<String>> {
         sys.calls()
             .iter()
             .map(|c| {
@@ -1072,30 +1126,34 @@ mod tests {
 
     /// Index of the first command `what` matches; panics with the whole list
     /// if there is none.
-    fn first(calls: &[Vec<String>], what: impl Fn(&[String]) -> bool, label: &str) -> usize {
+    pub(crate) fn first(
+        calls: &[Vec<String>],
+        what: impl Fn(&[String]) -> bool,
+        label: &str,
+    ) -> usize {
         calls
             .iter()
             .position(|c| what(c))
             .unwrap_or_else(|| panic!("no {label} in {calls:#?}"))
     }
 
-    fn is_program(c: &[String], program: &str) -> bool {
+    pub(crate) fn is_program(c: &[String], program: &str) -> bool {
         c.first().is_some_and(|p| p == program)
     }
 
-    fn mentions(c: &[String], word: &str) -> bool {
+    pub(crate) fn mentions(c: &[String], word: &str) -> bool {
         c.iter().any(|a| a == word)
     }
 
     /// `systemctl <verb> … <unit>`.
-    fn systemctl(c: &[String], verb: &str, unit: &str) -> bool {
+    pub(crate) fn systemctl(c: &[String], verb: &str, unit: &str) -> bool {
         is_program(c, bin::SYSTEMCTL) && mentions(c, verb) && mentions(c, unit)
     }
 
     /// alice with a PHP site (and an uploaded certificate), a Node.js
     /// application, an SFTP key and password, a database and a database
     /// user with access to it, and one finished backup.
-    async fn everything() -> Result<Everything> {
+    pub(crate) async fn everything() -> Result<Everything> {
         use crate::records::{AppRuntime, DbEngine};
         use crate::vhost::{AppRequest, VHostRequest};
         let dir = tempfile::tempdir().map_err(|e| Error::io("tempdir", "/tmp", e))?;
@@ -1165,7 +1223,7 @@ mod tests {
         db.create_user("alice", "alice_app", "db-password-123", DbEngine::Mariadb)
             .await?;
         db.grant("alice_app", "alice_wp").await?;
-        let (job, started) = backups.create("alice", 0).await?;
+        let (job, started) = backups.create("alice", 0, 0).await?;
         assert!(started);
         assert!(
             backups
@@ -1309,9 +1367,13 @@ mod tests {
                 .await?;
             self.db.delete_user("alice_app").await?;
             self.db.delete_database("alice_wp").await?;
+            // The deleted database waits in the trash: still refused.
+            self.refused(|e| matches!(e, Error::TenantHasDatabases(_)))
+                .await?;
+            assert_eq!(self.db.purge_trash("alice", "").await?, 1);
             self.refused(|e| matches!(e, Error::TenantHasBackups(_)))
                 .await?;
-            self.backups.retain("alice", &self.backup_id, 1).await?;
+            self.backups.retain("alice", &self.backup_id, 1, 0).await?;
             self.sys.clear_calls();
             assert!(self.tenants.delete("alice", true).await?);
             let calls = argvs(&self.sys);
