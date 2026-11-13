@@ -65,11 +65,12 @@ check "a backup of it, waited for" bash -c "oxpanel-ctl backup create $T --wait 
 check "the file manager works on the pre-existing tenant's home" bash -c "printf upgraded-by-file-manager | oxpanel-ctl files write $T public_html/fm.html >/dev/null && curl -s -H 'Host: static.upg.test' http://127.0.0.1/fm.html | grep -qx upgraded-by-file-manager"
 check "a file-manager job on it, waited for" bash -c "oxpanel-ctl files compress $T '' site.tar.gz public_html --format tar-gz --wait | grep -q 'state=JOB_STATE_SUCCEEDED'"
 check "a database of it goes to the trash and comes back under a new name" bash -c "id=\$(oxpanel-ctl db delete ${T}_shop | sed -n 's/.* trash_id=\([^ ]*\) .*/\1/p') && oxpanel-ctl db trash-list $T | grep -q \"^\$id ${T}_shop \" && oxpanel-ctl db trash-restore $T \"\$id\" ${T}_shop2 >/dev/null && oxpanel-ctl db list --tenant $T | grep -q 'database=${T}_shop2'"
+check "a scheduled task for the pre-existing tenant" bash -c "oxpanel-ctl task set $T nightly --node apps/app.upg.test/app.js --schedule 'daily 04:00' | grep -q '^changed=true' && systemctl -q is-enabled oxpanel-task-$T-nightly.timer"
 check "the old sites are still fine after those" bash -c 'curl -s -H "Host: static.upg.test" http://127.0.0.1/ | grep -qx static-old'
 check "a second run of the installer changes nothing" bash -c 'bash release/install.sh --yes 2>&1 | grep -q "^RESULT: ok changes=0 "'
 
 # ---- clean up what this phase made: the pre-existing tenant goes in one step
 check "the upgraded tenant is deleted with everything it has (cascade)" bash -c "oxpanel-ctl tenant delete $T --cascade --confirm $T --wait | grep -q 'kind=JOB_KIND_DELETE_TENANT .* state=JOB_STATE_SUCCEEDED'"
-check "nothing of it is left" bash -c "! id $T 2>/dev/null && test ! -e /home/$T && test -z \"\$(ls /etc/nginx/oxpanel.d | grep upg.test)\" && test -z \"\$(oxpanel-ctl backup list $T 2>/dev/null)\""
+check "nothing of it is left" bash -c "! id $T 2>/dev/null && test ! -e /etc/systemd/system/oxpanel-task-$T-nightly.timer && test ! -e /home/$T && test -z \"\$(ls /etc/nginx/oxpanel.d | grep upg.test)\" && test -z \"\$(oxpanel-ctl backup list $T 2>/dev/null)\""
 n=$(avc_count); if [ "$n" = 0 ]; then ok "zero AVC denials"; else avc_dump; fail "$n AVC denial(s)"; fi
 phase_end

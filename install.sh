@@ -104,7 +104,7 @@ Packages
   --repo-url URL        install from this dnf repository instead of a file
   --no-nodejs           skip the Node.js 22 stream (Node.js apps then unavailable)
   --switch-nodejs       replace an older installed Node.js by stream 22
-  --no-php              skip PHP-FPM
+  --no-php              skip PHP-FPM and php-cli (PHP sites and PHP scheduled tasks)
   --mask-php-fpm        mask the shared php-fpm.service even if it is in use
   --no-mariadb          skip MariaDB
   --harden-existing-mariadb
@@ -541,6 +541,8 @@ stage_php() {
   if [ "$OPT_PHP" != yes ]; then note "skipped (--no-php): sites are static only"; return 0; fi
   local state in_use=0
   if ! installed php-fpm; then run dnf -y install php-fpm || return 1; changed "php-fpm installed"; fi
+  # PHP's command-line interpreter runs the tenants' scheduled PHP tasks.
+  if ! installed php-cli; then run dnf -y install php-cli || return 1; changed "php-cli installed"; fi
   if [ "$OPT_MARIADB" = yes ] && ! installed php-mysqlnd; then run dnf -y install php-mysqlnd || return 1; changed "php-mysqlnd installed"; fi
   state="$(systemctl is-enabled php-fpm.service 2>/dev/null || true)"
   if [ "$state" = masked ]; then note "the shared php-fpm.service is masked (every tenant has its own PHP-FPM)"; return 0; fi
@@ -783,7 +785,7 @@ do_uninstall() {
   fi
   # dnf would also remove the packages that only the engine pulled in (Nginx, ...),
   # which would take the customers' sites down. Keep every one of them.
-  for pkg in nginx php-fpm nodejs npm mariadb-server openssl acl openssh-server xfsprogs; do
+  for pkg in nginx php-fpm php-cli nodejs npm mariadb-server openssl acl openssh-server xfsprogs; do
     if installed "$pkg"; then run dnf -y mark install "$pkg" || true; fi
   done
   if installed oxpanel-panel; then run dnf -y remove --noautoremove oxpanel-panel || die "could not remove oxpanel-panel"; say "removed: oxpanel-panel"; fi
@@ -805,8 +807,9 @@ do_uninstall() {
   say "  - backups: /var/lib/oxpanel-backups; certificates and keys: /etc/pki/oxpanel"
   say "  - /etc/nginx/oxpanel.d and /etc/nginx/conf.d/00-oxpanel.conf (the sites keep being served by Nginx)"
   say "  - /etc/ssh/sshd_config.d/60-oxpanel.conf and /etc/oxpanel-sftp (SFTP confinement and keys)"
-  say "  - per-tenant slices, PHP-FPM and application units (they keep running; the engine can no longer manage them,"
-  say "    and Node.js/Python applications need the OxPanel SELinux module, which the package removal took out: reinstall to restore it)"
+  say "  - per-tenant slices, PHP-FPM, application and scheduled-task units (they keep running and the tasks keep firing;"
+  say "    the engine can no longer manage them; scheduled backups, which the engine itself starts, pause until a reinstall;"
+  say "    Node.js/Python applications and scheduled tasks need the OxPanel SELinux module, which the package removal took out: reinstall to restore it)"
   say "  - nginx, MariaDB, PHP-FPM, Node.js, fail2ban, EPEL, firewall rules: installed packages and settings are yours now"
   say "  - the oxpanel groups and /var/lib/oxpanel-installer, $LOG"
   printf 'result=uninstalled\nfinished=%s\n' "$(date -u +%FT%TZ)" >"$STATE_DIR/status"

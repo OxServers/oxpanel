@@ -555,11 +555,13 @@ impl TenantService {
     }
 
     /// Delete a tenant with everything it has, in this order: a file-manager
-    /// job left running stopped, PHP and applications stopped, every site removed (with its certificate,
-    /// Automatic HTTPS state, logs, PHP pool and application unit), SFTP
-    /// access, every database user, database and the database trash
-    /// (dropped at once), the backups that are not retained, then the
-    /// account with its home. Retained backups (a final one among them)
+    /// job left running stopped, PHP and applications stopped, scheduled
+    /// tasks removed, every site removed (with its certificate, Automatic
+    /// HTTPS state, logs, PHP pools and application unit), SFTP access,
+    /// every database user, database and the database trash (dropped at
+    /// once), the backups that are not retained, then the account with its
+    /// home, the job histories, upload records and the backup schedule.
+    /// Retained backups (a final one among them)
     /// outlive it, detached from the name. Every step is idempotent and
     /// driven by records, so repeating this after a crash completes it.
     /// The caller (`lifecycle`) holds the mutation lock.
@@ -1175,6 +1177,49 @@ pub(crate) mod tests {
         is_program(c, bin::SYSTEMCTL) && mentions(c, verb) && mentions(c, unit)
     }
 
+    /// Essentials for alice: a scheduled task, PHP settings for the PHP site
+    /// (a pool of its own) and a daily backup schedule.
+    async fn add_essentials(
+        ctx: &Ctx,
+        vhosts: &crate::vhost::VHostService,
+        backups: &crate::backup::BackupService,
+    ) -> Result<()> {
+        crate::task::TaskService::new(ctx.clone())
+            .put(
+                "alice",
+                &crate::task::RawSpec {
+                    name: "nightly".into(),
+                    kind: Some(crate::task::TaskKind::Php),
+                    script: "public_html/cron.php".into(),
+                    schedule: crate::task::RawSchedule {
+                        form: Some(crate::task::Form::Daily),
+                        hour: 3,
+                        ..crate::task::RawSchedule::default()
+                    },
+                    ..crate::task::RawSpec::default()
+                },
+            )
+            .await?;
+        vhosts
+            .set_php_settings(
+                "example.com",
+                &crate::php_settings::RawSettings {
+                    memory_limit_mb: 256,
+                    ..crate::php_settings::RawSettings::default()
+                },
+            )
+            .await?;
+        crate::backup_schedule::ScheduleService::new(ctx.clone(), backups.clone())
+            .set(
+                "alice",
+                Some(crate::backup_schedule::Frequency::Daily),
+                None,
+                None,
+            )
+            .await?;
+        Ok(())
+    }
+
     /// alice with a PHP site (and an uploaded certificate), a Node.js
     /// application, an SFTP key and password, a database and a database
     /// user with access to it, and one finished backup.
@@ -1238,6 +1283,7 @@ pub(crate) mod tests {
                 &crate::system::fake_tls::fake_private_key("k1"),
             ))
             .await?;
+        add_essentials(&ctx, &vhosts, &backups).await?;
         let sftp = crate::sftp::SftpService::new(ctx.clone());
         sftp.add_key("alice", crate::sftp::tests::KEY_A, "laptop")
             .await?;
@@ -1256,7 +1302,9 @@ pub(crate) mod tests {
                 .await?
         );
         let host = crate::host::HostService::new(ctx.clone());
-        assert!(host.reconcile().await?.is_empty(), "everything in place");
+        emulate_task_timer(&ctx, true)?;
+        let drift = host.reconcile().await?;
+        assert!(drift.is_empty(), "everything in place: {drift:?}");
         Ok(Everything {
             _dir: dir,
             sys,
@@ -1298,6 +1346,29 @@ pub(crate) mod tests {
         Ok(job)
     }
 
+    /// What `systemctl enable`/`disable` does to alice's task timer on a real
+    /// host (the fake OS records the command only).
+    pub(crate) fn emulate_task_timer(ctx: &Ctx, enabled: bool) -> Result<()> {
+        let rec = crate::task::list_for(&ctx.config, "alice")?
+            .into_iter()
+            .next()
+            .ok_or_else(|| Error::Internal("no task".into()))?;
+        let units = crate::task::TaskUnits::of(&ctx.config, &rec)?;
+        let link = &units.timer_wanted;
+        if enabled {
+            if let Some(dir) = link.parent() {
+                std::fs::create_dir_all(dir).map_err(|e| Error::io("mkdir", dir, e))?;
+            }
+            if link.symlink_metadata().is_err() {
+                std::os::unix::fs::symlink(&units.timer, link)
+                    .map_err(|e| Error::io("symlink", link, e))?;
+            }
+        } else if link.symlink_metadata().is_ok() {
+            std::fs::remove_file(link).map_err(|e| Error::io("unlink", link, e))?;
+        }
+        Ok(())
+    }
+
     /// An upload of `tenant` in progress (its partial file is in the home).
     pub(crate) fn upload_in_progress(ctx: &Ctx, tenant: &str, millis: u128) -> Result<()> {
         ctx.store.save_upload(&crate::records::UploadRecord {
@@ -1327,6 +1398,7 @@ pub(crate) mod tests {
             let file_unit = format!("{}.service", file_job.unit);
             self.sys.clear_calls();
             self.tenants.set_suspended("alice", true).await?;
+            emulate_task_timer(&self.ctx, false)?;
             let calls = argvs(&self.sys);
             let order = [
                 first(&calls, |c| mentions(c, "reload-or-restart"), "nginx reload"),
@@ -1344,6 +1416,11 @@ pub(crate) mod tests {
                     &calls,
                     |c| systemctl(c, "disable", "oxpanel-app-app.example.com.service"),
                     "application stop",
+                ),
+                first(
+                    &calls,
+                    |c| systemctl(c, "disable", "oxpanel-task-alice-nightly.timer"),
+                    "task timer stop",
                 ),
                 first(
                     &calls,
@@ -1399,6 +1476,7 @@ pub(crate) mod tests {
         async fn resume(&self) -> Result<()> {
             self.sys.clear_calls();
             self.tenants.set_suspended("alice", false).await?;
+            emulate_task_timer(&self.ctx, true)?;
             let calls = argvs(&self.sys);
             let order = [
                 first(&calls, |c| is_program(c, bin::MARIADB), "database unlock"),
@@ -1416,6 +1494,11 @@ pub(crate) mod tests {
                     &calls,
                     |c| systemctl(c, "enable", "oxpanel-app-app.example.com.service"),
                     "application start",
+                ),
+                first(
+                    &calls,
+                    |c| systemctl(c, "enable", "oxpanel-task-alice-nightly.timer"),
+                    "task timer start",
                 ),
                 first(&calls, |c| mentions(c, "reload-or-restart"), "nginx reload"),
             ];
@@ -1502,6 +1585,23 @@ pub(crate) mod tests {
                 self.ctx.store.list_file_jobs()?.is_empty()
                     && self.ctx.store.list_uploads()?.is_empty(),
                 "the file manager's job history and upload records go with the tenant"
+            );
+            let cfg = &self.ctx.config;
+            assert!(
+                crate::task::list_for(cfg, "alice")?.is_empty()
+                    && !cfg
+                        .systemd_unit_dir
+                        .join("oxpanel-task-alice-nightly.timer")
+                        .exists()
+                    && !cfg
+                        .systemd_unit_dir
+                        .join("oxpanel-task-alice-nightly.service")
+                        .exists(),
+                "the scheduled task and its units go with the tenant"
+            );
+            assert!(
+                !cfg.backup_schedules_dir().join("alice.json").exists(),
+                "the backup schedule goes with the tenant"
             );
             assert!(
                 self.host.reconcile().await?.is_empty(),

@@ -94,7 +94,7 @@ whether it changed anything. The manual equivalent is in the section named.
 | selinux | the booleans `httpd_enable_homedirs`, `httpd_read_user_content`, `httpd_unified`; loads the `oxpanel` policy module | §3.2 |
 | nginx | `nginx -t`, then enable and start | §3.1 |
 | mariadb | installs `mariadb-server`, starts it, removes anonymous accounts and the `test` database, writes `/etc/my.cnf.d/oxpanel-local.cnf` (`skip-networking`), restarts; checks there is no listener on 3306. **An already-installed MariaDB is left exactly as it is** (`--harden-existing-mariadb` to harden it) | §3.5 |
-| php | `php-fpm` and `php-mysqlnd`; masks the shared `php-fpm.service` unless it is running (then it warns; `--mask-php-fpm`) | §9 (PHP) |
+| php | `php-fpm`, `php-cli` (scheduled PHP tasks) and `php-mysqlnd`; masks the shared `php-fpm.service` unless it is running (then it warns; `--mask-php-fpm`) | §9 (PHP) |
 | panel | optional hook, see below | §5 |
 | daemon | enable and start `oxpanel-daemon`; waits for the socket | §3.1 |
 | firewall | only if `firewalld` is running: opens `http` and `https` in the default zone, permanent and runtime. A firewall is never stopped or disabled; other firewalls are yours | §2 |

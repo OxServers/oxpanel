@@ -575,7 +575,7 @@ impl TaskUnits {
         }
     }
 
-    fn of(cfg: &Config, rec: &TaskRecord) -> Result<Self> {
+    pub(crate) fn of(cfg: &Config, rec: &TaskRecord) -> Result<Self> {
         let (tenant, name) = check_record(rec)?;
         Ok(Self::new(&cfg.systemd_unit_dir, &tenant, &name))
     }

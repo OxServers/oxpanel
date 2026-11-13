@@ -1583,6 +1583,11 @@ PY
   printf 'from-the-file-manager' | oxpanel-ctl files write lcz fm.txt >/dev/null
   oxpanel-ctl files mkdir lcz copies >/dev/null
   oxpanel-ctl files cp lcz copies fm.txt --wait >/dev/null
+  as_user lcz sh -c 'echo "console.log(1)" > /home/lcz/task.js'
+  oxpanel-ctl task set lcz nightly --node task.js --schedule 'daily 04:00' >/dev/null
+  oxpanel-ctl php set lcz.test --memory-limit 200M >/dev/null
+  oxpanel-ctl backup-schedule set lcz daily --hour $(( ($(date -u +%-H) + 12) % 24 )) >/dev/null
+  check "the customer has a scheduled task, a site PHP pool and a backup schedule" bash -c 'test -f /etc/systemd/system/oxpanel-task-lcz-nightly.timer && grep -q "^\[lcz.test\]" /etc/oxpanel-php/lcz.conf && test -f /var/lib/oxpanel/backup-schedules/lcz.json'
   check "the customer has a file-manager job in its history" grep -q '"tenant": "lcz"' <(cat /var/lib/oxpanel/file-jobs/*.json 2>/dev/null)
   out="$(timeout 300 oxpanel-ctl backup create lcz --wait)" || true
   LZB="$(backup_of "$out")"
@@ -1604,6 +1609,7 @@ PY
   check "no database records are left" bash -c '! grep -l "\"tenant\": \"lcz\"" /var/lib/oxpanel/databases/* /var/lib/oxpanel/db-users/* /var/lib/oxpanel/db-trash/* 2>/dev/null | grep -q .'
   check "the ordinary backup is deleted" test ! -e "$BK/lcz/$LZB"
   check "the account and its home are gone" bash -c '! id lcz 2>/dev/null && test ! -e /home/lcz && test ! -e /var/lib/oxpanel/tenants/lcz.json'
+  check "its scheduled task, PHP pools and backup schedule are gone" bash -c '! ls /etc/systemd/system | grep -q "^oxpanel-task-lcz-" && test ! -e /etc/systemd/system/timers.target.wants/oxpanel-task-lcz-nightly.timer && test ! -e /etc/oxpanel-php/lcz.conf && test ! -e /var/lib/oxpanel/backup-schedules/lcz.json'
   check "the file manager's job history and upload records are gone" bash -c '! grep -l "\"tenant\": \"lcz\"" /var/lib/oxpanel/file-jobs/* /var/lib/oxpanel/uploads/* 2>/dev/null | grep -q .'
   retained="$(oxpanel-ctl backup list-retained)"; echo "$retained"
   check "the final backup is kept, detached, with both databases" bash -c 'grep -A3 "^backup=$1 tenant=lcz tenant_deleted=true " <<<"$2" | grep -q "^  database lcz_one " && grep -A3 "^backup=$1 " <<<"$2" | grep -q "^  database lcz_two "' _ "$LZF" "$retained"

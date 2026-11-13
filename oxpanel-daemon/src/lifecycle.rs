@@ -389,6 +389,27 @@ mod tests {
             .all(|b| b.tenant_deleted && b.retain_until_unix != 0));
         assert!(all.sys.users().iter().all(|u| u.name != "alice"));
         assert_eq!(all.sys.mariadb_schema("alice_wp"), None);
+        let cfg = &all.ctx.config;
+        assert!(
+            crate::task::list_for(cfg, "alice")?.is_empty(),
+            "scheduled tasks gone"
+        );
+        assert!(
+            !cfg.systemd_unit_dir
+                .join("oxpanel-task-alice-nightly.timer")
+                .exists(),
+            "task units gone"
+        );
+        assert!(
+            !cfg.backup_schedules_dir().join("alice.json").exists(),
+            "backup schedule gone"
+        );
+        assert!(
+            std::fs::read_dir(&cfg.php_conf_dir).map_or(true, |d| d
+                .flatten()
+                .all(|e| !e.file_name().to_string_lossy().contains("alice"))),
+            "PHP pools (the tenant's and the site's) gone"
+        );
         assert!(all.host.reconcile().await?.is_empty());
         Ok(())
     }
