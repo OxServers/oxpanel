@@ -508,7 +508,8 @@ if grep -q ' disk_quota=true ' <(oxpanel-ctl host info); then
   check "the kernel holds the limit" bash -c 'xfs_quota -x -c "report -u -n -N -b -i -L $1 -U $1" "$2" | grep -qE "^#$1 +[0-9]+ +5120 +5120 .* 200 +200 "' _ "$QUID" "$QFS"
   check "writing beyond the limit fails with EDQUOT" bash -c 'as_out="$(setpriv --reuid=quotaa --regid=quotaa --clear-groups -- dd if=/dev/zero of=/home/quotaa/big bs=1M count=8 2>&1)"; rc=$?; echo "$as_out" | tail -1; test $rc -ne 0 && grep -q "Disk quota exceeded" <<<"$as_out"'
   check "usage comes from the quota system and is at the limit" bash -c 'u="$(oxpanel-ctl tenant usage quotaa | sed -n "s/.* disk_usage=\([0-9]*\).*/\1/p")"; test "$u" -ge $((4 << 20)) && test "$u" -le $((5 << 20))'
-  check "too many files fail too" bash -c 'setpriv --reuid=quotaa --regid=quotaa --clear-groups -- sh -c "rm -f /home/quotaa/big; for i in \$(seq 1 250); do : > /home/quotaa/f\$i || exit 0; done; exit 1"'
+  # Only the inode limit now (a shell redirection error would end `sh` itself, hence touch).
+  check "too many files fail too" bash -c 'oxpanel-ctl tenant set-limits quotaa --inodes 200 >/dev/null && setpriv --reuid=quotaa --regid=quotaa --clear-groups -- sh -c "rm -f /home/quotaa/big; i=0; while [ \$i -lt 400 ]; do i=\$((i+1)); touch /home/quotaa/f\$i 2>/dev/null || { echo refused at file \$i; exit 0; }; done; exit 1"'
   check "no drift with quotas set" grep -q '^drifts=0$' <(oxpanel-ctl host reconcile)
   check "raising the limit through set-limits" grep -q '^changed=true' <(oxpanel-ctl tenant set-limits quotaa --disk 64M)
   check "the write now succeeds" setpriv --reuid=quotaa --regid=quotaa --clear-groups -- dd if=/dev/zero of=/home/quotaa/big bs=1M count=8 status=none
