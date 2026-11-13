@@ -545,6 +545,46 @@ impl OxPanelEngine for Engine {
 mod tests {
     use super::*;
 
+    /// Every internal drift kind maps to the protobuf kind of the same name
+    /// (a swapped arm would make panels act on the wrong finding).
+    #[test]
+    fn every_drift_kind_maps_to_the_protobuf_kind_of_the_same_name() {
+        use crate::host::{Drift, DriftKind};
+        for kind in [
+            DriftKind::TenantIncomplete,
+            DriftKind::TenantAccountMissing,
+            DriftKind::TenantAccountMismatch,
+            DriftKind::TenantHomeInvalid,
+            DriftKind::TenantUnitDrift,
+            DriftKind::VHostTenantMissing,
+            DriftKind::VHostConfigDrift,
+            DriftKind::OrphanNginxConfig,
+            DriftKind::OrphanSliceUnit,
+            DriftKind::PhpPoolDrift,
+            DriftKind::OrphanPhpPool,
+            DriftKind::AppUnitDrift,
+            DriftKind::OrphanAppUnit,
+        ] {
+            let dbg = format!("{kind:?}");
+            let mut snake = String::new();
+            for (n, ch) in dbg.chars().enumerate() {
+                if ch.is_ascii_uppercase() && n > 0 {
+                    snake.push('_');
+                }
+                snake.push(ch.to_ascii_uppercase());
+            }
+            let wire = drift_to(&Drift {
+                kind,
+                subject: "x".into(),
+                detail: "y".into(),
+            });
+            let name = pb::DriftKind::try_from(wire.kind).map(|k| k.as_str_name());
+            // "VHost" is "VHOST" on the wire, not "V_HOST".
+            let want = format!("DRIFT_KIND_{}", snake.replace("V_HOST", "VHOST"));
+            assert_eq!(name.ok(), Some(want.as_str()), "{kind:?}");
+        }
+    }
+
     #[test]
     fn interceptor_fails_closed_without_peer_info() {
         let r = require_authenticated_peer(Request::new(()));

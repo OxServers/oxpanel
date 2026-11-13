@@ -31,7 +31,7 @@ pub struct TenantUsage {
 /// Sum `MemoryCurrent`, `CPUUsageNSec` and `TasksCurrent` over the units in a
 /// `systemctl show` listing. Units with nothing running report `[not set]`
 /// (or 2^64-1 on older systemd); both count as zero.
-fn parse_cgroup_usage(show_output: &str) -> (u64, u64, u64) {
+pub(crate) fn parse_cgroup_usage(show_output: &str) -> (u64, u64, u64) {
     let (mut mem, mut cpu, mut tasks) = (0u64, 0u64, 0u64);
     for line in show_output.lines() {
         let Some((key, value)) = line.split_once('=') else {

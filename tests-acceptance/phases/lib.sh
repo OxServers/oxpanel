@@ -22,14 +22,14 @@ daemon_active() { systemctl -q is-active oxpanel-daemon; }
 avc_count() {
   local n=0
   if command -v ausearch >/dev/null 2>&1 && systemctl -q is-active auditd; then
-    n=$(ausearch -m avc -ts boot -i 2>/dev/null | grep -c '^type=AVC' || true)
+    n=$(ausearch --input-logs -m avc -ts boot -i 2>/dev/null | grep -c '^type=AVC' || true)
   else
     n=$(journalctl -b -k --no-pager 2>/dev/null | grep -c 'avc:  denied' || true)
   fi
   echo "$n"
 }
 avc_dump() {
-  if command -v ausearch >/dev/null 2>&1 && systemctl -q is-active auditd; then ausearch -m avc -ts boot -i 2>/dev/null | tail -60; fi
+  if command -v ausearch >/dev/null 2>&1 && systemctl -q is-active auditd; then ausearch --input-logs -m avc -ts boot -i 2>/dev/null | tail -60; fi
   journalctl -b -k --no-pager 2>/dev/null | grep 'avc:  denied' | tail -30 || true
 }
 phase_end() { if [ "$PHASE_FAILED" = 1 ]; then echo "PHASE_RESULT: FAIL"; exit 1; else echo "PHASE_RESULT: OK"; exit 0; fi; }

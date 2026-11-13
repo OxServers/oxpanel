@@ -610,9 +610,12 @@ configuration with `nginx -t` on every change.
 
 ```sh
 make image         # AlmaLinux 9 dev/test image (one-time)
-make check         # rustfmt --check, clippy pedantic -D warnings, tests, cargo-deny
-make test          # 106 unit + 6 gRPC end-to-end tests (fake OS, no root)
-make integration   # boots systemd in a container, installs from packaging/, runs 224 assertions
+make check         # rustfmt --check, clippy pedantic -D warnings, tests, cargo-deny, feature traceability
+make test          # 160 tests (fake OS, no root): unit, property, gRPC surface, crash safety, perf budgets
+make traceability  # every row of docs/FEATURES.md maps to tests that exist (docs/traceability.map)
+make coverage      # line coverage of the daemon (cargo-llvm-cov; run `make image` once first)
+make bench         # engine benchmark against the fake OS (docs/PERFORMANCE.md); never part of `make check`
+make integration   # boots systemd in a container, installs from packaging/, runs 233 assertions
 make rpm           # build the RPM from the working tree into dist/rpms/
 make acceptance    # REAL AlmaLinux 9 VM (KVM, SELinux enforcing): install like a user, run all phases
 ./scripts/dev.sh cargo <anything>   # run cargo inside the image
@@ -631,11 +634,11 @@ workstation; you only need `/dev/kvm` to be readable — and drives it over SSH.
 | `INSTALL=git` | *(default)* | The VM runs this handbook's §3.2 "From source" block **verbatim** (cloned from GitHub), then the §3.4 verification block. This is the "user installing from git" test; it exercises what is on the remote, not your working tree. |
 | `INSTALL=rpm` | | Builds the RPM from your working tree and `dnf install`s it in the VM. Fast path for uncommitted changes and for the packaging. |
 | `GIT_REF=<branch or sha>` | current branch | Which commit the git install checks out. CI passes the pushed SHA. |
-| `PHASES="10 20 30 40 50 60 70"` | all | Subset of phases (below). |
+| `PHASES="10 20 30 40 50 60 70 80 90"` | all | Subset of phases (below). |
 | `KEEP=1` | | Leave the VM running afterwards; the report prints the `ssh` line (`make acceptance-destroy` removes it). |
 | `SOAK_N=20` | | Cycles for the soak phase. |
 | `CONTINUE=1` | | Run remaining phases after a failure. |
-| `TARGET=user@host` | | Use a machine you provide instead of a VM (`TARGET_KEY=path` for the key). Phases 60/70 reboot it and create accounts, so this needs `I_UNDERSTAND=1`. |
+| `TARGET=user@host` | | Use a machine you provide instead of a VM (`TARGET_KEY=path` for the key). Phases 60/70/80/90 reboot it, create accounts and attack them, so this needs `I_UNDERSTAND=1`. |
 
 Phases: **10** install (`dnf install` of the RPM or the handbook's source install; services start; `--check-config`) ·
 **20** the 79-check integration suite on the real host ·
@@ -643,7 +646,12 @@ Phases: **10** install (`dnf install` of the RPM or the handbook's source instal
 **40** sandbox: private network/UTS/mount namespaces, seccomp, capability bounding set, read-only `/usr` ·
 **50** `systemctl restart`, `SIGKILL` + auto-restart, a record forced back to `provisioning` is resumed with exactly one `useradd` ·
 **60** reboot with two tenants and two sites; everything must come back ·
-**70** soak: N create/destroy cycles, then nothing may be left behind.
+**70** soak: N create/destroy cycles, then nothing may be left behind ·
+**80** attacks: from inside a tenant's own PHP, Node.js and Python code, and from the network, try to read
+other tenants and the engine, escape through planted links, exhaust memory, tasks and `/tmp`, outlive
+suspension or deletion, smuggle requests; every attempt must fail (`docs/SECURITY.md`) ·
+**90** performance on the real host: 100 tenants with a site each, time per step and its growth, Nginx reload time, daemon memory
+(`docs/PERFORMANCE.md`).
 
 Results land in `dist/acceptance/<UTC stamp>/` (`latest` symlink): `report.md`
 with a per-phase table and failure context, `phases/*.log`, the VM's journals,

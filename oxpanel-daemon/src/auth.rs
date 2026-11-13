@@ -317,6 +317,40 @@ mod tests {
         assert!(!p.only_root());
     }
 
+    /// A peer whose *account* is in an allowed group is let in although
+    /// SO_PEERCRED cannot say so: the supplementary groups come from the
+    /// account database (covered end to end by the integration suite, here
+    /// with the fake one).
+    #[tokio::test]
+    async fn supplementary_groups_come_from_the_account_database() {
+        use crate::system::{FakeSystem, OsUser};
+        let (a, _b) = UnixStream::pair().unwrap_or_else(|e| panic!("socketpair: {e}"));
+        let me = a.peer_cred().unwrap_or_else(|e| panic!("peer_cred: {e}"));
+        let sys = FakeSystem::new();
+        sys.add_user(OsUser {
+            name: "panelapi".into(),
+            uid: me.uid(),
+            gid: me.gid(),
+            home: "/".into(),
+            shell: "/sbin/nologin".into(),
+        });
+        let policy = PeerPolicy::new(set(&[]), set(&[4242]), false);
+        assert!(
+            authenticate(&a, &policy, &sys).await.is_err(),
+            "not in the allowed group yet"
+        );
+        sys.add_membership("panelapi", 4242);
+        let peer = authenticate(&a, &policy, &sys)
+            .await
+            .unwrap_or_else(|e| panic!("should be allowed: {e}"));
+        assert_eq!(peer.uid, me.uid());
+        // An unknown account is refused, not an error.
+        let stranger = PeerPolicy::new(set(&[]), set(&[4242]), false);
+        assert!(authenticate(&a, &stranger, &FakeSystem::new())
+            .await
+            .is_err());
+    }
+
     #[test]
     fn scopes_confine_listed_uids_only() {
         let peer = |uid| PeerInfo {

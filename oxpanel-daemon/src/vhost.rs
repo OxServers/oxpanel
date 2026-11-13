@@ -521,6 +521,13 @@ impl VHostService {
         if !out.success() && !already_absent(&out.stderr_lossy()) {
             return out.into_result().map(|_| ());
         }
+        // The tenant owns this directory and may have deleted it (or renamed
+        // it away): there is then nothing to relabel, and `restorecon` would
+        // fail on the missing path, making the site impossible to remove and
+        // the tenant impossible to delete.
+        if root.symlink_metadata().is_err() {
+            return Ok(());
+        }
         self.ctx
             .sys
             .run_ok(
@@ -625,7 +632,7 @@ pub(crate) fn render_vhost(
 
 /// Read up to `limit` bytes from the end of `path`, dropping a leading
 /// partial line. A log that does not exist yet (no request so far) is empty.
-fn tail_file(path: &Path, limit: u64) -> Result<(String, bool)> {
+pub(crate) fn tail_file(path: &Path, limit: u64) -> Result<(String, bool)> {
     use std::io::{Read as _, Seek as _, SeekFrom};
     let mut file = match std::fs::File::open(path) {
         Ok(f) => f,
@@ -1056,6 +1063,44 @@ mod tests {
             h.tenants.delete("bob", true).await,
             Err(Error::TenantHasVHosts(_))
         ));
+        Ok(())
+    }
+
+    /// Defect found by acceptance phase 80: a tenant that deletes its own
+    /// document root (by mistake, or on purpose) made `RemoveVirtualHost` fail
+    /// on SELinux hosts, because `restorecon` was run on the missing path. The
+    /// site could then never be removed, nor the tenant deleted.
+    #[tokio::test]
+    async fn a_site_whose_document_root_the_tenant_deleted_can_still_be_removed() -> Result<()> {
+        let h = harness(true).await;
+        h.vhosts.configure(req("example.com", "alice")).await?;
+        let root = h.config.home_base.join("alice").join("public_html");
+        // The fake OS creates directories for real inside the sandbox.
+        if root.exists() {
+            std::fs::remove_dir_all(&root).map_err(|e| Error::io("rm", &root, e))?;
+        } else {
+            std::fs::create_dir_all(&root).map_err(|e| Error::io("mkdir", &root, e))?;
+            std::fs::remove_dir_all(&root).map_err(|e| Error::io("rm", &root, e))?;
+        }
+        let before = h.sys.calls_to(bin::RESTORECON).len();
+        // A real `restorecon` exits 255 on a missing path.
+        h.sys.script_failure(
+            bin::RESTORECON,
+            255,
+            "restorecon: lstat(/x) failed: No such file or directory",
+        );
+        assert!(h.vhosts.remove("example.com").await?);
+        assert_eq!(
+            h.sys.calls_to(bin::RESTORECON).len(),
+            before,
+            "nothing to relabel: restorecon must not be run on a missing path"
+        );
+        assert!(h
+            .sys
+            .calls_to(bin::SEMANAGE)
+            .iter()
+            .any(|c| args(c).starts_with(&["fcontext".to_owned(), "-d".to_owned()])));
+        assert!(h.vhosts.list(None).await?.is_empty(), "the record is gone");
         Ok(())
     }
 

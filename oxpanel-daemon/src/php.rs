@@ -111,7 +111,10 @@ php_admin_flag[allow_url_include] = off
 pub fn render_unit(tenant: &TenantRecord, name: &Username, conf: &Path) -> Result<String> {
     let home = safe_path_str(&tenant.home)?;
     let conf = safe_path_str(conf)?;
-    let slice = &tenant.slice_unit;
+    // Derived from the validated name, not copied from the record: a record
+    // is a file, and its `slice_unit` string would otherwise reach the unit
+    // unchecked (a line break in it would add a directive).
+    let slice = systemd::slice_unit_name(name);
     let php_fpm = bin::PHP_FPM;
     Ok(format!(
         "{HEADER_UNIT}[Unit]

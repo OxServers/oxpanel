@@ -13,7 +13,10 @@
     clippy::expect_used,
     clippy::unwrap_used,
     clippy::panic,
-    clippy::too_many_lines
+    clippy::too_many_lines,
+    clippy::unnecessary_wraps,
+    clippy::indexing_slicing,
+    clippy::cast_possible_truncation
 )]
 
 mod common;
@@ -23,10 +26,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use prost::Message as _;
 use proptest::prelude::*;
 use proptest::strategy::ValueTree as _;
 use proptest::test_runner::TestRunner;
+use prost::Message as _;
 use tonic::Code;
 
 use common::{
@@ -163,7 +166,13 @@ async fn every_rpc_is_refused_for_an_unauthorised_peer() {
         );
     }
     assert!(srv.fake().calls().is_empty());
-    assert!(srv.services.ctx.store.list_tenants().expect("list").is_empty());
+    assert!(srv
+        .services
+        .ctx
+        .store
+        .list_tenants()
+        .expect("list")
+        .is_empty());
 }
 
 fn create(username: &str) -> pb::CreateTenantRequest {
@@ -194,7 +203,10 @@ async fn malformed_requests_are_refused_without_side_effects() {
     // Field 1 holding bytes that are not UTF-8.
     let invalid_utf8 = vec![0x0a, 0x03, 0xff, 0xfe, 0xfd];
     // A varint that never ends.
-    let endless_varint = vec![0x08; 1].into_iter().chain([0xff; 12]).collect::<Vec<u8>>();
+    let endless_varint = vec![0x08; 1]
+        .into_iter()
+        .chain([0xff; 12])
+        .collect::<Vec<u8>>();
 
     let mut truncated = frame(&valid);
     truncated.truncate(truncated.len() - 3);
@@ -233,24 +245,48 @@ async fn malformed_requests_are_refused_without_side_effects() {
             srv.fake().calls()
         );
         assert!(
-            srv.services.ctx.store.list_tenants().expect("list").is_empty(),
+            srv.services
+                .ctx
+                .store
+                .list_tenants()
+                .expect("list")
+                .is_empty(),
             "{what}: created a tenant"
         );
         assert_alive(&srv).await;
     }
 
     // Not gRPC at all.
-    let r = raw_request(&srv.socket, "/oxpanel.v1.OxPanelEngine/CreateTenant", "application/json", b"{}".to_vec())
-        .await
-        .expect("transport");
+    let r = raw_request(
+        &srv.socket,
+        "/oxpanel.v1.OxPanelEngine/CreateTenant",
+        "application/json",
+        b"{}".to_vec(),
+    )
+    .await
+    .expect("transport");
     assert_ne!(r.grpc_status, Some(0), "{r:?}");
-    let r = raw_request(&srv.socket, "/oxpanel.v1.OxPanelEngine/NoSuchMethod", "application/grpc", frame(&[]))
-        .await
-        .expect("transport");
-    assert_eq!(r.grpc_status, Some(12), "unknown method is UNIMPLEMENTED: {r:?}");
-    let r = raw_request(&srv.socket, "/some.other.Service/CreateTenant", "application/grpc", frame(&valid))
-        .await
-        .expect("transport");
+    let r = raw_request(
+        &srv.socket,
+        "/oxpanel.v1.OxPanelEngine/NoSuchMethod",
+        "application/grpc",
+        frame(&[]),
+    )
+    .await
+    .expect("transport");
+    assert_eq!(
+        r.grpc_status,
+        Some(12),
+        "unknown method is UNIMPLEMENTED: {r:?}"
+    );
+    let r = raw_request(
+        &srv.socket,
+        "/some.other.Service/CreateTenant",
+        "application/grpc",
+        frame(&valid),
+    )
+    .await
+    .expect("transport");
     assert_eq!(r.grpc_status, Some(12), "{r:?}");
     assert!(srv.fake().calls().is_empty());
     assert_alive(&srv).await;
@@ -344,7 +380,10 @@ async fn unknown_fields_are_ignored_and_change_nothing() {
         .await
         .expect("replay")
         .into_inner();
-    assert!(!again.created, "the unknown fields were not part of the spec");
+    assert!(
+        !again.created,
+        "the unknown fields were not part of the spec"
+    );
     // A field given twice: the last value wins, as protobuf specifies; it is
     // validated like any other value.
     let mut twice = create("carol").encode_to_vec();
@@ -407,7 +446,7 @@ async fn random_requests_never_panic_or_corrupt_state() {
                 aliases: vec![s(), s()],
                 php: i % 2 == 0,
                 app: Some(pb::App {
-                    runtime: (i % 5) as i32 - 1,
+                    runtime: i32::try_from(i % 5).unwrap_or(0) - 1,
                     root: s(),
                     entry: s(),
                 }),
@@ -415,7 +454,7 @@ async fn random_requests_never_panic_or_corrupt_state() {
             .encode_to_vec(),
             2 => pb::ReadVirtualHostLogRequest {
                 domain: s(),
-                kind: (i % 7) as i32 - 2,
+                kind: i32::try_from(i % 7).unwrap_or(0) - 2,
                 max_bytes: u32::MAX,
             }
             .encode_to_vec(),
@@ -433,7 +472,11 @@ async fn random_requests_never_panic_or_corrupt_state() {
         };
         let _ = raw_call(&srv.socket, rpc, frame(&body)).await;
     }
-    assert_eq!(PANICS.load(Ordering::SeqCst), 0, "a request handler panicked");
+    assert_eq!(
+        PANICS.load(Ordering::SeqCst),
+        0,
+        "a request handler panicked"
+    );
     assert_alive(&srv).await;
     assert_consistent(&srv.world, &srv.services, "after random requests").await;
     // Whatever was created went through validation: every account name the
@@ -541,7 +584,9 @@ async fn concurrent_clients_neither_deadlock_nor_corrupt_state() {
                 c.list_virtual_hosts(pb::ListVirtualHostsRequest::default())
                     .await
                     .expect("list vhosts");
-                c.get_host_info(pb::GetHostInfoRequest {}).await.expect("info");
+                c.get_host_info(pb::GetHostInfoRequest {})
+                    .await
+                    .expect("info");
                 let drifts = c
                     .reconcile(pb::ReconcileRequest {})
                     .await
@@ -588,7 +633,10 @@ async fn concurrent_clients_neither_deadlock_nor_corrupt_state() {
                 .await
                 .expect("create");
                 // Everyone wants the same domain for a different tenant.
-                match c.configure_virtual_host(vhost("contested.example", &tenant, 0)).await {
+                match c
+                    .configure_virtual_host(vhost("contested.example", &tenant, 0))
+                    .await
+                {
                     Ok(_) => {
                         contested_won.fetch_add(1, Ordering::SeqCst);
                     }
@@ -597,9 +645,13 @@ async fn concurrent_clients_neither_deadlock_nor_corrupt_state() {
                 c.configure_virtual_host(vhost(&domain, &tenant, (w + round) % 4))
                     .await
                     .expect("configure");
-                c.configure_virtual_host(vhost(&format!("sh{w}-{round}.example"), "shared", round % 4))
-                    .await
-                    .expect("configure on the shared tenant");
+                c.configure_virtual_host(vhost(
+                    &format!("sh{w}-{round}.example"),
+                    "shared",
+                    round % 4,
+                ))
+                .await
+                .expect("configure on the shared tenant");
                 c.update_tenant_limits(pb::UpdateTenantLimitsRequest {
                     username: tenant.clone(),
                     limits: limits(128),
@@ -751,7 +803,9 @@ async fn a_running_dependency_installation_blocks_nobody() {
     c.configure_virtual_host(vhost("app.example", "alice", 2))
         .await
         .expect("app");
-    srv.world.chaos.delay(bin::SYSTEMD_RUN, Duration::from_millis(1500));
+    srv.world
+        .chaos
+        .delay(bin::SYSTEMD_RUN, Duration::from_millis(1500));
 
     let mut installer = connect(&srv.socket).await.expect("connect");
     let started = Instant::now();
@@ -763,14 +817,24 @@ async fn a_running_dependency_installation_blocks_nobody() {
             .await
     });
     tokio::time::sleep(Duration::from_millis(200)).await;
-    assert!(!install.is_finished(), "the installation should still be running");
-    c.create_tenant(create("bob")).await.expect("create during install");
+    assert!(
+        !install.is_finished(),
+        "the installation should still be running"
+    );
+    c.create_tenant(create("bob"))
+        .await
+        .expect("create during install");
     c.configure_virtual_host(vhost("bob.example", "bob", 1))
         .await
         .expect("configure during install");
-    c.reconcile(pb::ReconcileRequest {}).await.expect("reconcile during install");
+    c.reconcile(pb::ReconcileRequest {})
+        .await
+        .expect("reconcile during install");
     let others = started.elapsed();
-    assert!(!install.is_finished(), "other requests waited for the installation");
+    assert!(
+        !install.is_finished(),
+        "other requests waited for the installation"
+    );
     assert!(others < Duration::from_millis(1400), "{others:?}");
     let r = install.await.expect("join").expect("install").into_inner();
     assert!(r.succeeded);
@@ -789,7 +853,9 @@ async fn an_installation_cannot_revive_a_suspended_or_removed_application() {
         c.configure_virtual_host(vhost("app.example", "alice", 2))
             .await
             .expect("app");
-        srv.world.chaos.delay(bin::SYSTEMD_RUN, Duration::from_millis(800));
+        srv.world
+            .chaos
+            .delay(bin::SYSTEMD_RUN, Duration::from_millis(800));
         let mut installer = connect(&srv.socket).await.expect("connect");
         let install = tokio::spawn(async move {
             installer

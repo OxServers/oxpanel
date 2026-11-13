@@ -100,8 +100,8 @@ impl HostService {
         Ok(HostInfo {
             selinux: self.ctx.selinux,
             dry_run: cfg.dry_run,
-            tenant_count: count(self.ctx.store.list_tenants()?.len()),
-            vhost_count: count(self.ctx.store.list_vhosts()?.len()),
+            tenant_count: count(self.ctx.store.count_tenants()?),
+            vhost_count: count(self.ctx.store.count_vhosts()?),
             uid_min: cfg.uid_min,
             uid_max: cfg.uid_max,
             runtimes: Runtimes {
@@ -450,6 +450,31 @@ mod tests {
         h.sys.clear_calls();
         assert_eq!(h.host.reconcile().await?, vec![], "suspension is not drift");
         assert!(h.sys.calls().is_empty(), "reconcile is read-only");
+        Ok(())
+    }
+
+    /// An account that exists but is not the one the record describes (here:
+    /// a different home) is reported, not repaired.
+    #[tokio::test]
+    async fn reports_an_account_that_no_longer_matches_its_record() -> Result<()> {
+        let h = harness().await;
+        let cfg = &h.ctx.config;
+        let mut rec = h
+            .ctx
+            .store
+            .load_tenant(&Username::parse("alice")?)?
+            .ok_or_else(|| Error::Internal("no record".into()))?;
+        rec.home = cfg.home_base.join("somewhere-else");
+        h.ctx.store.save_tenant(&rec)?;
+        let drifts = h.host.reconcile().await?;
+        let found: Vec<_> = drifts
+            .iter()
+            .filter(|d| d.kind == DriftKind::TenantAccountMismatch)
+            .collect();
+        assert_eq!(found.len(), 1, "{drifts:?}");
+        assert!(found
+            .first()
+            .is_some_and(|d| d.subject == "alice" && d.detail.contains("somewhere-else")));
         Ok(())
     }
 
