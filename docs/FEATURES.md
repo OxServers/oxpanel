@@ -123,7 +123,7 @@ see "Not yet included" at the end so nobody assumes otherwise.
 
 - Rust, `#![forbid(unsafe_code)]`, clippy pedantic with warnings as errors, no `unwrap`/`expect`/`panic` in production paths.
 - No shell anywhere: every external program is an absolute path with an argv array; the only module that spawns processes is `system/real.rs`.
-- Tests: 132 unit tests (exact argv assertions against a fake OS), 6 end-to-end gRPC tests over a real UNIX socket, a 328-check root integration suite in an AlmaLinux 9 systemd container, and `make acceptance`: ≈370 checks on a real AlmaLinux 9 VM with SELinux enforcing (install from git or RPM, SELinux labels and zero AVC denials, sandbox namespaces, restart/kill/resume, reboot, soak). `cargo-deny` for advisories/licences/bans.
+- Tests: 132 unit tests (exact argv assertions against a fake OS), 6 end-to-end gRPC tests over a real UNIX socket, a 328-check root integration suite in an AlmaLinux 9 systemd container, and `make acceptance`: ≈480 checks on a real AlmaLinux 9 VM with SELinux enforcing (install from git or RPM, SELinux labels and zero AVC denials, sandbox namespaces, restart/kill/resume, reboot, soak). `cargo-deny` for advisories/licences/bans.
 - Builds without a system `protoc` (pure-Rust `protox`) and without a host toolchain (everything runs in the AlmaLinux 9 container).
 
 ## Not yet included
