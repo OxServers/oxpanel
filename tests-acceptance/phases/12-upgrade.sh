@@ -47,7 +47,14 @@ check "the daemon's journal has no errors since the upgrade" bash -c '! journalc
 # ---- nothing was lost
 check "the tenant is still there with the same uid" bash -c "oxpanel-ctl tenant get $T | grep -q ' uid=$UID_BEFORE '"
 check "its home is intact" test -f /home/$T/public_html/index.html
-check "its sites are all still configured" bash -c "diff <(oxpanel-ctl vhost list --tenant $T) vhosts.before"
+# The new oxpanel-ctl appends fields the old one did not print (dns_zone=);
+# every field the old engine reported must be unchanged, line for line.
+same_or_extended() { # <before> <after>: each line of after is the line of before, or it followed by more fields
+  [ "$(wc -l < "$1")" = "$(wc -l < "$2")" ] || return 1
+  paste -d '\n' "$1" "$2" | awk 'NR % 2 == 1 { old = $0; next } $0 != old && index($0, old " ") != 1 { print "changed: " old " -> " $0; bad = 1 } END { exit bad }'
+}
+oxpanel-ctl vhost list --tenant $T > vhosts.after
+check "its sites are all still configured" same_or_extended vhosts.before vhosts.after
 check "the Nginx files are the same set" bash -c 'diff <(ls /etc/nginx/oxpanel.d) nginx-files.before'
 eventually "static site still answers" 20 1 http_body_is static.upg.test / static-old
 eventually "PHP site still answers" 20 1 http_body_is php.upg.test / php-old
