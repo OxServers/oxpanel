@@ -301,6 +301,8 @@ async fn preflight(config: &Config, sys: &dyn System) -> Result<bool, Fatal> {
         bin::MKDIR,
         bin::DU,
         bin::GPASSWD,
+        bin::CHPASSWD,
+        bin::USERMOD,
     ] {
         if !is_executable(Path::new(b)) {
             return Err(Fatal::Unavailable(format!(
@@ -368,17 +370,7 @@ async fn preflight(config: &Config, sys: &dyn System) -> Result<bool, Fatal> {
     };
     // The web user receives ACL grants on every document root: it must never
     // be root or a tenant.
-    if sys
-        .group_by_name(&config.tenant_group)
-        .await
-        .map_err(|e| Fatal::Runtime(e.to_string()))?
-        .is_none()
-    {
-        return Err(Fatal::Config(format!(
-            "OXPANEL_TENANT_GROUP '{}' does not exist (the package creates it with systemd-sysusers)",
-            config.tenant_group
-        )));
-    }
+    require_groups(config, sys).await?;
     if web.uid == 0 {
         return Err(Fatal::Config("OXPANEL_WEB_USER must not be root".into()));
     }
@@ -389,6 +381,26 @@ async fn preflight(config: &Config, sys: &dyn System) -> Result<bool, Fatal> {
         )));
     }
     Ok(selinux)
+}
+
+/// The groups the package creates for the sshd drop-in must exist.
+async fn require_groups(config: &Config, sys: &dyn System) -> Result<(), Fatal> {
+    for (key, group) in [
+        ("OXPANEL_TENANT_GROUP", &config.tenant_group),
+        ("OXPANEL_SFTP_PASSWORD_GROUP", &config.sftp_password_group),
+    ] {
+        if sys
+            .group_by_name(group)
+            .await
+            .map_err(|e| Fatal::Runtime(e.to_string()))?
+            .is_none()
+        {
+            return Err(Fatal::Config(format!(
+                "{key} '{group}' does not exist (the package creates it with systemd-sysusers)"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn is_executable(p: &Path) -> bool {

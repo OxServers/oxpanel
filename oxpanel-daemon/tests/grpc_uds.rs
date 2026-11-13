@@ -570,6 +570,7 @@ async fn management_rpcs_over_uds() {
         .remove_sftp_key(pb::RemoveSftpKeyRequest {
             username: "alice".into(),
             fingerprint: FINGERPRINT.into(),
+            end_sessions: false,
         })
         .await
         .expect("remove key")
@@ -579,10 +580,49 @@ async fn management_rpcs_over_uds() {
         .remove_sftp_key(pb::RemoveSftpKeyRequest {
             username: "alice".into(),
             fingerprint: FINGERPRINT.into(),
+            end_sessions: false,
         })
         .await
         .expect_err("already removed");
     assert_eq!(gone.code(), Code::NotFound);
+
+    // SFTP password: validated, recorded as a flag, never returned.
+    let short = client
+        .set_sftp_password(pb::SetSftpPasswordRequest {
+            username: "alice".into(),
+            password: "too-short".into(),
+        })
+        .await
+        .expect_err("12 characters at least");
+    assert_eq!(short.code(), Code::InvalidArgument);
+    assert!(
+        !short.message().contains("too-short"),
+        "{}",
+        short.message()
+    );
+    let set = client
+        .set_sftp_password(pb::SetSftpPasswordRequest {
+            username: "alice".into(),
+            password: "correct horse battery".into(),
+        })
+        .await
+        .expect("set password")
+        .into_inner();
+    assert!(set.tenant.is_some_and(|t| t.sftp_password));
+    let chpasswd = srv.sys.calls_to(oxpanel_daemon::system::bin::CHPASSWD);
+    assert!(chpasswd.iter().all(|c| c
+        .args
+        .iter()
+        .all(|a| !a.to_string_lossy().contains("horse"))));
+    let cleared = client
+        .clear_sftp_password(pb::ClearSftpPasswordRequest {
+            username: "alice".into(),
+            end_sessions: false,
+        })
+        .await
+        .expect("clear password")
+        .into_inner();
+    assert!(cleared.cleared && cleared.tenant.is_some_and(|t| !t.sftp_password));
 
     // Disk limits on a host without quotas are refused, with what to do.
     let refused = client
@@ -677,6 +717,21 @@ async fn a_scoped_peer_can_only_call_its_scopes() {
             })
             .await
             .map(|_| ()),
+    ];
+    for (i, r) in denied.into_iter().enumerate() {
+        let e = r.expect_err("must be denied");
+        assert_eq!(e.code(), Code::PermissionDenied, "rpc #{i}");
+        assert!(e.message().contains("scope"), "{}", e.message());
+    }
+    assert!(
+        srv.sys.calls().is_empty(),
+        "denied requests never reach the OS"
+    );
+
+    // Customers manage their own SFTP access: with the vhost scope these
+    // get past the gate (and then fail on the missing tenant, not on
+    // permissions); listing needs only `read`.
+    let sftp_calls = [
         client
             .add_sftp_key(pb::AddSftpKeyRequest {
                 username: "alice".into(),
@@ -689,19 +744,35 @@ async fn a_scoped_peer_can_only_call_its_scopes() {
             .remove_sftp_key(pb::RemoveSftpKeyRequest {
                 username: "alice".into(),
                 fingerprint: FINGERPRINT.into(),
+                end_sessions: true,
+            })
+            .await
+            .map(|_| ()),
+        client
+            .set_sftp_password(pb::SetSftpPasswordRequest {
+                username: "alice".into(),
+                password: "correct horse battery".into(),
+            })
+            .await
+            .map(|_| ()),
+        client
+            .clear_sftp_password(pb::ClearSftpPasswordRequest {
+                username: "alice".into(),
+                end_sessions: false,
+            })
+            .await
+            .map(|_| ()),
+        client
+            .list_sftp_keys(pb::ListSftpKeysRequest {
+                username: "alice".into(),
             })
             .await
             .map(|_| ()),
     ];
-    for (i, r) in denied.into_iter().enumerate() {
-        let e = r.expect_err("must be denied");
-        assert_eq!(e.code(), Code::PermissionDenied, "rpc #{i}");
-        assert!(e.message().contains("scope"), "{}", e.message());
+    for (i, r) in sftp_calls.into_iter().enumerate() {
+        let e = r.expect_err("no such tenant");
+        assert_eq!(e.code(), Code::NotFound, "sftp rpc #{i}: {}", e.message());
     }
-    assert!(
-        srv.sys.calls().is_empty(),
-        "denied requests never reach the OS"
-    );
 
     // The vhost scope is honoured: the call gets past the gate (and then
     // fails on the missing tenant, not on permissions).

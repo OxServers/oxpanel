@@ -14,6 +14,29 @@ pub struct RunAs {
     pub gid: u32,
 }
 
+/// Bytes handed to a command on its standard input because they must never
+/// be in its argv (which every local user can read in `/proc`) or in a log:
+/// passwords. `Debug` never shows them.
+#[derive(Clone, PartialEq, Eq)]
+pub struct Secret(Vec<u8>);
+
+impl Secret {
+    pub fn new(bytes: impl Into<Vec<u8>>) -> Self {
+        Self(bytes.into())
+    }
+
+    /// The bytes, for the one place that writes them to the child.
+    pub fn expose(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret([redacted])")
+    }
+}
+
 /// An external program invocation: absolute program path plus discrete arguments.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommandSpec {
@@ -21,6 +44,8 @@ pub struct CommandSpec {
     pub args: Vec<OsString>,
     pub run_as: Option<RunAs>,
     pub timeout: Duration,
+    /// Written to the command's standard input (otherwise `/dev/null`).
+    pub stdin: Option<Secret>,
 }
 
 impl CommandSpec {
@@ -30,7 +55,16 @@ impl CommandSpec {
             args: Vec::new(),
             run_as: None,
             timeout,
+            stdin: None,
         }
+    }
+
+    /// Feed `secret` to the command on its standard input. It never appears
+    /// in [`Self::display`] or in the argv.
+    #[must_use]
+    pub fn stdin_secret(mut self, secret: Secret) -> Self {
+        self.stdin = Some(secret);
+        self
     }
 
     #[must_use]
@@ -200,6 +234,19 @@ mod tests {
                 "-p",
                 "/home/alice/public_html",
             ]
+        );
+    }
+
+    #[test]
+    fn secrets_stay_out_of_argv_display_and_debug() {
+        let spec = CommandSpec::new(bin::CHPASSWD, Duration::from_secs(1))
+            .stdin_secret(Secret::new("alice:hunter2-hunter2"));
+        assert!(spec.exec_plan().1.is_empty());
+        assert!(!spec.display().contains("hunter2"));
+        assert!(!format!("{spec:?}").contains("hunter2"));
+        assert_eq!(
+            spec.stdin.as_ref().map(Secret::expose),
+            Some(&b"alice:hunter2-hunter2"[..])
         );
     }
 

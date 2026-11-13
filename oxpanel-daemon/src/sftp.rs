@@ -27,26 +27,35 @@
 //! other way, and nothing about the home itself changes. The unit is enabled,
 //! so the mount returns after a reboot.
 //!
-//! SFTP access exists exactly while the tenant's record holds at least one
-//! public key. Suspension removes the keys file (the record keeps the keys)
-//! and ends running sessions; so does removing a key. Everything written here
-//! is rendered from the records alone and checked by `Reconcile`.
+//! **Passwords** are opt-in per tenant (and can be forbidden host-wide). A
+//! tenant with a password is also in a second group, and only that group's
+//! `Match` block offers password authentication — with exactly the same
+//! confinement as keys. The password reaches `chpasswd` on stdin and exists
+//! only as the hash in the shadow database; the record keeps a flag.
 //!
-//! Passwords are deliberately not offered: see the design record.
+//! SFTP access (chroot directory and mount) exists exactly while the tenant
+//! has at least one key or a password. Suspension removes the keys file (the
+//! record keeps the keys), locks the password hash and ends running sessions.
+//! Removing a key or the password ends sessions only when asked to.
+//! Everything written here is rendered from the records alone and checked by
+//! `Reconcile`.
 
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use tracing::{info, warn};
 
-use crate::config::Config;
+use crate::config::{Config, SftpPasswords};
 use crate::ctx::Ctx;
 use crate::error::{Error, Result};
 use crate::fsutil;
 use crate::nginx::safe_path_str;
 use crate::records::{now_unix, SftpKeyRecord, TenantRecord, TenantState};
-use crate::system::{bin, CommandSpec};
+use crate::system::{bin, CommandSpec, PasswordState, Secret};
 use crate::systemd;
-use crate::validate::{KeyFingerprint, KeyLabel, SshPublicKey, Username, MAX_SFTP_KEYS};
+use crate::validate::{
+    KeyFingerprint, KeyLabel, SftpPassword, SshPublicKey, Username, MAX_SFTP_KEYS,
+};
 
 const HEADER: &str = "# Managed by oxpanel-daemon. Manual edits will be overwritten.\n";
 /// sshd reads its configuration as root.
@@ -61,20 +70,23 @@ const CHROOT_DIR_MODE: u32 = 0o755;
 const UNIT_MODE: u32 = 0o644;
 const SSHD_UNIT: &str = "sshd.service";
 
-/// The sshd drop-in: one `Match` block for the tenant group.
+/// Failed authentication attempts sshd allows per connection for tenants
+/// (the stock default is 6).
+pub const MAX_AUTH_TRIES: u32 = 3;
+
+/// The sshd drop-in: a `Match` block for tenants with an SFTP password (only
+/// when passwords are allowed on this host), then one for every tenant. Both
+/// carry the same confinement; they differ only in the authentication
+/// methods. sshd takes the first value it finds for each directive, so a
+/// tenant in both groups gets the password block's methods.
 pub fn render_sshd_dropin(cfg: &Config) -> Result<String> {
     let keys = safe_path_str(&cfg.sftp_keys_dir)?;
     let chroot = cfg.sftp_chroot_dir();
     let chroot = safe_path_str(&chroot)?;
-    let group = &cfg.tenant_group;
-    Ok(format!(
-        "{HEADER}# Accounts of OxPanel tenants: SFTP only, inside their own home, with keys
-# that only OxPanel can change. Nothing here applies to any other account.
-Match Group {group}
-    AuthorizedKeysFile {keys}/%u
-    AuthenticationMethods publickey
-    PasswordAuthentication no
+    let confinement = format!(
+        "    AuthorizedKeysFile {keys}/%u
     KbdInteractiveAuthentication no
+    MaxAuthTries {MAX_AUTH_TRIES}
     ChrootDirectory {chroot}/%u
     ForceCommand internal-sftp
     DisableForwarding yes
@@ -85,10 +97,35 @@ Match Group {group}
     PermitTunnel no
     PermitTTY no
     PermitUserRC no
-# End of the block, whatever sshd reads after this file.
-Match all
 "
-    ))
+    );
+    let mut out = format!(
+        "{HEADER}# Accounts of OxPanel tenants: SFTP only, inside their own home, with keys
+# that only OxPanel can change. Nothing here applies to any other account.
+"
+    );
+    if cfg.sftp_passwords == SftpPasswords::Allowed {
+        let _ = write!(
+            out,
+            "# Tenants that were given an SFTP password: the same, plus password login.
+Match Group {}
+    AuthenticationMethods publickey password
+    PasswordAuthentication yes
+{confinement}",
+            cfg.sftp_password_group
+        );
+    }
+    let _ = write!(
+        out,
+        "Match Group {}
+    AuthenticationMethods publickey
+    PasswordAuthentication no
+{confinement}# End of the block, whatever sshd reads after this file.
+Match all
+",
+        cfg.tenant_group
+    );
+    Ok(out)
 }
 
 /// Paths of everything SFTP access puts on disk for one tenant.
@@ -267,31 +304,34 @@ pub async fn ensure_sshd_config(ctx: &Ctx) -> Result<bool> {
 
 /// Make the account a member of the tenant group (the drop-in's `Match`).
 pub async fn ensure_membership(ctx: &Ctx, tenant: &TenantRecord) -> Result<()> {
-    let cfg = &ctx.config;
+    set_membership(ctx, tenant, &ctx.config.tenant_group, true).await
+}
+
+/// Add the account to `group` or take it out, if it is not so already.
+async fn set_membership(ctx: &Ctx, tenant: &TenantRecord, group: &str, member: bool) -> Result<()> {
     let name = Username::parse(&tenant.username)?;
-    let Some(group) = ctx.sys.group_by_name(&cfg.tenant_group).await? else {
+    let Some(gid) = ctx.sys.group_by_name(group).await? else {
         return Err(Error::Internal(format!(
-            "group '{}' does not exist; it is created by the package (systemd-sysusers)",
-            cfg.tenant_group
+            "group '{group}' does not exist; it is created by the package (systemd-sysusers)"
         )));
     };
-    if ctx
+    let is_member = ctx
         .sys
         .groups_of(name.as_str(), tenant.gid)
         .await?
-        .contains(&group)
-    {
+        .contains(&gid);
+    if is_member == member {
         return Ok(());
     }
     ctx.sys
         .run_ok(
-            CommandSpec::new(bin::GPASSWD, cfg.command_timeout)
-                .arg("--add")
+            CommandSpec::new(bin::GPASSWD, ctx.config.command_timeout)
+                .arg(if member { "--add" } else { "--delete" })
                 .arg(name.as_str())
-                .arg(&cfg.tenant_group),
+                .arg(group),
         )
         .await?;
-    info!(tenant = %name, group = %cfg.tenant_group, "added to the tenant group");
+    info!(tenant = %name, group, member, "group membership changed");
     Ok(())
 }
 
@@ -335,13 +375,23 @@ pub async fn preflight(ctx: &Ctx, tenant: &TenantRecord) -> Result<()> {
     verify_confined(ctx, &Username::parse(&tenant.username)?).await
 }
 
-/// Bring the tenant's SFTP access in line with its record: with keys, the
-/// chroot directory, the mount and the keys file exist (the keys file only
-/// while the tenant is not suspended); without keys, none of them do.
-/// Idempotent. The caller holds the mutation lock.
+/// Whether the tenant can log in over SFTP at all (when not suspended): it
+/// has a key or a password.
+pub fn has_access(tenant: &TenantRecord) -> bool {
+    !tenant.sftp_keys.is_empty() || tenant.sftp_password
+}
+
+/// Bring the tenant's SFTP access in line with its record: with a key or a
+/// password, the chroot directory and the mount exist; the keys file exists
+/// while the tenant has keys and is not suspended; the password hash is
+/// usable exactly while the tenant has a password and is not suspended.
+/// Without any credential, none of it exists (a mount still in use by open
+/// sessions is left until they end). Idempotent. The caller holds the
+/// mutation lock.
 pub async fn ensure_access(ctx: &Ctx, tenant: &TenantRecord) -> Result<()> {
-    if tenant.sftp_keys.is_empty() {
-        return remove_access(ctx, tenant).await;
+    if !has_access(tenant) {
+        sync_password(ctx, tenant).await?;
+        return remove_access(ctx, tenant, false).await;
     }
     let cfg = &ctx.config;
     let timeout = cfg.command_timeout;
@@ -373,49 +423,139 @@ pub async fn ensure_access(ctx: &Ctx, tenant: &TenantRecord) -> Result<()> {
         )
         .await?;
 
-    if tenant.suspended {
-        fsutil::remove_if_exists(&paths.keys_file)?;
-        return Ok(());
-    }
-    fsutil::ensure_dir(&cfg.sftp_keys_dir, KEYS_DIR_MODE)?;
-    let keys_changed = fsutil::write_atomic(
-        &paths.keys_file,
-        render_keys_file(tenant)?.as_bytes(),
-        KEYS_FILE_MODE,
-    )?;
-    // Always: a crash between the write and this call must not leave a file
-    // the tenant cannot read. The mask it sets equals the group bits above,
-    // so the file's mode stays what `write_atomic` expects.
-    ctx.sys
-        .run_ok(
-            CommandSpec::new(bin::SETFACL, timeout)
-                .arg("-m")
-                .arg(format!("u:{name}:r--"))
-                .arg("--")
-                .arg(&paths.keys_file),
-        )
-        .await?;
+    let keys_changed = if tenant.suspended || tenant.sftp_keys.is_empty() {
+        fsutil::remove_if_exists(&paths.keys_file)?
+    } else {
+        fsutil::ensure_dir(&cfg.sftp_keys_dir, KEYS_DIR_MODE)?;
+        let changed = fsutil::write_atomic(
+            &paths.keys_file,
+            render_keys_file(tenant)?.as_bytes(),
+            KEYS_FILE_MODE,
+        )?;
+        // Always: a crash between the write and this call must not leave a
+        // file the tenant cannot read. The mask it sets equals the group bits
+        // above, so the file's mode stays what `write_atomic` expects.
+        ctx.sys
+            .run_ok(
+                CommandSpec::new(bin::SETFACL, timeout)
+                    .arg("-m")
+                    .arg(format!("u:{name}:r--"))
+                    .arg("--")
+                    .arg(&paths.keys_file),
+            )
+            .await?;
+        changed
+    };
+    sync_password(ctx, tenant).await?;
     if unit_changed || keys_changed {
-        info!(tenant = %name, keys = tenant.sftp_keys.len(), "sftp access configured");
+        info!(tenant = %name, keys = tenant.sftp_keys.len(), password = tenant.sftp_password, "sftp access configured");
     }
     Ok(())
 }
 
-/// Take SFTP access away, in the order that cannot fail half-way: the keys
-/// file first (no new logins), then running sessions are ended (a session
-/// whose working directory is inside the home would keep the mount busy),
-/// then the mount, the mount unit and the (then empty) chroot directories.
-/// Never recursive — a directory that is still mounted or holds anything is
-/// an error, not something to delete.
-pub async fn remove_access(ctx: &Ctx, tenant: &TenantRecord) -> Result<()> {
+/// Bring the password side in line with the record: membership of the
+/// password group exactly while the tenant has a password, and a shadow
+/// entry that is usable only while it has one and is not suspended. The
+/// order never opens a window: when a password goes, the group membership
+/// (which is what lets sshd ask for it) goes first; when it comes, the hash
+/// is put in its final state (locked if suspended) before the membership.
+/// Never needs the plaintext: suspension locks the existing hash and
+/// resumption unlocks it.
+pub async fn sync_password(ctx: &Ctx, tenant: &TenantRecord) -> Result<()> {
+    let group = ctx.config.sftp_password_group.clone();
+    if !tenant.sftp_password {
+        set_membership(ctx, tenant, &group, false).await?;
+    }
+    sync_shadow(ctx, tenant).await?;
+    if tenant.sftp_password {
+        set_membership(ctx, tenant, &group, true).await?;
+    }
+    Ok(())
+}
+
+async fn sync_shadow(ctx: &Ctx, tenant: &TenantRecord) -> Result<()> {
+    let name = Username::parse(&tenant.username)?;
+    let timeout = ctx.config.command_timeout;
+    let usermod = |flag: &str| {
+        CommandSpec::new(bin::USERMOD, timeout)
+            .arg(flag)
+            .arg(name.as_str())
+    };
+    match (
+        tenant.sftp_password,
+        tenant.suspended,
+        ctx.sys.password_state(name.as_str()).await?,
+    ) {
+        // An empty field would let any password in; never leave one.
+        (_, _, PasswordState::Empty)
+        | (false, _, PasswordState::Usable | PasswordState::Locked) => {
+            if tenant.sftp_password {
+                warn!(tenant = %name, "the account's password field was empty; it is disabled and the SFTP password must be set again");
+            }
+            clear_shadow(ctx, &name).await
+        }
+        (true, true, PasswordState::Usable) => ctx.sys.run_ok(usermod("--lock")).await.map(drop),
+        (true, false, PasswordState::Locked) => ctx.sys.run_ok(usermod("--unlock")).await.map(drop),
+        (true, _, PasswordState::NoPassword) => {
+            // Only the plaintext could restore it, and it is never kept.
+            warn!(tenant = %name, "the record says the tenant has an SFTP password, but the account has none; set it again");
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// Put the account's password field back to `!!` (what `useradd` leaves:
+/// no password can match). Through `chpasswd -e` on stdin, like setting it.
+async fn clear_shadow(ctx: &Ctx, name: &Username) -> Result<()> {
+    ctx.sys
+        .run_ok(
+            CommandSpec::new(bin::CHPASSWD, ctx.config.command_timeout)
+                .arg("-e")
+                .stdin_secret(Secret::new(format!("{name}:!!\n"))),
+        )
+        .await?;
+    info!(tenant = %name, "sftp password removed from the account");
+    Ok(())
+}
+
+/// Whether the tenant has a login session right now (its `user-<uid>.slice`
+/// is not inactive).
+pub async fn sessions_open(ctx: &Ctx, tenant: &TenantRecord) -> Result<bool> {
+    let out = ctx
+        .sys
+        .run_ok(
+            systemctl(ctx)
+                .args(["show", "--property=ActiveState", "--value", "--"])
+                .arg(format!("user-{}.slice", tenant.uid)),
+        )
+        .await?;
+    let state = out.stdout_lossy();
+    Ok(!matches!(state.trim(), "" | "inactive"))
+}
+
+/// Take SFTP access away: the keys file first (no new logins with a key);
+/// with `end`, running sessions are ended; then the mount, the mount unit
+/// and the (then empty) chroot directories. Without `end`, a mount that open
+/// sessions are still using is left in place (they keep working; nobody new
+/// can log in) and removed at the next start of the daemon after they have
+/// ended. Never recursive — a directory that is still mounted or holds
+/// anything is an error, not something to delete. The password is not
+/// touched here (see [`sync_password`]; `userdel` removes it with the
+/// account).
+pub async fn remove_access(ctx: &Ctx, tenant: &TenantRecord, end: bool) -> Result<()> {
     let cfg = &ctx.config;
     let paths = SftpPaths::for_tenant(cfg, tenant)?;
     let had_keys = fsutil::remove_if_exists(&paths.keys_file)?;
     let had_unit = paths.mount_unit.exists();
-    if had_keys || had_unit {
+    if end && (had_keys || had_unit) {
         end_sessions(ctx, tenant).await?;
     }
     if had_unit {
+        if !end && sessions_open(ctx, tenant).await? {
+            info!(tenant = %tenant.username, "sftp access withdrawn; the mount stays until the open sessions end");
+            return Ok(());
+        }
         ctx.sys
             .run_ok(
                 systemctl(ctx)
@@ -426,9 +566,26 @@ pub async fn remove_access(ctx: &Ctx, tenant: &TenantRecord) -> Result<()> {
         fsutil::remove_if_exists(&paths.mount_unit)?;
         systemd::daemon_reload(ctx.sys.as_ref(), cfg.command_timeout).await?;
     }
-    let mut had_dirs = false;
-    for dir in paths.chroot_dirs().iter().rev() {
-        had_dirs |= fsutil::remove_empty_dir(dir)?;
+    // The empty directories go with `rmdir` (never recursive: anything
+    // inside, or a mount still there, makes it fail), run outside the
+    // daemon's own mount namespace: a namespace started while a home was
+    // mounted keeps a copy of that mount, which makes the directory busy in
+    // here — and an `rmdir` in the host namespace removes that copy too.
+    let dirs: Vec<PathBuf> = paths
+        .chroot_dirs()
+        .into_iter()
+        .rev()
+        .filter(|d| d.is_dir())
+        .collect();
+    let had_dirs = !dirs.is_empty();
+    if had_dirs {
+        ctx.sys
+            .run_ok(
+                CommandSpec::new(bin::SYSTEMD_RUN, cfg.command_timeout)
+                    .args(["--wait", "--collect", "--quiet", "--", bin::RMDIR, "--"])
+                    .args(&dirs),
+            )
+            .await?;
     }
     if had_keys || had_unit || had_dirs {
         info!(tenant = %tenant.username, "sftp access removed");
@@ -436,13 +593,18 @@ pub async fn remove_access(ctx: &Ctx, tenant: &TenantRecord) -> Result<()> {
     Ok(())
 }
 
-/// Suspension: no key can log in (the keys file goes; the record keeps the
-/// keys) and running sessions end. Needs nothing from sshd, so it cannot be
-/// blocked by a broken sshd configuration. The mount stays.
+/// Suspension (`tenant.suspended` is already set): no key can log in (the
+/// keys file goes; the record keeps the keys), the password hash is locked
+/// (the record keeps the flag; resumption unlocks the same hash), and running
+/// sessions end. Needs nothing from sshd, so a broken sshd configuration
+/// cannot block it. The mount stays.
 pub async fn suspend_access(ctx: &Ctx, tenant: &TenantRecord) -> Result<()> {
     let paths = SftpPaths::for_tenant(&ctx.config, tenant)?;
     let had_keys = fsutil::remove_if_exists(&paths.keys_file)?;
-    if had_keys || !tenant.sftp_keys.is_empty() {
+    if tenant.sftp_password {
+        sync_shadow(ctx, tenant).await?;
+    }
+    if had_keys || has_access(tenant) {
         end_sessions(ctx, tenant).await?;
     }
     Ok(())
@@ -463,9 +625,25 @@ pub async fn end_sessions(ctx: &Ctx, tenant: &TenantRecord) -> Result<()> {
     Ok(())
 }
 
+/// After a credential was removed: keep or remove access accordingly, and
+/// end the tenant's sessions only when `end` asks for it.
+async fn apply(ctx: &Ctx, tenant: &TenantRecord, end: bool) -> Result<()> {
+    if has_access(tenant) {
+        ensure_access(ctx, tenant).await?;
+        if end {
+            end_sessions(ctx, tenant).await?;
+        }
+        Ok(())
+    } else {
+        sync_password(ctx, tenant).await?;
+        remove_access(ctx, tenant, end).await
+    }
+}
+
 /// Start-up convergence: the drop-in is current, every tenant is in the
 /// tenant group (tenants created before SFTP existed are not), and SFTP
-/// access matches the records. Failures are logged and reported by
+/// access matches the records — including mounts that were kept for open
+/// sessions and can go now. Failures are logged and reported by
 /// `Reconcile`; they never stop the daemon. Returns how many tenants have
 /// SFTP access.
 pub async fn converge_all(ctx: &Ctx) -> Result<usize> {
@@ -484,20 +662,25 @@ pub async fn converge_all(ctx: &Ctx) -> Result<usize> {
             warn!(tenant = %tenant.username, error = %e, "could not add the account to the tenant group");
             continue;
         }
-        if tenant.sftp_keys.is_empty() {
-            continue;
-        }
-        match ensure_access(ctx, &tenant).await {
-            Ok(()) => with_access += 1,
+        let access = has_access(&tenant);
+        let result = if access {
+            ensure_access(ctx, &tenant).await
+        } else {
+            // Nothing to do for most tenants; a mount kept for sessions that
+            // have ended since goes now.
+            apply(ctx, &tenant, false).await
+        };
+        match result {
+            Ok(()) => with_access += usize::from(access),
             Err(e) => {
-                warn!(tenant = %tenant.username, error = %e, "could not restore SFTP access");
+                warn!(tenant = %tenant.username, error = %e, "could not bring SFTP access in line with the record");
             }
         }
     }
     Ok(with_access)
 }
 
-/// The SFTP part of the API: a tenant's public keys.
+/// The SFTP part of the API: a tenant's public keys and password.
 #[derive(Debug, Clone)]
 pub struct SftpService {
     ctx: Ctx,
@@ -578,13 +761,18 @@ impl SftpService {
         Ok((rec, stored, changed))
     }
 
-    /// Take a key away. Running sessions of the tenant are ended, so a
-    /// connection that was authenticated with the key does not outlive it.
-    /// Removing the last key removes the access altogether. A key the tenant
-    /// does not have is `NOT_FOUND`, except that repeating the provisioning
-    /// still happens first — a removal interrupted half-way is completed by
-    /// asking again.
-    pub async fn remove_key(&self, username: &str, fingerprint: &str) -> Result<TenantRecord> {
+    /// Take a key away: it cannot start a new session. Running sessions of
+    /// the tenant continue unless `end` asks for them to be ended (all of
+    /// them: sshd cannot tell which key a session used). Removing the last
+    /// credential removes the access. A key the tenant does not have is
+    /// `NOT_FOUND`, except that repeating the provisioning still happens
+    /// first — a removal interrupted half-way is completed by asking again.
+    pub async fn remove_key(
+        &self,
+        username: &str,
+        fingerprint: &str,
+        end: bool,
+    ) -> Result<TenantRecord> {
         let name = Username::parse(username)?;
         let fingerprint = KeyFingerprint::parse(fingerprint)?;
         let _guard = self.ctx.lock.lock().await;
@@ -596,19 +784,14 @@ impl SftpService {
         if removed {
             self.ctx.store.save_tenant(&rec)?;
         }
-        ensure_access(&self.ctx, &rec).await?;
+        apply(&self.ctx, &rec, end && removed).await?;
         if !removed {
             return Err(Error::SftpKeyNotFound {
                 tenant: name.to_string(),
                 fingerprint: fingerprint.as_str().to_owned(),
             });
         }
-        if !rec.sftp_keys.is_empty() {
-            // The remaining keys stay; a session opened with the removed one
-            // must not outlive it. (Without keys, `remove_access` did this.)
-            end_sessions(&self.ctx, &rec).await?;
-        }
-        info!(tenant = %name, fingerprint = fingerprint.as_str(), "sftp key removed");
+        info!(tenant = %name, fingerprint = fingerprint.as_str(), end_sessions = end, "sftp key removed");
         Ok(rec)
     }
 
@@ -621,6 +804,64 @@ impl SftpService {
             .load_tenant(&name)?
             .ok_or_else(|| Error::TenantNotFound(name.to_string()))?
             .sftp_keys)
+    }
+
+    /// Set (or replace) the tenant's SFTP password. It goes to `chpasswd` on
+    /// stdin and is stored only as the system's hash; the record keeps a flag.
+    /// Refused on hosts that forbid SFTP passwords. Running sessions are not
+    /// affected. A suspended tenant's new password is locked at once.
+    pub async fn set_password(&self, username: &str, password: &str) -> Result<TenantRecord> {
+        let name = Username::parse(username)?;
+        let password = SftpPassword::parse(password)?;
+        if self.ctx.config.sftp_passwords == SftpPasswords::Forbidden {
+            return Err(Error::SftpUnavailable(
+                "SFTP passwords are forbidden on this host (OXPANEL_SFTP_PASSWORDS=false); use keys".into(),
+            ));
+        }
+        let _guard = self.ctx.lock.lock().await;
+        let mut rec = self.load_ready(&name)?;
+        preflight(&self.ctx, &rec).await?;
+        if !rec.sftp_password {
+            rec.sftp_password = true;
+            self.ctx.store.save_tenant(&rec)?;
+        }
+        // A suspended tenant must not be able to use the new password even
+        // for the moment between `chpasswd` and the lock: out of the password
+        // group first (sshd then does not ask for one), back in once locked.
+        if rec.suspended {
+            set_membership(&self.ctx, &rec, &self.ctx.config.sftp_password_group, false).await?;
+        }
+        let line = format!("{name}:{}\n", password.expose());
+        self.ctx
+            .sys
+            .run_ok(
+                CommandSpec::new(bin::CHPASSWD, self.ctx.config.command_timeout)
+                    .stdin_secret(Secret::new(line)),
+            )
+            .await?;
+        ensure_access(&self.ctx, &rec).await?;
+        info!(tenant = %name, "sftp password set");
+        Ok(rec)
+    }
+
+    /// Remove the tenant's SFTP password: it cannot start a new session.
+    /// Running sessions continue unless `end` asks for them to be ended.
+    /// Returns the record and whether the tenant had a password. Repeating
+    /// it completes an interrupted attempt.
+    pub async fn clear_password(&self, username: &str, end: bool) -> Result<(TenantRecord, bool)> {
+        let name = Username::parse(username)?;
+        let _guard = self.ctx.lock.lock().await;
+        let mut rec = self.load_ready(&name)?;
+        let had = rec.sftp_password;
+        if had {
+            rec.sftp_password = false;
+            self.ctx.store.save_tenant(&rec)?;
+        }
+        apply(&self.ctx, &rec, end && had).await?;
+        if had {
+            info!(tenant = %name, end_sessions = end, "sftp password cleared");
+        }
+        Ok((rec, had))
     }
 }
 
@@ -706,36 +947,60 @@ mod tests {
 
     #[test]
     fn dropin_confines_the_tenant_group_and_nobody_else() -> Result<()> {
-        let cfg = Config::default();
-        let d = render_sshd_dropin(&cfg)?;
-        assert!(d.starts_with(HEADER));
-        let directives: Vec<&str> = d
-            .lines()
-            .filter(|l| !l.starts_with('#'))
-            .map(str::trim)
-            .collect();
+        const CONFINEMENT: [&str; 13] = [
+            "AuthorizedKeysFile /etc/oxpanel-sftp/%u",
+            "KbdInteractiveAuthentication no",
+            "MaxAuthTries 3",
+            "ChrootDirectory /var/lib/oxpanel/sftp/%u",
+            "ForceCommand internal-sftp",
+            "DisableForwarding yes",
+            "AllowTcpForwarding no",
+            "AllowStreamLocalForwarding no",
+            "AllowAgentForwarding no",
+            "X11Forwarding no",
+            "PermitTunnel no",
+            "PermitTTY no",
+            "PermitUserRC no",
+        ];
+        let directives = |cfg: &Config| -> Result<Vec<String>> {
+            let d = render_sshd_dropin(cfg)?;
+            assert!(d.starts_with(HEADER));
+            Ok(d.lines()
+                .filter(|l| !l.starts_with('#'))
+                .map(|l| l.trim().to_owned())
+                .collect())
+        };
+        let block = |head: &[&str]| -> Vec<String> {
+            head.iter()
+                .chain(CONFINEMENT.iter())
+                .map(|s| (*s).to_owned())
+                .collect()
+        };
+        let tenants = block(&[
+            "Match Group oxpanel-tenants",
+            "AuthenticationMethods publickey",
+            "PasswordAuthentication no",
+        ]);
+        // Passwords allowed (the default): the password group gets the very
+        // same confinement, plus password authentication.
+        let mut want = block(&[
+            "Match Group oxpanel-sftp-password",
+            "AuthenticationMethods publickey password",
+            "PasswordAuthentication yes",
+        ]);
+        want.extend(tenants.iter().cloned());
+        want.push("Match all".to_owned());
         assert_eq!(
-            directives,
-            vec![
-                "Match Group oxpanel-tenants",
-                "AuthorizedKeysFile /etc/oxpanel-sftp/%u",
-                "AuthenticationMethods publickey",
-                "PasswordAuthentication no",
-                "KbdInteractiveAuthentication no",
-                "ChrootDirectory /var/lib/oxpanel/sftp/%u",
-                "ForceCommand internal-sftp",
-                "DisableForwarding yes",
-                "AllowTcpForwarding no",
-                "AllowStreamLocalForwarding no",
-                "AllowAgentForwarding no",
-                "X11Forwarding no",
-                "PermitTunnel no",
-                "PermitTTY no",
-                "PermitUserRC no",
-                "Match all",
-            ],
-            "every directive is inside the Match block: nothing global"
+            directives(&Config::default())?,
+            want,
+            "every directive is inside a Match block: nothing global"
         );
+        // Forbidden: no tenant is offered password authentication.
+        let mut cfg = Config::default();
+        cfg.sftp_passwords = SftpPasswords::Forbidden;
+        let mut want = tenants;
+        want.push("Match all".to_owned());
+        assert_eq!(directives(&cfg)?, want);
         Ok(())
     }
 
@@ -909,7 +1174,7 @@ mod tests {
         let paths = SftpPaths::for_tenant(cfg, &rec)?;
         h.sys.clear_calls();
 
-        let rec = h.sftp.remove_key("foo-bar", FP_A).await?;
+        let rec = h.sftp.remove_key("foo-bar", FP_A, true).await?;
         assert_eq!(rec.sftp_keys.len(), 1);
         assert!(!read(&paths.keys_file).contains(BLOB_A));
         assert_eq!(
@@ -919,16 +1184,16 @@ mod tests {
         );
         assert!(paths.mount_unit.exists(), "one key left: access stays");
         assert!(matches!(
-            h.sftp.remove_key("foo-bar", FP_A).await,
+            h.sftp.remove_key("foo-bar", FP_A, true).await,
             Err(Error::SftpKeyNotFound { .. })
         ));
         assert!(matches!(
-            h.sftp.remove_key("foo-bar", "SHA256:nope").await,
+            h.sftp.remove_key("foo-bar", "SHA256:nope", true).await,
             Err(Error::InvalidInput { .. })
         ));
 
         h.sys.clear_calls();
-        let rec = h.sftp.remove_key("foo-bar", FP_B).await?;
+        let rec = h.sftp.remove_key("foo-bar", FP_B, true).await?;
         assert!(rec.sftp_keys.is_empty());
         assert_eq!(
             argv(&h),
@@ -944,6 +1209,20 @@ mod tests {
                     paths.mount_unit_name.clone(),
                 ],
                 strs(&[bin::SYSTEMCTL, "daemon-reload"]),
+                // Innermost first, never recursive, in the host's namespace.
+                std::iter::once(bin::SYSTEMD_RUN.to_owned())
+                    .chain(
+                        ["--wait", "--collect", "--quiet", "--", bin::RMDIR, "--"]
+                            .map(String::from)
+                    )
+                    .chain(
+                        paths
+                            .chroot_dirs()
+                            .iter()
+                            .rev()
+                            .map(|d| d.to_string_lossy().into_owned())
+                    )
+                    .collect(),
             ]
         );
         assert!(!paths.keys_file.exists());
@@ -968,8 +1247,8 @@ mod tests {
         let precious = paths.mount_point.join("index.html");
         std::fs::write(&precious, "data").map_err(|e| Error::io("write", &precious, e))?;
         assert!(matches!(
-            h.sftp.remove_key("foo-bar", FP_A).await,
-            Err(Error::Io { .. })
+            h.sftp.remove_key("foo-bar", FP_A, true).await,
+            Err(Error::CommandFailed { .. })
         ));
         assert_eq!(read(&precious), "data");
         // The key is gone from the record and from sshd's view all the same.
@@ -1163,6 +1442,7 @@ mod tests {
                 label: String::new(),
                 added_at_unix: 0,
             }],
+            sftp_password: false,
         };
         assert!(render_keys_file(&t).is_ok());
         let good = t.sftp_keys.clone();
@@ -1182,5 +1462,255 @@ mod tests {
         assert!(SftpPaths::for_tenant(&cfg, &t).is_err());
         t.home = PathBuf::from("/");
         assert!(SftpPaths::for_tenant(&cfg, &t).is_err());
+    }
+
+    const PASSWORD: &str = "correct horse battery";
+
+    fn stdin_of(h: &Harness, program: &str) -> Vec<String> {
+        h.sys
+            .calls()
+            .iter()
+            .filter(|c| c.program == program)
+            .map(|c| {
+                String::from_utf8_lossy(c.stdin.as_ref().map_or(&[][..], Secret::expose))
+                    .into_owned()
+            })
+            .collect()
+    }
+
+    async fn state(h: &Harness) -> Result<PasswordState> {
+        h.sys.password_state("foo-bar").await
+    }
+
+    async fn in_password_group(h: &Harness) -> Result<bool> {
+        Ok(h.sys
+            .groups_of("foo-bar", 20000)
+            .await?
+            .contains(&crate::system::fake::FAKE_PASSWORD_GROUP.1))
+    }
+
+    #[tokio::test]
+    async fn a_password_is_set_through_stdin_only_with_exact_commands() -> Result<()> {
+        let h = harness().await;
+        let paths = SftpPaths::for_tenant(&h.ctx.config, &h.tenants.get("foo-bar").await?)?;
+        let rec = h.sftp.set_password("foo-bar", PASSWORD).await?;
+        assert!(rec.sftp_password && rec.sftp_keys.is_empty());
+        assert!(
+            h.tenants.get("foo-bar").await?.sftp_password,
+            "recorded as a flag"
+        );
+        let sshd_t = strs(&[
+            bin::SSHD,
+            "-T",
+            "-C",
+            "user=foo-bar,host=localhost,addr=127.0.0.1",
+        ]);
+        assert_eq!(
+            argv(&h),
+            vec![
+                strs(&[bin::SSHD, "-t"]),
+                strs(&[bin::SYSTEMCTL, "try-reload-or-restart", "sshd.service"]),
+                sshd_t.clone(),
+                // The password: on stdin, nothing on the command line.
+                strs(&[bin::CHPASSWD]),
+                sshd_t,
+                strs(&[bin::SYSTEMCTL, "daemon-reload"]),
+                vec![
+                    bin::SYSTEMCTL.to_owned(),
+                    "enable".into(),
+                    "--now".into(),
+                    "--".into(),
+                    paths.mount_unit_name.clone(),
+                ],
+                // Only now can sshd ask this account for a password.
+                strs(&[bin::GPASSWD, "--add", "foo-bar", "oxpanel-sftp-password"]),
+            ]
+        );
+        assert_eq!(
+            stdin_of(&h, bin::CHPASSWD),
+            vec![format!("foo-bar:{PASSWORD}\n")]
+        );
+        assert_eq!(state(&h).await?, PasswordState::Usable);
+        assert!(in_password_group(&h).await?);
+        assert!(paths.mount_point.is_dir(), "a password alone gives access");
+        assert!(!paths.keys_file.exists(), "no keys, no keys file");
+        let record = std::fs::read_to_string(h.ctx.config.tenants_dir().join("foo-bar.json"))
+            .map_err(|e| Error::io("read", "record", e))?;
+        assert!(
+            !record.contains("horse"),
+            "the record never holds the password"
+        );
+
+        // Bad input never reaches the OS.
+        h.sys.clear_calls();
+        for bad in ["too-short", "line\nbreak-in-it-here"] {
+            assert!(matches!(
+                h.sftp.set_password("foo-bar", bad).await,
+                Err(Error::InvalidInput { .. })
+            ));
+        }
+        assert!(h.sys.calls().is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn suspension_locks_the_hash_and_resume_unlocks_it_without_the_plaintext() -> Result<()> {
+        let h = harness().await;
+        h.sftp.set_password("foo-bar", PASSWORD).await?;
+        h.sys.clear_calls();
+        h.tenants.set_suspended("foo-bar", true).await?;
+        let calls = argv(&h);
+        assert!(
+            calls.contains(&strs(&[bin::USERMOD, "--lock", "foo-bar"])),
+            "{calls:?}"
+        );
+        assert_eq!(
+            calls.last(),
+            Some(&strs(&[bin::SYSTEMCTL, "stop", "--", "user-20000.slice"])),
+            "sessions end with the suspension"
+        );
+        assert_eq!(state(&h).await?, PasswordState::Locked);
+        assert!(
+            h.tenants.get("foo-bar").await?.sftp_password,
+            "the record keeps it"
+        );
+
+        // A password set while suspended is locked before sshd may ask for it.
+        h.sys.clear_calls();
+        h.sftp
+            .set_password("foo-bar", "another long passphrase")
+            .await?;
+        let calls = argv(&h);
+        let pos = |c: &[&str]| calls.iter().position(|x| *x == strs(c));
+        let (out, set, lock, back) = (
+            pos(&[bin::GPASSWD, "--delete", "foo-bar", "oxpanel-sftp-password"]),
+            pos(&[bin::CHPASSWD]),
+            pos(&[bin::USERMOD, "--lock", "foo-bar"]),
+            pos(&[bin::GPASSWD, "--add", "foo-bar", "oxpanel-sftp-password"]),
+        );
+        assert!(
+            out.is_some() && out < set && set < lock && lock < back,
+            "{calls:?}"
+        );
+        assert_eq!(state(&h).await?, PasswordState::Locked);
+
+        h.sys.clear_calls();
+        h.tenants.set_suspended("foo-bar", false).await?;
+        assert!(argv(&h).contains(&strs(&[bin::USERMOD, "--unlock", "foo-bar"])));
+        assert!(
+            stdin_of(&h, bin::CHPASSWD).is_empty(),
+            "nothing re-sends a password"
+        );
+        assert_eq!(state(&h).await?, PasswordState::Usable);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn clearing_the_password_ends_sessions_only_when_asked() -> Result<()> {
+        let h = harness().await;
+        h.sftp.add_key("foo-bar", KEY_A, "").await?;
+        h.sftp.set_password("foo-bar", PASSWORD).await?;
+        h.sys.clear_calls();
+        let (rec, had) = h.sftp.clear_password("foo-bar", false).await?;
+        assert!(had && !rec.sftp_password);
+        let calls = argv(&h);
+        let pos = |c: &[&str]| calls.iter().position(|x| *x == strs(c));
+        let (out, clear) = (
+            pos(&[bin::GPASSWD, "--delete", "foo-bar", "oxpanel-sftp-password"]),
+            pos(&[bin::CHPASSWD, "-e"]),
+        );
+        assert!(
+            out.is_some() && out < clear,
+            "group first, then the hash: {calls:?}"
+        );
+        assert_eq!(stdin_of(&h, bin::CHPASSWD), vec!["foo-bar:!!\n".to_owned()]);
+        assert!(
+            !calls.iter().any(|c| c.get(1).is_some_and(|a| a == "stop")),
+            "sessions continue"
+        );
+        assert_eq!(state(&h).await?, PasswordState::NoPassword);
+        assert!(!in_password_group(&h).await?);
+        let paths = SftpPaths::for_tenant(&h.ctx.config, &rec)?;
+        assert!(paths.keys_file.exists(), "the key still works");
+
+        // Again: nothing to do; with the flag on a tenant without a password, still nothing.
+        h.sys.clear_calls();
+        assert!(!h.sftp.clear_password("foo-bar", true).await?.1);
+        assert!(h.sys.calls_to(bin::CHPASSWD).is_empty());
+
+        // With the flag, sessions end.
+        h.sftp.set_password("foo-bar", PASSWORD).await?;
+        h.sys.clear_calls();
+        h.sftp.clear_password("foo-bar", true).await?;
+        assert_eq!(
+            argv(&h).last(),
+            Some(&strs(&[bin::SYSTEMCTL, "stop", "--", "user-20000.slice"]))
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn without_end_sessions_the_mount_waits_for_open_sessions() -> Result<()> {
+        let h = harness().await;
+        let (rec, ..) = h.sftp.add_key("foo-bar", KEY_A, "").await?;
+        h.sftp.add_key("foo-bar", KEY_B, "").await?;
+        let paths = SftpPaths::for_tenant(&h.ctx.config, &rec)?;
+        // One key of two: nothing but the keys file changes.
+        h.sys.clear_calls();
+        h.sftp.remove_key("foo-bar", FP_A, false).await?;
+        assert!(!argv(&h)
+            .iter()
+            .any(|c| c.get(1).is_some_and(|a| a == "stop")));
+        // The last credential while a session is open: no new logins, the
+        // session keeps its mount.
+        h.sys.set_sessions_open(true);
+        h.sys.clear_calls();
+        h.sftp.remove_key("foo-bar", FP_B, false).await?;
+        assert!(!paths.keys_file.exists());
+        assert!(paths.mount_unit.exists() && paths.mount_point.is_dir());
+        assert_eq!(
+            argv(&h),
+            vec![strs(&[
+                bin::SYSTEMCTL,
+                "show",
+                "--property=ActiveState",
+                "--value",
+                "--",
+                "user-20000.slice"
+            ])]
+        );
+        // The session has ended; the next start of the daemon tidies up.
+        h.sys.set_sessions_open(false);
+        converge_all(&h.ctx).await?;
+        assert!(!paths.mount_unit.exists() && !paths.chroot.exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_host_that_forbids_passwords_refuses_them_before_anything() -> Result<()> {
+        let dir = tempfile::tempdir().map_err(|e| Error::io("tempdir", "/tmp", e))?;
+        let mut cfg = Config::default();
+        cfg.state_dir = dir.path().join("state");
+        cfg.home_base = dir.path().join("home");
+        cfg.systemd_unit_dir = dir.path().join("systemd");
+        cfg.sftp_passwords = SftpPasswords::Forbidden;
+        std::fs::create_dir_all(&cfg.home_base).map_err(|e| Error::io("mkdir", "home", e))?;
+        let sys = Arc::new(FakeSystem::new());
+        let ctx = Ctx::new(cfg, sys.clone(), false);
+        ctx.store.init()?;
+        TenantService::new(ctx.clone())
+            .create("foo-bar", Limits::default(), "")
+            .await?;
+        sys.clear_calls();
+        let r = SftpService::new(ctx.clone())
+            .set_password("foo-bar", PASSWORD)
+            .await;
+        assert!(
+            matches!(&r, Err(Error::SftpUnavailable(m)) if m.contains("OXPANEL_SFTP_PASSWORDS")),
+            "{r:?}"
+        );
+        assert!(sys.calls().is_empty());
+        assert!(!TenantService::new(ctx).get("foo-bar").await?.sftp_password);
+        Ok(())
     }
 }

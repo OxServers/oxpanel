@@ -54,6 +54,10 @@ pub struct TenantRecord {
     /// before SFTP existed.
     #[serde(default)]
     pub sftp_keys: Vec<SftpKeyRecord>,
+    /// The tenant has an SFTP password. Only this flag is recorded: the
+    /// password exists solely as the hash in the shadow database.
+    #[serde(default)]
+    pub sftp_password: bool,
 }
 
 /// One SSH public key of a tenant. Everything in here is public.
@@ -274,6 +278,7 @@ mod tests {
             owner: String::new(),
             suspended: false,
             sftp_keys: Vec::new(),
+            sftp_password: false,
         }
     }
 

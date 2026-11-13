@@ -84,10 +84,25 @@ enum SftpCmd {
         #[arg(long, default_value = "")]
         label: String,
     },
-    /// Remove a key by its fingerprint (SHA256:…); ends running sessions.
+    /// Remove a key by its fingerprint (SHA256:…). Running sessions continue
+    /// unless --end-sessions is given.
     RemoveKey {
         username: String,
         fingerprint: String,
+        /// Also end the tenant's running SFTP sessions.
+        #[arg(long)]
+        end_sessions: bool,
+    },
+    /// Set or replace the tenant's SFTP password, read from standard input
+    /// (one line; never pass it as an argument).
+    SetPassword { username: String },
+    /// Remove the tenant's SFTP password. Running sessions continue unless
+    /// --end-sessions is given.
+    ClearPassword {
+        username: String,
+        /// Also end the tenant's running SFTP sessions.
+        #[arg(long)]
+        end_sessions: bool,
     },
     /// The tenant's keys.
     ListKeys { username: String },
@@ -292,7 +307,7 @@ fn print_tenant(t: &pb::Tenant) {
     let l = t.limits.unwrap_or_default();
     let state = pb::TenantState::try_from(t.state).map_or("unknown", |s| s.as_str_name());
     say!(
-        "tenant={} owner={} uid={} gid={} home={} state={} suspended={} slice={} memory_max={} cpu_weight={} io_weight={} tasks_max={} disk_max={} inodes_max={} sftp_keys={} created_at={}",
+        "tenant={} owner={} uid={} gid={} home={} state={} suspended={} slice={} memory_max={} cpu_weight={} io_weight={} tasks_max={} disk_max={} inodes_max={} sftp_keys={} sftp_password={} created_at={}",
         t.username,
         if t.owner.is_empty() { "-" } else { t.owner.as_str() },
         t.uid,
@@ -308,6 +323,7 @@ fn print_tenant(t: &pb::Tenant) {
         l.disk_max_bytes,
         l.inodes_max,
         t.sftp_key_count,
+        t.sftp_password,
         t.created_at.as_ref().map_or(0, |ts| ts.seconds),
     );
 }
@@ -577,7 +593,7 @@ async fn run_host(
                 .await?
                 .into_inner();
             say!(
-                "version={} selinux={} php={} node={} node_version={} python={} sftp={} disk_quota={} dry_run={} tenants={} vhosts={} uid_range={}-{} load={:.2},{:.2},{:.2} memory_total={} memory_free={} home_disk_total={} home_disk_free={} uptime={}",
+                "version={} selinux={} php={} node={} node_version={} python={} sftp={} sftp_passwords={} disk_quota={} dry_run={} tenants={} vhosts={} uid_range={}-{} load={:.2},{:.2},{:.2} memory_total={} memory_free={} home_disk_total={} home_disk_free={} uptime={}",
                 i.daemon_version,
                 i.selinux_enabled,
                 i.php_available,
@@ -589,6 +605,7 @@ async fn run_host(
                 },
                 i.python_available,
                 i.sftp_available,
+                i.sftp_passwords_allowed,
                 i.disk_quota_available,
                 i.dry_run,
                 i.tenant_count,
@@ -668,15 +685,46 @@ async fn run_sftp(
         SftpCmd::RemoveKey {
             username,
             fingerprint,
+            end_sessions,
         } => {
             let r = c
                 .remove_sftp_key(pb::RemoveSftpKeyRequest {
                     username,
                     fingerprint,
+                    end_sessions,
                 })
                 .await?
                 .into_inner();
             say!("removed=true remaining={}", r.remaining);
+        }
+        SftpCmd::SetPassword { username } => {
+            let mut input = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut input)
+                .map_err(|e| format!("reading the password from stdin: {e}"))?;
+            // One line: its terminating newline is not part of the password.
+            let line = input.strip_suffix('\n').unwrap_or(&input);
+            let password = line.strip_suffix('\r').unwrap_or(line).to_owned();
+            let r = c
+                .set_sftp_password(pb::SetSftpPasswordRequest { username, password })
+                .await?
+                .into_inner();
+            say!("password=set");
+            if let Some(t) = &r.tenant {
+                print_tenant(t);
+            }
+        }
+        SftpCmd::ClearPassword {
+            username,
+            end_sessions,
+        } => {
+            let r = c
+                .clear_sftp_password(pb::ClearSftpPasswordRequest {
+                    username,
+                    end_sessions,
+                })
+                .await?
+                .into_inner();
+            say!("cleared={}", r.cleared);
         }
         SftpCmd::ListKeys { username } => {
             for k in &c

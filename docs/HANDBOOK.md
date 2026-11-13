@@ -184,6 +184,11 @@ valid. After editing: `sudo systemctl restart oxpanel-daemon`.
 | `OXPANEL_NGINX_LOG_DIR` | `/var/log/nginx/oxpanel` | Per-site `<domain>.access.log` / `<domain>.error.log`. If you change it, change `/etc/logrotate.d/oxpanel` too. |
 | `OXPANEL_PHP_CONF_DIR` | `/etc/oxpanel-php` | One PHP-FPM configuration per tenant that uses PHP. World-readable (each tenant's FPM reads its own); holds no secrets. |
 | `OXPANEL_WEB_USER` | `nginx` | Account the web-server workers run as; receives ACL grants on document roots. Must exist, must not be root, must not be inside the tenant uid range. |
+| `OXPANEL_TENANT_GROUP` | `oxpanel-tenants` | Group every tenant is put in; OxPanel's sshd drop-in confines its members to chrooted SFTP. Created by the package; must exist. |
+| `OXPANEL_SFTP_PASSWORD_GROUP` | `oxpanel-sftp-password` | Group of the tenants with an SFTP password (the only ones offered password login). Created by the package; must exist. |
+| `OXPANEL_SFTP_PASSWORDS` | `true` | Whether tenants may be given SFTP passwords (opt-in per tenant). `false` = keys only (§9). |
+| `OXPANEL_SSHD_DROPIN_FILE` | `/etc/ssh/sshd_config.d/60-oxpanel.conf` | The sshd drop-in OxPanel owns; its directory must be included by `sshd_config`. |
+| `OXPANEL_SFTP_KEYS_DIR` | `/etc/oxpanel-sftp` | Per-tenant SFTP keys files (root-owned). |
 | `OXPANEL_COMMAND_TIMEOUT_SECS` | `60` | Upper bound for any single external command (`useradd`, `nginx -t`, …). |
 | `OXPANEL_LOG` | `info` | `tracing` filter: `info`, `debug`, `oxpanel_daemon=trace`, … |
 | `OXPANEL_DRY_RUN` | `false` | Use the in-memory fake OS (development only — see §11). |
@@ -248,8 +253,8 @@ scopes; a uid that is not listed (including root) may call everything.
 
 | Scope | RPCs |
 |---|---|
-| `read` | `GetTenant`, `ListTenants`, `ListVirtualHosts`, `GetTenantUsage`, `GetHostInfo`, `Reconcile` |
-| `vhost` | `ConfigureVirtualHost`, `RemoveVirtualHost` |
+| `read` | `GetTenant`, `ListTenants`, `ListVirtualHosts`, `GetTenantUsage`, `GetHostInfo`, `Reconcile`, `ListSftpKeys` |
+| `vhost` | `ConfigureVirtualHost`, `RemoveVirtualHost`, `AddSftpKey`, `RemoveSftpKey`, `SetSftpPassword`, `ClearSftpPassword` (customers manage their own SFTP access) |
 | `tenant` | `CreateTenant`, `UpdateTenantLimits`, `UpdateTenantOwner`, `SuspendTenant`, `ResumeTenant` |
 | `delete` | `DeleteTenant` |
 
@@ -367,7 +372,11 @@ sudo oxpanel-ctl sftp add-key acme --key-file acme_laptop.pub --label laptop
 # changed=true
 # fingerprint=SHA256:… type=ssh-ed25519 label=laptop added_at=1794571200
 sudo oxpanel-ctl sftp list-keys acme
-sudo oxpanel-ctl sftp remove-key acme SHA256:…    # ends its sessions; the last key removes access
+sudo oxpanel-ctl sftp remove-key acme SHA256:…    # no new logins with it; sessions continue
+sudo oxpanel-ctl sftp remove-key acme SHA256:… --end-sessions   # …and end the tenant's sessions
+# Or a password (opt-in per tenant), read from stdin — never as an argument
+sudo oxpanel-ctl sftp set-password acme < acme.pw   # password=set
+sudo oxpanel-ctl sftp clear-password acme [--end-sessions]
 
 # A disk limit (needs quotas on the host, §9.1): 5 GiB and 200 000 files
 sudo oxpanel-ctl tenant set-limits acme --memory 1G --cpu-weight 25 --tasks-max 200 --disk 5G --inodes 200000
@@ -476,6 +485,7 @@ needs to confirm a site is live, poll it.
 | `/var/lib/oxpanel/sftp/<username>/` | `root 0755` | SFTP chroot; contains only `home/<username>`, the tenant's home bind-mounted |
 | `/etc/systemd/system/var-lib-oxpanel-sftp-<name>-home-<name>.mount` | `root 0644` | that bind mount (enabled, so it returns after a reboot) |
 | group `oxpanel-tenants` | | every tenant account is a member; grants no file access |
+| group `oxpanel-sftp-password` | | tenants with an SFTP password; the password itself only as the hash in `/etc/shadow` (the record has a flag) |
 | XFS user quota of the tenant's uid | | the disk and inode limit (`xfs_quota -x -c 'report -u -n -b -i' /`) |
 | SELinux hosts | | `semanage fcontext` equivalence `<docroot> = /usr/share/nginx/html` (labels the tree `httpd_sys_content_t`; a plain rule would be overridden by `file_contexts.homedirs`) |
 
@@ -607,12 +617,34 @@ back if sshd rejects it). For members of that group sshd allows nothing but
 SFTP, chrooted into a directory that contains only the tenant's own home, with
 keys only OxPanel can change — also for tenants that have no key, so a
 compromised site cannot give itself a login by writing
-`~/.ssh/authorized_keys`. Root and every other account are not affected. Only
-public keys are accepted (no passwords). Check what sshd will do for an
-account: `sshd -T -C user=acme,host=x,addr=127.0.0.1 | grep -E 'forcecommand|chroot'`.
-Suspending a tenant withdraws its keys file and ends its running sessions;
-`tenant resume` restores them. Removing a key also ends the tenant's running
-sessions.
+`~/.ssh/authorized_keys`. Root and every other account are not affected.
+Check what sshd will do for an account:
+`sshd -T -C user=acme,host=x,addr=127.0.0.1 | grep -E 'forcecommand|chroot|passwordauth'`.
+Suspending a tenant withdraws its keys file, locks its password hash and ends
+its running sessions; `tenant resume` restores them. Removing a key or the
+password stops new logins with it; running sessions continue unless
+`--end-sessions` is given.
+
+**SFTP passwords** — opt-in per tenant (`sftp set-password`, read from stdin),
+allowed by default; `OXPANEL_SFTP_PASSWORDS=false` in `daemon.env` forbids them
+host-wide (restart the daemon: the password block leaves the sshd drop-in, so
+existing passwords stop working at once; `host reconcile` lists the tenants
+that still have one recorded; `sftp clear-password` removes them). Tenants
+with a password are in the group `oxpanel-sftp-password`; only that group is
+offered password authentication, with the same confinement as keys. The
+password exists only as the hash in `/etc/shadow`.
+
+*Brute force.* OpenSSH 9.9 on AlmaLinux 9.8 already refuses an address for a
+while after failed logins (`PerSourcePenalties`, default
+`authfail:5 … max:600 min:15`), limits unauthenticated connections
+(`MaxStartups 10:30:100`) and closes a login after `LoginGraceTime 120`.
+OxPanel's drop-in sets `MaxAuthTries 3` for tenants (stock: 6). Everything
+global stays yours; for longer, cross-address bans install fail2ban and enable
+its `sshd` jail (`dnf install fail2ban-server`, then `[sshd] enabled = true` in
+`/etc/fail2ban/jail.d/sshd.local`). `pam_faillock` (`authselect
+enable-feature with-faillock`) also works but locks every account after
+failures, your own included. Watch `journalctl -u sshd` for
+"Failed password for <tenant>".
 
 ### 9.1 Disk quotas: preparing the host
 

@@ -21,7 +21,7 @@ pub mod command;
 pub mod fake;
 pub mod real;
 
-pub use command::{CommandOutput, CommandSpec, RunAs};
+pub use command::{CommandOutput, CommandSpec, RunAs, Secret};
 pub use fake::FakeSystem;
 pub use real::RealSystem;
 
@@ -56,6 +56,14 @@ pub mod bin {
     pub const GPASSWD: &str = "/usr/bin/gpasswd";
     /// Optional: only needed for SFTP access (`sshd -t`, `sshd -T`).
     pub const SSHD: &str = "/usr/sbin/sshd";
+    /// Sets a tenant's SFTP password from stdin (`user:password`), so the
+    /// password is never in an argv.
+    pub const CHPASSWD: &str = "/usr/sbin/chpasswd";
+    /// Locks and unlocks a password hash (suspension).
+    pub const USERMOD: &str = "/usr/sbin/usermod";
+    /// Removes empty SFTP chroot directories (run through `systemd-run`, in
+    /// the host's mount namespace).
+    pub const RMDIR: &str = "/usr/bin/rmdir";
     /// Optional: only needed for disk quotas (XFS).
     pub const XFS_QUOTA: &str = "/usr/sbin/xfs_quota";
 }
@@ -118,6 +126,43 @@ pub fn parse_mountinfo(text: &str, major: u64, minor: u64) -> Option<QuotaState>
     })
 }
 
+/// What the password field of an account in `/etc/shadow` amounts to. The
+/// hash itself never leaves [`System`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasswordState {
+    /// No such account in the shadow file.
+    Missing,
+    /// No password can match (`!!`, `!`, `*`, …): how `useradd` leaves it.
+    NoPassword,
+    /// A hash that a login can match.
+    Usable,
+    /// A hash disabled by a leading `!` (`usermod --lock`).
+    Locked,
+    /// An empty field: *any* password matches. Never wanted.
+    Empty,
+}
+
+/// Classify the password field of `user` in the text of `/etc/shadow`.
+pub fn shadow_password_state(text: &str, user: &str) -> PasswordState {
+    let Some(field) = text.lines().find_map(|line| {
+        let mut f = line.splitn(3, ':');
+        (f.next() == Some(user)).then(|| f.next().unwrap_or(""))
+    }) else {
+        return PasswordState::Missing;
+    };
+    if field.is_empty() {
+        return PasswordState::Empty;
+    }
+    let unlocked = field.trim_start_matches('!');
+    if unlocked.is_empty() || unlocked.starts_with('*') {
+        PasswordState::NoPassword
+    } else if unlocked.len() == field.len() {
+        PasswordState::Usable
+    } else {
+        PasswordState::Locked
+    }
+}
+
 /// Operating-system primitives the daemon depends on.
 #[tonic::async_trait]
 pub trait System: Send + Sync + 'static {
@@ -160,6 +205,9 @@ pub trait System: Send + Sync + 'static {
 
     /// Quota support of the file system holding `path`. Read-only.
     async fn quota_state(&self, path: &Path) -> Result<QuotaState>;
+
+    /// The state of an account's password in the shadow database. Read-only.
+    async fn password_state(&self, user: &str) -> Result<PasswordState>;
 }
 
 #[cfg(test)]
@@ -174,6 +222,30 @@ mod tests {
 99 70 252:5 / /data rw,relatime - xfs /dev/mapper/vg-data rw,attr2,uqnoenforce
 100 70 252:6 / /old rw,relatime - ext4 /dev/vda6 rw,usrquota
 ";
+
+    #[test]
+    fn shadow_fields_are_classified_without_exposing_them() {
+        let text = "root:$6$abc$def:19000:0:99999:7:::
+alice:!!:20000:0:99999:7:::
+bob:$6$salt$hash:20000::::::
+carol:!$6$salt$hash:20000::::::
+dave::20000::::::
+erin:*:20000::::::
+frank:!*:20000::::::
+";
+        for (user, want) in [
+            ("alice", PasswordState::NoPassword),
+            ("bob", PasswordState::Usable),
+            ("carol", PasswordState::Locked),
+            ("dave", PasswordState::Empty),
+            ("erin", PasswordState::NoPassword),
+            ("frank", PasswordState::NoPassword),
+            ("ghost", PasswordState::Missing),
+            ("ali", PasswordState::Missing),
+        ] {
+            assert_eq!(shadow_password_state(text, user), want, "{user}");
+        }
+    }
 
     #[test]
     fn mountinfo_tells_whether_user_quotas_are_enforced() {

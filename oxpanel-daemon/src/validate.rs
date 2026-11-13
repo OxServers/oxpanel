@@ -17,6 +17,10 @@ pub const MAX_WEIGHT: u32 = 10_000;
 pub const MIN_DISK_MAX_BYTES: u64 = 1024 * 1024;
 /// Smallest accepted inode limit (a fresh home already holds a handful of files).
 pub const MIN_INODES_MAX: u64 = 100;
+/// Shortest SFTP password the engine accepts; further policy is the panel's.
+pub const MIN_SFTP_PASSWORD_CHARS: usize = 12;
+/// Longest accepted SFTP password (characters).
+pub const MAX_SFTP_PASSWORD_CHARS: usize = 256;
 /// Most SSH public keys one tenant may hold.
 pub const MAX_SFTP_KEYS: usize = 20;
 /// Longest accepted public-key line (a 16384-bit RSA key is about 2.8 kB).
@@ -409,6 +413,42 @@ impl Limits {
     /// Whether any kernel disk quota is requested.
     pub fn has_disk_quota(&self) -> bool {
         self.disk_max_bytes.is_some() || self.inodes_max.is_some()
+    }
+}
+
+/// An SFTP password: 12..=256 characters, none of them control characters
+/// (a newline would start a second `user:password` line for `chpasswd`).
+/// `Debug` never shows it; it is handed to `chpasswd` on stdin only.
+#[derive(Clone, PartialEq, Eq)]
+pub struct SftpPassword(String);
+
+impl SftpPassword {
+    pub fn parse(raw: &str) -> Result<Self> {
+        let chars = raw.chars().count();
+        if !(MIN_SFTP_PASSWORD_CHARS..=MAX_SFTP_PASSWORD_CHARS).contains(&chars) {
+            return Err(Error::invalid(
+                "password",
+                format!("must be {MIN_SFTP_PASSWORD_CHARS}..={MAX_SFTP_PASSWORD_CHARS} characters"),
+            ));
+        }
+        if raw.chars().any(char::is_control) {
+            return Err(Error::invalid(
+                "password",
+                "must not contain control characters (newlines, tabs, NUL, …)",
+            ));
+        }
+        Ok(Self(raw.to_owned()))
+    }
+
+    /// The password, for the one place that writes it to `chpasswd`.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for SftpPassword {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SftpPassword([redacted])")
     }
 }
 
@@ -957,6 +997,37 @@ mod tests {
         assert_eq!(mpint_bits(&[0x80]), None, "negative");
         assert_eq!(mpint_bits(&[]), None);
         assert_eq!(mpint_bits(&[0, 0]), None, "zero");
+    }
+
+    #[test]
+    fn sftp_passwords_have_a_minimum_length_and_no_control_characters() {
+        for ok in [
+            "correct horse",
+            "x".repeat(12).as_str(),
+            "pässwörd-ünïcode",
+            "with:colon:s and spaces",
+        ] {
+            assert!(SftpPassword::parse(ok).is_ok(), "{ok}");
+        }
+        let long = "y".repeat(MAX_SFTP_PASSWORD_CHARS + 1);
+        for bad in [
+            "",
+            "elevenchars",
+            "two\nlines-here",
+            "tab\there-and-more",
+            "nul\0-in-the-middle",
+            long.as_str(),
+        ] {
+            assert!(is_invalid(SftpPassword::parse(bad)), "{bad:?}");
+        }
+        let p = SftpPassword::parse("hunter2-hunter2").unwrap_or_else(|e| panic!("{e}"));
+        assert!(!format!("{p:?}").contains("hunter2"));
+        // The error message never echoes the password either.
+        let e = SftpPassword::parse("short-pw")
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
+        assert!(!e.contains("short-pw"), "{e}");
     }
 
     #[test]

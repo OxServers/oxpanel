@@ -210,6 +210,7 @@ fn tenant_to(rec: &TenantRecord) -> pb::Tenant {
         owner: rec.owner.clone(),
         suspended: rec.suspended,
         sftp_key_count: u32::try_from(rec.sftp_keys.len()).unwrap_or(u32::MAX),
+        sftp_password: rec.sftp_password,
     }
 }
 
@@ -548,6 +549,7 @@ impl OxPanelEngine for Engine {
             sftp_available: i.facilities.sftp,
             disk_quota_available: i.facilities.disk_quota,
             disk_quota_detail: i.facilities.disk_quota_detail,
+            sftp_passwords_allowed: i.facilities.sftp_passwords,
         }))
     }
 
@@ -573,8 +575,8 @@ impl OxPanelEngine for Engine {
         req: Request<pb::AddSftpKeyRequest>,
     ) -> Result<Response<pb::AddSftpKeyResponse>, Status> {
         const RPC: &str = "AddSftpKey";
-        // Giving someone a way to log in is a tenant-level change.
-        let peer = self.authorise(&req, RPC, Scope::Tenant)?;
+        // Customers manage their own SFTP access (owner decision): vhost scope.
+        let peer = self.authorise(&req, RPC, Scope::VHost)?;
         let r = req.into_inner();
         // The key itself is public, but there is no reason to log it.
         info!(rpc = RPC, peer, username = %r.username, "request");
@@ -594,12 +596,12 @@ impl OxPanelEngine for Engine {
         req: Request<pb::RemoveSftpKeyRequest>,
     ) -> Result<Response<pb::RemoveSftpKeyResponse>, Status> {
         const RPC: &str = "RemoveSftpKey";
-        let peer = self.authorise(&req, RPC, Scope::Tenant)?;
+        let peer = self.authorise(&req, RPC, Scope::VHost)?;
         let r = req.into_inner();
-        info!(rpc = RPC, peer, username = %r.username, fingerprint = %r.fingerprint, "request");
+        info!(rpc = RPC, peer, username = %r.username, fingerprint = %r.fingerprint, end_sessions = r.end_sessions, "request");
         let rec = self
             .sftp
-            .remove_key(&r.username, &r.fingerprint)
+            .remove_key(&r.username, &r.fingerprint, r.end_sessions)
             .await
             .map_err(|e| fail(RPC, &peer, e))?;
         Ok(Response::new(pb::RemoveSftpKeyResponse {
@@ -621,6 +623,44 @@ impl OxPanelEngine for Engine {
             .map_err(|e| fail(RPC, &peer, e))?;
         Ok(Response::new(pb::ListSftpKeysResponse {
             keys: keys.iter().map(sftp_key_to).collect(),
+        }))
+    }
+
+    async fn set_sftp_password(
+        &self,
+        req: Request<pb::SetSftpPasswordRequest>,
+    ) -> Result<Response<pb::SetSftpPasswordResponse>, Status> {
+        const RPC: &str = "SetSftpPassword";
+        let peer = self.authorise(&req, RPC, Scope::VHost)?;
+        let r = req.into_inner();
+        // The password is never logged; only who asked for which tenant.
+        info!(rpc = RPC, peer, username = %r.username, "request");
+        let rec = self
+            .sftp
+            .set_password(&r.username, &r.password)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(pb::SetSftpPasswordResponse {
+            tenant: Some(tenant_to(&rec)),
+        }))
+    }
+
+    async fn clear_sftp_password(
+        &self,
+        req: Request<pb::ClearSftpPasswordRequest>,
+    ) -> Result<Response<pb::ClearSftpPasswordResponse>, Status> {
+        const RPC: &str = "ClearSftpPassword";
+        let peer = self.authorise(&req, RPC, Scope::VHost)?;
+        let r = req.into_inner();
+        info!(rpc = RPC, peer, username = %r.username, end_sessions = r.end_sessions, "request");
+        let (rec, cleared) = self
+            .sftp
+            .clear_password(&r.username, r.end_sessions)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(pb::ClearSftpPasswordResponse {
+            cleared,
+            tenant: Some(tenant_to(&rec)),
         }))
     }
 }

@@ -12,7 +12,7 @@ use std::ffi::CString;
 use nix::unistd::{fchown, getgrouplist, Gid, Group, Uid, User};
 use tracing::{debug, warn};
 
-use super::{CommandOutput, CommandSpec, HostStats, OsUser, QuotaState, System};
+use super::{CommandOutput, CommandSpec, HostStats, OsUser, PasswordState, QuotaState, System};
 use crate::error::{Error, Result};
 
 /// Environment handed to every child process. Nothing from the daemon's own
@@ -48,12 +48,26 @@ impl System for RealSystem {
             .env_clear()
             .env("PATH", CHILD_PATH)
             .env("LC_ALL", "C")
-            .stdin(Stdio::null())
+            .stdin(if spec.stdin.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             // If we stop waiting (timeout below), the child is killed rather than orphaned.
             .kill_on_drop(true);
-        let child = cmd.spawn().map_err(|e| Error::io("spawn", program, e))?;
+        let mut child = cmd.spawn().map_err(|e| Error::io("spawn", program, e))?;
+        if let (Some(secret), Some(mut pipe)) = (spec.stdin.as_ref(), child.stdin.take()) {
+            use tokio::io::AsyncWriteExt as _;
+            // Small (a password line): fits the pipe buffer, so writing
+            // before reading the output cannot deadlock. Dropping the pipe
+            // closes it, which ends the child's input.
+            pipe.write_all(secret.expose())
+                .await
+                .map_err(|e| Error::io("write stdin", program, e))?;
+            drop(pipe);
+        }
         let secs = spec.timeout.as_secs();
         match tokio::time::timeout(spec.timeout, child.wait_with_output()).await {
             Ok(Ok(out)) => {
@@ -239,6 +253,18 @@ impl System for RealSystem {
         })
         .await
         .map_err(|e| Error::Internal(format!("quota_state task: {e}")))?
+    }
+
+    async fn password_state(&self, user: &str) -> Result<PasswordState> {
+        let user = user.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let shadow = Path::new("/etc/shadow");
+            // Read, classified and dropped here; the hash is never returned or logged.
+            let text = std::fs::read_to_string(shadow).map_err(|e| Error::io("read", shadow, e))?;
+            Ok(super::shadow_password_state(&text, &user))
+        })
+        .await
+        .map_err(|e| Error::Internal(format!("password_state task: {e}")))?
     }
 }
 

@@ -1,6 +1,9 @@
 # SFTP access and disk quotas (M2c) — design
 
-Date: 2026-11-13. Status: implemented on branch `m2c-sftp-quotas`.
+Date: 2026-11-13. Status: implemented on branch `m2c-sftp-quotas`. Revised the same day after
+three owner decisions: SFTP passwords are offered (opt-in per tenant),
+customers manage their own SFTP access (`vhost` scope), and removing a
+credential ends sessions only when asked.
 
 ## Goal
 
@@ -89,7 +92,11 @@ directories are removed with `rmdir` — never recursively, so nothing inside a
 still-mounted home can ever be deleted through it. The mount unit sets
 `LazyUnmount=yes`, so a file still held open in there (by root, or by a session
 on a host without logind) cannot make the removal fail; logins are impossible
-by then.
+by then. The `rmdir` runs through `systemd-run` in the host's mount
+namespace: a daemon started while a home was mounted holds a copy of that
+mount in its own namespace (found by the integration suite after a daemon
+restart), which makes the directory busy from inside; an `rmdir` in the host
+namespace succeeds and the kernel detaches the stale copy.
 
 ### Keys
 
@@ -106,30 +113,91 @@ The keys file `/etc/oxpanel-sftp/<t>` is `root:root 0640` with an ACL entry
 `user:<t>:r--` (sshd reads it with the tenant's uid); the directory is 0711,
 so a tenant can read its own file and neither list nor read the others.
 
-Removing a key ends **all** running sessions of the tenant, not only those of
-that key (sshd offers no way to tell them apart from outside).
+### Removing a credential: sessions continue unless asked
 
-### Passwords: not offered
+(Owner decision.) `RemoveSftpKey` and `ClearSftpPassword` take
+`end_sessions` (default false). Without it, the credential cannot start a new
+session and running sessions continue; with it, **all** running sessions of
+the tenant end (sshd offers no way to tell from outside which credential a
+session used). If the last credential goes while a session is still open
+(the tenant's `user-<uid>.slice` is active), the chroot mount is left in place
+for that session — nobody new can log in — and removed at the daemon's next
+start once the session has ended; until then `Reconcile` lists it as
+`ORPHAN_SFTP_ACCESS`. Suspension and deletion always end sessions.
 
-Key authentication only. Passwords would need brute-force protection
-(fail2ban or similar), a way to deliver them that keeps them out of argv and
-logs (`chpasswd` on stdin), and they are what gets reused and phished. The
-panel can generate a key pair for customers who have none. If passwords are
-wanted later, the drop-in's `AuthenticationMethods` is the single switch and
-the account already has a (locked) password field.
+### Passwords: offered, opt-in per tenant
+
+(Owner decision; the first version offered keys only.) `SetSftpPassword` /
+`ClearSftpPassword`. A tenant has no password until one is set, and it can be
+cleared again.
+
+- **Same confinement as keys.** A tenant with a password is also a member of
+  a second group, `oxpanel-sftp-password`. The drop-in's first `Match` block
+  is for that group and repeats the whole confinement (chroot,
+  `internal-sftp`, no forwarding, no TTY) adding only
+  `AuthenticationMethods publickey password` and `PasswordAuthentication yes`;
+  the tenant block keeps `publickey` only. sshd takes the first value of each
+  directive, so password tenants get the password methods and identical
+  confinement, and tenants without a password are not even asked for one.
+- **Never in argv, logs or records.** The password arrives in the request
+  body, is validated (12–256 characters, no control characters — a newline
+  would start a second `chpasswd` line; further policy is the panel's) by a
+  type whose `Debug` is redacted, and is written to `chpasswd` on **stdin**
+  (`CommandSpec::stdin_secret`; never in `display()` or debug logs). Only the
+  system hash (`ENCRYPT_METHOD` of `login.defs`, SHA-512 on AlmaLinux 9)
+  exists afterwards; the record holds `sftp_password: true`; nothing returns
+  it. It is not zeroed in memory after use (Rust strings; no extra
+  dependency).
+- **No window.** Setting: `chpasswd` first, then (if suspended) `usermod
+  --lock`, and only then the group membership that lets sshd ask for a
+  password; a suspended tenant is taken out of the group before `chpasswd`.
+  Clearing: out of the group first, then the field is set back to `!!` (what
+  `useradd` leaves) with `chpasswd -e`, also on stdin.
+- **Suspension without the plaintext.** `usermod --lock` prefixes the hash
+  with `!`; resumption `usermod --unlock` restores the same hash. Deletion:
+  `userdel` removes the shadow entry and group memberships.
+- **Sandbox and SELinux.** `chpasswd` and `usermod` write `/etc/shadow`,
+  `/etc/gshadow` and their lock files under `/etc`, which the unit's
+  `ReadWritePaths=/etc` already allows (as for `useradd`); the daemon reads
+  `/etc/shadow` itself to classify the field for Reconcile (never returning
+  or logging the hash). No new SELinux rule was needed: the acceptance VM
+  ran it enforcing with zero denials.
+- **Host-wide switch** `OXPANEL_SFTP_PASSWORDS` (reported as
+  `HostInfo.sftp_passwords_allowed`). **Default: allowed**, because the
+  owner asked for passwords to be offered and they are opt-in per tenant:
+  nothing changes on a host until the panel sets one, and tenants without a
+  password are never offered password authentication. Set it to `false` on
+  hosts that want keys only: setting a password is refused, the password
+  block is left out of the drop-in (so existing passwords stop working at
+  once), and `Reconcile` reports every tenant whose record still has one.
+
+**Brute force.** What sshd on AlmaLinux 9.8 (OpenSSH 9.9) already does:
+`MaxAuthTries 6` per connection, `MaxStartups 10:30:100` (unauthenticated
+connections dropped at random beyond 10, all beyond 100), `LoginGraceTime
+120`, and `PerSourcePenalties` (new in 9.8, on by default: an address that
+fails authentication is refused for a while — `authfail` 5 s, growing, at
+most 600 s, enforced once it reaches 15 s). `pam_faillock` is not enabled by
+the default authselect profile. OxPanel's drop-in sets `MaxAuthTries 3` for
+both tenant blocks (the directive is allowed in `Match`; `MaxStartups`,
+`LoginGraceTime` and `PerSourcePenalties` are global and stay the
+operator's). Left to the operator, documented in the handbook: fail2ban (its
+`sshd` jail) for longer bans across addresses, or `authselect enable-feature
+with-faillock` (which would also lock out the operator's own accounts after
+failures — a host decision, not OxPanel's).
 
 ### Suspension and deletion
 
-Suspension removes the keys file (the record keeps the keys) and ends running
-sessions by stopping `user-<uid>.slice` — every login session of the tenant
+Suspension removes the keys file (the record keeps the keys), locks the
+password hash, and ends running sessions by stopping `user-<uid>.slice` — every login session of the tenant
 lands there through `pam_systemd`, which is also why the existing
 `user-<uid>.slice.d/50-oxpanel.conf` drop-in applies the tenant's limits to
 SFTP sessions (verified on the VM: the session process's cgroup is under
 `user-<uid>.slice`). Suspension needs nothing from sshd, so a broken sshd
 cannot block it. Resumption writes the keys file again; if that fails (sshd
 broken at that moment) the sites still come back, the failure is logged and
-`Reconcile` reports the missing keys file. Deletion removes keys file,
-sessions, mount, unit and chroot before `userdel`.
+`Reconcile` reports the missing keys file (a password stays locked until
+access is restored). Deletion removes keys file, sessions, mount, unit and
+chroot before `userdel`, which removes the password.
 
 This relies on systemd-logind, as every AlmaLinux host has it. Without logind
 (the integration container) sessions are not in a user slice and are not
@@ -139,7 +207,10 @@ ended by suspension; new logins are refused all the same.
 
 `SFTP_ACCESS_DRIFT` (keys file or mount unit missing or different from the
 record, a keys file present while suspended, an account not in the tenant
-group), `ORPHAN_SFTP_ACCESS` (keys files, mount units, chroot directories no
+group; and for passwords: the password-group membership or the kind of
+shadow entry — usable, locked, none, or **empty** — not what the record and
+the suspension state say, in either direction, or a recorded password on a
+host that forbids them), `ORPHAN_SFTP_ACCESS` (keys files, mount units, chroot directories no
 tenant accounts for), `SSHD_CONFIG_DRIFT` (the drop-in missing or edited
 while sshd is installed). Whether a mount is currently active is not checked
 (Reconcile stays free of commands).
@@ -196,14 +267,21 @@ check.
 
 ## API numbers used
 
-`ResourceLimits` 5–6, `Tenant.sftp_key_count` 11, `HostInfo` 24–26 (27 free),
-`DriftKind` 18–21, three new RPCs and their messages at the end. Key
-management requires the `tenant` scope (`ListSftpKeys`: `read`): a customer
-tier confined to `read+vhost` cannot give anyone a login.
+`ResourceLimits` 5–6, `Tenant` 11 (`sftp_key_count`) and 12
+(`sftp_password`), `HostInfo` 24–27, `DriftKind` 18–21, five new RPCs and
+their messages at the end, `RemoveSftpKeyRequest.end_sessions` 3.
+
+Scopes (owner decision): customers manage their own SFTP access, so
+`AddSftpKey`, `RemoveSftpKey`, `SetSftpPassword` and `ClearSftpPassword`
+need the `vhost` scope and `ListSftpKeys` `read`. Scopes are per RPC class,
+not per object: a peer with `vhost` can manage the SFTP access of any
+tenant, exactly as it can configure any tenant's virtual hosts; confining it
+to its own tenant is the panel's job (as for virtual hosts).
 
 ## Not included
 
-Passwords; per-key session termination; SFTP-specific logging/auditing
+Per-key session termination; password policy beyond length (the panel's);
+zeroing passwords in memory; SFTP-specific logging/auditing
 (`internal-sftp -l`); a read-only mode; FTP/FTPS; SSH shell access of any
 kind; ext4 or project quotas; inode usage in `GetTenantUsage`; quota grace
 periods and warnings.

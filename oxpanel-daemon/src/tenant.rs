@@ -124,6 +124,7 @@ impl TenantService {
             owner,
             suspended: false,
             sftp_keys: Vec::new(),
+            sftp_password: false,
         };
         // Claim the name and uid *before* the irreversible step, so a crash
         // can never leave behind an account the daemon refuses to recognise.
@@ -345,12 +346,12 @@ impl TenantService {
                 crate::php::set_running(&self.ctx, &rec, false).await?;
                 crate::app::set_running_all(&self.ctx, &rec, false).await?;
             }
-            // SFTP follows the sites: the keys file goes away with the
-            // suspension (and running sessions are ended) and returns with
-            // the resumption. A tenant without keys has neither.
+            // SFTP follows the sites: the keys file goes away and the
+            // password hash is locked with the suspension (and running
+            // sessions are ended); both return with the resumption.
             if suspended {
                 sftp::suspend_access(&self.ctx, &rec).await?;
-            } else if !rec.sftp_keys.is_empty() {
+            } else if sftp::has_access(&rec) {
                 // The sites are back already; a host whose sshd cannot take
                 // the keys right now must not keep them down. `Reconcile`
                 // reports the missing keys file until access is restored.
@@ -457,8 +458,9 @@ impl TenantService {
         let timeout = self.ctx.config.command_timeout;
         // SFTP first: the home must not be removed while it is still mounted
         // into the chroot directory, and userdel refuses an account that has
-        // running sessions (`remove_access` ends them).
-        sftp::remove_access(&self.ctx, &rec).await?;
+        // running sessions (`remove_access` ends them). The password and the
+        // group memberships go with the account.
+        sftp::remove_access(&self.ctx, &rec, true).await?;
         // The uid will be given to another tenant one day; not its limits.
         quota::clear(&self.ctx, rec.uid).await?;
         if self.ctx.sys.user_by_name(name.as_str()).await?.is_some() {

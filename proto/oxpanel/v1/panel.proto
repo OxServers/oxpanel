@@ -59,11 +59,21 @@ service OxPanelEngine {
   // Adding a key the tenant already has changes nothing but its label.
   // FAILED_PRECONDITION if sshd is missing or would not confine the tenant.
   rpc AddSftpKey(AddSftpKeyRequest) returns (AddSftpKeyResponse);
-  // Remove one key; running SFTP sessions of the tenant are ended. Removing
-  // the last key removes SFTP access altogether. NOT_FOUND if the tenant has
-  // no such key.
+  // Remove one key: it cannot start a new session. Running sessions continue
+  // unless `end_sessions` is set. Removing the last key (with no password
+  // either) removes SFTP access altogether. NOT_FOUND if the tenant has no
+  // such key.
   rpc RemoveSftpKey(RemoveSftpKeyRequest) returns (RemoveSftpKeyResponse);
   rpc ListSftpKeys(ListSftpKeysRequest) returns (ListSftpKeysResponse);
+  // Give the tenant an SFTP password, or replace it. Same confinement as a
+  // key (SFTP only, chrooted, no forwarding). Stored only as the system's
+  // password hash; never returned. FAILED_PRECONDITION if the host forbids
+  // SFTP passwords (HostInfo.sftp_passwords_allowed) or cannot confine the
+  // tenant.
+  rpc SetSftpPassword(SetSftpPasswordRequest) returns (SetSftpPasswordResponse);
+  // Remove the tenant's SFTP password: it cannot start a new session.
+  // Running sessions continue unless `end_sessions` is set.
+  rpc ClearSftpPassword(ClearSftpPasswordRequest) returns (ClearSftpPasswordResponse);
 }
 
 // Per-tenant resource limits, applied through systemd (cgroups v2).
@@ -103,8 +113,10 @@ message Tenant {
   string owner = 9;
   // True while the tenant is suspended (its sites answer 503).
   bool suspended = 10;
-  // Number of SSH keys that may log in over SFTP; 0 = no SFTP access.
+  // Number of SSH keys that may log in over SFTP.
   uint32 sftp_key_count = 11;
+  // The tenant has an SFTP password. (SFTP access: a key or a password.)
+  bool sftp_password = 12;
 }
 
 enum TenantState {
@@ -319,6 +331,10 @@ message HostInfo {
   // What was found about quotas, and when they are not available, what the
   // operator has to change.
   string disk_quota_detail = 26;
+  // Tenants may be given SFTP passwords (OXPANEL_SFTP_PASSWORDS, default
+  // true). When false, SetSftpPassword is refused and sshd offers password
+  // authentication to no tenant.
+  bool sftp_passwords_allowed = 27;
 }
 
 message ReconcileRequest {}
@@ -450,10 +466,13 @@ message AddSftpKeyResponse {
 message RemoveSftpKeyRequest {
   string username = 1;
   string fingerprint = 2;
+  // Also end the tenant's running SFTP sessions (all of them: sshd cannot
+  // tell which credential a session used). Default: they continue.
+  bool end_sessions = 3;
 }
 
 message RemoveSftpKeyResponse {
-  // Keys the tenant still has; 0 = SFTP access was removed.
+  // Keys the tenant still has.
   uint32 remaining = 1;
 }
 
@@ -464,4 +483,27 @@ message ListSftpKeysRequest {
 message ListSftpKeysResponse {
   // Oldest first.
   repeated SftpKey keys = 1;
+}
+
+message SetSftpPasswordRequest {
+  string username = 1;
+  // 12..=256 characters, no control characters. Further policy (strength,
+  // reuse) is the panel's. Never logged, never in an argv, never returned.
+  string password = 2;
+}
+
+message SetSftpPasswordResponse {
+  Tenant tenant = 1;
+}
+
+message ClearSftpPasswordRequest {
+  string username = 1;
+  // Also end the tenant's running SFTP sessions. Default: they continue.
+  bool end_sessions = 2;
+}
+
+message ClearSftpPasswordResponse {
+  // false when the tenant had no SFTP password.
+  bool cleared = 1;
+  Tenant tenant = 2;
 }

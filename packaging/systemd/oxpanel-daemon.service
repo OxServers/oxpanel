@@ -41,7 +41,8 @@ PrivateTmp=yes
 PrivateDevices=yes
 DevicePolicy=closed
 ProtectSystem=strict
-# /etc:      useradd/userdel/gpasswd rewrite passwd/shadow/group via rename; nginx and systemd
+# /etc:      useradd/userdel/gpasswd/usermod/chpasswd rewrite passwd/shadow/group via rename
+#            (chpasswd gets SFTP passwords on stdin, never in argv); nginx and systemd
 #            unit files (including the mount units of SFTP chroots); the sshd drop-in and the
 #            tenants' SFTP keys files (/etc/oxpanel-sftp). `sshd -t`/`-T` only read /etc/ssh.
 #            xfs_quota needs the block device, which PrivateDevices hides: it runs in a

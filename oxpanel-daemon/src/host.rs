@@ -91,6 +91,8 @@ pub struct HostInfo {
 pub struct Facilities {
     /// sshd is installed and confines tenants (see [`crate::sftp`]).
     pub sftp: bool,
+    /// Tenants may be given SFTP passwords (`OXPANEL_SFTP_PASSWORDS`).
+    pub sftp_passwords: bool,
     /// Disk limits are enforced by the kernel (see [`crate::quota`]).
     pub disk_quota: bool,
     /// What was found about quotas, and what to do if they are unavailable.
@@ -130,6 +132,7 @@ impl HostService {
             stats: self.ctx.sys.host_stats(&cfg.home_base).await?,
             facilities: Facilities {
                 sftp: crate::sftp::is_available(&self.ctx).await?,
+                sftp_passwords: cfg.sftp_passwords == crate::config::SftpPasswords::Allowed,
                 disk_quota: quota.available,
                 disk_quota_detail: quota.detail,
             },
@@ -412,13 +415,16 @@ async fn check_sftp(ctx: &Ctx, tenants: &[TenantRecord], out: &mut Vec<Drift>) -
                 format!("the account is not in group '{}'", cfg.tenant_group),
             ));
         }
-        if t.sftp_keys.is_empty() {
+        if exists {
+            check_password(ctx, t, out).await?;
+        }
+        if !sftp::has_access(t) {
             continue;
         }
         let paths = SftpPaths::for_tenant(cfg, t)?;
         let mut expected = vec![(&paths.mount_unit, Some(sftp::render_mount_unit(t, &paths)?))];
-        // While suspended there must be no keys file at all.
-        let keys = (!t.suspended)
+        // While suspended (or without keys) there must be no keys file at all.
+        let keys = (!t.suspended && !t.sftp_keys.is_empty())
             .then(|| sftp::render_keys_file(t))
             .transpose()?;
         expected.push((&paths.keys_file, keys));
@@ -427,7 +433,7 @@ async fn check_sftp(ctx: &Ctx, tenants: &[TenantRecord], out: &mut Vec<Drift>) -
                 Some(c) => compare_file(path, &c)?,
                 None => path
                     .exists()
-                    .then_some("exists although the tenant is suspended"),
+                    .then_some("exists although the tenant is suspended or has no keys"),
             };
             if let Some(problem) = problem {
                 out.push(Drift::new(
@@ -461,9 +467,69 @@ async fn check_sftp(ctx: &Ctx, tenants: &[TenantRecord], out: &mut Vec<Drift>) -
             out.push(Drift::new(
                 DriftKind::OrphanSftpAccess,
                 path.to_string_lossy(),
-                "no tenant with SFTP keys accounts for this",
+                "no tenant with SFTP access accounts for this (a mount kept for sessions that were open when the last credential was removed goes at the daemon's next start)",
             ));
         }
+    }
+    Ok(())
+}
+
+/// The password side of SFTP access: membership of the password group and
+/// the state of the shadow entry must match the record. Looks only at what
+/// kind of entry it is, never at the hash.
+async fn check_password(ctx: &Ctx, t: &TenantRecord, out: &mut Vec<Drift>) -> Result<()> {
+    use crate::system::PasswordState;
+    let cfg = &ctx.config;
+    let subject = t.username.as_str();
+    if let Some(gid) = ctx.sys.group_by_name(&cfg.sftp_password_group).await? {
+        let member = ctx.sys.groups_of(subject, t.gid).await?.contains(&gid);
+        if member != t.sftp_password {
+            let detail = if member {
+                format!("the account is in group '{}' (password login) but the record has no SFTP password", cfg.sftp_password_group)
+            } else {
+                format!(
+                    "the record has an SFTP password but the account is not in group '{}'",
+                    cfg.sftp_password_group
+                )
+            };
+            out.push(Drift::new(DriftKind::SftpAccessDrift, subject, detail));
+        }
+    }
+    let state = ctx.sys.password_state(subject).await?;
+    let expected = match (t.sftp_password, t.suspended) {
+        (false, _) => PasswordState::NoPassword,
+        (true, false) => PasswordState::Usable,
+        (true, true) => PasswordState::Locked,
+    };
+    if state != expected && state != PasswordState::Missing {
+        let found = match state {
+            PasswordState::Empty => "an EMPTY password (any password logs in)",
+            PasswordState::Usable => "a usable password",
+            PasswordState::Locked => "a locked password",
+            PasswordState::NoPassword | PasswordState::Missing => "no password",
+        };
+        let wanted = match expected {
+            PasswordState::Usable => "a usable SFTP password",
+            PasswordState::Locked => "a locked SFTP password (suspended)",
+            _ => "no SFTP password",
+        };
+        let fix = if t.sftp_password && state == PasswordState::NoPassword {
+            "set the password again"
+        } else {
+            "repeat SetSftpPassword or ClearSftpPassword, or restart the daemon"
+        };
+        out.push(Drift::new(
+            DriftKind::SftpAccessDrift,
+            subject,
+            format!("the account has {found}, the record says {wanted} ({fix})"),
+        ));
+    }
+    if t.sftp_password && cfg.sftp_passwords == crate::config::SftpPasswords::Forbidden {
+        out.push(Drift::new(
+            DriftKind::SftpAccessDrift,
+            subject,
+            "the record has an SFTP password, but this host forbids them (OXPANEL_SFTP_PASSWORDS=false) so sshd does not accept it; ClearSftpPassword",
+        ));
     }
     Ok(())
 }
@@ -976,6 +1042,78 @@ mod tests {
         assert!(drifts
             .first()
             .is_some_and(|d| d.detail.contains("not enforced")));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reports_password_drift_both_ways() -> Result<()> {
+        use crate::sftp::SftpService;
+        let h = harness().await;
+        let sftp = SftpService::new(h.ctx.clone());
+        sftp.set_password("alice", "correct horse battery").await?;
+        assert_eq!(
+            h.host.reconcile().await?,
+            vec![],
+            "a set password is not drift"
+        );
+        h.tenants.set_suspended("alice", true).await?;
+        assert_eq!(
+            h.host.reconcile().await?,
+            vec![],
+            "nor a locked one while suspended"
+        );
+        h.tenants.set_suspended("alice", false).await?;
+        // alice's password disappears; foo-bar (none recorded) gets one, and
+        // a place in the password group.
+        h.sys.set_shadow_field("alice", "!!");
+        h.sys.set_shadow_field("foo-bar", "$6$x$y");
+        h.sys
+            .run_ok(
+                crate::system::CommandSpec::new(bin::GPASSWD, h.ctx.config.command_timeout).args([
+                    "--add",
+                    "foo-bar",
+                    "oxpanel-sftp-password",
+                ]),
+            )
+            .await?;
+        h.sys.clear_calls();
+        let drifts = h.host.reconcile().await?;
+        assert_eq!(
+            kinds(&drifts),
+            vec![
+                (DriftKind::SftpAccessDrift, "alice"),
+                (DriftKind::SftpAccessDrift, "foo-bar"),
+                (DriftKind::SftpAccessDrift, "foo-bar"),
+            ]
+        );
+        assert!(drifts
+            .iter()
+            .any(|d| d.detail.contains("set the password again")));
+        assert!(h.sys.calls().is_empty(), "reconcile is read-only");
+        // An empty password field is always drift.
+        h.sys.set_shadow_field("alice", "");
+        assert!(h
+            .host
+            .reconcile()
+            .await?
+            .iter()
+            .any(|d| d.subject == "alice" && d.detail.contains("EMPTY")));
+        // A restart repairs what it can without a plaintext: foo-bar loses the
+        // stray password and membership; alice's empty field is disabled.
+        crate::sftp::converge_all(&h.ctx).await?;
+        assert_eq!(
+            h.sys.password_state("foo-bar").await?,
+            crate::system::PasswordState::NoPassword
+        );
+        assert_eq!(
+            h.sys.password_state("alice").await?,
+            crate::system::PasswordState::NoPassword
+        );
+        assert_eq!(
+            kinds(&h.host.reconcile().await?),
+            vec![(DriftKind::SftpAccessDrift, "alice")],
+            "only the lost password remains: it must be set again"
+        );
         Ok(())
     }
 }

@@ -486,7 +486,7 @@ if [ -x /usr/sbin/sshd ] && command -v sftp >/dev/null; then
   check "the other key still does" sftp_ok kb sftpa
   check_not "removing it again is NOT_FOUND" oxpanel-ctl sftp remove-key sftpa "$FPA"
   FPB="$(ssh-keygen -lf "$SFTPDIR/kb.pub" | awk '{print $2}')"
-  check "removing the last key" grep -q 'remaining=0' <(oxpanel-ctl sftp remove-key sftpa "$FPB")
+  check "removing the last key" grep -q 'remaining=0' <(oxpanel-ctl sftp remove-key sftpa "$FPB" --end-sessions)
   check "no keys file, mount, unit or chroot left" bash -c 'test ! -e /etc/oxpanel-sftp/sftpa && ! findmnt -n /var/lib/oxpanel/sftp/sftpa/home/sftpa && test ! -e "/etc/systemd/system/$1" && test ! -e /var/lib/oxpanel/sftp/sftpa' _ "$MNT"
   check "the tenant's files are untouched" test -f /home/sftpa/public_html/up.html
   check "access again, then delete the tenant with it" bash -c 'oxpanel-ctl sftp add-key sftpa --key-file "$1/ka.pub" >/dev/null && sftp_ok ka sftpa' _ "$SFTPDIR"
@@ -496,6 +496,114 @@ if [ -x /usr/sbin/sshd ] && command -v sftp >/dev/null; then
   check "delete sftpb" grep -q '^deleted=true' <(oxpanel-ctl tenant delete sftpb --remove-home)
   check "no drift after SFTP teardown" grep -q '^drifts=0$' <(oxpanel-ctl host reconcile)
   rm -rf "$SFTPDIR"
+else
+  echo "skip - sshd or the sftp client is not installed"
+fi
+
+echo "== sftp passwords, end_sessions"
+if [ -x /usr/sbin/sshd ] && command -v sftp >/dev/null; then
+  export PWDIR; PWDIR="$(mktemp -d /root/sftp-pw.XXXXXX)"; chmod 700 "$PWDIR"
+  export PW='correct horse battery staple'
+  printf '%s\n' "$PW" > "$PWDIR/pw"; printf 'wrong horse battery staple\n' > "$PWDIR/bad"
+  # The client reads the password from a file through SSH_ASKPASS: never in an argv.
+  printf '#!/bin/sh\ncat "$PWFILE"\n' > "$PWDIR/askpass"; chmod 700 "$PWDIR/askpass"
+  export PW_O="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o LogLevel=ERROR -o PubkeyAuthentication=no -o PreferredAuthentications=password -o NumberOfPasswordPrompts=1"
+  # pw_sftp <user> <password file>, sftp batch commands on stdin
+  # shellcheck disable=SC2086
+  pw_sftp() { PWFILE="$2" SSH_ASKPASS="$PWDIR/askpass" SSH_ASKPASS_REQUIRE=force setsid -w sftp $PW_O -o BatchMode=no -b - "$1@127.0.0.1"; }
+  pw_ok() { local i; for i in $(seq 1 40); do echo pwd | pw_sftp "$1" "$2" >/dev/null 2>&1 && return 0; sleep 1; done; return 1; }
+  pw_denied() { local i out; for i in $(seq 1 40); do out="$(echo pwd | pw_sftp "$1" "$2" 2>&1)" && return 1; grep -q "Permission denied" <<<"$out" && return 0; sleep 1; done; return 1; }
+  export -f pw_sftp pw_ok pw_denied
+  key_session_count() { pgrep -u "$1" sshd 2>/dev/null | wc -l; }
+
+  check "host info reports sftp_passwords=true (the default)" grep -q ' sftp_passwords=true ' <(oxpanel-ctl host info)
+  check "create tenant pwa" grep -q '^created=true' <(oxpanel-ctl tenant create pwa)
+  check "create tenant pwb" grep -q '^created=true' <(oxpanel-ctl tenant create pwb)
+  check_not "a password shorter than 12 characters is refused" bash -c 'echo short-pw | oxpanel-ctl sftp set-password pwa'
+  check "a tenant without a password is not offered password login" bash -c '/usr/sbin/sshd -T -C user=pwa,host=x,addr=127.0.0.1 | grep -qx "passwordauthentication no"'
+  check "set-password (read from stdin)" bash -c 'oxpanel-ctl sftp set-password pwa < "$PWDIR/pw" | grep -q "^password=set" && oxpanel-ctl tenant get pwa | grep -q " sftp_password=true "'
+  check "the shadow file holds a hash, not the password" bash -c 'f="$(getent shadow pwa | cut -d: -f2)"; [ "${f#\$}" != "$f" ] && ! grep -qF "$PW" /etc/shadow'
+  check "the password is in no record and not in the journal" bash -c '! grep -rqF "$PW" /var/lib/oxpanel && ! journalctl -u oxpanel-daemon --no-pager | grep -qF "$PW"'
+  check "the account is in the password group" bash -c 'id -nG pwa | grep -qw oxpanel-sftp-password'
+  check "password tenants are confined exactly like key tenants" bash -c 'e="$(/usr/sbin/sshd -T -C user=pwa,host=x,addr=127.0.0.1)"; for kv in "passwordauthentication yes" "authenticationmethods publickey password" "maxauthtries 3" "forcecommand internal-sftp" "chrootdirectory /var/lib/oxpanel/sftp/%u" "permittty no" "disableforwarding yes" "allowtcpforwarding no" "x11forwarding no" "permittunnel no" "kbdinteractiveauthentication no"; do grep -qx "$kv" <<<"$e" || { echo "missing: $kv"; exit 1; }; done'
+  check "password login works and lands in the home" bash -c 'pw_ok pwa "$PWDIR/pw" && echo pwd | pw_sftp pwa "$PWDIR/pw" | grep -q "/home/pwa"'
+  echo "uploaded-with-a-password" > "$PWDIR/up.txt"
+  check "upload with a password; the file belongs to the tenant" bash -c 'echo "put $PWDIR/up.txt up.txt" | pw_sftp pwa "$PWDIR/pw" && test "$(stat -c %U /home/pwa/up.txt)" = pwa'
+  check "the tenant sees only its own home (password login)" bash -c 'test "$(echo "ls -1 /" | pw_sftp pwa "$PWDIR/pw" | grep -v "^sftp>")" = "/home" && ! echo "ls /etc" | pw_sftp pwa "$PWDIR/pw" >/dev/null 2>&1'
+  check "a wrong password is refused" pw_denied pwa "$PWDIR/bad"
+  check "the password does not work for another tenant" pw_denied pwb "$PWDIR/pw"
+  # shellcheck disable=SC2086
+  out="$(PWFILE="$PWDIR/pw" SSH_ASKPASS="$PWDIR/askpass" SSH_ASKPASS_REQUIRE=force setsid -w ssh $PW_O pwa@127.0.0.1 'echo shell-ran; touch /home/pwa/shell-ran' </dev/null 2>&1 || true)"
+  check "no shell with a password either" bash -c '! grep -q shell-ran <<<"$1" && test ! -e /home/pwa/shell-ran' _ "$out"
+  check_not "no TCP forwarding with a password (ssh -W)" bash -c 'printf "GET / HTTP/1.0\r\n\r\n" | PWFILE="$PWDIR/pw" SSH_ASKPASS="$PWDIR/askpass" SSH_ASKPASS_REQUIRE=force timeout 20 setsid -w ssh $PW_O -W 127.0.0.1:80 pwa@127.0.0.1 2>/dev/null | grep -q "^HTTP/"'
+  check "no drift with a password" grep -q '^drifts=0$' <(oxpanel-ctl host reconcile)
+
+  # Suspension locks the hash (no plaintext kept) and ends sessions; resume unlocks it.
+  check "log in again before the session test" pw_ok pwa "$PWDIR/pw"
+  ( sleep 60 | PWFILE="$PWDIR/pw" SSH_ASKPASS="$PWDIR/askpass" SSH_ASKPASS_REQUIRE=force setsid -w ssh $PW_O -s pwa@127.0.0.1 sftp >/dev/null 2>&1 ) &
+  HOLD=$!
+  check "an open password session" bash -c 'for i in $(seq 1 50); do pgrep -u pwa sshd >/dev/null && exit 0; sleep 0.2; done; exit 1'
+  check "suspend pwa" grep -q '^changed=true' <(oxpanel-ctl tenant suspend pwa)
+  check "the hash is locked while suspended (kept, prefixed with !)" bash -c 'getent shadow pwa | cut -d: -f2 | grep -qE "^![^!*]"'
+  if [ "$LOGIND" = 1 ]; then
+    check "suspension ends the password session" bash -c 'for i in $(seq 1 50); do pgrep -u pwa sshd >/dev/null || exit 0; sleep 0.2; done; exit 1'
+  fi
+  check "no password login while suspended" pw_denied pwa "$PWDIR/pw"
+  check "resume pwa" grep -q '^changed=true' <(oxpanel-ctl tenant resume pwa)
+  check "the same password works again after resume" pw_ok pwa "$PWDIR/pw"
+  pkill -P "$HOLD" 2>/dev/null || true; kill "$HOLD" 2>/dev/null || true; wait "$HOLD" 2>/dev/null || true
+  pkill -u pwa sshd 2>/dev/null || true
+
+  # end_sessions: without it a live session continues; with it, it ends.
+  ssh-keygen -q -t ed25519 -N '' -f "$PWDIR/k"
+  check "pwa also gets a key" grep -q '^changed=true' <(oxpanel-ctl sftp add-key pwa --key-file "$PWDIR/k.pub")
+  FPK="$(ssh-keygen -lf "$PWDIR/k.pub" | awk '{print $2}')"
+  # shellcheck disable=SC2086
+  hold_key_session() { ( sleep 60 | ssh $SSH_O -i "$PWDIR/k" -s pwa@127.0.0.1 sftp >/dev/null 2>&1 ) & HOLD=$!; for i in $(seq 1 50); do pgrep -u pwa sshd >/dev/null && return 0; sleep 0.2; done; return 1; }
+  check "key login (after the refusals above)" bash -c 'for i in $(seq 1 40); do echo pwd | sftp $SSH_O -i "$PWDIR/k" -b - pwa@127.0.0.1 >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1'
+  check "an open key session" hold_key_session
+  check "clear-password without --end-sessions" grep -q '^cleared=true' <(oxpanel-ctl sftp clear-password pwa)
+  check "the open session continues" bash -c 'sleep 1; pgrep -u pwa sshd >/dev/null'
+  check "but the password no longer logs in" pw_denied pwa "$PWDIR/pw"
+  check "the hash is gone and so is the group membership" bash -c 'test "$(getent shadow pwa | cut -d: -f2)" = "!!" && ! id -nG pwa | grep -qw oxpanel-sftp-password'
+  check "remove-key without --end-sessions: the session still continues" bash -c 'oxpanel-ctl sftp remove-key pwa "$1" | grep -q remaining=0 && sleep 1 && pgrep -u pwa sshd >/dev/null' _ "$FPK"
+  if [ "$LOGIND" = 1 ]; then
+    check "its mount is kept while it is open (reported until the daemon tidies it up)" bash -c 'findmnt -n /var/lib/oxpanel/sftp/pwa/home/pwa >/dev/null && oxpanel-ctl host reconcile | grep -q "kind=DRIFT_KIND_ORPHAN_SFTP_ACCESS"'
+  fi
+  pkill -P "$HOLD" 2>/dev/null || true; kill "$HOLD" 2>/dev/null || true; wait "$HOLD" 2>/dev/null || true
+  pkill -u pwa sshd 2>/dev/null || true
+  check "after the session ended, a daemon restart removes the kept mount" bash -c 'for i in $(seq 1 40); do systemctl -q is-active "user-$(id -u pwa).slice" || break; sleep 0.5; done; systemctl restart oxpanel-daemon && test ! -e /var/lib/oxpanel/sftp/pwa && oxpanel-ctl host reconcile | grep -qx "drifts=0"'
+  check "key again" grep -q '^changed=true' <(oxpanel-ctl sftp add-key pwa --key-file "$PWDIR/k.pub")
+  check "key login works" bash -c 'for i in $(seq 1 40); do echo pwd | sftp $SSH_O -i "$PWDIR/k" -b - pwa@127.0.0.1 >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1'
+  check "an open key session (2)" hold_key_session
+  if [ "$LOGIND" = 1 ]; then
+    check "remove-key --end-sessions ends it" bash -c 'oxpanel-ctl sftp remove-key pwa "$1" --end-sessions | grep -q remaining=0 && for i in $(seq 1 50); do pgrep -u pwa sshd >/dev/null || exit 0; sleep 0.2; done; exit 1' _ "$FPK"
+  else
+    check "remove-key --end-sessions" bash -c 'oxpanel-ctl sftp remove-key pwa "$1" --end-sessions | grep -q remaining=0' _ "$FPK"
+  fi
+  pkill -P "$HOLD" 2>/dev/null || true; kill "$HOLD" 2>/dev/null || true; wait "$HOLD" 2>/dev/null || true
+
+  # Reconcile notices password state that differs from the record, both ways.
+  check "a password set behind OxPanel's back is drift" bash -c 'printf "pwb:%s\n" "$PW" | chpasswd && oxpanel-ctl host reconcile | grep -q "kind=DRIFT_KIND_SFTP_ACCESS_DRIFT subject=pwb"'
+  check "set-password pwa again" bash -c 'oxpanel-ctl sftp set-password pwa < "$PWDIR/pw" | grep -q "^password=set"'
+  check "a recorded password that vanished is drift" bash -c 'printf "pwa:!!\n" | chpasswd -e && oxpanel-ctl host reconcile | grep -q "subject=pwa detail=.*set the password again"'
+  check "a daemon restart removes the stray password; the lost one must be set again" bash -c 'systemctl restart oxpanel-daemon && test "$(getent shadow pwb | cut -d: -f2)" = "!!" && oxpanel-ctl host reconcile | grep -q "subject=pwa" && ! oxpanel-ctl host reconcile | grep -q "subject=pwb"'
+  check "set it again: no drift" bash -c 'oxpanel-ctl sftp set-password pwa < "$PWDIR/pw" >/dev/null && oxpanel-ctl host reconcile | grep -qx "drifts=0"'
+
+  # The host-wide switch.
+  systemctl set-environment OXPANEL_SFTP_PASSWORDS=false; systemctl restart oxpanel-daemon
+  check "with OXPANEL_SFTP_PASSWORDS=false host info says so" grep -q ' sftp_passwords=false ' <(oxpanel-ctl host info)
+  check_not "and set-password is refused" bash -c 'oxpanel-ctl sftp set-password pwb < "$PWDIR/pw"'
+  check "sshd offers no tenant password login" bash -c '/usr/sbin/sshd -T -C user=pwa,host=x,addr=127.0.0.1 | grep -qx "passwordauthentication no"'
+  check "a recorded password is refused by sshd" pw_denied pwa "$PWDIR/pw"
+  check "and reported" bash -c 'oxpanel-ctl host reconcile | grep -q "subject=pwa detail=.*forbids"'
+  systemctl unset-environment OXPANEL_SFTP_PASSWORDS; systemctl restart oxpanel-daemon
+  check "allowed again: the password works" pw_ok pwa "$PWDIR/pw"
+  check "delete pwa (with a password)" grep -q '^deleted=true' <(oxpanel-ctl tenant delete pwa --remove-home)
+  check "no shadow entry, chroot or mount left" bash -c '! getent shadow pwa && test ! -e /var/lib/oxpanel/sftp/pwa && ! findmnt -n /var/lib/oxpanel/sftp/pwa/home/pwa'
+  check "delete pwb" grep -q '^deleted=true' <(oxpanel-ctl tenant delete pwb --remove-home)
+  check "no drift after the password tests" grep -q '^drifts=0$' <(oxpanel-ctl host reconcile)
+  rm -rf "$PWDIR"
 else
   echo "skip - sshd or the sftp client is not installed"
 fi

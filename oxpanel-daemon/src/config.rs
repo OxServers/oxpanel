@@ -57,6 +57,11 @@ pub struct Config {
     /// One authorized-keys file per tenant with SFTP access, outside the
     /// tenant's home so that the tenant cannot edit it.
     pub sftp_keys_dir: PathBuf,
+    /// Group of the tenants that have an SFTP password; sshd offers password
+    /// authentication to its members only. Created by the package.
+    pub sftp_password_group: String,
+    /// Whether tenants may be given SFTP passwords at all.
+    pub sftp_passwords: SftpPasswords,
     /// Install a catch-all `default_server` that closes connections for
     /// unknown host names, so no tenant ever becomes the default site.
     pub nginx_default_server: bool,
@@ -91,6 +96,8 @@ impl Default for Config {
             tenant_group: "oxpanel-tenants".to_owned(),
             sshd_dropin_file: PathBuf::from("/etc/ssh/sshd_config.d/60-oxpanel.conf"),
             sftp_keys_dir: PathBuf::from("/etc/oxpanel-sftp"),
+            sftp_password_group: "oxpanel-sftp-password".to_owned(),
+            sftp_passwords: SftpPasswords::Allowed,
             nginx_default_server: true,
             command_timeout: Duration::from_secs(60),
             dry_run: false,
@@ -131,16 +138,7 @@ impl Config {
         path("OXPANEL_PHP_CONF_DIR", &mut c.php_conf_dir)?;
         path("OXPANEL_SSHD_DROPIN_FILE", &mut c.sshd_dropin_file)?;
         path("OXPANEL_SFTP_KEYS_DIR", &mut c.sftp_keys_dir)?;
-        if let Some(v) = get("OXPANEL_TENANT_GROUP") {
-            let v = v.trim();
-            if !is_plain_name(v) {
-                return Err(Error::invalid(
-                    "config",
-                    "OXPANEL_TENANT_GROUP must be a plain group name",
-                ));
-            }
-            v.clone_into(&mut c.tenant_group);
-        }
+        c.sftp_from_lookup(&get)?;
 
         if let Some(g) = get("OXPANEL_SOCKET_GROUP") {
             let g = g.trim();
@@ -272,6 +270,51 @@ impl Config {
             .parent()
             .unwrap_or(&self.state_dir)
             .join("scratch")
+    }
+}
+
+/// Host-wide policy on SFTP passwords (`OXPANEL_SFTP_PASSWORDS`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SftpPasswords {
+    /// A tenant may be given one (opt-in, per tenant). The default.
+    Allowed,
+    /// Keys only: setting a password is refused and sshd offers no password
+    /// authentication to any tenant.
+    Forbidden,
+}
+
+impl Config {
+    /// The SFTP part of [`Config::from_lookup`].
+    fn sftp_from_lookup(&mut self, get: &impl Fn(&str) -> Option<String>) -> Result<()> {
+        for (key, target) in [
+            ("OXPANEL_TENANT_GROUP", &mut self.tenant_group),
+            ("OXPANEL_SFTP_PASSWORD_GROUP", &mut self.sftp_password_group),
+        ] {
+            if let Some(v) = get(key) {
+                let v = v.trim();
+                if !is_plain_name(v) {
+                    return Err(Error::invalid(
+                        "config",
+                        format!("{key} must be a plain group name"),
+                    ));
+                }
+                v.clone_into(target);
+            }
+        }
+        if self.tenant_group == self.sftp_password_group {
+            return Err(Error::invalid(
+                "config",
+                "OXPANEL_TENANT_GROUP and OXPANEL_SFTP_PASSWORD_GROUP must differ",
+            ));
+        }
+        if let Some(v) = get("OXPANEL_SFTP_PASSWORDS") {
+            self.sftp_passwords = if parse_bool("OXPANEL_SFTP_PASSWORDS", &v)? {
+                SftpPasswords::Allowed
+            } else {
+                SftpPasswords::Forbidden
+            };
+        }
+        Ok(())
     }
 }
 
@@ -459,6 +502,18 @@ mod tests {
         assert!(from(&[("OXPANEL_WEB_USER", "nginx;rm")]).is_err());
         assert!(from(&[("OXPANEL_TENANT_GROUP", "hosting users")]).is_err());
         assert!(from(&[("OXPANEL_TENANT_GROUP", "")]).is_err());
+        assert!(from(&[("OXPANEL_SFTP_PASSWORD_GROUP", "oxpanel-tenants")]).is_err());
+        assert!(from(&[("OXPANEL_SFTP_PASSWORDS", "maybe")]).is_err());
+        assert_eq!(
+            from(&[("OXPANEL_SFTP_PASSWORDS", "false")])
+                .map(|c| c.sftp_passwords)
+                .ok(),
+            Some(SftpPasswords::Forbidden)
+        );
+        assert_eq!(
+            from(&[]).map(|c| c.sftp_passwords).ok(),
+            Some(SftpPasswords::Allowed)
+        );
         assert!(from(&[("OXPANEL_SSHD_DROPIN_FILE", "sshd.conf")]).is_err());
         assert!(from(&[("OXPANEL_SFTP_KEYS_DIR", "/etc/ox panel")]).is_err());
         let c = from(&[
