@@ -207,3 +207,20 @@ Passwords; per-key session termination; SFTP-specific logging/auditing
 (`internal-sftp -l`); a read-only mode; FTP/FTPS; SSH shell access of any
 kind; ext4 or project quotas; inode usage in `GetTenantUsage`; quota grace
 periods and warnings.
+
+## Verification
+
+132 unit tests and 6 gRPC end-to-end tests (fake OS, exact argv), the root
+integration suite in the systemd container (SFTP end to end with a real sshd;
+quotas only as the refusal path, the container has no XFS), and
+`INSTALL=rpm make acceptance` on AlmaLinux 9.8 with SELinux enforcing: all
+phases pass with zero AVC denials, including real `sftp` logins with keys,
+uploads served by Nginx and used by PHP, the refused shell and forwards, the
+chroot showing nothing but the home, suspension ending a live session that
+ran in the tenant's `user-<uid>.slice`, key removal, deletion, a write and an
+SFTP upload failing on the quota, an inode limit, and SFTP access and a disk
+limit surviving a reboot.
+
+One finding from the VM: OpenSSH 9.9 (`PerSourcePenalties`) briefly drops
+connections from an address after repeated failed logins; the test suite
+retries positive logins and requires refusals to be "Permission denied".
