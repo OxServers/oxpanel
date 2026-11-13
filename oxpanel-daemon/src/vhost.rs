@@ -585,14 +585,26 @@ impl VHostService {
         if root.symlink_metadata().is_err() {
             return Ok(());
         }
-        self.ctx
+        // That check is only a shortcut: the tenant can remove, replace or
+        // flip the path between it and `restorecon` (acceptance phase 80,
+        // section 4c, made removal fail in most attempts that way). The rule
+        // is gone by now, so the label is only the tenant's own business:
+        // whatever `restorecon` could not reset is never served again (the
+        // site's configuration is gone) and is relabelled with the home or
+        // removed with it. A failure here must not make the site impossible
+        // to remove, nor the tenant impossible to delete.
+        let out = self
+            .ctx
             .sys
-            .run_ok(
+            .run(
                 CommandSpec::new(bin::RESTORECON, timeout)
                     .args(["-RF", "--"])
                     .arg(root),
             )
             .await?;
+        if !out.success() {
+            warn!(path = %root.display(), stderr = %out.stderr_lossy().trim(), "the document root changed while it was being relabelled; its label is left as it is");
+        }
         Ok(())
     }
 }
@@ -1170,6 +1182,50 @@ mod tests {
             .iter()
             .any(|c| args(c).starts_with(&["fcontext".to_owned(), "-d".to_owned()])));
         assert!(h.vhosts.list(None).await?.is_empty(), "the record is gone");
+        Ok(())
+    }
+
+    /// Defect found while investigating acceptance phase 80, section 4c: the
+    /// tenant flips its document root between a directory and a link while
+    /// the operator removes the site. The root exists when the daemon looks,
+    /// and is gone (or a link) when `restorecon` walks it, which then fails;
+    /// on the VM that made `RemoveVirtualHost` fail in 12 of 15 attempts, and
+    /// a tenant running such a loop could keep its site, and itself, from
+    /// ever being removed. The relabel is now best effort; the parts that
+    /// matter (the configuration, the labelling rule, the record) are not.
+    #[tokio::test]
+    async fn a_site_can_be_removed_while_the_tenant_flips_its_document_root() -> Result<()> {
+        let h = harness(true).await;
+        h.vhosts.configure(req("example.com", "alice")).await?;
+        let root = h.config.home_base.join("alice").join("public_html");
+        std::fs::create_dir_all(&root).map_err(|e| Error::io("mkdir", &root, e))?;
+        let config = nginx::conf_path(&h.config.nginx_conf_dir, &Domain::parse("example.com")?);
+        assert!(config.exists());
+        let before = h.sys.calls_to(bin::RESTORECON).len();
+        // The path is there when looked at, and gone when restorecon walks it.
+        h.sys.script_failure(
+            bin::RESTORECON,
+            255,
+            "restorecon: lstat(/home/alice/public_html) failed: No such file or directory",
+        );
+        assert!(
+            h.vhosts.remove("example.com").await?,
+            "removed despite the race"
+        );
+        assert_eq!(
+            h.sys.calls_to(bin::RESTORECON).len(),
+            before + 1,
+            "the relabel was attempted (and lost the race)"
+        );
+        assert!(h
+            .sys
+            .calls_to(bin::SEMANAGE)
+            .iter()
+            .any(|c| args(c).starts_with(&["fcontext".to_owned(), "-d".to_owned()])));
+        assert!(!config.exists(), "the configuration is gone");
+        assert!(h.vhosts.list(None).await?.is_empty(), "the record is gone");
+        // And the tenant can be deleted afterwards.
+        assert!(h.tenants.delete("alice", true).await?);
         Ok(())
     }
 

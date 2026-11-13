@@ -256,13 +256,30 @@ as_user attack1 sh -c "rm $AT/public_html && mv $AT/public_html.real $AT/public_
 check "the operator's next request converges (the tenant restored its directory)" bash -c "oxpanel-ctl tenant resume attack1 >/dev/null; oxpanel-ctl vhost set aphp.test --tenant attack1 --php >/dev/null"
 check "no drift after the attack and the repair" bash -c "oxpanel-ctl host reconcile | grep -q '^drifts=0$'"
 
-echo "-- 4c. race: the tenant flips a path between directory and link while the operator configures"
-( timeout 25 setpriv --reuid=attack1 --regid=attack1 --clear-groups --no-new-privs -- sh -c "while :; do rm -rf $AT/race; ln -s /var/lib/oxpanel $AT/race; rm -f $AT/race; mkdir $AT/race; done" >/dev/null 2>&1 & )
-for _ in $(seq 1 40); do ctl vhost set race.test --tenant attack1 --root race >/dev/null 2>&1 || true; done
+echo "-- 4c. race: the tenant flips a path between directory and link while the operator configures and removes"
+# What the engine guarantees here (and what this section asserts): a
+# configuration raced by the tenant either completes or is refused whole —
+# it never acts outside the home and never leaves a record without its
+# configuration or the reverse; a configuration that loses the race is
+# simply refused (it is NOT guaranteed that any of the 40 wins: on the VM
+# 0 to 6 of 40 do, and a run where none did failed this section when it
+# expected the site to exist); and an existing site can always be removed,
+# whatever the tenant does to its document root meanwhile.
+check "a site whose document root the tenant will race (created first)" bash -c "oxpanel-ctl vhost set race.test --tenant attack1 --root race | grep -q '^changed=true'"
+check "a second site that does not exist yet" bash -c "! test -e /var/lib/oxpanel/vhosts/race2.test.json"
+( timeout 120 setpriv --reuid=attack1 --regid=attack1 --clear-groups --no-new-privs -- sh -c "while :; do rm -rf $AT/race; ln -s /var/lib/oxpanel $AT/race; rm -f $AT/race; mkdir $AT/race; done" >/dev/null 2>&1 & )
+won=0; for _ in $(seq 1 40); do ctl vhost set race.test --tenant attack1 --root race >/dev/null 2>&1 && won=$((won+1)); done
+won2=0; for _ in $(seq 1 20); do ctl vhost set race2.test --tenant attack1 --root race >/dev/null 2>&1 && won2=$((won2+1)); done
+info "raced configurations that completed: $won of 40 (existing site), $won2 of 20 (new site)"
+check "the raced site still has both its record and its configuration, and Nginx accepts it" bash -c "test -f /var/lib/oxpanel/vhosts/race.test.json && test -f /etc/nginx/oxpanel.d/race.test.conf && nginx -t >/dev/null 2>&1"
+check "the new site has either both its record and its configuration or neither ($won2 of 20 completed)" bash -c "{ test -f /var/lib/oxpanel/vhosts/race2.test.json && test -f /etc/nginx/oxpanel.d/race2.test.conf; } || { test ! -e /var/lib/oxpanel/vhosts/race2.test.json && test ! -e /etc/nginx/oxpanel.d/race2.test.conf; }"
+check "the operator removes the raced site while its document root keeps changing (found by this section: restorecon losing the race used to fail the removal)" bash -c "oxpanel-ctl vhost remove race.test | grep -q '^removed=true' && test ! -e /var/lib/oxpanel/vhosts/race.test.json && test ! -e /etc/nginx/oxpanel.d/race.test.conf"
+check "removing the second site answers by its record, and leaves nothing ($won2 of 20 completed)" bash -c "out=\$(oxpanel-ctl vhost remove race2.test) && { [ \"\$out\" = removed=true ] || [ \"\$out\" = removed=false ]; } && test ! -e /var/lib/oxpanel/vhosts/race2.test.json && test ! -e /etc/nginx/oxpanel.d/race2.test.conf"
 pkill -u attack1 -f 'while :' 2>/dev/null || true; sleep 1
-check "after 40 configurations raced against the flipping path, nothing outside the home changed" test "$(snap)" = "$S1"
+check "after 60 configurations and two removals raced against the flipping path, nothing outside the home changed" test "$(snap)" = "$S1"
 check "the engine's records are intact" bash -c "oxpanel-ctl tenant get victim1 | grep -q READY && test -f /var/lib/oxpanel/tenants/attack1.json"
-check "the operator can remove the raced site although its document root keeps changing or is gone" bash -c "oxpanel-ctl vhost remove race.test | grep -q '^removed=true'"
+check "no SELinux labelling rule is left for the raced path" bash -c "! semanage fcontext -l -C 2>/dev/null | grep -q '$AT/race'"
+check "Nginx still accepts the whole configuration" nginx -t
 as_user attack1 sh -c "rm -rf $AT/race $AT/evil $AT/evil2 $AT/evil3 $AT/evil4 $AT/rootlink $AT/loop $AT/big; rmdir /tmp/att-outside" 2>/dev/null || true
 
 echo "-- 4e. the tenant deletes, or replaces by a link, the document root of a site; the operator removes the site"
