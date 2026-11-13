@@ -1411,6 +1411,15 @@ impl BackupService {
         }
         let output = self.unit_output(&job.unit).await;
         let _guard = self.ctx.lock.lock().await;
+        // Concluded by someone else meanwhile (two drivers of one job): done.
+        if self
+            .ctx
+            .store
+            .load_job(id)?
+            .is_none_or(|j| j.state != JobState::Running)
+        {
+            return Ok(true);
+        }
         let outcome = match &state {
             UnitState::Exited => Ok(()),
             // Whether a vanished unit had finished is for the result file to say.
@@ -3269,5 +3278,515 @@ mod tests {
         let kept = tail(&text);
         assert!(kept.len() <= OUTPUT_MAX_BYTES && kept.ends_with("last line"));
         assert_eq!(tail("  short \n"), "short");
+    }
+
+    // ---- databases in backups -------------------------------------------
+
+    const TRIGGER: &str = "CREATE DEFINER=`alice_app`@`localhost` TRIGGER stamp BEFORE INSERT ON posts FOR EACH ROW SET NEW.id = NEW.id + 1";
+    const VIEW: &str = "CREATE ALGORITHM=UNDEFINED DEFINER=`alice_app`@`localhost` SQL SECURITY DEFINER VIEW `recent` AS select `posts`.`id` AS `id` from `posts`";
+    const ROOT_PROC: &str = "CREATE DEFINER=`root`@`localhost` PROCEDURE `rootly`()\nSELECT 1";
+
+    /// MariaDB with `<tenant>_wp`: a table, a trigger and a view by the
+    /// tenant's user, and a procedure whose definer is root.
+    async fn with_database(h: &Harness, tenant: &str) -> Result<crate::db::DbService> {
+        use crate::records::DbEngine;
+        h.sys.install_mariadb();
+        let db = crate::db::DbService::new(h.ctx.clone());
+        let wp = format!("{tenant}_wp");
+        db.create_database(tenant, &wp, DbEngine::Mariadb).await?;
+        db.create_user(
+            tenant,
+            &format!("{tenant}_app"),
+            "Secret-pass-123",
+            DbEngine::Mariadb,
+        )
+        .await?;
+        let mut script = format!("CREATE TABLE `{wp}`.`posts` (id INT);\nUSE `{wp}`;\n");
+        for o in [TRIGGER, VIEW, ROOT_PROC] {
+            script.push_str("DELIMITER $$\n");
+            script.push_str(&o.replace("alice_app", &format!("{tenant}_app")));
+            script.push_str("\n$$\n");
+        }
+        h.sys.mariadb_admin(&script)?;
+        h.sys.clear_calls();
+        Ok(db)
+    }
+
+    #[tokio::test]
+    async fn backups_include_each_database_as_a_dump_and_its_objects() -> Result<()> {
+        let h = harness(false).await;
+        with_database(&h, "alice").await?;
+        let (job, _) = h.backups.create("alice", 0, 0).await?;
+        let argv = h
+            .sys
+            .calls_to(bin::SYSTEMD_RUN)
+            .first()
+            .map(args)
+            .unwrap_or_default();
+        assert!(
+            argv.ends_with(&[
+                "--databases".to_owned(),
+                "alice_wp".to_owned(),
+                "--socket".to_owned(),
+                "/var/lib/mysql/mysql.sock".to_owned(),
+            ]),
+            "{argv:?}"
+        );
+        // The stored objects are taken by the daemon, never from the dump:
+        // triggers and routines, not views (the dump has those).
+        let objects_script =
+            "USE `alice_wp`;\nSHOW CREATE TRIGGER `stamp`;\nSHOW CREATE PROCEDURE `rootly`;\n";
+        let sent = h.sys.calls_to(bin::MARIADB);
+        let capture = sent
+            .iter()
+            .find(|c| c.stdin.as_deref() == Some(objects_script.as_bytes()))
+            .unwrap_or_else(|| panic!("no capture"));
+        assert!(args(capture).ends_with(&["--binary-mode".to_owned(), "--sandbox".to_owned()]));
+        let dir = h.dir(&job);
+        let member: ObjectsMember = serde_json::from_slice(
+            &std::fs::read(dir.join("db-alice_wp.objects.json"))
+                .map_err(|e| Error::io("read", &dir, e))?,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(member.database, "alice_wp");
+        let defs: Vec<(&str, &str)> = member
+            .objects
+            .iter()
+            .map(|o| (o.name.as_str(), o.definition.as_str()))
+            .collect();
+        assert_eq!(defs, vec![("stamp", TRIGGER), ("rootly", ROOT_PROC)]);
+
+        let done = h.finish(&job).await?;
+        assert_eq!(done.state, JobState::Succeeded, "{}", done.message);
+        let backup = h
+            .ctx
+            .store
+            .load_backup(&BackupId::parse(&job.backup_id)?)?
+            .unwrap_or_else(|| panic!("record"));
+        let kinds: Vec<(&str, &str)> = backup
+            .members
+            .iter()
+            .map(|m| (m.name.as_str(), m.kind.as_str()))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ("db-alice_wp.objects.json", KIND_MARIADB_OBJECTS),
+                ("db-alice_wp.sql.gz", worker::KIND_MARIADB),
+                ("home.tar.gz", "home"),
+                ("records.json", "records"),
+            ]
+        );
+        for m in &backup.members {
+            let (size, sha) = worker::hash_file(&dir.join(&m.name))?;
+            assert_eq!((m.size_bytes, m.sha256.as_str()), (size, sha.as_str()));
+        }
+        let expected = vec![BackupDatabase {
+            name: "alice_wp".into(),
+            engine: crate::records::DbEngine::Mariadb,
+            size_bytes: 16_384,
+            dump_member: "db-alice_wp.sql.gz".into(),
+            objects_member: "db-alice_wp.objects.json".into(),
+        }];
+        assert_eq!(backup.databases, expected);
+        let manifest: Manifest = serde_json::from_slice(
+            &std::fs::read(dir.join(MANIFEST)).map_err(|e| Error::io("read", &dir, e))?,
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(manifest.databases, expected);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_missing_dump_fails_the_backup_and_leaves_nothing() -> Result<()> {
+        let h = harness(false).await;
+        with_database(&h, "alice").await?;
+        let (job, _) = h.backups.create("alice", 0, 0).await?;
+        let result = h.dir(&job).join("db-alice_wp.sql.gz.result.json");
+        std::fs::remove_file(&result).map_err(|e| Error::io("rm", &result, e))?;
+        let done = h.finish(&job).await?;
+        assert_eq!(done.state, JobState::Failed);
+        assert_eq!(
+            done.message,
+            "the dump of database alice_wp is missing or incomplete"
+        );
+        assert!(!h.dir(&job).exists());
+        assert!(h.backups.list("alice").await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn without_mariadb_a_tenant_with_databases_is_not_backed_up() -> Result<()> {
+        let h = harness(false).await;
+        with_database(&h, "alice").await?;
+        h.sys.set_mariadb_running(false);
+        assert!(matches!(
+            h.backups.create("alice", 0, 0).await,
+            Err(Error::DbUnavailable(_))
+        ));
+        assert!(h.ctx.store.list_backups()?.is_empty());
+        assert!(h.ctx.store.list_jobs()?.is_empty());
+        assert!(h.sys.calls_to(bin::SYSTEMD_RUN).is_empty());
+        // A tenant without databases does not need MariaDB.
+        let done = h.backup("bob").await?;
+        assert_eq!(done.state, JobState::Succeeded);
+        Ok(())
+    }
+
+    /// The `systemd-run` argv of a database restore job.
+    fn restore_db_argv(job: &JobRecord, input: &str, sha: &str, size: u64) -> Vec<String> {
+        let mut expected: Vec<String> =
+            vec!["--quiet".into(), format!("--unit=oxpanel-job-{}", job.id)];
+        for property in [
+            format!(
+                "Description=OxPanel database restore job {} (tenant alice)",
+                job.id
+            ),
+            "Slice=oxpanel-tenant-alice.slice".into(),
+            "Nice=19".into(),
+            "CPUSchedulingPolicy=batch".into(),
+            "IOSchedulingClass=best-effort".into(),
+            "IOSchedulingPriority=7".into(),
+            "RuntimeMaxSec=21600".into(),
+            "RemainAfterExit=yes".into(),
+            "UMask=0077".into(),
+            "CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_SETPCAP".into(),
+            "NoNewPrivileges=yes".into(),
+            "PrivateNetwork=yes".into(),
+            "PrivateTmp=yes".into(),
+            "PrivateDevices=yes".into(),
+            "ProtectSystem=strict".into(),
+            // It writes no file at all.
+            "ReadOnlyPaths=/".into(),
+            "ProtectKernelTunables=yes".into(),
+            "ProtectKernelModules=yes".into(),
+            "ProtectKernelLogs=yes".into(),
+            "ProtectControlGroups=yes".into(),
+            "ProtectClock=yes".into(),
+            "ProtectHostname=yes".into(),
+            "RestrictNamespaces=yes".into(),
+            "RestrictRealtime=yes".into(),
+            "RestrictSUIDSGID=yes".into(),
+            "LockPersonality=yes".into(),
+            "MemoryDenyWriteExecute=yes".into(),
+            "SystemCallArchitectures=native".into(),
+        ] {
+            expected.push("--property".into());
+            expected.push(property);
+        }
+        expected.extend(
+            [
+                "--",
+                "/usr/sbin/oxpanel-daemon",
+                "worker",
+                "restore-db",
+                "--input",
+                input,
+                "--sha256",
+                sha,
+                "--size",
+                &size.to_string(),
+                "--socket",
+                "/var/lib/mysql/mysql.sock",
+                "--database",
+                "alice_old",
+            ]
+            .map(str::to_owned),
+        );
+        expected
+    }
+
+    #[tokio::test]
+    async fn a_database_is_restored_from_a_backup_only_under_a_new_name() -> Result<()> {
+        let h = harness(false).await;
+        with_database(&h, "alice").await?;
+        let backup = h.backup("alice").await?;
+        let id = backup.backup_id.clone();
+        h.sys.clear_calls();
+        // Refused before anything: an existing name, another tenant's name,
+        // a database the backup does not hold, another tenant's backup.
+        for (tenant, database, new_name) in [
+            ("alice", "alice_wp", "alice_wp"),
+            ("alice", "alice_wp", "bob_x"),
+            ("alice", "alice_nope", "alice_old"),
+            ("bob", "alice_wp", "bob_x"),
+        ] {
+            let refused = h
+                .backups
+                .restore_database(tenant, &id, database, new_name)
+                .await;
+            assert!(
+                matches!(
+                    refused,
+                    Err(Error::DbObjectUnusable { .. }
+                        | Error::InvalidInput { .. }
+                        | Error::BackupNotFound { .. })
+                ),
+                "{tenant} {database} {new_name}: {refused:?}"
+            );
+        }
+        assert!(h.sys.calls_to(bin::SYSTEMD_RUN).is_empty());
+        assert_eq!(h.ctx.store.list_databases()?.len(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_database_restore_runs_a_sandboxed_loader_and_replays_the_objects() -> Result<()> {
+        let h = harness(false).await;
+        with_database(&h, "alice").await?;
+        let backup = h.backup("alice").await?;
+        let id = backup.backup_id.clone();
+        h.sys.clear_calls();
+
+        let (job, started) = h
+            .backups
+            .restore_database("alice", &id, "alice_wp", "alice_old")
+            .await?;
+        assert!(started);
+        assert_eq!(
+            (job.kind, job.database.as_str(), job.new_name.as_str()),
+            (JobKind::RestoreDatabase, "alice_wp", "alice_old")
+        );
+        let old = crate::validate::DbName::parse("alice_old", "n")?;
+        let rec = h.ctx.store.load_database(&old)?;
+        assert_eq!(rec.map(|r| r.state), Some(DbState::Provisioning));
+        // The empty database is created before the worker starts.
+        let calls = h.sys.calls();
+        let created = calls.iter().position(|c| {
+            c.program == bin::MARIADB
+                && c.stdin
+                    .as_deref()
+                    .is_some_and(|s| s.starts_with(b"CREATE DATABASE IF NOT EXISTS `alice_old`"))
+        });
+        let worker = calls.iter().position(|c| c.program == bin::SYSTEMD_RUN);
+        assert!(
+            created.is_some() && created < worker,
+            "{created:?} {worker:?}"
+        );
+        let dump = h
+            .ctx
+            .store
+            .load_backup(&BackupId::parse(&id)?)?
+            .and_then(|b| {
+                b.members
+                    .into_iter()
+                    .find(|m| m.name == "db-alice_wp.sql.gz")
+            })
+            .unwrap_or_else(|| panic!("dump member"));
+        let input = h.dir(&backup).join("db-alice_wp.sql.gz");
+        assert_eq!(
+            h.sys.calls_to(bin::SYSTEMD_RUN).first().map(args),
+            Some(restore_db_argv(
+                &job,
+                &input.to_string_lossy(),
+                &dump.sha256,
+                dump.size_bytes
+            ))
+        );
+        // Repeated: the same job; another restore meanwhile: refused.
+        let (again, started) = h
+            .backups
+            .restore_database("alice", &id, "alice_wp", "alice_old")
+            .await?;
+        assert!(!started && again.id == job.id);
+        assert!(matches!(
+            h.backups
+                .restore_database("alice", &id, "alice_wp", "alice_older")
+                .await,
+            Err(Error::JobRunning { .. })
+        ));
+
+        let done = h.finish(&job).await?;
+        assert_eq!(done.state, JobState::Succeeded, "{}", done.message);
+        assert_eq!(
+            done.message,
+            format!("database alice_wp of backup {id} restored as alice_old (1 stored objects were not re-created, see object_issues); it has no grants yet")
+        );
+        let [issue] = done.object_issues.as_slice() else {
+            panic!("{:?}", done.object_issues);
+        };
+        assert_eq!(
+            (issue.name.as_str(), issue.definition.as_str()),
+            ("rootly", ROOT_PROC)
+        );
+        let rec = h.ctx.store.load_database(&old)?;
+        assert_eq!(rec.map(|r| r.state), Some(DbState::Ready));
+        let (tables, objects) = h
+            .sys
+            .mariadb_schema("alice_old")
+            .unwrap_or_else(|| panic!("schema"));
+        assert_eq!(tables, ["from_dump"], "loaded by the worker");
+        assert_eq!(
+            objects,
+            vec![(
+                "TRIGGER".to_owned(),
+                "stamp".to_owned(),
+                "alice_app@localhost".to_owned()
+            )]
+        );
+        let replay = crate::db::objects::replay_script(
+            &Schema::of_db(&old),
+            member_def(&h, &backup, "stamp")?
+                .as_ref()
+                .unwrap_or_else(|| panic!("stamp")),
+        )
+        .unwrap_or_default();
+        assert!(h.sys.mariadb_scripts().contains(&replay));
+        no_drift(&h).await?;
+        Ok(())
+    }
+
+    async fn no_drift(h: &Harness) -> Result<()> {
+        let drifts = crate::host::HostService::new(h.ctx.clone())
+            .reconcile()
+            .await?;
+        assert!(drifts.is_empty(), "{drifts:?}");
+        Ok(())
+    }
+
+    fn member_def(
+        h: &Harness,
+        backup: &JobRecord,
+        name: &str,
+    ) -> Result<Option<crate::records::DbObjectDef>> {
+        let path = h.dir(backup).join("db-alice_wp.objects.json");
+        let member: ObjectsMember =
+            serde_json::from_slice(&std::fs::read(&path).map_err(|e| Error::io("read", &path, e))?)
+                .unwrap_or_else(|e| panic!("{e}"));
+        Ok(member.objects.into_iter().find(|o| o.name == name))
+    }
+
+    #[tokio::test]
+    async fn a_failed_load_removes_the_new_database_again() -> Result<()> {
+        let h = harness(false).await;
+        with_database(&h, "alice").await?;
+        let backup = h.backup("alice").await?;
+        let (job, _) = h
+            .backups
+            .restore_database("alice", &backup.backup_id, "alice_wp", "alice_old")
+            .await?;
+        assert!(h.sys.mariadb_schema("alice_old").is_some());
+        h.sys
+            .script_stdout(bin::SYSTEMCTL, &failed("exit-code", worker::EXIT_LOAD));
+        let done = h.finish(&job).await?;
+        assert_eq!(done.state, JobState::Failed);
+        assert_eq!(
+            done.message,
+            "the dump could not be loaded into the new database, which was removed again (see output)"
+        );
+        assert_eq!(h.sys.mariadb_schema("alice_old"), None);
+        let old = crate::validate::DbName::parse("alice_old", "n")?;
+        assert_eq!(h.ctx.store.load_database(&old)?, None);
+        assert!(crate::host::HostService::new(h.ctx.clone())
+            .reconcile()
+            .await?
+            .is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_deleted_tenants_database_is_restored_into_its_new_account() -> Result<()> {
+        let h = harness(false).await;
+        let db = with_database(&h, "bob").await?;
+        // A final backup kept for 5 days, then bob is deleted.
+        let before = now_unix();
+        let (fin, _) = h.backups.create("bob", 0, 5).await?;
+        let fin = h.finish(&fin).await?;
+        let rec = h.ctx.store.load_backup(&BackupId::parse(&fin.backup_id)?)?;
+        let until = rec.map_or(0, |r| r.retain_until_unix);
+        assert!(until >= before + 5 * 86_400 && until <= now_unix() + 5 * 86_400);
+        db.delete_user("bob_app").await?;
+        db.delete_database("bob_wp").await?;
+        db.purge_trash("bob", "").await?;
+        assert!(h.tenants.delete("bob", true).await?);
+        h.tenants.create("bob", Limits::default(), "").await?;
+        h.sys.clear_calls();
+        // Only the operator's call reaches it, naming backup, source and target.
+        assert!(matches!(
+            h.backups
+                .restore_database("bob", &fin.backup_id, "bob_wp", "bob_old")
+                .await,
+            Err(Error::BackupNotFound { .. })
+        ));
+        assert!(matches!(
+            h.backups
+                .restore_retained_database(&fin.backup_id, "alice", "bob", "bob_wp", "bob_old")
+                .await,
+            Err(Error::BackupNotFound { .. })
+        ));
+        assert!(matches!(
+            h.backups
+                .restore_retained_database(&fin.backup_id, "bob", "bob", "bob_wp", "alice_old")
+                .await,
+            Err(Error::InvalidInput {
+                field: "new_name",
+                ..
+            })
+        ));
+        assert!(matches!(
+            h.backups
+                .restore_retained_database(&fin.backup_id, "bob", "carol", "bob_wp", "carol_old")
+                .await,
+            Err(Error::TenantNotFound(_))
+        ));
+        assert!(h.sys.calls_to(bin::SYSTEMD_RUN).is_empty());
+        let (job, started) = h
+            .backups
+            .restore_retained_database(&fin.backup_id, "bob", "bob", "bob_wp", "bob_old")
+            .await?;
+        assert!(started && job.tenant == "bob");
+        let argv = h
+            .sys
+            .calls_to(bin::SYSTEMD_RUN)
+            .first()
+            .map(args)
+            .unwrap_or_default();
+        let input = h.dir(&fin).join("db-bob_wp.sql.gz");
+        assert!(argv.contains(&input.to_string_lossy().into_owned()));
+        assert_eq!(h.finish(&job).await?.state, JobState::Succeeded);
+        let old = crate::validate::DbName::parse("bob_old", "n")?;
+        assert_eq!(
+            h.ctx.store.load_database(&old)?.map(|r| r.state),
+            Some(DbState::Ready)
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn retention_can_be_given_in_days() -> Result<()> {
+        let h = harness(false).await;
+        for (months, days) in [(1, 1), (0, 367), (13, 0)] {
+            assert!(matches!(
+                h.backups.create("alice", months, days).await,
+                Err(Error::InvalidInput { .. })
+            ));
+        }
+        assert!(h.ctx.store.list_backups()?.is_empty());
+        let before = now_unix();
+        let (job, _) = h.backups.create("alice", 0, 10).await?;
+        h.finish(&job).await?;
+        let until = |h: &Harness| -> Result<u64> {
+            Ok(h.ctx
+                .store
+                .load_backup(&BackupId::parse(&job.backup_id)?)?
+                .map_or(0, |b| b.retain_until_unix))
+        };
+        let got = until(&h)?;
+        assert!(got >= before + 10 * 86_400 && got <= now_unix() + 10 * 86_400);
+        let before = now_unix();
+        let rec = h.backups.retain("alice", &job.backup_id, 0, 3).await?;
+        assert!(
+            rec.retain_until_unix >= before + 3 * 86_400
+                && rec.retain_until_unix <= now_unix() + 3 * 86_400
+        );
+        for (months, days) in [(1, 3), (0, 0), (0, 367)] {
+            assert!(matches!(
+                h.backups
+                    .retain("alice", &job.backup_id, months, days)
+                    .await,
+                Err(Error::InvalidInput { .. })
+            ));
+        }
+        Ok(())
     }
 }

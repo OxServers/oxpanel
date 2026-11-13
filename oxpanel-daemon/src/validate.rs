@@ -998,6 +998,69 @@ mod id_tests {
     use super::*;
 
     #[test]
+    fn trash_ids_are_allow_listed_and_name_a_schema_no_tenant_can_own() {
+        let id = TrashId::from_millis(1_731_500_000_123);
+        assert_eq!(id.as_str(), "t1731500000123");
+        assert_eq!(id.schema(), "oxpanel_trash_t1731500000123");
+        assert!(TrashId::parse(id.as_str()).is_ok());
+        for bad in [
+            "",
+            "t",
+            "t123",
+            "b1731500000123",
+            "t1731500000123/..",
+            "t17315000001x3",
+            "T1731500000123",
+            "t1731500000123`",
+        ] {
+            assert!(TrashId::parse(bad).is_err(), "{bad:?}");
+        }
+        // No database name can be a trash schema: its "tenant" is reserved.
+        assert!(DbName::parse(&id.schema(), "name").is_err());
+        assert!(Username::parse("oxpanel_trash").is_err());
+    }
+
+    #[test]
+    fn retention_is_given_in_months_or_days_never_both() -> Result<()> {
+        assert_eq!(retain_days(1, "d")?, 86_400);
+        assert_eq!(retain_days(366, "d")?, 366 * 86_400);
+        for bad in [0, 367, u32::MAX] {
+            assert!(retain_days(bad, "d").is_err(), "{bad}");
+        }
+        assert_eq!(retention(0, 0)?, 0);
+        assert_eq!(retention(2, 0)?, 2 * RETENTION_MONTH_SECS);
+        assert_eq!(retention(0, 10)?, 10 * 86_400);
+        assert!(matches!(
+            retention(1, 1),
+            Err(Error::InvalidInput {
+                field: "retain_days",
+                ..
+            })
+        ));
+        assert!(retention(13, 0).is_err() && retention(0, 367).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn the_trash_cap_defaults_to_the_disk_limit() -> Result<()> {
+        let none = Limits::default();
+        assert_eq!(none.db_trash_cap(), None, "no disk limit, no cap");
+        let disk = Limits::default().with_disk(5 << 30, 0)?;
+        assert_eq!(disk.db_trash_cap(), Some(5 << 30));
+        let explicit = disk.with_db_trash(1 << 20);
+        assert_eq!(explicit.db_trash_cap(), Some(1 << 20));
+        assert_eq!(explicit.with_db_trash(0).db_trash_cap(), Some(5 << 30));
+        assert_eq!(Limits::default().with_db_trash(7).db_trash_cap(), Some(7));
+        // Records written before the setting existed read as "default".
+        let old: Limits = serde_json::from_str(
+            r#"{"memory_max_bytes":null,"cpu_weight":null,"io_weight":null,"tasks_max":null}"#,
+        )
+        .map_err(|e| Error::Internal(e.to_string()))?;
+        assert_eq!(old.db_trash_max_bytes, None);
+        Ok(())
+    }
+
+    #[test]
     fn backup_and_job_ids_are_allow_listed() {
         assert!(BackupId::parse("b1731500000123").is_ok());
         assert_eq!(BackupId::from_millis(5).as_str(), "b0000000000005");

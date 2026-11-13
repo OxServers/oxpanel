@@ -647,9 +647,11 @@ pub fn parse_objects(text: &str) -> Result<SchemaObjects> {
             "procedure" => K::Procedure,
             "function" => K::Function,
             "event" => K::Event,
-            other => return Err(Error::Internal(format!(
+            other => {
+                return Err(Error::Internal(format!(
                 "the database holds a {other} ('{name}'), which OxPanel cannot keep; drop it first"
-            ))),
+            )))
+            }
         };
         out.objects.push(Listed {
             kind,

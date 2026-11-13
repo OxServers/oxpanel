@@ -879,7 +879,7 @@ fn check_unrecorded(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use crate::config::Config;
     use crate::host::HostService;
@@ -888,21 +888,21 @@ mod tests {
     use crate::validate::Limits;
     use std::sync::Arc;
 
-    const MARIADB: DbEngine = DbEngine::Mariadb;
-    const PASSWORD: &str = "Secret-pass-123";
+    pub(super) const MARIADB: DbEngine = DbEngine::Mariadb;
+    pub(super) const PASSWORD: &str = "Secret-pass-123";
     const HASH: &str = "*683682FA5B18D74444A8178F2DD3E999D9007573";
 
-    struct Harness {
+    pub(super) struct Harness {
         _dir: tempfile::TempDir,
-        sys: Arc<FakeSystem>,
-        ctx: Ctx,
-        tenants: TenantService,
-        db: DbService,
-        host: HostService,
+        pub(super) sys: Arc<FakeSystem>,
+        pub(super) ctx: Ctx,
+        pub(super) tenants: TenantService,
+        pub(super) db: DbService,
+        pub(super) host: HostService,
     }
 
     /// Tenants `alice`, `acme` and `acme_shop`; MariaDB installed and empty.
-    async fn harness_with(configure: impl FnOnce(&mut Config)) -> Harness {
+    pub(super) async fn harness_with(configure: impl FnOnce(&mut Config)) -> Harness {
         let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
         let mut cfg = Config::default();
         cfg.state_dir = dir.path().join("state");
@@ -947,11 +947,11 @@ mod tests {
         h
     }
 
-    async fn harness() -> Harness {
+    pub(super) async fn harness() -> Harness {
         harness_with(|_| {}).await
     }
 
-    fn args(c: &CommandSpec) -> Vec<String> {
+    pub(super) fn args(c: &CommandSpec) -> Vec<String> {
         c.args
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
@@ -960,7 +960,7 @@ mod tests {
 
     /// The scripts that changed something (everything but the read-only
     /// queries: state, sizes, object listings).
-    fn mutations(h: &Harness) -> Vec<String> {
+    pub(super) fn mutations(h: &Harness) -> Vec<String> {
         h.sys
             .mariadb_scripts()
             .into_iter()
@@ -972,7 +972,7 @@ mod tests {
             .collect()
     }
 
-    fn kinds(d: &[Drift]) -> Vec<(DriftKind, &str)> {
+    pub(super) fn kinds(d: &[Drift]) -> Vec<(DriftKind, &str)> {
         d.iter().map(|d| (d.kind, d.subject.as_str())).collect()
     }
 

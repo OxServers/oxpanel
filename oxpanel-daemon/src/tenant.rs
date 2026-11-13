@@ -575,7 +575,7 @@ impl TenantService {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::config::Config;
     use crate::system::{FakeSystem, OsUser, System};
@@ -1100,20 +1100,20 @@ mod tests {
 
     /// A tenant using every feature at once, for
     /// [`one_tenant_with_every_feature_through_suspend_resume_and_delete`].
-    struct Everything {
+    pub(crate) struct Everything {
         _dir: tempfile::TempDir,
-        sys: Arc<FakeSystem>,
-        ctx: Ctx,
-        tenants: TenantService,
-        vhosts: crate::vhost::VHostService,
-        db: crate::db::DbService,
-        backups: crate::backup::BackupService,
-        host: crate::host::HostService,
-        backup_id: String,
+        pub(crate) sys: Arc<FakeSystem>,
+        pub(crate) ctx: Ctx,
+        pub(crate) tenants: TenantService,
+        pub(crate) vhosts: crate::vhost::VHostService,
+        pub(crate) db: crate::db::DbService,
+        pub(crate) backups: crate::backup::BackupService,
+        pub(crate) host: crate::host::HostService,
+        pub(crate) backup_id: String,
     }
 
     /// Every external command since the last `clear_calls`, program first.
-    fn argvs(sys: &FakeSystem) -> Vec<Vec<String>> {
+    pub(crate) fn argvs(sys: &FakeSystem) -> Vec<Vec<String>> {
         sys.calls()
             .iter()
             .map(|c| {
@@ -1126,30 +1126,34 @@ mod tests {
 
     /// Index of the first command `what` matches; panics with the whole list
     /// if there is none.
-    fn first(calls: &[Vec<String>], what: impl Fn(&[String]) -> bool, label: &str) -> usize {
+    pub(crate) fn first(
+        calls: &[Vec<String>],
+        what: impl Fn(&[String]) -> bool,
+        label: &str,
+    ) -> usize {
         calls
             .iter()
             .position(|c| what(c))
             .unwrap_or_else(|| panic!("no {label} in {calls:#?}"))
     }
 
-    fn is_program(c: &[String], program: &str) -> bool {
+    pub(crate) fn is_program(c: &[String], program: &str) -> bool {
         c.first().is_some_and(|p| p == program)
     }
 
-    fn mentions(c: &[String], word: &str) -> bool {
+    pub(crate) fn mentions(c: &[String], word: &str) -> bool {
         c.iter().any(|a| a == word)
     }
 
     /// `systemctl <verb> … <unit>`.
-    fn systemctl(c: &[String], verb: &str, unit: &str) -> bool {
+    pub(crate) fn systemctl(c: &[String], verb: &str, unit: &str) -> bool {
         is_program(c, bin::SYSTEMCTL) && mentions(c, verb) && mentions(c, unit)
     }
 
     /// alice with a PHP site (and an uploaded certificate), a Node.js
     /// application, an SFTP key and password, a database and a database
     /// user with access to it, and one finished backup.
-    async fn everything() -> Result<Everything> {
+    pub(crate) async fn everything() -> Result<Everything> {
         use crate::records::{AppRuntime, DbEngine};
         use crate::vhost::{AppRequest, VHostRequest};
         let dir = tempfile::tempdir().map_err(|e| Error::io("tempdir", "/tmp", e))?;

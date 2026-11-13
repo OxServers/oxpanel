@@ -495,7 +495,7 @@ pub fn spawn_purger(ctx: Ctx) {
                     Ok(0) => {}
                     Ok(n) => info!(purged = n, "overdue deleted databases purged"),
                     Err(e) => {
-                        warn!(error = %e, "could not purge overdue deleted databases; will retry")
+                        warn!(error = %e, "could not purge overdue deleted databases; will retry");
                     }
                 }
             }
@@ -629,5 +629,529 @@ pub fn drifts(
                 "a trash schema that no trash record accounts for (reported, never removed)",
             ));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::mariadb::hex_text;
+    use crate::db::tests::{harness, kinds, mutations, Harness, MARIADB, PASSWORD};
+    use crate::records::DbObjectKind;
+    use crate::system::bin;
+    use crate::validate::Limits;
+
+    /// Every object kind, all by `alice_app`, plus a procedure whose definer
+    /// is root (put there by an administrator).
+    const OBJECTS: [&str; 6] = [
+        "CREATE ALGORITHM=UNDEFINED DEFINER=`alice_app`@`localhost` SQL SECURITY DEFINER VIEW `recent` AS select `posts`.`id` AS `id` from `posts`",
+        "CREATE DEFINER=`alice_app`@`localhost` TRIGGER stamp BEFORE INSERT ON posts FOR EACH ROW SET NEW.id = NEW.id + 1",
+        "CREATE DEFINER=`alice_app`@`localhost` PROCEDURE `cleanup`()\nBEGIN DELETE FROM posts; END",
+        "CREATE DEFINER=`alice_app`@`localhost` FUNCTION `twice`(x INT) RETURNS int(11)\n    DETERMINISTIC\nRETURN x * 2",
+        "CREATE DEFINER=`alice_app`@`localhost` EVENT `nightly` ON SCHEDULE EVERY 1 DAY DO CALL cleanup()",
+        "CREATE DEFINER=`root`@`localhost` PROCEDURE `rootly`()\nSELECT 1",
+    ];
+
+    /// `alice_wp` with two tables and every kind of object, granted to
+    /// `alice_app`.
+    async fn fixture(h: &Harness) -> Result<()> {
+        h.db.create_database("alice", "alice_wp", MARIADB).await?;
+        h.db.create_user("alice", "alice_app", PASSWORD, MARIADB)
+            .await?;
+        h.db.grant("alice_app", "alice_wp").await?;
+        let mut script = format!(
+            "CREATE TABLE `alice_wp`.`posts` (id INT);\nCREATE TABLE `alice_wp`.`users` (id INT);\nUSE `alice_wp`;\nSET SESSION sql_mode = {};\n",
+            hex_text("STRICT_TRANS_TABLES")
+        );
+        for o in OBJECTS {
+            script.push_str("DELIMITER $$\n");
+            script.push_str(o);
+            script.push_str("\n$$\n");
+        }
+        h.sys.mariadb_admin(&script)?;
+        h.sys.clear_calls();
+        Ok(())
+    }
+
+    fn trashed(d: Deleted) -> DbTrashRecord {
+        match d {
+            Deleted::Trashed(t) => *t,
+            other => panic!("not trashed: {other:?}"),
+        }
+    }
+
+    /// The scripts sent through the hardened client.
+    fn hardened(h: &Harness) -> Vec<String> {
+        h.sys
+            .calls_to(bin::MARIADB)
+            .into_iter()
+            .filter(|c| {
+                c.args
+                    .iter()
+                    .rev()
+                    .take(2)
+                    .map(|a| a.to_string_lossy().into_owned())
+                    .collect::<Vec<_>>()
+                    == ["--sandbox", "--binary-mode"]
+            })
+            .filter_map(|c| c.stdin)
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .collect()
+    }
+
+    fn name(s: &str) -> DbName {
+        DbName::parse(s, "name").unwrap_or_else(|e| panic!("{e}"))
+    }
+
+    fn record(h: &Harness, id: &str) -> Result<DbTrashRecord> {
+        Ok(h.ctx
+            .store
+            .load_trash(&TrashId::parse(id)?)?
+            .unwrap_or_else(|| panic!("record {id}")))
+    }
+
+    async fn grant_exists(h: &Harness, user: &str, db: &str) -> Result<bool> {
+        Ok(mariadb::snapshot(&h.ctx)
+            .await?
+            .grant_on(&name(user), &name(db))
+            .is_some())
+    }
+
+    #[tokio::test]
+    async fn deleting_moves_the_database_aside_with_its_objects() -> Result<()> {
+        let h = harness().await;
+        fixture(&h).await?;
+        let t = trashed(h.db.delete_database("alice_wp").await?);
+        let schema = format!("oxpanel_trash_{}", t.id);
+        assert_eq!(
+            mutations(&h),
+            vec![
+                "USE `alice_wp`;\nSHOW CREATE VIEW `recent`;\nSHOW CREATE TRIGGER `stamp`;\nSHOW CREATE FUNCTION `twice`;\nSHOW CREATE PROCEDURE `cleanup`;\nSHOW CREATE PROCEDURE `rootly`;\nSHOW CREATE EVENT `nightly`;\n".to_owned(),
+                "REVOKE ALL PRIVILEGES ON `alice\\_wp`.* FROM 'alice_app'@'localhost';\nKILL USER 'alice_app'@'localhost';\n".to_owned(),
+                format!("CREATE DATABASE IF NOT EXISTS `{schema}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\nDROP VIEW IF EXISTS `alice_wp`.`recent`;\nDROP TRIGGER IF EXISTS `alice_wp`.`stamp`;\nRENAME TABLE `alice_wp`.`posts` TO `{schema}`.`posts`, `alice_wp`.`users` TO `{schema}`.`users`;\nDROP DATABASE IF EXISTS `alice_wp`;\n"),
+            ]
+        );
+        // Every script that names tenant-chosen things went through the
+        // hardened client; the revoke (validated names only) needs no more.
+        let hard = hardened(&h);
+        assert_eq!(hard.len(), 2, "{hard:?}");
+        assert!(hard.iter().any(|s| s.contains("SHOW CREATE")));
+        assert!(hard.iter().any(|s| s.contains("RENAME TABLE")));
+        // The record: trashed, every object kept, purged in 30 days.
+        assert_eq!(record(&h, &t.id)?, t);
+        assert_eq!(t.state, TrashState::Trashed);
+        assert_eq!((t.name.as_str(), t.tenant.as_str()), ("alice_wp", "alice"));
+        assert_eq!(t.purge_at_unix, t.deleted_at_unix + 30 * 86_400);
+        assert_eq!(t.size_bytes, 16_384);
+        let kept: Vec<(DbObjectKind, &str, &str)> = t
+            .objects
+            .iter()
+            .map(|o| (o.kind, o.name.as_str(), o.definer.as_str()))
+            .collect();
+        assert_eq!(
+            kept,
+            vec![
+                (DbObjectKind::View, "recent", "alice_app@localhost"),
+                (DbObjectKind::Trigger, "stamp", "alice_app@localhost"),
+                (DbObjectKind::Function, "twice", "alice_app@localhost"),
+                (DbObjectKind::Procedure, "cleanup", "alice_app@localhost"),
+                (DbObjectKind::Procedure, "rootly", "root@localhost"),
+                (DbObjectKind::Event, "nightly", "alice_app@localhost"),
+            ]
+        );
+        let texts: Vec<&str> = t.objects.iter().map(|o| o.definition.as_str()).collect();
+        let [view, trigger, procedure, function, event, rootly] = OBJECTS;
+        assert_eq!(
+            texts,
+            vec![view, trigger, function, procedure, rootly, event]
+        );
+        assert!(t
+            .objects
+            .iter()
+            .filter(|o| o.kind != DbObjectKind::View)
+            .all(|o| o.sql_mode == "STRICT_TRANS_TABLES"));
+        // On the server: the tables in the hidden schema, the name gone.
+        assert_eq!(h.sys.mariadb_schema("alice_wp"), None);
+        assert_eq!(
+            h.sys.mariadb_schema(&schema),
+            Some((vec!["posts".to_owned(), "users".to_owned()], vec![]))
+        );
+        assert!(h
+            .db
+            .list_users("alice")
+            .await?
+            .iter()
+            .all(|u| u.grants.is_empty()));
+        // The name is free at once, and the old grant does not come back.
+        assert!(h.db.create_database("alice", "alice_wp", MARIADB).await?.1);
+        assert!(!grant_exists(&h, "alice_app", "alice_wp").await?);
+        assert!(h.host.reconcile().await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn restoring_needs_a_new_name_and_recreates_the_objects_without_grants() -> Result<()> {
+        let h = harness().await;
+        fixture(&h).await?;
+        let t = trashed(h.db.delete_database("alice_wp").await?);
+        let schema = format!("oxpanel_trash_{}", t.id);
+        h.db.create_database("alice", "alice_wp", MARIADB).await?;
+        h.sys.clear_calls();
+        // Refused: an existing name, another tenant's name, another
+        // tenant's trash, no name.
+        assert!(matches!(
+            h.db.restore_trash("alice", &t.id, "alice_wp").await,
+            Err(Error::DbObjectUnusable { .. })
+        ));
+        assert!(matches!(
+            h.db.restore_trash("alice", &t.id, "acme_back").await,
+            Err(Error::InvalidInput {
+                field: "new_name",
+                ..
+            })
+        ));
+        assert!(matches!(
+            h.db.restore_trash("acme", &t.id, "acme_back").await,
+            Err(Error::TrashNotFound { .. })
+        ));
+        assert!(matches!(
+            h.db.restore_trash("alice", &t.id, "").await,
+            Err(Error::InvalidInput { .. })
+        ));
+        assert!(mutations(&h).is_empty(), "refusals change nothing");
+        let (rec, issues) = h.db.restore_trash("alice", &t.id, "alice_back").await?;
+        assert_eq!(
+            (rec.name.as_str(), rec.state),
+            ("alice_back", DbState::Ready)
+        );
+        // The root-definer procedure is not re-created; it is reported with
+        // its definition.
+        let [issue] = issues.as_slice() else {
+            panic!("{issues:?}");
+        };
+        assert_eq!(
+            (issue.kind, issue.name.as_str()),
+            (DbObjectKind::Procedure, "rootly")
+        );
+        assert!(
+            issue.reason.contains("definer 'root@localhost'"),
+            "{}",
+            issue.reason
+        );
+        assert_eq!(issue.definition, OBJECTS[5]);
+        let target = Schema::of_db(&name("alice_back"));
+        let replay = |n: &str| {
+            t.objects
+                .iter()
+                .find(|o| o.name == n)
+                .and_then(|d| objects::replay_script(&target, d))
+                .unwrap_or_else(|| panic!("{n}"))
+        };
+        let sent = mutations(&h);
+        assert_eq!(
+            sent,
+            vec![
+                format!("CREATE DATABASE IF NOT EXISTS `alice_back` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\nRENAME TABLE `{schema}`.`posts` TO `alice_back`.`posts`, `{schema}`.`users` TO `alice_back`.`users`;\n"),
+                content::create_view(&target, OBJECTS[0]),
+                // One client process per object: routines, triggers, events.
+                replay("cleanup"),
+                replay("twice"),
+                replay("stamp"),
+                replay("nightly"),
+                format!("DROP DATABASE IF EXISTS `{schema}`;\n"),
+            ]
+        );
+        let hard = hardened(&h);
+        assert!(
+            sent.iter().all(|s| hard.contains(s)),
+            "all through the hardened client"
+        );
+        let (tables, mut objs) = h
+            .sys
+            .mariadb_schema("alice_back")
+            .unwrap_or_else(|| panic!("restored schema"));
+        objs.sort();
+        assert_eq!(tables, ["posts", "users"]);
+        let want =
+            |k: &str, n: &str| (k.to_owned(), n.to_owned(), "alice_app@localhost".to_owned());
+        assert_eq!(
+            objs,
+            vec![
+                want("EVENT", "nightly"),
+                want("FUNCTION", "twice"),
+                want("PROCEDURE", "cleanup"),
+                want("TRIGGER", "stamp"),
+                want("VIEW", "recent"),
+            ]
+        );
+        assert!(
+            !grant_exists(&h, "alice_app", "alice_back").await?,
+            "no grants"
+        );
+        assert_eq!(h.sys.mariadb_schema(&schema), None);
+        assert_eq!(h.ctx.store.load_trash(&TrashId::parse(&t.id)?)?, None);
+        assert!(matches!(
+            h.db.restore_trash("alice", &t.id, "alice_again").await,
+            Err(Error::TrashNotFound { .. })
+        ));
+        assert!(h.host.reconcile().await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_delete_over_the_trash_cap_is_refused_before_anything_changes() -> Result<()> {
+        let h = harness().await;
+        h.tenants
+            .update_limits("alice", Limits::default().with_db_trash(20_000))
+            .await?;
+        h.db.create_database("alice", "alice_a", MARIADB).await?;
+        h.db.create_database("alice", "alice_b", MARIADB).await?;
+        h.db.create_user("alice", "alice_app", PASSWORD, MARIADB)
+            .await?;
+        h.db.grant("alice_app", "alice_b").await?;
+        trashed(h.db.delete_database("alice_a").await?);
+        h.sys.clear_calls();
+        assert!(matches!(
+            h.db.delete_database("alice_b").await,
+            Err(Error::DbTrashFull {
+                held: 16_384,
+                size: 16_384,
+                cap: 20_000,
+                ..
+            })
+        ));
+        assert!(mutations(&h).is_empty(), "refused before any change");
+        let rec = h.ctx.store.load_database(&name("alice_b"))?;
+        assert_eq!(rec.map(|r| r.state), Some(DbState::Ready));
+        assert!(grant_exists(&h, "alice_app", "alice_b").await?);
+        let listing = h.db.list_trash("alice").await?;
+        assert_eq!(
+            (listing.total_bytes, listing.cap_bytes),
+            (16_384, Some(20_000))
+        );
+        assert_eq!(h.db.purge_trash("alice", "").await?, 1);
+        trashed(h.db.delete_database("alice_b").await?);
+        // Without a setting the disk limit is the cap; without one, none.
+        assert_eq!(h.db.list_trash("acme").await?.cap_bytes, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn purging_one_or_all_and_overdue_items() -> Result<()> {
+        let h = harness().await;
+        let mut ids = Vec::new();
+        for db in ["alice_a", "alice_b", "alice_c"] {
+            h.db.create_database("alice", db, MARIADB).await?;
+            ids.push(trashed(h.db.delete_database(db).await?).id);
+        }
+        let [a, b, c] = ids.as_slice() else {
+            panic!("{ids:?}");
+        };
+        h.sys.clear_calls();
+        assert!(matches!(
+            h.db.purge_trash("acme", a).await,
+            Err(Error::TrashNotFound { .. })
+        ));
+        assert!(matches!(
+            h.db.purge_trash("alice", "nope").await,
+            Err(Error::InvalidInput { .. })
+        ));
+        assert_eq!(h.db.purge_trash("alice", a).await?, 1);
+        assert_eq!(
+            hardened(&h),
+            vec![format!("DROP DATABASE IF EXISTS `oxpanel_trash_{a}`;\n")]
+        );
+        assert_eq!(h.sys.mariadb_schema(&format!("oxpanel_trash_{a}")), None);
+        // Overdue: only that one goes.
+        let mut overdue = record(&h, b)?;
+        overdue.purge_at_unix = 1;
+        h.ctx.store.save_trash(&overdue)?;
+        assert_eq!(purge_overdue(&h.ctx).await?, 1);
+        assert_eq!(purge_overdue(&h.ctx).await?, 0);
+        let left: Vec<String> = h
+            .ctx
+            .store
+            .list_trash()?
+            .into_iter()
+            .map(|t| t.id)
+            .collect();
+        assert_eq!(left.as_slice(), std::slice::from_ref(c));
+        // An item being moved or restored is not purged.
+        let mut busy = record(&h, c)?;
+        busy.state = TrashState::Moving;
+        h.ctx.store.save_trash(&busy)?;
+        assert!(matches!(
+            h.db.purge_trash("alice", c).await,
+            Err(Error::DbObjectUnusable { .. })
+        ));
+        assert_eq!(h.db.purge_trash("alice", "").await?, 0, "skipped by 'all'");
+        busy.state = TrashState::Trashed;
+        h.ctx.store.save_trash(&busy)?;
+        assert_eq!(h.db.purge_trash("alice", "").await?, 1);
+        assert!(h.ctx.store.list_trash()?.is_empty());
+        assert!(h.host.reconcile().await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_move_or_restore_is_completed_by_repeating_it() -> Result<()> {
+        let h = harness().await;
+        h.db.create_database("alice", "alice_wp", MARIADB).await?;
+        h.db.create_user("alice", "alice_app", PASSWORD, MARIADB)
+            .await?;
+        h.db.grant("alice_app", "alice_wp").await?;
+        h.sys
+            .mariadb_admin("CREATE TABLE `alice_wp`.`t` (a INT);\n")?;
+        // State, objects, size, revoke, objects again: then the move fails.
+        for _ in 0..5 {
+            h.sys.script_pass_through(bin::MARIADB);
+        }
+        h.sys
+            .script_failure(bin::MARIADB, 1, "ERROR 1205 (HY000): Lock wait timeout");
+        assert!(h.db.delete_database("alice_wp").await.is_err());
+        let rec = h.ctx.store.load_database(&name("alice_wp"))?;
+        assert_eq!(rec.map(|r| r.state), Some(DbState::Deleting));
+        let pending = h.ctx.store.list_trash()?;
+        let [moving] = pending.as_slice() else {
+            panic!("{pending:?}");
+        };
+        assert_eq!(moving.state, TrashState::Moving);
+        let subject = format!("{} (alice_wp)", moving.id);
+        let drifts = h.host.reconcile().await?;
+        assert!(
+            kinds(&drifts).contains(&(DriftKind::DatabaseTrashDrift, subject.as_str())),
+            "{drifts:?}"
+        );
+        let t = trashed(h.db.delete_database("alice_wp").await?);
+        assert_eq!(t.id, moving.id, "the same trash item");
+        assert_eq!(
+            h.sys
+                .mariadb_schema(&format!("oxpanel_trash_{}", t.id))
+                .map(|s| s.0),
+            Some(vec!["t".to_owned()])
+        );
+        // A restore that fails after it recorded the new name.
+        h.sys.script_pass_through(bin::MARIADB);
+        h.sys.script_pass_through(bin::MARIADB);
+        h.sys
+            .script_failure(bin::MARIADB, 1, "ERROR 1205 (HY000): Lock wait timeout");
+        assert!(h
+            .db
+            .restore_trash("alice", &t.id, "alice_back")
+            .await
+            .is_err());
+        let rec = h.ctx.store.load_database(&name("alice_back"))?;
+        assert_eq!(rec.map(|r| r.state), Some(DbState::Provisioning));
+        let drifts = h.host.reconcile().await?;
+        assert!(
+            kinds(&drifts).contains(&(DriftKind::DatabaseTrashDrift, subject.as_str())),
+            "{drifts:?}"
+        );
+        assert!(matches!(
+            h.db.restore_trash("alice", &t.id, "alice_other").await,
+            Err(Error::InvalidInput {
+                field: "new_name",
+                ..
+            })
+        ));
+        assert!(matches!(
+            h.db.purge_trash("alice", &t.id).await,
+            Err(Error::DbObjectUnusable { .. })
+        ));
+        let (rec, issues) = h.db.restore_trash("alice", &t.id, "alice_back").await?;
+        assert!(issues.is_empty());
+        assert_eq!(rec.state, DbState::Ready);
+        assert_eq!(
+            h.sys.mariadb_schema("alice_back").map(|s| s.0),
+            Some(vec!["t".to_owned()])
+        );
+        assert!(h.host.reconcile().await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reconcile_reports_orphaned_vanished_overdue_and_reachable_trash() -> Result<()> {
+        let h = harness().await;
+        let mut ids = Vec::new();
+        for db in ["alice_a", "alice_b"] {
+            h.db.create_database("alice", db, MARIADB).await?;
+            ids.push(trashed(h.db.delete_database(db).await?).id);
+        }
+        let [a, b] = ids.as_slice() else {
+            panic!("{ids:?}");
+        };
+        h.sys.mariadb_admin(&format!(
+            "CREATE DATABASE `oxpanel_trash_t0000000000001`;\nDROP DATABASE `oxpanel_trash_{a}`;\n"
+        ))?;
+        let mut overdue = record(&h, b)?;
+        overdue.purge_at_unix = 1;
+        h.ctx.store.save_trash(&overdue)?;
+        h.sys.mariadb_admin(
+            "CREATE USER 'spy'@'%';\nGRANT SELECT ON `oxpanel%`.* TO 'spy'@'%';\n",
+        )?;
+        let drifts = h.host.reconcile().await?;
+        let (gone, late) = (format!("{a} (alice_a)"), format!("{b} (alice_b)"));
+        let reach = format!("oxpanel_trash_{b}");
+        let mut found = kinds(&drifts);
+        found.sort_unstable();
+        let mut want = vec![
+            (
+                DriftKind::DatabasePrivilegeDrift,
+                "oxpanel_trash_t0000000000001",
+            ),
+            (DriftKind::DatabasePrivilegeDrift, reach.as_str()),
+            (DriftKind::DatabaseTrashDrift, gone.as_str()),
+            (DriftKind::DatabaseTrashDrift, late.as_str()),
+            (
+                DriftKind::OrphanDatabaseTrash,
+                "oxpanel_trash_t0000000000001",
+            ),
+        ];
+        want.sort_unstable();
+        assert_eq!(found, want, "{drifts:?}");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn trash_is_owned_and_a_whole_tenant_is_dropped_at_once() -> Result<()> {
+        let h = harness().await;
+        let alice = Username::parse("alice")?;
+        h.db.create_database("alice", "alice_wp", MARIADB).await?;
+        h.db.create_database("alice", "alice_old", MARIADB).await?;
+        h.db.create_user("alice", "alice_app", PASSWORD, MARIADB)
+            .await?;
+        h.db.grant("alice_app", "alice_wp").await?;
+        let t = trashed(h.db.delete_database("alice_old").await?);
+        assert!(tenant_has_trash(&h.ctx, &alice)?);
+        h.sys.clear_calls();
+        let rec = h
+            .ctx
+            .store
+            .load_tenant(&alice)?
+            .unwrap_or_else(|| panic!("tenant"));
+        drop_everything(&h.ctx, &rec).await?;
+        assert_eq!(
+            hardened(&h),
+            vec![format!(
+                "ALTER USER 'alice_app'@'localhost' ACCOUNT LOCK;\nKILL USER 'alice_app'@'localhost';\nDROP USER IF EXISTS 'alice_app'@'localhost';\nDROP DATABASE IF EXISTS `alice_wp`;\nDROP DATABASE IF EXISTS `oxpanel_trash_{}`;\n",
+                t.id
+            )]
+        );
+        assert!(h.ctx.store.list_databases()?.is_empty());
+        assert!(h.ctx.store.list_db_users()?.is_empty());
+        assert!(h.ctx.store.list_trash()?.is_empty());
+        assert!(!crate::db::tenant_has_objects(&h.ctx, &alice)?);
+        assert_eq!(h.sys.mariadb_schema("alice_wp"), None);
+        // Nothing left: a second run touches nothing.
+        h.sys.clear_calls();
+        drop_everything(&h.ctx, &rec).await?;
+        assert!(h.sys.calls().is_empty());
+        // Trash alone keeps a tenant from being deleted.
+        h.db.create_database("alice", "alice_x", MARIADB).await?;
+        trashed(h.db.delete_database("alice_x").await?);
+        assert!(crate::db::tenant_has_objects(&h.ctx, &alice)?);
+        assert!(!tenant_has_trash(&h.ctx, &Username::parse("acme")?)?);
+        assert!(h.host.reconcile().await?.is_empty());
+        Ok(())
     }
 }
