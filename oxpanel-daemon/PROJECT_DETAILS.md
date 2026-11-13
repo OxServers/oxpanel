@@ -129,5 +129,6 @@ not per object; per-owner confinement is a possible later refinement.
 2. Confined SELinux domain (`oxpanel_t`) and a capability *allow*-list for the unit; a confining policy for `oxpanel_app_t` (today it only labels applications so the web server can be allowed to reach exactly them).
 3. ~~Per-tenant PHP-FPM in the tenant slice; per-vhost logs~~ — done (hosting milestone 2a). Node.js and Python applications likewise (one sandboxed service per site, UNIX socket, own SELinux domain). Next: runtime version choice, per-tenant PHP settings, application environment variables.
 4. ~~TLS for virtual hosts (ACME)~~ — done (M2b): uploaded and ACME (HTTP-01) certificates; the ACME client `oxpanel-acme` runs unprivileged outside the daemon. Next: DNS-01 / wildcard certificates. SFTP access and disk quotas: done (M2c).
-5. Repair mode for `Reconcile` (today it reports only).
-6. Split privileged helper behind the `System` trait.
+5. ~~Tenant databases (MariaDB), per-tenant backups and restores~~ — done (M2d, M2e; merged with M2b/M2c in the M2 integration). Next: database dumps in backups, a database trash, cascade deletion of a customer with an optional final backup.
+6. Repair mode for `Reconcile` (today it reports only).
+7. Split privileged helper behind the `System` trait.

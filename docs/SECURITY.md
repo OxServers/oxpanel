@@ -2,9 +2,13 @@
 
 Scope: `oxpanel-daemon` and `oxpanel-ctl` at the state described in
 [FEATURES.md](FEATURES.md) (tenants, virtual hosts, PHP-FPM, Node.js and Python
-applications, per-site logs, management RPCs, per-peer scopes). TLS, SFTP,
-databases and backups are not part of this document: they do not exist at this
-commit.
+applications, per-site logs, management RPCs, per-peer scopes). It was
+written before HTTPS, SFTP, disk quotas, databases and backups were merged
+(M2 integration, see `docs/superpowers/specs/2026-11-13-integration-design.md`):
+their own threat analysis is in their design records
+(`docs/superpowers/specs/2026-11-13-{tls,sftp,db,backup}-design.md`) and their
+attacks are tested by `tests-integration/run-inside.sh` (also on the VM, phase
+20). Phase 80 below does not attack them; section 5 lists what that leaves.
 
 This is a description of what the code does and what the tests try, not a
 promise. Every statement of the form "stopped by X" names the test that tries
@@ -144,8 +148,11 @@ operator granted that uid; arbitrary field values.
   has `PrivateNetwork=yes` and `IPAddressDeny=any`; nothing to scan.
 * Nginx on port 80 is the only exposure. An unknown or missing `Host` reaches
   no tenant (`return 444`); a suspended site serves nothing from the tenant.
-  There is no TLS yet: traffic, including anything a tenant's application sets as
-  a cookie, is in the clear until the TLS work lands.
+  HTTPS (port 443) is served for sites with a certificate (uploaded, ACME, or
+  Automatic HTTPS); an unknown name or a client without SNI gets a failed
+  handshake. Sites without a certificate, and port 80 unless a site redirects,
+  are in the clear. sshd (SFTP, tenants confined to a chroot) is the other
+  exposure the engine configures.
 
 ## 4. What the tests prove, by layer
 
@@ -161,7 +168,10 @@ operator granted that uid; arbitrary field values.
 
 Stated plainly, in order of how much they matter.
 
-1. **No disk quotas.** A tenant can fill the root file system through its home,
+1. **Disk quotas only where the host enforces them.** With XFS user quotas
+   (handbook §9.1, acceptance phase 15) a tenant's files are bounded wherever
+   its uid owns them on that file system; without them (or for a tenant
+   without a disk limit) a tenant can fill the file system through its home,
    its private `/tmp` or its logs, and take every other tenant's writes down
    with it. Phase 80 measures the `/tmp` case and reports the space consumed.
 2. **Applications are not confined by a policy beyond `oxpanel_app_t`.** The
@@ -199,13 +209,19 @@ Stated plainly, in order of how much they matter.
    `docs/PERFORMANCE.md` has the numbers. A panel that hangs a client mid-request
    cannot hold the lock beyond the 300 s request timeout.
 8. **A full-scope panel is fully trusted.** See 3.2.
-9. **No TLS, no tamper-evident audit trail.** Every request is logged to the
+9. **No tamper-evident audit trail.** Every request is logged to the
    journal with the calling peer (`peer="uid=0 gid=0 pid=…"`), the RPC and the
    tenant or domain, but the journal is the only record and root can edit it.
 10. **Tenant homes and `/tmp` are outside the daemon's control.** A tenant can
     leave its own home in any state (delete its document root, replace it by a
     link, fill it): the daemon tolerates all of it (phase 80, section 4) but
     cannot make the files sensible.
+11. **The attack phase predates the M2 features.** Phase 80 does not try
+    to escape the SFTP chroot or forward ports over SSH, read another site's
+    private key or the ACME client's account, reach another tenant's database
+    from tenant code, or feed the backup worker a hostile archive. Each of
+    these is tried in `tests-integration/run-inside.sh` (container and VM),
+    not from inside a tenant's PHP, Node.js or Python code as phase 80 does.
 
 ## 6. Defects found by the testing work
 

@@ -1094,7 +1094,7 @@ async fn run_host(
                 .await?
                 .into_inner();
             say!(
-                "version={} selinux={} php={} node={} node_version={} python={} sftp={} sftp_passwords={} disk_quota={} dry_run={} tenants={} vhosts={} uid_range={}-{} load={:.2},{:.2},{:.2} memory_total={} memory_free={} home_disk_total={} home_disk_free={} uptime={} tls={} acme={} acme_directory={} auto_https={} backup_disk_total={} backup_disk_free={} backup_keep={}",
+                "version={} selinux={} php={} node={} node_version={} python={} sftp={} sftp_passwords={} disk_quota={} dry_run={} tenants={} vhosts={} uid_range={}-{} load={:.2},{:.2},{:.2} memory_total={} memory_free={} home_disk_total={} home_disk_free={} uptime={} backup_disk_total={} backup_disk_free={} backup_keep={} tls={} acme={} acme_directory={} auto_https={}",
                 i.daemon_version,
                 i.selinux_enabled,
                 i.php_available,
@@ -1121,13 +1121,14 @@ async fn run_host(
                 i.home_disk_total_bytes,
                 i.home_disk_free_bytes,
                 i.uptime_seconds,
+                i.backup_disk_total_bytes,
+                i.backup_disk_free_bytes,
+                i.backup_keep,
+                // Last on the line: scripts match `auto_https=…$`.
                 i.tls_available,
                 i.acme_available,
                 i.acme_directory_url,
                 i.auto_https_enabled,
-                i.backup_disk_total_bytes,
-                i.backup_disk_free_bytes,
-                i.backup_keep,
             );
             say!("disk_quota_detail={}", i.disk_quota_detail);
             // One line per database engine.

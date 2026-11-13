@@ -38,7 +38,7 @@ daemon never touches an account, unit or config file it has no record for.
 
 Known limits (v1): the daemon runs unconfined under SELinux (as `unconfined_service_t`)
 — a confined `oxpanel_t` domain is roadmap; the capability set is a deny-list,
-not yet an allow-list; per-tenant PHP-FPM pools / TLS are not implemented.
+not yet an allow-list. What the engine does today is in `docs/FEATURES.md`.
 
 ## Layout
 

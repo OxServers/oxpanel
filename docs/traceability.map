@@ -41,6 +41,7 @@
   it grpc_uds full_tenant_and_vhost_lifecycle_over_uds
   sh tests-integration/run-inside.sh authorised peer via oxpanel group membership works
 [Tenant accounts] Delete tenant
+  unit tenant one_tenant_with_every_feature_through_suspend_resume_and_delete
   unit tenant delete_flow
   unit tenant delete_refuses_while_vhosts_exist
   sh tests-integration/run-inside.sh tenant with vhosts cannot be deleted
@@ -69,6 +70,7 @@
   unit tenant update_owner_sets_clears_and_validates
   sh tests-integration/run-inside.sh owner label replaced
 [Tenant accounts] Suspend / resume
+  unit tenant one_tenant_with_every_feature_through_suspend_resume_and_delete
   unit vhost suspend_turns_every_site_of_the_tenant_into_503_and_resume_restores
   unit vhost suspend_rolls_back_every_file_when_nginx_rejects
   unit vhost suspension_stops_php_after_the_sites_and_resume_starts_it_first

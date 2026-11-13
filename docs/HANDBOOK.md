@@ -303,10 +303,10 @@ scopes; a uid that is not listed (including root) may call everything.
 
 | Scope | RPCs |
 |---|---|
-| `read` | `GetTenant`, `ListTenants`, `ListVirtualHosts`, `GetTenantUsage`, `GetHostInfo`, `Reconcile`, `ListSftpKeys` |
-| `vhost` | `ConfigureVirtualHost`, `RemoveVirtualHost`, `AddSftpKey`, `RemoveSftpKey`, `SetSftpPassword`, `ClearSftpPassword` (customers manage their own SFTP access) |
-| `tenant` | `CreateTenant`, `UpdateTenantLimits`, `UpdateTenantOwner`, `SuspendTenant`, `ResumeTenant` |
-| `delete` | `DeleteTenant` |
+| `read` | `GetTenant`, `ListTenants`, `ListVirtualHosts`, `ReadVirtualHostLog`, `GetTenantUsage`, `GetHostInfo`, `Reconcile`, `GetAutoHttpsStatus`, `ListSftpKeys`, `ListDatabases`, `ListDatabaseUsers`, `ListBackups`, `GetJob`, `ListRetainedBackups` |
+| `vhost` | `ConfigureVirtualHost`, `RemoveVirtualHost`, `RestartApp`, `InstallAppDependencies`, `InstallCertificate`, `RemoveCertificate`, `RequestCertificate`, `RenewCertificates`, `RunAutoHttps`, `AddSftpKey`, `RemoveSftpKey`, `SetSftpPassword`, `ClearSftpPassword`, `CreateDatabase`, `DeleteDatabase`, `CreateDatabaseUser`, `SetDatabaseUserPassword`, `DeleteDatabaseUser`, `GrantDatabaseAccess`, `RevokeDatabaseAccess` (customers manage their own sites, certificates, SFTP access and databases) |
+| `tenant` | `CreateTenant`, `UpdateTenantLimits`, `UpdateTenantOwner`, `SuspendTenant`, `ResumeTenant`, `CreateBackup`, `RestoreBackup`, `RetainBackup` |
+| `delete` | `DeleteTenant`, `DeleteBackup`, `RestoreRetainedBackup` (a retained backup of a deleted tenant is reached only with this scope) |
 
 ```sh
 # The customer-facing tier runs as its own account and can never create,
@@ -958,11 +958,11 @@ workstation; you only need `/dev/kvm` to be readable — and drives it over SSH.
 | `KEEP=1` | | Leave the VM running afterwards; the report prints the `ssh` line (`make acceptance-destroy` removes it). |
 | `SOAK_N=20` | | Cycles for the soak phase. |
 | `CONTINUE=1` | | Run remaining phases after a failure. |
-| `TARGET=user@host` | | Use a machine you provide instead of a VM (`TARGET_KEY=path` for the key). Phases 60/70/80/90 reboot it, create accounts and attack them, so this needs `I_UNDERSTAND=1`. |
+| `TARGET=user@host` | | Use a machine you provide instead of a VM (`TARGET_KEY=path` for the key). Phases 15/60/70/80/90 reboot it, create accounts and attack them, so this needs `I_UNDERSTAND=1`. |
 
-Phases: **10** install (`dnf install` of the RPM or the handbook's source install; services start; `--check-config`) ·
+Phases: **10** install (`dnf install` of the RPM or the handbook's source install; MariaDB set up as in §3.5; services start; `--check-config`) ·
 **15** host preparation for disk quotas: runs §9.1's block, reboots, checks the quota option is on ·
-**20** the 79-check integration suite on the real host ·
+**20** the @COUNT_P20@-check integration suite on the real host (`tests-integration/run-inside.sh`: everything above plus HTTPS and ACME against a local test CA, SFTP, quotas, databases and backups) ·
 **30** SELinux: enforcing, docroot labels, `semanage` rule lifecycle, site serves, **zero AVC denials** ·
 **40** sandbox: private network/UTS/mount namespaces, seccomp, capability bounding set, read-only `/usr` ·
 **50** `systemctl restart`, `SIGKILL` + auto-restart, a record forced back to `provisioning` is resumed with exactly one `useradd` ·
