@@ -59,6 +59,8 @@ pub struct VHostRequest {
     pub hsts: bool,
     /// Whether Automatic HTTPS looks after the site.
     pub auto_https: crate::records::AutoHttpsChoice,
+    /// Whether DNS hosting gives the site's names address records.
+    pub dns: crate::records::DnsChoice,
 }
 
 /// An application as requested on the wire; empty strings mean "default".
@@ -182,6 +184,7 @@ impl VHostService {
             // The certificate is not part of the request: it stays as it is.
             tls: existing.as_ref().and_then(|e| e.tls.clone()),
             auto_https: req.auto_https,
+            dns: req.dns,
         };
         // The pool must be listening before Nginx is told to use it.
         let pool_changed = if rec.php {
@@ -200,6 +203,11 @@ impl VHostService {
             self.ctx.store.save_vhost(&rec)?;
         }
         let switched_off = self.drop_switched_off(&tenant_rec, &domain, &rec).await?;
+        // DNS hosting follows the site's names. The site is served whatever
+        // happens there; a failure is logged and reported by Reconcile.
+        if let Err(e) = crate::dns::site_changed(&self.ctx, existing.as_ref(), Some(&rec)).await {
+            warn!(%domain, error = %e, "the site's DNS records could not be brought up to date; see `oxpanel-ctl host reconcile`");
+        }
         let changed = changed || record_changed || switched_off;
         if changed {
             info!(%domain, %tenant, root = %abs_root.display(), php = rec.php, app = rec.app.as_ref().map_or("-", |a| a.runtime.as_str()), "virtual host configured");
@@ -378,6 +386,11 @@ impl VHostService {
         // first would strand a running PHP pool or application with nothing
         // left that says OxPanel owns it.
         self.ctx.store.delete_vhost(&domain)?;
+        // Its address records go; a zone created for it goes too unless the
+        // tenant added records to it.
+        if let Err(e) = crate::dns::site_changed(&self.ctx, Some(&rec), None).await {
+            warn!(%domain, error = %e, "the site's DNS records could not be removed; see `oxpanel-ctl host reconcile`");
+        }
         info!(%domain, tenant = %rec.tenant, "virtual host removed");
         Ok(true)
     }

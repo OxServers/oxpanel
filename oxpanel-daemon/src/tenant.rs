@@ -398,6 +398,9 @@ impl TenantService {
         if crate::db::tenant_has_objects(&self.ctx, name)? {
             return Err(Error::TenantHasDatabases(name.to_string()));
         }
+        // DNS zones hold the tenant's records: deleted explicitly
+        // (`crate::dns::remove_tenant_zones` for a cascade).
+        crate::dns::refuse_tenant_deletion(&self.ctx, name)?;
         // Backups are the tenant's data too: they are deleted explicitly,
         // never as a side effect, and no job may be in flight.
         crate::backup::refuse_tenant_deletion(&self.ctx, name)
@@ -836,6 +839,7 @@ mod tests {
             hsts: false,
             tls: None,
             auto_https: crate::records::AutoHttpsChoice::On,
+            dns: crate::records::DnsChoice::On,
         })?;
         assert!(matches!(
             h.svc.delete("alice", false).await,

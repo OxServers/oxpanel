@@ -19,6 +19,7 @@ use crate::error::Result;
 
 pub mod command;
 pub mod fake;
+mod fake_dns;
 mod fake_mariadb;
 pub mod fake_tls;
 pub mod real;
@@ -81,6 +82,13 @@ pub mod bin {
     pub const RMDIR: &str = "/usr/bin/rmdir";
     /// Optional: only needed for disk quotas (XFS).
     pub const XFS_QUOTA: &str = "/usr/sbin/xfs_quota";
+    /// Optional: DNS hosting (BIND). The server itself only runs in its own
+    /// unit; the daemon asks it for its version and validates with the
+    /// checkers, and talks to it with rndc in a transient unit.
+    pub const NAMED: &str = "/usr/sbin/named";
+    pub const NAMED_CHECKCONF: &str = "/usr/sbin/named-checkconf";
+    pub const NAMED_CHECKZONE: &str = "/usr/sbin/named-checkzone";
+    pub const RNDC: &str = "/usr/sbin/rndc";
 }
 
 /// A resolved account from the system user database.

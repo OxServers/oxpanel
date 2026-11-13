@@ -113,6 +113,8 @@ pub struct Config {
     pub backup_timeout: Duration,
     /// The program a job's transient unit runs: this daemon, in worker mode.
     pub worker_exe: PathBuf,
+    /// DNS hosting (`OXPANEL_DNS_*`), see [`crate::dns::DnsConfig`].
+    pub dns: crate::dns::DnsConfig,
 }
 
 /// Let's Encrypt's production directory.
@@ -164,6 +166,7 @@ impl Default for Config {
             backup_min_free_bytes: 1 << 30,
             backup_timeout: Duration::from_secs(6 * 3600),
             worker_exe: PathBuf::from("/usr/sbin/oxpanel-daemon"),
+            dns: crate::dns::DnsConfig::default(),
         }
     }
 }
@@ -264,6 +267,7 @@ impl Config {
         c.db_from_lookup(&get)?;
         path("OXPANEL_BACKUP_DIR", &mut c.backup_dir)?;
         c.backup_from_lookup(&get)?;
+        c.dns = crate::dns::DnsConfig::from_lookup(&get)?;
         c.validate()?;
         Ok(c)
     }
@@ -686,6 +690,9 @@ pub(crate) fn sandbox_feature_paths(cfg: &mut Config, dir: &Path) {
     cfg.sshd_dropin_file = dir.join("sshd_config.d").join("60-oxpanel.conf");
     cfg.socket_path = dir.join("run").join("oxpanel.sock");
     cfg.backup_dir = dir.join("backups");
+    cfg.dns.conf_dir = dir.join("named-oxpanel");
+    cfg.dns.data_dir = dir.join("oxpanel-dns");
+    cfg.dns.suffix_list = dir.join("public_suffix_list.dat");
     for d in [dir.join("sshd_config.d"), dir.join("run")] {
         std::fs::create_dir_all(&d).unwrap_or_else(|e| panic!("{}: {e}", d.display()));
     }

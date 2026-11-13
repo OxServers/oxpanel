@@ -76,7 +76,12 @@ enum Cmd {
     /// SFTP access of tenants (SSH public keys).
     #[command(subcommand)]
     Sftp(SftpCmd),
+    /// DNS hosting: zones and records of tenants' domains.
+    #[command(subcommand)]
+    Dns(dns::DnsCmd),
 }
+
+mod dns;
 
 #[derive(Subcommand, Debug)]
 enum SftpCmd {
@@ -308,6 +313,10 @@ enum VhostCmd {
         /// certificate by itself when switched on for the host).
         #[arg(long)]
         no_auto_https: bool,
+        /// Keep the site out of DNS hosting (its domain's DNS is hosted
+        /// elsewhere): its names get no records in a zone on this host.
+        #[arg(long)]
+        no_dns: bool,
     },
     /// Restart the site's application (after putting new code in place).
     RestartApp {
@@ -461,7 +470,7 @@ fn print_tenant(t: &pb::Tenant) {
 
 fn print_vhost(v: &pb::VirtualHost) {
     say!(
-        "domain={} tenant={} document_root={} aliases={} php={} app={} config={}",
+        "domain={} tenant={} document_root={} aliases={} php={} app={} config={} dns_zone={}",
         v.domain,
         v.tenant,
         v.document_root,
@@ -482,7 +491,14 @@ fn print_vhost(v: &pb::VirtualHost) {
                 format!("{runtime}:{}:{}", a.root, a.entry)
             }
         ),
-        v.config_path
+        v.config_path,
+        if v.dns_opt_out {
+            "opted-out"
+        } else if v.dns_zone.is_empty() {
+            "-"
+        } else {
+            v.dns_zone.as_str()
+        }
     );
 }
 
@@ -496,6 +512,7 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
         Cmd::Sftp(cmd) => run_sftp(&mut c, cmd).await?,
         Cmd::Db(cmd) => run_db(&mut c, cmd).await?,
         Cmd::Backup(cmd) => run_backup(&mut c, cmd).await?,
+        Cmd::Dns(cmd) => dns::run_dns(&mut c, cmd).await?,
     })
 }
 
@@ -810,12 +827,14 @@ async fn run_vhost(
             redirect_https,
             hsts,
             no_auto_https,
+            no_dns,
         } => {
             let r = c
                 .configure_virtual_host(pb::ConfigureVirtualHostRequest {
                     redirect_https,
                     hsts,
                     auto_https_opt_out: no_auto_https,
+                    dns_opt_out: no_dns,
                     domain,
                     tenant,
                     document_root: root,
@@ -1145,6 +1164,9 @@ async fn run_host(
                     e.database_count,
                     e.database_user_count,
                 );
+            }
+            if let Some(d) = &i.dns {
+                dns::print_host_dns(d);
             }
         }
         HostCmd::Reconcile => {

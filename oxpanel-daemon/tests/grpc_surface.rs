@@ -97,6 +97,18 @@ fn scope_table() -> BTreeMap<&'static str, Scope> {
         ("RetainBackup", Scope::Tenant),
         ("ListRetainedBackups", Scope::Read),
         ("RestoreRetainedBackup", Scope::Delete),
+        // DNS hosting (dns stream; a customer edits its own zones, as it
+        // manages its own databases)
+        ("CreateDnsZone", Scope::VHost),
+        ("ListDnsZones", Scope::Read),
+        ("GetDnsZone", Scope::Read),
+        ("DeleteDnsZone", Scope::VHost),
+        ("AddDnsRecord", Scope::VHost),
+        ("UpdateDnsRecord", Scope::VHost),
+        ("RemoveDnsRecord", Scope::VHost),
+        ("ResetDnsZone", Scope::VHost),
+        ("CheckDnsZone", Scope::Read),
+        ("SetDnssec", Scope::VHost),
     ]
     .into_iter()
     .collect()
@@ -488,6 +500,7 @@ async fn random_requests_never_panic_or_corrupt_state() {
                 redirect_https: i % 3 == 0,
                 hsts: i % 2 == 1,
                 auto_https_opt_out: i % 4 == 0,
+                dns_opt_out: i % 5 == 0,
             }
             .encode_to_vec(),
             2 => pb::ReadVirtualHostLogRequest {

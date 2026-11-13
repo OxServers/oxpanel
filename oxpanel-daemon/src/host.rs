@@ -53,6 +53,11 @@ pub enum DriftKind {
     BackupArchiveModified,
     OrphanBackupArchive,
     BackupIncomplete,
+    DnsZoneDrift,
+    OrphanDnsFile,
+    DnsServerDrift,
+    DnsSecondaryDrift,
+    DnssecDrift,
 }
 
 /// One difference between a record and the operating system.
@@ -119,6 +124,8 @@ pub struct HostInfo {
     pub databases: Vec<crate::db::EngineFacts>,
     pub tls: TlsSupport,
     pub facilities: Facilities,
+    /// DNS hosting (see [`crate::dns`]).
+    pub dns: crate::dns::DnsFacts,
 }
 
 /// What tenants can be given on this host beyond web hosting.
@@ -186,6 +193,7 @@ impl HostService {
                 disk_quota_detail: quota.detail,
             },
             databases: crate::db::facts(&self.ctx).await?,
+            dns: crate::dns::facts(&self.ctx).await?,
         })
     }
 
@@ -241,6 +249,7 @@ impl HostService {
         check_quotas(&self.ctx, &tenants, &mut out).await?;
         out.extend(crate::db::drifts(&self.ctx, &tenants).await?);
         check_backups(&self.ctx, &mut out)?;
+        out.extend(crate::dns::drifts(&self.ctx).await?);
         Ok(out)
     }
 
@@ -1031,6 +1040,7 @@ mod tests {
             hsts: false,
             tls: None,
             auto_https: crate::records::AutoHttpsChoice::On,
+            dns: crate::records::DnsChoice::On,
         };
         h.ctx.store.save_vhost(&orphan_site)?;
 

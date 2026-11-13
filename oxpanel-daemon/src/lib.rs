@@ -24,6 +24,8 @@
 //!   the server).
 //! - [`backup`]   — per-tenant backups and restores, run as jobs; [`worker`]
 //!   is the half of a job that runs outside the daemon.
+//! - [`dns`]      — DNS hosting: zones of tenants on OxPanel's own BIND
+//!   instance, records, secondaries, DNSSEC.
 //! - [`host`]     — host information and record ↔ OS reconciliation.
 //! - [`auth`]     — peer-credential gate for the UNIX socket.
 //! - [`server`]   — gRPC ↔ domain mapping.
@@ -47,6 +49,7 @@ pub mod backup;
 pub mod config;
 pub mod ctx;
 pub mod db;
+pub mod dns;
 pub mod error;
 pub mod fsutil;
 pub mod host;

@@ -54,6 +54,8 @@ struct Inner {
     ssh: FakeSsh,
     /// Password field per account, as `/etc/shadow` would hold it.
     shadow: BTreeMap<String, String>,
+    /// The DNS server (see `fake_dns`).
+    dns: super::fake_dns::FakeDns,
 }
 
 /// Failures the tests switch on (a struct of its own: clippy allows at most
@@ -157,6 +159,46 @@ impl FakeSystem {
         fake.add_group(FAKE_TENANT_GROUP.0, FAKE_TENANT_GROUP.1);
         fake.add_group(FAKE_PASSWORD_GROUP.0, FAKE_PASSWORD_GROUP.1);
         fake
+    }
+
+    /// DNS: the fake server reads zone serials from `zones_dir` when it
+    /// (re)loads.
+    pub fn dns_follow(&self, zones_dir: &Path) {
+        if let Ok(mut i) = self.inner.lock() {
+            i.dns.zones_dir = Some(zones_dir.to_owned());
+        }
+    }
+
+    /// DNS: the serial the fake primary serves for `zone`.
+    pub fn dns_served(&self, zone: &str) -> Option<u32> {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|i| i.dns.served.get(zone).copied())
+    }
+
+    /// DNS: stop (or start) the fake server.
+    pub fn set_dns_down(&self, down: bool) {
+        if let Ok(mut i) = self.inner.lock() {
+            i.dns.down = down;
+        }
+    }
+
+    /// DNS: secondaries serve an older serial than the primary.
+    pub fn set_dns_secondaries_lag(&self, lag: bool) {
+        if let Ok(mut i) = self.inner.lock() {
+            i.dns.secondaries_lag = lag;
+        }
+    }
+
+    /// DNS: what the resolver answers for `name`/`qtype` (`NS`, `DS`), as a
+    /// probe line without its index (`ok NOERROR 0 ns=…`).
+    pub fn set_dns_resolver(&self, name: &str, qtype: &str, line: &str) {
+        if let Ok(mut i) = self.inner.lock() {
+            i.dns
+                .resolver
+                .insert((name.to_owned(), qtype.to_owned()), line.to_owned());
+        }
     }
 
     /// Turn kernel-enforced user quotas on the fake file system on or off.
@@ -545,7 +587,8 @@ fn limit_value(command: &str, key: &str) -> Option<u64> {
 /// backup jobs). Order matters: the SFTP session check is a `systemctl show
 /// --property=ActiveState` too, and must not be answered as a job unit.
 fn fake_feature_command(i: &mut Inner, spec: &CommandSpec) -> Option<CommandOutput> {
-    fake_ssh_and_accounts(i, spec)
+    super::fake_dns::command(&mut i.dns, spec)
+        .or_else(|| fake_ssh_and_accounts(i, spec))
         .or_else(|| fake_tls_quota_and_db(i, spec))
         .or_else(|| emulate_job(i, spec))
 }

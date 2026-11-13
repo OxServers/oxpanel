@@ -621,6 +621,7 @@ proptest! {
             hsts: false,
             tls: None,
             auto_https: oxpanel_daemon::records::AutoHttpsChoice::On,
+            dns: oxpanel_daemon::records::DnsChoice::On,
         };
         store.save_vhost(&v).expect("save vhost");
         prop_assert_eq!(store.load_vhost(&d).expect("load"), Some(v));
@@ -655,6 +656,7 @@ proptest! {
             config_path: PathBuf::from("/x"), created_at_unix: 0, php: false, app: None,
             redirect_https: false, hsts: false, tls: None,
             auto_https: oxpanel_daemon::records::AutoHttpsChoice::On,
+            dns: oxpanel_daemon::records::DnsChoice::On,
         };
         let _ = store.save_vhost(&v);
         // Everything that exists is inside the two record directories.
