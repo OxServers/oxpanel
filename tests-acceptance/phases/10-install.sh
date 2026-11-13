@@ -38,7 +38,7 @@ case "$INSTALL" in
     [ "$rc" = 0 ] || fail "install.sh exited $rc (see above)"
     ok "install.sh --yes ran clean ($(( $(date +%s) - start ))s)"
     check "the run reports success and that a reboot is needed for quotas" bash -c 'grep -q "^RESULT: ok changes=[1-9][0-9]* .*reboot_required=yes" install-1.log'
-    check "every stage ran" bash -c 'for s in preflight nodejs engine selinux nginx mariadb php panel daemon firewall fail2ban quota verify; do grep -q "^\[$s\]" install-1.log || { echo "stage $s missing"; exit 1; }; done'
+    check "every stage ran" bash -c 'for s in preflight nodejs engine selinux nginx mariadb php panel daemon dns firewall fail2ban quota verify; do grep -q "^\[$s\]" install-1.log || { echo "stage $s missing"; exit 1; }; done'
     check "the status file records the result" bash -c 'grep -qx "reboot_required=yes" /var/lib/oxpanel-installer/status && grep -qx "result=ok" /var/lib/oxpanel-installer/status'
     check "the log file exists, root-only" test "$(stat -c %a /var/log/oxpanel-install.log)" = 600
     # Idempotence: the second run changes nothing.

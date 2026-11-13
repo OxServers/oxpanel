@@ -837,6 +837,8 @@
   sh tests-acceptance/phases/10-install.sh rpm -V is clean
   sh tests-acceptance/phases/10-install.sh socket is root:oxpanel 0660
 [Operations] Release and installer
+  sh tests-acceptance/phases/17-installer-options.sh an enabled stock named.service stops the run (it may serve real zones)
+  sh tests-acceptance/phases/17-installer-options.sh --dns with its settings and --disable-stock-named
   sh tests-acceptance/phases/10-install.sh install.sh --yes ran clean
   sh tests-acceptance/phases/10-install.sh the second run changes nothing
   sh tests-acceptance/phases/10-install.sh every stage ran
@@ -860,6 +862,8 @@
   sh tests-acceptance/phases/17-installer-options.sh the fstab line gained uquota
   sh tests-acceptance/phases/17-installer-options.sh then the installer reports quotas active on it
 [Operations] Uninstall and upgrade
+  sh tests-acceptance/phases/95-uninstall.sh its zone file and the DNS server's keys are still there
+  sh tests-acceptance/phases/95-uninstall.sh its zone is served again, with the tenant's own record
   sh tests-acceptance/phases/12-upgrade.sh the tenant is still there with the same uid
   sh tests-acceptance/phases/12-upgrade.sh Node.js site still answers
   sh tests-acceptance/phases/12-upgrade.sh host reconcile is clean after the upgrade

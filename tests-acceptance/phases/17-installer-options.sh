@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Phase 17 — installer options that the main run does not use (installer mode):
-# the answers file, the panel account hook, and the /etc/fstab variant of the disk
+# the answers file, the panel account hook, DNS hosting, and the /etc/fstab variant of the disk
 # quota change (on a loopback XFS image that stands in for a separate /home).
 cd "$(dirname "$0")/.."; source phases/lib.sh
 echo "== phase 17: installer options"
@@ -13,6 +13,7 @@ cleanup() {
   umount /mnt/xt >/dev/null 2>&1 || true
   [ -f /root/acc/fstab.keep ] && cp -p /root/acc/fstab.keep /etc/fstab
   systemctl daemon-reload; systemctl restart oxpanel-daemon; rm -f /var/xt.img /etc/fstab.oxpanel-installer.bak
+  systemctl stop oxpanel-dns >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -38,6 +39,27 @@ check_not "panelapi is now refused creating a tenant (scope read+vhost)" runuser
 check "but can still read" runuser -u panelapi -- oxpanel-ctl tenant list
 check "the scope line is kept by a run that does not mention it" bash -c "$INST --only engine >/dev/null 2>&1; grep -qx \"OXPANEL_PEER_SCOPES=\$(id -u panelapi):read+vhost\" $ENVF"
 check_not "a bad scope is refused" bash -c "$INST --panel-account --panel-scopes everything --only panel"
+
+# --- DNS hosting
+DNSF="--dns-nameservers ns1.inst.example,ns2.inst.example --dns-contact hostmaster@inst.example --dns-ipv4 192.0.2.53"
+check_not "--dns without its settings is refused" bash -c "$INST --dns --only dns"
+check "and nothing was written" bash -c "! grep -q '^OXPANEL_DNS' $ENVF"
+systemctl enable named >/dev/null 2>&1
+check_not "an enabled stock named.service stops the run (it may serve real zones)" bash -c "$INST --dns $DNSF --only dns"
+check "it was left alone, and nothing was written" bash -c "systemctl -q is-enabled named && ! grep -q '^OXPANEL_DNS' $ENVF"
+$INST --dns $DNSF --disable-stock-named --only dns > opt-dns.log 2>&1; rc=$?
+tail -8 opt-dns.log
+check "--dns with its settings and --disable-stock-named" test "$rc" = 0
+check "the stock named is stopped and disabled" bash -c '! systemctl -q is-enabled named && ! systemctl -q is-active named'
+check "the DNS lines are in the installer's block" bash -c "grep -qx OXPANEL_DNS=true $ENVF && grep -qx OXPANEL_DNS_NAMESERVERS=ns1.inst.example,ns2.inst.example $ENVF"
+check "oxpanel-dns runs" systemctl -q is-active oxpanel-dns
+check "it answers, authoritatively only (a name it does not host is refused, not resolved)" bash -c 'dig +norec +time=2 @127.0.0.1 example.org A | grep -q "status: REFUSED"'
+check "the engine reports DNS hosting available" bash -c 'oxpanel-ctl host info | grep -q "^dns=true .*dns_available=true"'
+check "a second run changes nothing" bash -c "$INST --dns $DNSF --only dns 2>&1 | grep -q '^RESULT: ok changes=0 '"
+check "the firewall stage opens 53 for it" bash -c "$INST --dns $DNSF --only firewall >/dev/null 2>&1 && firewall-cmd -q --query-service=dns"
+check "a run that does not mention DNS keeps it" bash -c "$INST --only engine >/dev/null 2>&1; grep -qx OXPANEL_DNS=true $ENVF"
+check "--no-dns takes the lines out" bash -c "$INST --no-dns --only dns >/dev/null 2>&1; ! grep -q '^OXPANEL_DNS' $ENVF"
+firewall-cmd -q --remove-service=dns; firewall-cmd -q --permanent --remove-service=dns
 
 # --- fstab variant: a separate XFS file system holding the homes
 cp -p /etc/fstab /root/acc/fstab.keep

@@ -596,6 +596,9 @@ impl TenantService {
                     .await?;
             }
         }
+        // DNS zones: the sites' automatic ones went with the sites; what is
+        // left holds the tenant's own records (and DNSSEC keys) and goes now.
+        crate::dns::remove_tenant_zones(&self.ctx, name).await?;
         sftp::remove_access(&self.ctx, &rec, true).await?;
         crate::db::trash::drop_everything(&self.ctx, &rec).await?;
         crate::backup::remove_unretained(&self.ctx, name)?;
@@ -1181,8 +1184,33 @@ pub(crate) mod tests {
         is_program(c, bin::SYSTEMCTL) && mentions(c, verb) && mentions(c, unit)
     }
 
+    /// The sandbox of `Everything`, with DNS hosting switched on.
+    fn sandbox_with_dns(cfg: &mut Config, p: &std::path::Path) -> Result<()> {
+        crate::config::sandbox_feature_paths(cfg, p);
+        let list = &cfg.dns.suffix_list;
+        std::fs::write(list, "com\nnet\norg\n").map_err(|e| Error::io("write", list, e))?;
+        cfg.dns.enabled = true;
+        cfg.dns.nameservers = vec![
+            crate::validate::Domain::parse("ns1.example.net")?,
+            crate::validate::Domain::parse("ns2.example.net")?,
+        ];
+        cfg.dns.soa_contact = "hostmaster@example.net".into();
+        cfg.dns.ipv4 = Some(std::net::Ipv4Addr::new(203, 0, 113, 10));
+        Ok(())
+    }
+
+    /// The fake OS of `Everything`: MariaDB installed, the DNS server serving
+    /// what is in the zones directory.
+    fn fake_os(cfg: &Config) -> Arc<FakeSystem> {
+        let sys = Arc::new(FakeSystem::new());
+        sys.install_mariadb();
+        sys.dns_follow(&cfg.dns.data_dir.join("zones"));
+        sys
+    }
+
     /// Essentials for alice: a scheduled task, PHP settings for the PHP site
-    /// (a pool of its own) and a daily backup schedule.
+    /// (a pool of its own) and a daily backup schedule; and an MX record of
+    /// her own in the zone her sites got, so the zone outlives the sites.
     async fn add_essentials(
         ctx: &Ctx,
         vhosts: &crate::vhost::VHostService,
@@ -1221,6 +1249,19 @@ pub(crate) mod tests {
                 None,
             )
             .await?;
+        crate::dns::DnsService::new(ctx.clone())
+            .add_record(
+                "alice",
+                "example.com",
+                &crate::dns::rr::RawRr {
+                    name: "@".into(),
+                    rtype: Some(crate::dns::rr::RrType::Mx),
+                    value: "mx.mail-provider.net.".into(),
+                    priority: 10,
+                    ..crate::dns::rr::RawRr::default()
+                },
+            )
+            .await?;
         Ok(())
     }
 
@@ -1240,7 +1281,7 @@ pub(crate) mod tests {
         cfg.php_conf_dir = p.join("php");
         cfg.nginx_conf_dir = p.join("nginx").join("oxpanel.d");
         cfg.nginx_include_file = p.join("nginx").join("conf.d").join("00-oxpanel.conf");
-        crate::config::sandbox_feature_paths(&mut cfg, p);
+        sandbox_with_dns(&mut cfg, p)?;
         for d in [
             &cfg.home_base,
             &cfg.systemd_unit_dir,
@@ -1248,8 +1289,7 @@ pub(crate) mod tests {
         ] {
             std::fs::create_dir_all(d).map_err(|e| Error::io("mkdir", d, e))?;
         }
-        let sys = Arc::new(FakeSystem::new());
-        sys.install_mariadb();
+        let sys = fake_os(&cfg);
         let ctx = Ctx::new(cfg, sys.clone(), false);
         ctx.store.init()?;
         crate::sftp::converge_all(&ctx).await?;
@@ -1470,6 +1510,16 @@ pub(crate) mod tests {
                 "nothing ran for the refused change"
             );
             assert!(
+                self.sys.dns_served("example.com").is_some(),
+                "the zone keeps answering while suspended"
+            );
+            assert!(matches!(
+                crate::dns::DnsService::new(self.ctx.clone())
+                    .reset_zone("alice", "example.com")
+                    .await,
+                Err(Error::DnsConflict(m)) if m.contains("suspended")
+            ));
+            assert!(
                 self.host.reconcile().await?.is_empty(),
                 "suspended is not drift"
             );
@@ -1559,6 +1609,14 @@ pub(crate) mod tests {
             done.finished_at_unix = now_unix();
             self.ctx.store.save_file_job(&done)?;
             upload_in_progress(&self.ctx, "alice", 1_794_000_000_003)?;
+            // The zone outlived the sites (it holds alice's MX): refused.
+            self.refused(|e| matches!(e, Error::TenantHasDnsZones(_)))
+                .await?;
+            assert!(
+                crate::dns::DnsService::new(self.ctx.clone())
+                    .delete_zone("alice", "example.com")
+                    .await?
+            );
             self.refused(|e| matches!(e, Error::TenantHasBackups(_)))
                 .await?;
             self.backups.retain("alice", &self.backup_id, 1, 0).await?;

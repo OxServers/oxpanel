@@ -47,6 +47,8 @@ OPT_YES=0 OPT_FORCE=0 OPT_UNINSTALL=0 OPT_CHECK=0 OPT_ONLY=""
 OPT_FAIL2BAN="" OPT_EPEL="" OPT_QUOTA="" OPT_REBOOT="" OPT_MARIADB=yes OPT_PHP=yes OPT_NODEJS=yes
 OPT_HARDEN_EXISTING="" OPT_PANEL_ACCOUNT="" OPT_SWITCH_NODEJS="" OPT_MASK_PHPFPM=""
 OPT_IGNORE_IP="" OPT_PANEL_SCOPES="" OPT_PANEL_RPM="" OPT_REPO_URL="" OPT_ANSWERS="" OPT_HOME_BASE=""
+OPT_DNS="" OPT_DNS_NAMESERVERS="" OPT_DNS_CONTACT="" OPT_DNS_IPV4="" OPT_DNS_IPV6="" OPT_DISABLE_STOCK_NAMED=""
+DNS_KEYS='^OXPANEL_DNS(_NAMESERVERS|_SOA_CONTACT|_IPV4|_IPV6)?='
 ENGINE_RPM=""
 INTERACTIVE=0
 CHANGE_FILE="" WARN_FILE="" FLAG_DIR=""
@@ -91,8 +93,8 @@ General
                         quota=yes, reboot=no, ignore_ip=203.0.113.5, ...)
   --check               preflight checks only; changes nothing
   --only STAGE          run only this stage (after preflight); stages:
-                        nodejs engine selinux nginx mariadb php daemon firewall
-                        fail2ban quota panel verify
+                        nodejs engine selinux nginx mariadb php panel daemon dns
+                        firewall fail2ban quota verify
   --force               continue past a conflicting web server or port 80 owner
   --uninstall           remove the engine packages and OxPanel's own
                         configuration; never customers' homes, databases or
@@ -121,6 +123,17 @@ Optional features (each asks when interactive; each is off with --yes)
   --reboot              reboot at the end if a reboot is needed
   --no-fail2ban --no-quota --no-reboot   say no explicitly
   --home-base PATH      where tenant homes live (default: OXPANEL_HOME_BASE or /home)
+
+DNS hosting (optional; this host as the name server of its customers' domains)
+  --dns                 install BIND and switch DNS hosting on (needs the four below)
+  --no-dns              switch it off (zones and keys stay on disk)
+  --dns-nameservers L   the name servers' host names, comma separated, first = SOA
+                        primary (e.g. ns1.example.net,ns2.example.net)
+  --dns-contact ADDR    the zones' SOA contact (e.g. hostmaster@example.net)
+  --dns-ipv4 ADDR       this host's PUBLIC IPv4 address (never guessed: behind
+  --dns-ipv6 ADDR       NAT the interface's address is private); one or both
+  --disable-stock-named stop and disable the distribution's named.service if it
+                        runs (it would hold port 53); otherwise the installer stops
 
 Panel (optional hook; the panel is a separate product)
   --panel-rpm FILE      install the panel RPM, then make sure the `panelapi`
@@ -161,6 +174,13 @@ parse_args() {
       --home-base) [ $# -ge 2 ] || die "--home-base needs a path"; OPT_HOME_BASE="$2"; shift;;
       --panel-rpm) [ $# -ge 2 ] || die "--panel-rpm needs a file"; OPT_PANEL_RPM="$2"; OPT_PANEL_ACCOUNT=yes; shift;;
       --panel-account) OPT_PANEL_ACCOUNT=yes;;
+      --dns) OPT_DNS=yes;;
+      --no-dns) OPT_DNS=no;;
+      --dns-nameservers) [ $# -ge 2 ] || die "--dns-nameservers needs a list"; OPT_DNS_NAMESERVERS="$2"; shift;;
+      --dns-contact) [ $# -ge 2 ] || die "--dns-contact needs an address"; OPT_DNS_CONTACT="$2"; shift;;
+      --dns-ipv4) [ $# -ge 2 ] || die "--dns-ipv4 needs an address"; OPT_DNS_IPV4="$2"; shift;;
+      --dns-ipv6) [ $# -ge 2 ] || die "--dns-ipv6 needs an address"; OPT_DNS_IPV6="$2"; shift;;
+      --disable-stock-named) OPT_DISABLE_STOCK_NAMED=yes;;
       --panel-scopes) [ $# -ge 2 ] || die "--panel-scopes needs a value"; OPT_PANEL_SCOPES="$2"; shift;;
       -*) die "unknown option: $1 (see --help)";;
       *) ENGINE_RPM="$1";;
@@ -208,6 +228,12 @@ load_answers() {
       panel_scopes) [ -n "$OPT_PANEL_SCOPES" ] || OPT_PANEL_SCOPES="$val";;
       panel_rpm) [ -n "$OPT_PANEL_RPM" ] || { OPT_PANEL_RPM="$val"; OPT_PANEL_ACCOUNT=yes; };;
       panel_account) [ -n "$OPT_PANEL_ACCOUNT" ] || OPT_PANEL_ACCOUNT="$(yesno_value "$key" "$val")";;
+      dns) [ -n "$OPT_DNS" ] || OPT_DNS="$(yesno_value "$key" "$val")";;
+      dns_nameservers) [ -n "$OPT_DNS_NAMESERVERS" ] || OPT_DNS_NAMESERVERS="$val";;
+      dns_contact) [ -n "$OPT_DNS_CONTACT" ] || OPT_DNS_CONTACT="$val";;
+      dns_ipv4) [ -n "$OPT_DNS_IPV4" ] || OPT_DNS_IPV4="$val";;
+      dns_ipv6) [ -n "$OPT_DNS_IPV6" ] || OPT_DNS_IPV6="$val";;
+      disable_stock_named) [ -n "$OPT_DISABLE_STOCK_NAMED" ] || OPT_DISABLE_STOCK_NAMED="$(yesno_value "$key" "$val")";;
       *) die "$OPT_ANSWERS:$n: unknown key '$key'";;
     esac
   done <"$OPT_ANSWERS"
@@ -446,7 +472,31 @@ env_block_content() {
     scopes="$(env_block_current | grep '^OXPANEL_PEER_SCOPES=' || true)"
   fi
   if [ -n "$scopes" ]; then echo "$scopes"; fi
+  dns_env_lines
 }
+
+# The DNS hosting lines of the installer's block: written once BIND is there
+# (so the daemon never starts with DNS on and no server); kept as they are by
+# a run that does not mention DNS; removed only by --no-dns.
+dns_env_lines() {
+  case "$OPT_DNS" in
+    yes)
+      installed bind || return 0
+      echo "OXPANEL_DNS=true"
+      echo "OXPANEL_DNS_NAMESERVERS=$OPT_DNS_NAMESERVERS"
+      echo "OXPANEL_DNS_SOA_CONTACT=$OPT_DNS_CONTACT"
+      if [ -n "$OPT_DNS_IPV4" ]; then echo "OXPANEL_DNS_IPV4=$OPT_DNS_IPV4"; fi
+      if [ -n "$OPT_DNS_IPV6" ]; then echo "OXPANEL_DNS_IPV6=$OPT_DNS_IPV6"; fi
+      ;;
+    no) ;;
+    *) env_block_current | grep -E "$DNS_KEYS" || true;;
+  esac
+}
+
+# DNS hosting is configured in the installer's block (by an earlier run).
+dns_in_block() { env_block_current | grep -qx 'OXPANEL_DNS=true'; }
+dns_wanted() { [ "$OPT_DNS" = yes ] || { [ -z "$OPT_DNS" ] && dns_in_block; }; }
+stock_named_on() { installed bind && { unit_active named || unit_enabled named; }; }
 
 engine_env_block() {
   local want cur new
@@ -572,6 +622,42 @@ stage_daemon() {
   [ -S /run/oxpanel/oxpanel.sock ] || die "the engine socket did not appear; see: journalctl -u oxpanel-daemon"
 }
 
+# ------------------------------------------------------------------ stage: dns
+stage_dns() {
+  if ! dns_wanted; then
+    if [ "$OPT_DNS" = no ] || [ -z "$(env_block_current | grep -E "$DNS_KEYS" || true)" ]; then
+      rm -f "$FLAG_DIR/env-changed"
+      engine_env_block
+      if flag_is env-changed && unit_active oxpanel-daemon; then run systemctl restart oxpanel-daemon || return 1; fi
+    fi
+    note "DNS hosting not requested (--dns to switch it on)"; return 0
+  fi
+  local pkg ns1
+  for pkg in bind bind-utils publicsuffix-list; do
+    if ! installed "$pkg"; then run dnf -y install "$pkg" || return 1; changed "$pkg installed"; fi
+  done
+  # The distribution's named would hold port 53 and the control port. Decided
+  # (and refused when not allowed) before any change; here it is carried out.
+  if unit_active named || unit_enabled named; then
+    run systemctl disable --now named || return 1
+    changed "the distribution's named.service stopped and disabled (--disable-stock-named)"
+  fi
+  if [ "$OPT_DNS" = yes ]; then
+    rm -f "$FLAG_DIR/env-changed"
+    engine_env_block
+    if flag_is env-changed && unit_active oxpanel-daemon; then run systemctl restart oxpanel-daemon || return 1; fi
+  fi
+  # The daemon renders the server's configuration and starts oxpanel-dns.service itself.
+  for _ in $(seq 1 30); do unit_active oxpanel-dns && break; sleep 1; done
+  unit_active oxpanel-dns || die "oxpanel-dns.service did not start; see: journalctl -u oxpanel-daemon -u oxpanel-dns"
+  ns1="$(env_block_current | sed -n 's/^OXPANEL_DNS_NAMESERVERS=\([^,]*\).*/\1/p')"
+  if dig +norec +time=2 +tries=2 @127.0.0.1 "${ns1:-example.invalid}" SOA 2>/dev/null | grep -q 'status:'; then
+    note "oxpanel-dns answers on port 53 (authoritative only; no recursion)"
+  else
+    die "oxpanel-dns.service runs but does not answer on 127.0.0.1:53; see: journalctl -u oxpanel-dns"
+  fi
+}
+
 # ------------------------------------------------------------------ stage: firewall
 stage_firewall() {
   local svc zone any=0
@@ -580,11 +666,13 @@ stage_firewall() {
     return 0
   fi
   zone="$(firewall-cmd --get-default-zone)"
-  for svc in http https; do
+  local svcs="http https"
+  if dns_wanted; then svcs="http https dns"; fi
+  for svc in $svcs; do
     if ! quiet firewall-cmd --permanent --query-service="$svc"; then run firewall-cmd --permanent --add-service="$svc" || return 1; any=1; fi
     if ! quiet firewall-cmd --query-service="$svc"; then run firewall-cmd --add-service="$svc" || return 1; any=1; fi
   done
-  if [ "$any" -eq 1 ]; then changed "firewalld: http and https opened in zone $zone"; else note "firewalld already allows http and https in zone $zone"; fi
+  if [ "$any" -eq 1 ]; then changed "firewalld: ${svcs// /, } opened in zone $zone"; else note "firewalld already allows ${svcs// /, } in zone $zone"; fi
   note "(only the default zone '$zone' was changed; interfaces in other zones are yours)"
 }
 
@@ -765,6 +853,11 @@ stage_verify() {
     *) die "oxpanel-ctl host reconcile failed (exit $rc): $out";;
   esac
   if [ "$OPT_FAIL2BAN" = yes ]; then quiet fail2ban-client status sshd || die "fail2ban jail sshd is not running"; note "fail2ban jail sshd: running"; fi
+  if dns_wanted; then
+    unit_active oxpanel-dns || die "DNS hosting is configured but oxpanel-dns.service is not running"
+    oxpanel-ctl host info 2>&1 | grep -q '^dns=true .*dns_available=true' || warn "the engine does not report DNS hosting as available; see: oxpanel-ctl host info | grep ^dns"
+    note "DNS hosting: oxpanel-dns running"
+  fi
   if [ "$OPT_QUOTA" = yes ] && ! flag_is reboot-required; then
     if oxpanel-ctl host info 2>&1 | grep -q ' disk_quota=true '; then note "disk quotas: active"; else warn "disk quotas were requested but the engine reports them unavailable"; fi
   fi
@@ -785,7 +878,7 @@ do_uninstall() {
   fi
   # dnf would also remove the packages that only the engine pulled in (Nginx, ...),
   # which would take the customers' sites down. Keep every one of them.
-  for pkg in nginx php-fpm php-cli nodejs npm mariadb-server openssl acl openssh-server xfsprogs; do
+  for pkg in nginx php-fpm php-cli nodejs npm mariadb-server openssl acl openssh-server xfsprogs bind bind-utils publicsuffix-list; do
     if installed "$pkg"; then run dnf -y mark install "$pkg" || true; fi
   done
   if installed oxpanel-panel; then run dnf -y remove --noautoremove oxpanel-panel || die "could not remove oxpanel-panel"; say "removed: oxpanel-panel"; fi
@@ -807,6 +900,10 @@ do_uninstall() {
   say "  - backups: /var/lib/oxpanel-backups; certificates and keys: /etc/pki/oxpanel"
   say "  - /etc/nginx/oxpanel.d and /etc/nginx/conf.d/00-oxpanel.conf (the sites keep being served by Nginx)"
   say "  - /etc/ssh/sshd_config.d/60-oxpanel.conf and /etc/oxpanel-sftp (SFTP confinement and keys)"
+  say "  - DNS hosting data: zones and DNSSEC signing keys in /var/lib/oxpanel-dns, the server's configuration and"
+  say "    TSIG/rndc keys in /etc/named/oxpanel, zone records in /var/lib/oxpanel/dns-zones. oxpanel-dns.service went"
+  say "    with the package, so THE HOSTED DOMAINS DO NOT RESOLVE until a reinstall (secondaries keep answering"
+  say "    until their zones expire). Keep the signing keys: new ones would need a new DS at every registrar"
   say "  - per-tenant slices, PHP-FPM, application and scheduled-task units (they keep running and the tasks keep firing;"
   say "    the engine can no longer manage them; scheduled backups, which the engine itself starts, pause until a reinstall;"
   say "    Node.js/Python applications and scheduled tasks need the OxPanel SELinux module, which the package removal took out: reinstall to restore it)"
@@ -852,7 +949,8 @@ enabled afterwards (fail2ban needs its updates). Disable it later with: dnf conf
     read -r OPT_IGNORE_IP || OPT_IGNORE_IP=""
   fi
   check_quota_offer
-  say "decisions: fail2ban=${OPT_FAIL2BAN:-no} epel=${OPT_EPEL:-no} quota=${OPT_QUOTA:-no} reboot=${OPT_REBOOT:-no} mariadb=$OPT_MARIADB php=$OPT_PHP nodejs=$OPT_NODEJS$([ "$INTERACTIVE" -eq 1 ] && echo ' (interactive)' || echo ' (unattended)')"
+  decide_dns
+  say "decisions: fail2ban=${OPT_FAIL2BAN:-no} epel=${OPT_EPEL:-no} quota=${OPT_QUOTA:-no} reboot=${OPT_REBOOT:-no} mariadb=$OPT_MARIADB php=$OPT_PHP nodejs=$OPT_NODEJS dns=$(dns_wanted && echo yes || echo no)$([ "$INTERACTIVE" -eq 1 ] && echo ' (interactive)' || echo ' (unattended)')"
 
   if ! installed php-fpm && [ ! -e "$STATE_DIR/php-fpm-installed-by-installer" ]; then : >"$STATE_DIR/php-fpm-installed-by-installer"; fi
   stage nodejs   "Node.js 22 module stream"                      stage_nodejs
@@ -863,11 +961,52 @@ enabled afterwards (fail2ban needs its updates). Disable it later with: dnf conf
   stage php      "PHP-FPM, shared pool masked"                    stage_php
   stage panel    "panel hook (optional)"                          stage_panel
   stage daemon   "oxpanel-daemon service"                         stage_daemon
-  stage firewall "firewalld: ports 80 and 443"                    stage_firewall
+  stage dns      "DNS hosting (optional): BIND as oxpanel-dns"    stage_dns
+  stage firewall "firewalld: ports 80 and 443 (and 53 with DNS)"  stage_firewall
   stage fail2ban "login banning with fail2ban (optional)"         stage_fail2ban
   stage quota    "disk quotas (optional)"                         stage_quota
   stage verify   "final verification"                             stage_verify
   finish
+}
+
+# DNS hosting: asked (interactive) or taken from flags; the operator's values are
+# required and never guessed; the distribution's named is never stopped unasked.
+decide_dns() {
+  local n
+  if [ -z "$OPT_DNS" ] && dns_in_block; then return 0; fi
+  decide OPT_DNS "DNS hosting: this host can be the authoritative name server of its customers' domains
+(BIND, run by OxPanel as oxpanel-dns.service; zones are created for sites by themselves). You need two
+name-server host names under a domain you control and this host's public address(es); port 53 (TCP and
+UDP) is opened in firewalld." "Set up DNS hosting?"
+  [ "$OPT_DNS" = yes ] || return 0
+  if [ "$INTERACTIVE" -eq 1 ]; then
+    if [ -z "$OPT_DNS_NAMESERVERS" ]; then printf 'Name servers (comma separated, e.g. ns1.example.net,ns2.example.net): ' >&2; read -r OPT_DNS_NAMESERVERS || true; fi
+    if [ -z "$OPT_DNS_CONTACT" ]; then printf 'SOA contact (e.g. hostmaster@example.net): ' >&2; read -r OPT_DNS_CONTACT || true; fi
+    if [ -z "$OPT_DNS_IPV4" ] && [ -z "$OPT_DNS_IPV6" ]; then
+      printf "This host's PUBLIC IPv4 address (empty for none): " >&2; read -r OPT_DNS_IPV4 || true
+      printf "This host's PUBLIC IPv6 address (empty for none): " >&2; read -r OPT_DNS_IPV6 || true
+    fi
+  fi
+  printf '%s' "$OPT_DNS_NAMESERVERS" | grep -Eq '^[a-z0-9]([a-z0-9.-]*[a-z0-9])?(,[a-z0-9]([a-z0-9.-]*[a-z0-9])?)*$' \
+    || die "DNS hosting needs the name servers' host names: --dns-nameservers ns1.example.net,ns2.example.net"
+  printf '%s' "$OPT_DNS_CONTACT" | grep -Eq '^[a-z0-9._-]+@[a-z0-9]([a-z0-9.-]*[a-z0-9])?$' \
+    || die "DNS hosting needs the SOA contact: --dns-contact hostmaster@example.net"
+  [ -n "$OPT_DNS_IPV4" ] || [ -n "$OPT_DNS_IPV6" ] || die "DNS hosting needs this host's public address: --dns-ipv4 and/or --dns-ipv6 (never guessed)"
+  if [ -n "$OPT_DNS_IPV4" ]; then printf '%s' "$OPT_DNS_IPV4" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$' || die "--dns-ipv4: '$OPT_DNS_IPV4' is not an IPv4 address"; fi
+  if [ -n "$OPT_DNS_IPV6" ]; then printf '%s' "$OPT_DNS_IPV6" | grep -Eq '^[0-9a-fA-F:]+$' || die "--dns-ipv6: '$OPT_DNS_IPV6' is not an IPv6 address"; fi
+  if grep -Eq "^[[:space:]]*OXPANEL_DNS=" "$ENV_FILE" 2>/dev/null && ! dns_in_block && ! env_block_current | grep -q '^OXPANEL_DNS='; then
+    die "$ENV_FILE already configures DNS hosting outside the installer's block; change it there, or remove those lines and run again"
+  fi
+  if stock_named_on; then
+    n="$(grep -cE '^[[:space:]]*zone[[:space:]]' /etc/named.conf 2>/dev/null || echo 0)"
+    if [ "$OPT_DISABLE_STOCK_NAMED" != yes ]; then
+      if [ "$INTERACTIVE" -eq 1 ] && ask "The distribution's named.service is running or enabled ($n zone statement(s) in /etc/named.conf); it would hold port 53. Stop and disable it?"; then
+        OPT_DISABLE_STOCK_NAMED=yes
+      else
+        die "the distribution's named.service is running or enabled ($n zone statement(s) in /etc/named.conf, which may serve real zones). It would hold port 53. Move what it serves, then run again with --disable-stock-named (nothing was changed)."
+      fi
+    fi
+  fi
 }
 
 # The disk-quota question, asked only where it makes sense.

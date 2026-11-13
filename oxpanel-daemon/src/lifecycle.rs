@@ -391,6 +391,19 @@ mod tests {
         assert_eq!(all.sys.mariadb_schema("alice_wp"), None);
         let cfg = &all.ctx.config;
         assert!(
+            crate::dns::DnsService::new(all.ctx.clone())
+                .list_zones("alice")
+                .await?
+                .is_empty()
+                && !cfg
+                    .dns
+                    .data_dir
+                    .join("zones")
+                    .join("example.com.zone")
+                    .exists(),
+            "the zone (with alice's MX) and its file are gone"
+        );
+        assert!(
             crate::task::list_for(cfg, "alice")?.is_empty(),
             "scheduled tasks gone"
         );

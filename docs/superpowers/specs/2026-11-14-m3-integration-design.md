@@ -1,22 +1,23 @@
-# Integration of the M3 streams (lifecycle, files, installer, essentials) — design
+# Integration of the M3 streams (lifecycle, files, installer, essentials, DNS) — design
 
 Date: 2026-11-14. Status: branch `m3-integration`, from `m2-integration`
 (`43f8b69`).
 
 ## What
 
-Four finished branches merged into one, in this order, each with a real
+Five finished branches merged into one, in this order, each with a real
 merge commit followed by commits that fix what the merge broke:
 `m3-lifecycle` (`f177362`), `m3-files` (`e977547`), `m3-installer`
-(`8e8071f`), `m3-essentials` (`f7a0a6d`, itself based on `m3-lifecycle`).
+(`8e8071f`), `m3-essentials` (`f7a0a6d`, itself based on `m3-lifecycle`),
+`m3-dns` (`ddcc235`, based on `m2-integration`).
 The individual design records stay authoritative for their features; this
 record covers only what the combination needed. It extends
 `2026-11-13-integration-design.md` (the M2 integration), whose method and
-lifecycle order it follows. `m3-dns` is not part of it.
+lifecycle order it follows.
 
 - `m3-lifecycle` merged without conflicts; `make check` and `make
   integration` passed on the merge commit as it was.
-- `m3-files` and `m3-essentials` conflicted only where both sides added at
+- `m3-files`, `m3-essentials` and `m3-dns` conflicted only where both sides added at
   the same place (proto service block and messages, records store, server
   handlers and converters, error mapping, config, start-up, scope table,
   `run-inside.sh` sections, traceability rows, docs, the Containerfile).
@@ -25,15 +26,22 @@ lifecycle order it follows. `m3-dns` is not part of it.
 
 ### API numbering
 
-No field, enum value, RPC or message is duplicated or renumbered (checked
-mechanically on the merged `panel.proto`: 179 messages and enums, 78 RPCs).
+No field, enum value, RPC or message is duplicated (checked mechanically on
+the merged `panel.proto`: 203 messages and enums, 88 RPCs).
 Lifecycle added `ResourceLimits` 7, `HostInfo` 35, `DriftKind` 30–31,
 `JobKind` 3–4, `Job` 14–17; essentials added `Tenant` 13, `VirtualHost`
 12–13, `HostInfo` 36–42, `DriftKind` 32–34; the file manager added only new
 messages and RPCs (its jobs are `FileJob`, not `JobKind` values), and the
 installer nothing. So essentials' numbers, chosen on its lifecycle base,
-did not collide and nothing was renumbered. Every new RPC (5 lifecycle, 19
-file manager, 9 essentials) has a scope decision in
+did not collide. DNS chose its numbers on `m2-integration` and collided with
+lifecycle and essentials; it was renumbered (nothing is released):
+`VirtualHost.dns_opt_out` 12 → **14**, `VirtualHost.dns_zone` 13 → **15**,
+`HostInfo.dns` 35 → **43**, `DriftKind` `DNS_ZONE_DRIFT` 30 → **35**,
+`ORPHAN_DNS_FILE` 31 → **36**, `DNS_SERVER_DRIFT` 32 → **37**,
+`DNS_SECONDARY_DRIFT` 33 → **38**, `DNSSEC_DRIFT` 34 → **39**;
+`ConfigureVirtualHostRequest.dns_opt_out` stays **10** (free). Code, CLI
+and tests use the generated names only. Every new RPC (5 lifecycle, 19 file
+manager, 9 essentials, 10 DNS) has a scope decision in
 `tests/grpc_surface.rs`.
 
 ## Order of a tenant's lifecycle across features
@@ -43,8 +51,8 @@ file manager, 9 essentials) has a scope decision in
 meets. The order is asserted end to end by
 `tenant::tests::one_tenant_with_every_feature_through_suspend_resume_and_delete`
 (which now also carries a database in the trash, a running file job, an
-upload in progress, a scheduled task, PHP settings with their own pool, and
-a backup schedule) and by the lifecycle tests (cascade with every feature;
+upload in progress, a scheduled task, PHP settings with their own pool, a
+backup schedule, and a DNS zone with a record of the tenant's own) and by the lifecycle tests (cascade with every feature;
 `a_cascade_waits_for_file_jobs_and_takes_the_file_managers_state_along`):
 
 - **Suspend:** the sites answer 503 (Nginx re-rendered and reloaded); a
@@ -54,7 +62,10 @@ a backup schedule) and by the lifecycle tests (cascade with every feature;
   site pools inside it); applications stop; scheduled-task timers are
   disabled and a running task is stopped; SFTP (keys file removed,
   password hash locked, sessions ended); last the database accounts
-  (`ACCOUNT LOCK`, `KILL USER`). The trash has no grants and is untouched;
+  (`ACCOUNT LOCK`, `KILL USER`). DNS zones keep answering unchanged (mail
+  and third-party services depend on them; the sites' records lead to the
+  503 pages), and changing them is refused (DNS's decision; engine-driven
+  updates still happen). The trash has no grants and is untouched;
   scheduled backups keep running (essentials' decision); Automatic HTTPS
   skips suspended tenants.
 - **Resume:** the exact reverse: database accounts, SFTP, PHP-FPM,
@@ -63,8 +74,8 @@ a backup schedule) and by the lifecycle tests (cascade with every feature;
   HTTPS catches up.
 - **Delete (refusing, the default):** every refusal runs before anything is
   written, reading records only: virtual hosts, databases, database users
-  or trash, a running file job, backups that are not retained, a running
-  backup, restore or deletion job. Then the record goes to `deleting`,
+  or trash, a running file job, DNS zones, backups that are not retained, a
+  running backup, restore or deletion job. Then the record goes to `deleting`,
   retained backups are detached, scheduled tasks are removed (they are
   configuration; `userdel` would refuse while one runs), SFTP access, the
   disk quota, `userdel`, slice units, backup and file-manager job history,
@@ -78,7 +89,9 @@ a backup schedule) and by the lifecycle tests (cascade with every feature;
   stopped (only after a crash can there be one), PHP and applications
   stopped, scheduled tasks removed, every site removed (with its
   certificate, Automatic HTTPS state, logs, PHP pools — the tenant's and
-  the sites' own — and application unit), SFTP access, database users,
+  the sites' own — and application unit; the sites' automatic zones follow
+  them), the tenant's remaining DNS zones with their DNSSEC keys
+  (`dns::remove_tenant_zones`), SFTP access, database users,
   databases and trash dropped, backups that are not retained removed, the
   account with its home (partial uploads go with it), slice units, job
   histories, upload records, the backup schedule, the record. Each step is
@@ -141,6 +154,46 @@ a backup schedule) and by the lifecycle tests (cascade with every feature;
   the new state directories (`db-trash`, `file-jobs`, `uploads`, `tasks`,
   `backup-schedules`) are created by the daemon under `/var/lib/oxpanel`.
 
+### DNS hosting in the combination
+
+- **Zones and a retained final backup.** Zone data is engine state, not
+  tenant files, and is deliberately not in tenant backups (DNS design). The
+  cascade deletes the tenant's zones, their records and their DNSSEC
+  signing keys even when a final backup is retained: a zone without its
+  owner would keep answering for a customer who is gone, and nothing can
+  restore it from the backup anyway. A returning customer gets zones again
+  with its sites; its own records must be re-entered, and a signed zone
+  gets a new key, i.e. a new DS at the registrar. Keeping zone records
+  beside a retained backup is possible later; it is an owner decision.
+- **Sites, Automatic HTTPS and DNS.** Creating a site, changing its
+  aliases and removing it drive both: DNS follows the site's names best
+  effort (a failure is logged and reported by `Reconcile` as
+  `DNS_ZONE_DRIFT`, never fails the site), and Automatic HTTPS is started
+  by the API after the site is configured, as before; `Reconcile` reports
+  both kinds of drift.
+- **`TZ=UTC`.** DNS serials come from the daemon's own clock in UNIX
+  seconds, and no BIND tool's time output is parsed; `oxpanel-dns.service`
+  is started by systemd and does not inherit the daemon's environment.
+- **Installer.** A `dns` stage (after `daemon`): `--dns` with
+  `--dns-nameservers`, `--dns-contact`, `--dns-ipv4`/`--dns-ipv6` (or the
+  answers-file keys; the values are never guessed and are asked for when
+  interactive), installs `bind`, `bind-utils` and `publicsuffix-list`,
+  writes the `OXPANEL_DNS_*` lines into the installer's block of
+  `daemon.env` (only once BIND is installed, so the daemon never runs with
+  DNS on and no server), restarts the daemon, waits for `oxpanel-dns` and
+  asks it a question on 127.0.0.1:53. An enabled or running `named.service`
+  stops the run before any change, with the number of zone statements in
+  `/etc/named.conf`; `--disable-stock-named` (or "yes" when interactive)
+  stops and disables it. A later run that does not mention DNS keeps it;
+  `--no-dns` takes the lines out (zones and keys stay). The firewall stage
+  opens the `dns` service (53/tcp, 53/udp) with DNS hosting. `--uninstall`
+  leaves zones, keys and configuration, and says the hosted domains stop
+  resolving until a reinstall (`oxpanel-dns.service` goes with the
+  package). Phase 17 tests the stage (refusals, the stock `named`, a second
+  run, `--no-dns`, the firewall), phase 95 keeps a zone with a record of
+  the tenant's across uninstall and reinstall, phase 12 checks the new unit
+  arrives with an upgrade without starting.
+
 ## Phase 80, "the operator can remove the raced site …"
 
 The check failed once each in two earlier acceptance runs and passed on
@@ -182,7 +235,8 @@ the first runs while the tenant is still flipping the path.
 - The crash-safety matrix (`tests/crash_safety.rs`) still interrupts only
   the base workflows; the trash, the cascade, the file manager and the
   essentials have their own resumability tests.
-- Phase 80 does not attack the file manager, the trash or scheduled tasks;
+- Phase 80 does not attack the file manager, the trash, scheduled tasks or
+  DNS hosting;
   their attacks are covered by `files_tests`, the task property and unit
   tests, and the integration suite.
 - A file job and a backup restore of the same tenant at the same time are

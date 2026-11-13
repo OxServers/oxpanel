@@ -76,6 +76,21 @@ open-core:
   `openat2(RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV)`; archives
   are parsed by pure-Rust crates with bomb and path-trick limits. See
   `src/files.rs` and the files design record.
+- **Scheduled tasks:** a systemd timer and a oneshot service per task, as
+  the tenant, in its slice, sandboxed like an application (`oxpanel_app_t`
+  on SELinux hosts); the command is structured (interpreter chosen by the
+  engine, a script inside the home, quoted arguments), never a command line.
+  See `src/task.rs` and the essentials design record. Per-site PHP settings
+  run in a pool of the site's own inside the tenant's PHP-FPM
+  (`src/php_settings.rs`); scheduled backups are started by the daemon
+  (`src/backup_schedule.rs`).
+- **DNS hosting:** OxPanel's own BIND instance (`oxpanel-dns.service`,
+  configuration in `/etc/named/oxpanel`, zones and DNSSEC keys in
+  `/var/lib/oxpanel-dns`), authoritative only; zone files rendered from
+  records and checked by BIND's own checkers before they are loaded; one
+  owner per zone, no overlapping zones, no public suffix as a zone. The
+  daemon keeps `PrivateNetwork=yes`: `rndc` and the outside probe run in
+  transient units. See `src/dns/` and the DNS design record.
 - **Disk:** XFS user quotas per tenant uid (`src/quota.rs`), when the host
   mounts the homes' file system with `uquota`; refused, never ignored, when not.
 - **SELinux:** document roots get a persistent `httpd_sys_content_t` file-context
@@ -113,7 +128,8 @@ proto/oxpanel/v1/panel.proto    API contract
 oxpanel-proto/                  generated types
 oxpanel-daemon/                 the engine (src/, tests/, CLAUDE.md, README.md)
 oxpanel-ctl/                    admin CLI
-packaging/                      systemd unit, daemon.env, sysusers.d, tmpfiles.d, RPM spec
+packaging/                      systemd units, daemon.env, sysusers.d, tmpfiles.d, SELinux module, fail2ban jail, RPM spec
+install.sh                      one-command installer and uninstaller for AlmaLinux 9
 tests-integration/              Containerfile (AlmaLinux 9) + run-inside.sh assertions
 scripts/                        dev.sh, integration-test.sh
 .github/workflows/ci.yml        check + integration
@@ -139,6 +155,6 @@ not per object; per-owner confinement is a possible later refinement.
 2. Confined SELinux domain (`oxpanel_t`) and a capability *allow*-list for the unit; a confining policy for `oxpanel_app_t` (today it only labels applications so the web server can be allowed to reach exactly them).
 3. ~~Per-tenant PHP-FPM in the tenant slice; per-vhost logs~~ — done (hosting milestone 2a). Node.js and Python applications likewise (one sandboxed service per site, UNIX socket, own SELinux domain). Next: runtime version choice, per-tenant PHP settings, application environment variables.
 4. ~~TLS for virtual hosts (ACME)~~ — done (M2b): uploaded and ACME (HTTP-01) certificates; the ACME client `oxpanel-acme` runs unprivileged outside the daemon. Next: DNS-01 / wildcard certificates. SFTP access and disk quotas: done (M2c).
-5. ~~Tenant databases (MariaDB), per-tenant backups and restores~~ — done (M2d, M2e; merged with M2b/M2c in the M2 integration). Database dumps in backups, a database trash and the one-step (cascade) deletion of a customer with an optional final backup: done (M3 lifecycle). A file manager running as the tenant: done (M3 files). Both merged in the M3 integration.
+5. ~~Tenant databases (MariaDB), per-tenant backups and restores~~ — done (M2d, M2e; merged with M2b/M2c in the M2 integration). Database dumps in backups, a database trash and the one-step (cascade) deletion of a customer with an optional final backup: done (M3 lifecycle). A file manager running as the tenant: done (M3 files). Scheduled tasks, per-site PHP settings and scheduled backups: done (M3 essentials). DNS hosting with secondaries and DNSSEC: done (M3 dns). The installer (`install.sh`) and release packaging 0.2.0: done (M3 installer). All merged in the M3 integration.
 6. Repair mode for `Reconcile` (today it reports only).
 7. Split privileged helper behind the `System` trait.

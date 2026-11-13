@@ -97,7 +97,8 @@ whether it changed anything. The manual equivalent is in the section named.
 | php | `php-fpm`, `php-cli` (scheduled PHP tasks) and `php-mysqlnd`; masks the shared `php-fpm.service` unless it is running (then it warns; `--mask-php-fpm`) | §9 (PHP) |
 | panel | optional hook, see below | §5 |
 | daemon | enable and start `oxpanel-daemon`; waits for the socket | §3.1 |
-| firewall | only if `firewalld` is running: opens `http` and `https` in the default zone, permanent and runtime. A firewall is never stopped or disabled; other firewalls are yours | §2 |
+| dns | optional (`--dns` with `--dns-nameservers`, `--dns-contact`, `--dns-ipv4`/`--dns-ipv6`, or the answers-file keys `dns`, `dns_nameservers`, `dns_contact`, `dns_ipv4`, `dns_ipv6`; the values are never guessed): installs `bind`, `bind-utils` and `publicsuffix-list`, writes the `OXPANEL_DNS_*` lines into its block of `daemon.env`, restarts the daemon, which starts `oxpanel-dns.service`, and asks the server a question on 127.0.0.1:53. **A running or enabled `named.service` stops the run before any change** (it may serve real zones and would hold port 53); `--disable-stock-named` stops and disables it. A later run that does not mention DNS keeps it; `--no-dns` takes the lines out (zones and keys stay) | §9.2 |
+| firewall | only if `firewalld` is running: opens `http` and `https` (and `dns`, 53/tcp and 53/udp, with DNS hosting) in the default zone, permanent and runtime. A firewall is never stopped or disabled; other firewalls are yours | §2 |
 | fail2ban | optional, see below | §9 |
 | quota | optional, see below | §9.1 |
 | verify | `oxpanel-daemon --check-config`, `oxpanel-ctl host info`, `oxpanel-ctl host reconcile` | §3.4 |
@@ -1433,7 +1434,7 @@ them is signed with a new key, i.e. a new DS at the registrar).
 ```sh
 make image         # AlmaLinux 9 dev/test image (one-time)
 make check         # rustfmt --check, clippy pedantic -D warnings, tests, cargo-deny, feature traceability, shellcheck of install.sh
-make test          # 288 tests (fake OS, no root): unit, property, gRPC surface, crash safety, perf budgets
+make test          # 442 tests (fake OS, no root): unit, property, gRPC surface, crash safety, perf budgets
 make traceability  # every row of docs/FEATURES.md maps to tests that exist (docs/traceability.map)
 make coverage      # line coverage of the daemon (cargo-llvm-cov; run `make image` once first)
 make bench         # engine benchmark against the fake OS (docs/PERFORMANCE.md); never part of `make check`
@@ -1472,7 +1473,7 @@ Phases: **10** install (`dnf install` of the RPM or the handbook's source instal
 **12** (upgrade mode) upgrade 0.1.0 to the current release with `install.sh`: tenants, sites and limits survive, and the new features (SFTP, databases and their trash, backups, the file manager, deleting the tenant in one step) work on the pre-existing tenant ·
 **15** host preparation for disk quotas: runs §9.1's block (in installer mode the installer already did it, and is run again after the reboot), reboots, checks the quota option is on ·
 **16** (installer mode) fail2ban: wrong SFTP passwords from one address of a network namespace get it banned, a correct login from another address works, an address on the ignore list is never banned, no AVC denials ·
-**20** the 703-check integration suite on the real host (`tests-integration/run-inside.sh`: everything above plus HTTPS and ACME against a local test CA, SFTP, quotas, databases and backups) ·
+**20** the 1219-check integration suite on the real host (`tests-integration/run-inside.sh`: everything above plus HTTPS and ACME against a local test CA, SFTP, quotas, databases and backups) ·
 **30** SELinux: enforcing, docroot labels, `semanage` rule lifecycle, site serves, **zero AVC denials** ·
 **40** sandbox: private network/UTS/mount namespaces, seccomp, capability bounding set, read-only `/usr` ·
 **50** `systemctl restart`, `SIGKILL` + auto-restart, a record forced back to `provisioning` is resumed with exactly one `useradd` ·

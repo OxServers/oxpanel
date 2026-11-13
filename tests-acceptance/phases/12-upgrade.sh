@@ -58,6 +58,7 @@ info "reconcile after: exit $rc"; cat reconcile.after | head -20
 check "host reconcile is clean after the upgrade (the daemon re-rendered what changed)" test "$rc" = 0
 
 # ---- the new engine's features work on the old tenant
+check "the DNS server's unit came with the upgrade, not started (DNS hosting is off until configured)" bash -c 'systemctl cat oxpanel-dns.service >/dev/null && ! systemctl -q is-active oxpanel-dns && oxpanel-ctl host info | grep -q "^dns=false"'
 check "the new host info shows the databases" bash -c 'oxpanel-ctl host info | grep -q "^database_engine=mariadb available=true"'
 check "an SFTP key can be added to the pre-existing tenant" bash -c "ssh-keygen -q -t ed25519 -N '' -f /root/acc/upg.key && oxpanel-ctl sftp add-key $T --key-file /root/acc/upg.key.pub --label upg | grep -q '^changed=true'"
 check "a database for it" oxpanel-ctl db create ${T}_shop --tenant $T

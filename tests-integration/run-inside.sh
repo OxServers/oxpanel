@@ -2412,6 +2412,18 @@ CONF
   check "removing the last site keeps a zone with the tenant's records" bash -c "oxpanel-ctl vhost remove dnsa.oxtest | grep -q ^removed=true && oxpanel-ctl dns zone-show dnsa.oxtest --tenant dnsa | grep -q '^zone=dnsa.oxtest .* sites=-'"
   check "its MX still answers, its site's A does not" bash -c "test \"\$(dig +short @127.0.0.1 dnsa.oxtest MX | wc -l)\" = 2 && test -z \"\$(dig +short @127.0.0.1 dnsa.oxtest A)\""
   check "reset to defaults removes the tenant's records" bash -c "oxpanel-ctl dns zone-reset dnsa.oxtest --tenant dnsa | grep -q '^zone=dnsa.oxtest .* records=0 '"
+  echo "-- deleting a customer with its zones in one go (cascade)"
+  oxpanel-ctl tenant create dnsc >/dev/null
+  oxpanel-ctl vhost set dnsc.oxtest --tenant dnsc >/dev/null
+  check "dnsc's site got a zone" eventually 20 bash -c "oxpanel-ctl dns zone-list --tenant dnsc | grep -q '^zone=dnsc.oxtest '"
+  check "with a record of its own" grep -q '^changed=true' <(oxpanel-ctl dns record-add dnsc.oxtest --tenant dnsc --name @ --type txt --value dnsc-own)
+  check "and DNSSEC on" grep -q '^zone=dnsc.oxtest ' <(oxpanel-ctl dns dnssec dnsc.oxtest on --tenant dnsc)
+  check "its signing key exists" eventually 60 bash -c "ls /var/lib/oxpanel-dns/keys/dnsc.oxtest 2>/dev/null | grep -q '[.]private$'"
+  check_not "the refusing delete refuses while it has a site and a zone" oxpanel-ctl tenant delete dnsc --remove-home
+  out="$(timeout 300 oxpanel-ctl tenant delete dnsc --cascade --confirm dnsc --wait)" || true; echo "$out" | tail -1
+  check "the cascade deletes the customer" bash -c 'grep -q "kind=JOB_KIND_DELETE_TENANT .* state=JOB_STATE_SUCCEEDED" <<<"$1" && ! id dnsc 2>/dev/null' _ "$out"
+  check "with its zone, zone file and signing keys" bash -c 'test -z "$(oxpanel-ctl dns zone-list --tenant dnsc 2>/dev/null)" && test ! -e /var/lib/oxpanel-dns/zones/dnsc.oxtest.zone && test ! -e /var/lib/oxpanel-dns/keys/dnsc.oxtest && ! ls /var/lib/oxpanel/dns-zones | grep -q dnsc'
+  check "the zone is no longer answered" grep -q 'status: REFUSED' <(dq dnsc.oxtest SOA)
   for z in dnsa.oxtest sig.parent.oxtest; do check "delete zone $z" grep -q '^deleted=true' <(oxpanel-ctl dns zone-delete "$z" --tenant dnsa); done
   # The sites of the earlier sections got zones when DNS hosting was switched
   # on; switching it off again (below) leaves zones alone, so they go first.
