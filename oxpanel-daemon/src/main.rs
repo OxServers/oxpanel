@@ -279,6 +279,8 @@ async fn run(cli: Cli) -> Result<(), Fatal> {
     tokio::spawn(auto_https_periodically(engine.tls()));
 
     resume_jobs(&ctx, &engine).await;
+    // Scheduled backups: due ones (after downtime: once) now, then periodically.
+    engine.schedules().spawn();
 
     let shutdown = async {
         let mut term =

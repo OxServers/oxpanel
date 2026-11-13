@@ -1443,6 +1443,7 @@ pub(crate) mod tests {
                 added_at_unix: 0,
             }],
             sftp_password: false,
+            php_limits: crate::php_settings::PhpLimits::default(),
         };
         assert!(render_keys_file(&t).is_ok());
         let good = t.sftp_keys.clone();

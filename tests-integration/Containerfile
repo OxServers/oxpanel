@@ -71,3 +71,6 @@ RUN dnf -y install --setopt=install_weak_deps=False openssh-server openssh-clien
 # MariaDB (tenant databases) and the PHP driver for it, for the integration test.
 RUN dnf -y install --setopt=install_weak_deps=False mariadb-server php-mysqlnd \
     && dnf clean all && rm -rf /var/cache/dnf
+
+# PHP's command-line interpreter, for scheduled tasks that run PHP scripts.
+RUN dnf -y install --setopt=install_weak_deps=False php-cli && dnf clean all && rm -rf /var/cache/dnf

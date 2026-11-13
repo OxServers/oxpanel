@@ -237,7 +237,6 @@ fn parts(vhost: &VHostRecord) -> Result<(Domain, &AppRecord)> {
 /// be enabled. Read-only, so a request that cannot succeed is refused before
 /// it has created anything.
 pub async fn preflight(ctx: &Ctx, runtime: AppRuntime) -> Result<()> {
-    let timeout = ctx.config.command_timeout;
     if !ctx.sys.is_installed(required_program(runtime)).await {
         return Err(Error::RuntimeUnavailable(match runtime {
             AppRuntime::Node => "Node.js (nodejs)",
@@ -254,12 +253,20 @@ pub async fn preflight(ctx: &Ctx, runtime: AppRuntime) -> Result<()> {
             });
         }
     }
+    require_policy(ctx).await
+}
+
+/// On SELinux hosts, OxPanel's policy module must be loaded: without it a
+/// unit could not start in the application domain (`oxpanel_app_t`) and the
+/// web server could not reach an application. Refused with something
+/// actionable. Also used by scheduled tasks, which run in that domain.
+pub async fn require_policy(ctx: &Ctx) -> Result<()> {
     if ctx.selinux {
-        // Without the module the unit could not start in its domain and the
-        // web server could not reach it: refuse with something actionable.
         let modules = ctx
             .sys
-            .run_ok(CommandSpec::new(bin::SEMODULE, timeout).arg("--list-modules"))
+            .run_ok(
+                CommandSpec::new(bin::SEMODULE, ctx.config.command_timeout).arg("--list-modules"),
+            )
             .await?;
         if !modules
             .stdout_lossy()
@@ -270,6 +277,18 @@ pub async fn preflight(ctx: &Ctx, runtime: AppRuntime) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// The SELinux context application units (and scheduled tasks) run in.
+pub fn selinux_context_line(selinux: bool) -> String {
+    if selinux {
+        format!(
+            "SELinuxContext={SELINUX_APP_CONTEXT}
+"
+        )
+    } else {
+        String::new()
+    }
 }
 
 /// Create the application directory (as the tenant), a virtualenv for Python,
@@ -540,6 +559,7 @@ mod tests {
             suspended: false,
             sftp_keys: Vec::new(),
             sftp_password: false,
+            php_limits: crate::php_settings::PhpLimits::default(),
         }
     }
 

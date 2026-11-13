@@ -125,6 +125,7 @@ impl TenantService {
             suspended: false,
             sftp_keys: Vec::new(),
             sftp_password: false,
+            php_limits: crate::php_settings::PhpLimits::default(),
         };
         // Claim the name and uid *before* the irreversible step, so a crash
         // can never leave behind an account the daemon refuses to recognise.
@@ -346,12 +347,14 @@ impl TenantService {
             self.restore_access(&rec).await?;
             crate::php::set_running(&self.ctx, &rec, true).await?;
             crate::app::set_running_all(&self.ctx, &rec, true).await?;
+            crate::task::set_running_all(&self.ctx, &rec, true).await?;
         }
         vhost::sync_tenant_configs(&self.ctx, &rec, changed).await?;
         if changed {
             if suspended {
                 crate::php::set_running(&self.ctx, &rec, false).await?;
                 crate::app::set_running_all(&self.ctx, &rec, false).await?;
+                crate::task::set_running_all(&self.ctx, &rec, false).await?;
                 // The keys file goes away, the password hash is locked and
                 // running sessions are ended.
                 sftp::suspend_access(&self.ctx, &rec).await?;
@@ -504,7 +507,11 @@ impl TenantService {
     ) -> Result<()> {
         let name = Username::parse(&rec.username)?;
         let timeout = self.ctx.config.command_timeout;
-        // SFTP first: the home must not be removed while it is still mounted
+        // Scheduled tasks are configuration, not data: they go first (their
+        // timers stop, a running one is ended; userdel refuses an account
+        // with running processes).
+        crate::task::remove_all(&self.ctx, &rec.username).await?;
+        // Then SFTP: the home must not be removed while it is still mounted
         // into the chroot directory, and userdel refuses an account that has
         // running sessions (`remove_access` ends them). The password and the
         // group memberships go with the account.
@@ -530,6 +537,7 @@ impl TenantService {
         )
         .await?;
         crate::backup::forget_tenant_jobs(&self.ctx, &name, keep_job)?;
+        crate::backup_schedule::forget(&self.ctx.config, &name)?;
         self.ctx.store.delete_tenant(&name)?;
         Ok(())
     }
@@ -559,6 +567,7 @@ impl TenantService {
         crate::backup::detach_retained(&self.ctx, name)?;
         crate::php::set_running(&self.ctx, &rec, false).await?;
         crate::app::set_running_all(&self.ctx, &rec, false).await?;
+        crate::task::remove_all(&self.ctx, &rec.username).await?;
         let vhosts = vhost::VHostService::new(self.ctx.clone());
         for v in self.ctx.store.list_vhosts()? {
             if v.tenant == rec.username {
@@ -890,6 +899,7 @@ pub(crate) mod tests {
             hsts: false,
             tls: None,
             auto_https: crate::records::AutoHttpsChoice::On,
+            php_settings: crate::php_settings::PhpSettings::default(),
         })?;
         assert!(matches!(
             h.svc.delete("alice", false).await,

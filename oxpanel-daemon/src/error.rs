@@ -176,6 +176,17 @@ pub enum Error {
     #[error("tenant '{0}' still has backups; delete them or mark them retained first")]
     TenantHasBackups(String),
 
+    /// No record of this scheduled task.
+    #[error("tenant '{tenant}' has no scheduled task '{name}'")]
+    TaskNotFound { tenant: String, name: String },
+
+    #[error("tenant '{tenant}' already has the maximum of {max} scheduled tasks")]
+    TaskLimitReached { tenant: String, max: u32 },
+
+    /// PHP settings were sent for a site that does not run PHP.
+    #[error("virtual host '{0}' does not run PHP; enable PHP first")]
+    PhpNotEnabled(String),
+
     #[error("{program} exited with {status}")]
     CommandFailed {
         program: String,
@@ -272,6 +283,9 @@ impl Error {
                 | Self::TooManyJobs
                 | Self::BackupNoSpace { .. }
                 | Self::TenantHasBackups(_)
+                | Self::TaskNotFound { .. }
+                | Self::TaskLimitReached { .. }
+                | Self::PhpNotEnabled(_)
         )
     }
 }
@@ -293,6 +307,7 @@ impl From<Error> for Status {
             }
             Error::TenantExists(_) | Error::SpecMismatch(_) => Status::already_exists(message),
             Error::TenantNotFound(_)
+            | Error::TaskNotFound { .. }
             | Error::VHostNotFound(_)
             | Error::SftpKeyNotFound { .. }
             | Error::DbObjectNotFound { .. }
@@ -318,11 +333,13 @@ impl From<Error> for Status {
             | Error::BackupNotReady(_)
             | Error::JobRunning { .. }
             | Error::TenantHasBackups(_)
+            | Error::PhpNotEnabled(_)
             | Error::NginxInvalid(_) => Status::failed_precondition(message),
             Error::UidExhausted { .. }
             | Error::TooManySftpKeys(_)
             | Error::DbLimitReached { .. }
             | Error::TooManyJobs
+            | Error::TaskLimitReached { .. }
             | Error::BackupNoSpace { .. } => Status::resource_exhausted(message),
             Error::Unauthorised => Status::permission_denied(message),
             Error::CommandTimeout { .. } => Status::deadline_exceeded(message),

@@ -58,6 +58,13 @@ pub struct TenantRecord {
     /// password exists solely as the hash in the shadow database.
     #[serde(default)]
     pub sftp_password: bool,
+    /// Caps on the PHP settings of the tenant's sites (0 = the host
+    /// maximum). Not written while empty, so older records stay as they were.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::php_settings::PhpLimits::is_empty"
+    )]
+    pub php_limits: crate::php_settings::PhpLimits,
 }
 
 /// One SSH public key of a tenant. Everything in here is public.
@@ -103,6 +110,13 @@ pub struct VHostRecord {
     /// Whether Automatic HTTPS looks after this site.
     #[serde(default)]
     pub auto_https: AutoHttpsChoice,
+    /// PHP settings of this site (`SetPhpSettings`). Kept when PHP is
+    /// switched off, used while it is on. Not written while empty.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::php_settings::PhpSettings::is_empty"
+    )]
+    pub php_settings: crate::php_settings::PhpSettings,
 }
 
 /// A site's Automatic HTTPS setting.
@@ -810,7 +824,7 @@ impl Store {
     }
 }
 
-fn load<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>> {
+pub(crate) fn load<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>> {
     let Some(bytes) = fsutil::read_optional(path)? else {
         return Ok(None);
     };
@@ -821,7 +835,7 @@ fn load<T: for<'de> Deserialize<'de>>(path: &Path) -> Result<Option<T>> {
     Ok(Some(rec))
 }
 
-fn save<T: Serialize>(path: &Path, rec: &T) -> Result<()> {
+pub(crate) fn save<T: Serialize>(path: &Path, rec: &T) -> Result<()> {
     let mut bytes = serde_json::to_vec_pretty(rec)
         .map_err(|e| Error::Internal(format!("serialise record: {e}")))?;
     bytes.push(b'\n');
@@ -832,7 +846,7 @@ fn save<T: Serialize>(path: &Path, rec: &T) -> Result<()> {
 /// A corrupt record is logged and skipped here so one damaged file cannot
 /// block every other tenant's operations; mutations on the damaged tenant
 /// itself still fail closed through [`load`].
-fn list<T: for<'de> Deserialize<'de>>(dir: &Path) -> Result<Vec<T>> {
+pub(crate) fn list<T: for<'de> Deserialize<'de>>(dir: &Path) -> Result<Vec<T>> {
     let mut out = Vec::new();
     for path in fsutil::list_files_with_suffix(dir, ".json")? {
         match load::<T>(&path) {
@@ -875,6 +889,7 @@ mod tests {
             suspended: false,
             sftp_keys: Vec::new(),
             sftp_password: false,
+            php_limits: crate::php_settings::PhpLimits::default(),
         }
     }
 
@@ -976,6 +991,7 @@ mod tests {
             hsts: false,
             tls: None,
             auto_https: AutoHttpsChoice::On,
+            php_settings: crate::php_settings::PhpSettings::default(),
         };
         assert!(s.save_vhost(&v).is_err());
     }

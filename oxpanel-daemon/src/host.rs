@@ -55,6 +55,9 @@ pub enum DriftKind {
     BackupIncomplete,
     DatabaseTrashDrift,
     OrphanDatabaseTrash,
+    TaskUnitDrift,
+    OrphanTaskUnit,
+    OrphanBackupSchedule,
 }
 
 /// One difference between a record and the operating system.
@@ -123,6 +126,8 @@ pub struct HostInfo {
     pub databases: Vec<crate::db::EngineFacts>,
     pub tls: TlsSupport,
     pub facilities: Facilities,
+    /// PHP's command-line interpreter is installed (PHP scheduled tasks).
+    pub php_cli: bool,
 }
 
 /// What tenants can be given on this host beyond web hosting.
@@ -191,6 +196,7 @@ impl HostService {
                 disk_quota_detail: quota.detail,
             },
             databases: crate::db::facts(&self.ctx).await?,
+            php_cli: self.ctx.sys.is_installed(bin::PHP_CLI).await,
         })
     }
 
@@ -246,6 +252,8 @@ impl HostService {
         check_quotas(&self.ctx, &tenants, &mut out).await?;
         out.extend(crate::db::drifts(&self.ctx, &tenants).await?);
         check_backups(&self.ctx, &mut out)?;
+        out.extend(crate::task::drifts(&self.ctx, &tenants)?);
+        out.extend(crate::backup_schedule::drifts(cfg, &tenants)?);
         Ok(out)
     }
 
@@ -360,7 +368,15 @@ fn check_php_pools(
         let name = Username::parse(&t.username)?;
         let files = PoolFiles::for_tenant(&cfg.php_conf_dir, &cfg.systemd_unit_dir, &name);
         for (path, expected) in [
-            (&files.conf, php::render_pool_conf(t, &name, &cfg.web_user)?),
+            (
+                &files.conf,
+                php::render_pool_conf_with_sites(
+                    t,
+                    &name,
+                    &cfg.web_user,
+                    &php::site_pools(cfg, t, vhosts, None)?,
+                )?,
+            ),
             (&files.unit, php::render_unit(t, &name, &files.conf)?),
         ] {
             if let Some(problem) = compare_file(path, &expected)? {
@@ -813,7 +829,7 @@ fn check_backup_files(b: &BackupRecord, dir: &Path, out: &mut Vec<Drift>) -> Res
 }
 
 /// `None` when the file holds exactly `expected`.
-fn compare_file(path: &Path, expected: &str) -> Result<Option<&'static str>> {
+pub(crate) fn compare_file(path: &Path, expected: &str) -> Result<Option<&'static str>> {
     Ok(match fsutil::read_optional(path)? {
         None => Some("is missing"),
         Some(bytes) if bytes != expected.as_bytes() => Some("differs from the record"),
@@ -1040,6 +1056,7 @@ mod tests {
             hsts: false,
             tls: None,
             auto_https: crate::records::AutoHttpsChoice::On,
+            php_settings: crate::php_settings::PhpSettings::default(),
         };
         h.ctx.store.save_vhost(&orphan_site)?;
 

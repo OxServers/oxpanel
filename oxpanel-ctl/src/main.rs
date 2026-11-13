@@ -22,6 +22,8 @@ use tower::service_fn;
 
 use oxpanel_proto::v1 as pb;
 
+mod essentials;
+
 /// Print a line to stdout; a closed pipe (`oxpanel-ctl … | head`) ends the
 /// program quietly instead of panicking with "Broken pipe".
 fn emit(line: &str) {
@@ -76,6 +78,15 @@ enum Cmd {
     /// SFTP access of tenants (SSH public keys).
     #[command(subcommand)]
     Sftp(SftpCmd),
+    /// Scheduled tasks (cron jobs) of tenants.
+    #[command(subcommand)]
+    Task(essentials::TaskCmd),
+    /// PHP settings of sites, and a tenant's caps on them.
+    #[command(subcommand)]
+    Php(essentials::PhpCmd),
+    /// Backups the engine starts by itself (off, daily, weekly).
+    #[command(subcommand)]
+    BackupSchedule(essentials::ScheduleCmd),
 }
 
 #[derive(Subcommand, Debug)]
@@ -531,6 +542,9 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
         Cmd::Sftp(cmd) => run_sftp(&mut c, cmd).await?,
         Cmd::Db(cmd) => run_db(&mut c, cmd).await?,
         Cmd::Backup(cmd) => run_backup(&mut c, cmd).await?,
+        Cmd::Task(cmd) => essentials::run_task(&mut c, cmd).await?,
+        Cmd::Php(cmd) => essentials::run_php(&mut c, cmd).await?,
+        Cmd::BackupSchedule(cmd) => essentials::run_schedule(&mut c, cmd).await?,
     })
 }
 
@@ -1273,6 +1287,7 @@ async fn run_host(
                 i.auto_https_enabled,
             );
             say!("disk_quota_detail={}", i.disk_quota_detail);
+            essentials::print_host_info(&i);
             // One line per database engine.
             for e in &i.database_engines {
                 say!(

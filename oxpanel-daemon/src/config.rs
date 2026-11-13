@@ -116,6 +116,146 @@ pub struct Config {
     pub backup_timeout: Duration,
     /// The program a job's transient unit runs: this daemon, in worker mode.
     pub worker_exe: PathBuf,
+    /// Scheduled tasks, PHP settings and scheduled backups (see [`Essentials`]).
+    pub essentials: Essentials,
+}
+
+/// Settings of scheduled tasks, per-site PHP settings and scheduled backups.
+#[derive(Debug, Clone)]
+pub struct Essentials {
+    /// The time-zone database time zones are checked against.
+    pub zoneinfo_dir: PathBuf,
+    /// Most scheduled tasks one tenant may have (`OXPANEL_TASK_MAX_PER_TENANT`).
+    pub task_max_per_tenant: u32,
+    /// Shortest "every N minutes" interval (`OXPANEL_TASK_MIN_INTERVAL_MINUTES`).
+    pub task_min_interval_minutes: u32,
+    /// Longest time limit a task may be given (`OXPANEL_TASK_MAX_TIMEOUT_SECS`).
+    pub task_max_timeout_secs: u32,
+    /// Host maxima of PHP settings (`OXPANEL_PHP_MAX_*`).
+    pub php_max: crate::php_settings::PhpLimits,
+    /// Scheduled backups run at all (`OXPANEL_BACKUP_SCHEDULES`).
+    pub backup_schedules: bool,
+    /// What tenants without a choice of their own get
+    /// (`OXPANEL_BACKUP_SCHEDULE_DEFAULT`).
+    pub backup_schedule_default: crate::backup_schedule::Frequency,
+    /// UTC hours (inclusive) the engine assigns backup times in
+    /// (`OXPANEL_BACKUP_WINDOW`, e.g. `01-05`).
+    pub backup_window: (u32, u32),
+    /// How often the backup scheduler looks for due backups
+    /// (`OXPANEL_BACKUP_SCHEDULE_CHECK_SECS`).
+    pub backup_schedule_check: Duration,
+}
+
+impl Default for Essentials {
+    fn default() -> Self {
+        Self {
+            zoneinfo_dir: PathBuf::from("/usr/share/zoneinfo"),
+            task_max_per_tenant: 20,
+            task_min_interval_minutes: 5,
+            task_max_timeout_secs: 3600,
+            php_max: crate::php_settings::PhpLimits::HOST_DEFAULT,
+            backup_schedules: true,
+            backup_schedule_default: crate::backup_schedule::Frequency::Daily,
+            backup_window: (1, 5),
+            backup_schedule_check: Duration::from_secs(300),
+        }
+    }
+}
+
+impl Essentials {
+    /// The `OXPANEL_TASK_*`, `OXPANEL_PHP_MAX_*` and backup-schedule settings.
+    fn read_env(&mut self, get: &impl Fn(&str) -> Option<String>) -> Result<()> {
+        let bounded = |key: &str, cur: &mut u32, min: u32, max: u32| -> Result<()> {
+            if let Some(v) = get(key) {
+                let n = parse_u32(key, &v)?;
+                if !(min..=max).contains(&n) {
+                    return Err(Error::invalid(
+                        "config",
+                        format!("{key} must be {min}..={max}"),
+                    ));
+                }
+                *cur = n;
+            }
+            Ok(())
+        };
+        bounded(
+            "OXPANEL_TASK_MAX_PER_TENANT",
+            &mut self.task_max_per_tenant,
+            0,
+            1000,
+        )?;
+        bounded(
+            "OXPANEL_TASK_MIN_INTERVAL_MINUTES",
+            &mut self.task_min_interval_minutes,
+            1,
+            1440,
+        )?;
+        bounded(
+            "OXPANEL_TASK_MAX_TIMEOUT_SECS",
+            &mut self.task_max_timeout_secs,
+            10,
+            86_400,
+        )?;
+        let m = &mut self.php_max;
+        bounded(
+            "OXPANEL_PHP_MAX_MEMORY_MB",
+            &mut m.memory_limit_mb,
+            16,
+            65_536,
+        )?;
+        bounded("OXPANEL_PHP_MAX_UPLOAD_MB", &mut m.upload_max_mb, 1, 65_536)?;
+        bounded(
+            "OXPANEL_PHP_MAX_EXECUTION_SECS",
+            &mut m.max_execution_time_secs,
+            1,
+            86_400,
+        )?;
+        bounded(
+            "OXPANEL_PHP_MAX_INPUT_TIME_SECS",
+            &mut m.max_input_time_secs,
+            1,
+            86_400,
+        )?;
+        bounded(
+            "OXPANEL_PHP_MAX_INPUT_VARS",
+            &mut m.max_input_vars,
+            100,
+            1_000_000,
+        )?;
+        if let Some(v) = get("OXPANEL_BACKUP_SCHEDULES") {
+            self.backup_schedules = parse_bool("OXPANEL_BACKUP_SCHEDULES", &v)?;
+        }
+        if let Some(v) = get("OXPANEL_BACKUP_SCHEDULE_DEFAULT") {
+            self.backup_schedule_default = crate::backup_schedule::Frequency::parse(v.trim())
+                .ok_or_else(|| {
+                    Error::invalid(
+                        "config",
+                        "OXPANEL_BACKUP_SCHEDULE_DEFAULT must be off, daily or weekly",
+                    )
+                })?;
+        }
+        if let Some(v) = get("OXPANEL_BACKUP_WINDOW") {
+            let bad = || {
+                Error::invalid(
+                    "config",
+                    "OXPANEL_BACKUP_WINDOW must be two UTC hours FROM-TO (0-23, FROM <= TO), e.g. 01-05",
+                )
+            };
+            let (from, to) = v.trim().split_once('-').ok_or_else(bad)?;
+            let (from, to) = (
+                from.parse::<u32>().map_err(|_| bad())?,
+                to.parse::<u32>().map_err(|_| bad())?,
+            );
+            if from > to || to > 23 {
+                return Err(bad());
+            }
+            self.backup_window = (from, to);
+        }
+        let mut secs = u32::try_from(self.backup_schedule_check.as_secs()).unwrap_or(300);
+        bounded("OXPANEL_BACKUP_SCHEDULE_CHECK_SECS", &mut secs, 5, 3600)?;
+        self.backup_schedule_check = Duration::from_secs(u64::from(secs));
+        Ok(())
+    }
 }
 
 /// Let's Encrypt's production directory.
@@ -168,6 +308,7 @@ impl Default for Config {
             backup_min_free_bytes: 1 << 30,
             backup_timeout: Duration::from_secs(6 * 3600),
             worker_exe: PathBuf::from("/usr/sbin/oxpanel-daemon"),
+            essentials: Essentials::default(),
         }
     }
 }
@@ -268,6 +409,7 @@ impl Config {
         c.db_from_lookup(&get)?;
         path("OXPANEL_BACKUP_DIR", &mut c.backup_dir)?;
         c.backup_from_lookup(&get)?;
+        c.essentials.read_env(&get)?;
         c.validate()?;
         Ok(c)
     }
@@ -459,6 +601,17 @@ impl Config {
     pub fn jobs_dir(&self) -> PathBuf {
         self.state_dir.join("jobs")
     }
+    /// `state_dir/tasks`: one record per scheduled task.
+    pub fn tasks_dir(&self) -> PathBuf {
+        self.state_dir.join("tasks")
+    }
+
+    /// `state_dir/backup-schedules`: one record per tenant the backup
+    /// scheduler knows.
+    pub fn backup_schedules_dir(&self) -> PathBuf {
+        self.state_dir.join("backup-schedules")
+    }
+
     /// `state_dir/sftp`: one root-owned chroot directory per tenant with SFTP
     /// access; the tenant's home is bind-mounted inside it.
     pub fn sftp_chroot_dir(&self) -> PathBuf {
@@ -869,5 +1022,72 @@ mod tests {
             ("OXPANEL_NGINX_INCLUDE_FILE", "/etc/nginx/conf.d/x.conf")
         ])
         .is_err());
+    }
+
+    #[test]
+    fn parses_essentials_settings() {
+        let c = from(&[]).unwrap_or_else(|e| panic!("{e}"));
+        let e = &c.essentials;
+        assert_eq!(
+            (
+                e.task_max_per_tenant,
+                e.task_min_interval_minutes,
+                e.task_max_timeout_secs
+            ),
+            (20, 5, 3600)
+        );
+        assert_eq!(e.php_max, crate::php_settings::PhpLimits::HOST_DEFAULT);
+        assert!(e.backup_schedules);
+        assert_eq!(
+            e.backup_schedule_default,
+            crate::backup_schedule::Frequency::Daily
+        );
+        assert_eq!(e.backup_window, (1, 5));
+        assert_eq!(e.backup_schedule_check, Duration::from_secs(300));
+        let c = from(&[
+            ("OXPANEL_TASK_MAX_PER_TENANT", "3"),
+            ("OXPANEL_TASK_MIN_INTERVAL_MINUTES", "1"),
+            ("OXPANEL_TASK_MAX_TIMEOUT_SECS", "60"),
+            ("OXPANEL_PHP_MAX_MEMORY_MB", "512"),
+            ("OXPANEL_PHP_MAX_UPLOAD_MB", "64"),
+            ("OXPANEL_BACKUP_SCHEDULES", "false"),
+            ("OXPANEL_BACKUP_SCHEDULE_DEFAULT", "weekly"),
+            ("OXPANEL_BACKUP_WINDOW", "22-23"),
+            ("OXPANEL_BACKUP_SCHEDULE_CHECK_SECS", "5"),
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
+        let e = &c.essentials;
+        assert_eq!(
+            (
+                e.task_max_per_tenant,
+                e.task_min_interval_minutes,
+                e.task_max_timeout_secs
+            ),
+            (3, 1, 60)
+        );
+        assert_eq!(
+            (e.php_max.memory_limit_mb, e.php_max.upload_max_mb),
+            (512, 64)
+        );
+        assert!(!e.backup_schedules);
+        assert_eq!(
+            e.backup_schedule_default,
+            crate::backup_schedule::Frequency::Weekly
+        );
+        assert_eq!(e.backup_window, (22, 23));
+        assert_eq!(e.backup_schedule_check, Duration::from_secs(5));
+        for (k, v) in [
+            ("OXPANEL_TASK_MIN_INTERVAL_MINUTES", "0"),
+            ("OXPANEL_TASK_MAX_TIMEOUT_SECS", "5"),
+            ("OXPANEL_PHP_MAX_MEMORY_MB", "8"),
+            ("OXPANEL_PHP_MAX_INPUT_VARS", "10"),
+            ("OXPANEL_BACKUP_SCHEDULE_DEFAULT", "hourly"),
+            ("OXPANEL_BACKUP_WINDOW", "5-1"),
+            ("OXPANEL_BACKUP_WINDOW", "1-24"),
+            ("OXPANEL_BACKUP_WINDOW", "3"),
+            ("OXPANEL_BACKUP_SCHEDULE_CHECK_SECS", "1"),
+        ] {
+            assert!(from(&[(k, v)]).is_err(), "{k}={v}");
+        }
     }
 }

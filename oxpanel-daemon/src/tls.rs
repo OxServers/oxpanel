@@ -1061,6 +1061,7 @@ pub(crate) mod tests {
             hsts: false,
             tls: None,
             auto_https: crate::records::AutoHttpsChoice::On,
+            php_settings: crate::php_settings::PhpSettings::default(),
         }
     }
 

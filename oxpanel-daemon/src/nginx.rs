@@ -124,6 +124,20 @@ pub struct ServerBlock<'a> {
     pub acme_challenge_dir: &'a Path,
     /// Set when the virtual host has a certificate: it is served over HTTPS too.
     pub tls: Option<TlsBlock<'a>>,
+    /// Limits that follow the site's PHP settings (`None`: Nginx's defaults,
+    /// and nothing is rendered).
+    pub php_tuning: Option<PhpTuning>,
+}
+
+/// Nginx limits that must follow a site's PHP settings, or the settings
+/// would do nothing (see [`crate::php_settings::nginx_tuning`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PhpTuning {
+    /// `client_max_body_size` in MiB (server level).
+    pub client_max_body_mb: Option<u32>,
+    /// `fastcgi_read_timeout` / `fastcgi_send_timeout` in seconds.
+    pub read_timeout_secs: Option<u32>,
+    pub send_timeout_secs: Option<u32>,
 }
 
 /// Render the complete, self-contained configuration of one virtual host: a
@@ -232,6 +246,7 @@ server {{
 /// What an active site serves, identically over HTTP and HTTPS: everything
 /// between `server_name` and the closing brace.
 fn render_site(b: &ServerBlock<'_>, logs: &str) -> Result<String> {
+    use std::fmt::Write as _;
     let root = safe_path_str(b.document_root)?;
     // Without PHP a script must never be handed out as a download: its
     // source routinely holds database passwords.
@@ -240,6 +255,19 @@ fn render_site(b: &ServerBlock<'_>, logs: &str) -> Result<String> {
         return 404;
     }
 ";
+    // Only rendered when the site's PHP settings call for it, so a site that
+    // sets nothing keeps exactly the configuration it had.
+    let tuning = b.php_socket.and(b.php_tuning).unwrap_or_default();
+    let body_size = tuning.client_max_body_mb.map_or_else(String::new, |mb| {
+        format!("    client_max_body_size {mb}m;\n")
+    });
+    let mut timeouts = String::new();
+    if let Some(s) = tuning.read_timeout_secs {
+        let _ = writeln!(timeouts, "        fastcgi_read_timeout {s}s;");
+    }
+    if let Some(s) = tuning.send_timeout_secs {
+        let _ = writeln!(timeouts, "        fastcgi_send_timeout {s}s;");
+    }
     let (index, tries, extra) = match (b.php_socket, b.app_socket) {
         (None, None) => ("index.html index.htm", "$uri $uri/ =404", no_php.to_owned()),
         (Some(sock), _) => (
@@ -256,7 +284,7 @@ fn render_site(b: &ServerBlock<'_>, logs: &str) -> Result<String> {
         fastcgi_param SCRIPT_FILENAME $realpath_root$fastcgi_script_name;
         fastcgi_param DOCUMENT_ROOT $realpath_root;
         fastcgi_hide_header X-Powered-By;
-        fastcgi_pass unix:{};
+{timeouts}        fastcgi_pass unix:{};
     }}
 ",
                 safe_path_str(sock)?
@@ -289,7 +317,7 @@ fn render_site(b: &ServerBlock<'_>, logs: &str) -> Result<String> {
         "    root {root};
     index {index};
 
-{logs}    autoindex off;
+{logs}{body_size}    autoindex off;
     # Refuse to serve through symlinks whose target the tenant does not own.
     disable_symlinks if_not_owner;
 
@@ -460,6 +488,7 @@ mod tests {
             php_socket: None,
             app_socket: None,
             acme_challenge_dir: Path::new("/var/lib/oxpanel-acme/challenges"),
+            php_tuning: None,
             tls: None,
         })?;
         assert!(s.starts_with(HEADER));
@@ -499,6 +528,7 @@ mod tests {
                 php_socket: None,
                 app_socket: None,
                 acme_challenge_dir: Path::new("/var/lib/oxpanel-acme/challenges"),
+                php_tuning: None,
                 tls: None,
             });
             assert!(r.is_err(), "{bad}");
@@ -640,6 +670,7 @@ mod tests {
             php_socket: None,
             app_socket: None,
             acme_challenge_dir: Path::new("/var/lib/oxpanel-acme/challenges"),
+            php_tuning: None,
             tls: None,
         })?;
         assert!(s.contains("server_name example.com www.example.com;"));
@@ -664,6 +695,7 @@ mod tests {
             php_socket: Some(Path::new("/run/oxpanel-php/alice/php.sock")),
             app_socket: None,
             acme_challenge_dir: Path::new("/var/lib/oxpanel-acme/challenges"),
+            php_tuning: None,
             tls: None,
         })?;
         assert!(s.contains("index index.php index.html index.htm;"));
@@ -689,6 +721,7 @@ mod tests {
             php_socket: Some(Path::new("/run/x.sock; include /etc/shadow")),
             app_socket: None,
             acme_challenge_dir: Path::new("/var/lib/oxpanel-acme/challenges"),
+            php_tuning: None,
             tls: None,
         });
         assert!(bad.is_err());
@@ -709,6 +742,7 @@ mod tests {
             php_socket: None,
             app_socket: Some(Path::new("/run/oxpanel-app/example.com/app.sock")),
             acme_challenge_dir: Path::new("/var/lib/oxpanel-acme/challenges"),
+            php_tuning: None,
             tls: None,
         })?;
         assert!(s.contains("location / {\n        try_files $uri @app;\n    }"));
@@ -731,6 +765,7 @@ mod tests {
             php_socket: None,
             app_socket: Some(Path::new("/run/a.sock:/admin; proxy_pass http://evil")),
             acme_challenge_dir: Path::new("/var/lib/oxpanel-acme/challenges"),
+            php_tuning: None,
             tls: None,
         });
         assert!(bad.is_err());
@@ -758,6 +793,7 @@ mod tests {
             php_socket: php,
             app_socket: app,
             acme_challenge_dir: Path::new("/var/lib/oxpanel-acme/challenges"),
+            php_tuning: None,
             tls: Some(tls),
         };
         for (php, app, marker) in [
@@ -794,6 +830,51 @@ mod tests {
             ..block(None, None)
         })
         .is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn php_tuning_raises_the_body_size_and_timeouts_and_nothing_else() -> Result<()> {
+        let alice = Username::parse("alice")?;
+        let domain = d("example.com");
+        let block = |tuning: Option<PhpTuning>, php: bool| ServerBlock {
+            domain: &domain,
+            aliases: &[],
+            tenant: &alice,
+            document_root: Path::new("/home/alice/public_html"),
+            suspended: false,
+            access_log: Path::new("/var/log/nginx/oxpanel/example.com.access.log"),
+            error_log: Path::new("/var/log/nginx/oxpanel/example.com.error.log"),
+            php_socket: php.then_some(Path::new("/run/oxpanel-php/alice/example.com.sock")),
+            app_socket: None,
+            acme_challenge_dir: Path::new("/var/lib/oxpanel-acme/challenges"),
+            tls: None,
+            php_tuning: tuning,
+        };
+        let tuning = PhpTuning {
+            client_max_body_mb: Some(65),
+            read_timeout_secs: Some(150),
+            send_timeout_secs: Some(90),
+        };
+        let plain = render_server_block(&block(None, true))?;
+        let tuned = render_server_block(&block(Some(tuning), true))?;
+        // Exactly three lines more, in the right places.
+        let expected = plain
+            .replace(
+                "    server_tokens off;\n    autoindex off;",
+                "    server_tokens off;\n    client_max_body_size 65m;\n    autoindex off;",
+            )
+            .replace(
+                "        fastcgi_hide_header X-Powered-By;\n",
+                "        fastcgi_hide_header X-Powered-By;\n        fastcgi_read_timeout 150s;\n        fastcgi_send_timeout 90s;\n",
+            );
+        assert_ne!(plain, tuned);
+        assert_eq!(tuned, expected);
+        // Without PHP the tuning has nothing to apply to.
+        assert_eq!(
+            render_server_block(&block(Some(tuning), false))?,
+            render_server_block(&block(None, false))?
+        );
         Ok(())
     }
 }

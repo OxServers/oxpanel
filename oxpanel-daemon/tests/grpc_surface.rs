@@ -105,6 +105,18 @@ fn scope_table() -> BTreeMap<&'static str, Scope> {
         ("PurgeDatabaseTrash", Scope::VHost),
         ("RestoreBackupDatabase", Scope::Tenant),
         ("RestoreRetainedBackupDatabase", Scope::Delete),
+        // Essentials: a customer manages its own scheduled tasks and PHP
+        // settings (the customer tier's write scope); a plan's PHP caps and
+        // the backup schedule are the operator's, like CreateBackup.
+        ("PutScheduledTask", Scope::VHost),
+        ("DeleteScheduledTask", Scope::VHost),
+        ("ListScheduledTasks", Scope::Read),
+        ("RunScheduledTask", Scope::VHost),
+        ("ReadScheduledTaskLog", Scope::Read),
+        ("SetPhpSettings", Scope::VHost),
+        ("SetTenantPhpLimits", Scope::Tenant),
+        ("SetBackupSchedule", Scope::Tenant),
+        ("GetBackupSchedule", Scope::Read),
     ]
     .into_iter()
     .collect()
