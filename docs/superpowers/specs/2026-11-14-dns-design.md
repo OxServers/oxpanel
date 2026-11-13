@@ -85,8 +85,10 @@ the transfer key only (it lists every hosted domain).
 **The daemon keeps `PrivateNetwork=yes`.** It validates with the checkers
 (local files only) and starts/reloads the unit with `systemctl`. `rndc`
 needs TCP on the loopback, so it runs in a transient unit (`systemd-run
---wait`, no capabilities, read-only system), its output written by systemd
-to a root-only scratch file — the pattern `xfs_quota` already uses. No
+--wait`, no capabilities, read-only system), its output discarded (under
+SELinux rndc runs in `ndc_t`, which may not write a file systemd opened for
+it — found on the VM; the exit status says enough, and the server logs the
+command). No
 `ReadWritePaths` change was needed (`/etc` and `/var/lib` were writable).
 
 ## Validate, activate, roll back

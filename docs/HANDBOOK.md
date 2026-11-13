@@ -1054,6 +1054,12 @@ publishes the DS (the domain would stop resolving for every validating
 resolver), and refuses without `--force` when it cannot check. Switching on
 again creates a new key: a new DS for the registrar.
 
+**Switching DNS hosting off** (`OXPANEL_DNS=false`) stops creating and
+changing zones but deletes nothing: the server keeps serving the zones that
+exist, and tenants owning zones cannot be deleted. Delete the zones first
+(`dns zone-list`, then `dns zone-delete <zone> --tenant <t>`, which works
+while BIND is installed), then `systemctl disable --now oxpanel-dns`.
+
 **Backups.** Zones are engine records (`/var/lib/oxpanel/dns-zones`), not
 tenant files, so tenant backups do not contain them; back up
 `/var/lib/oxpanel` (with the rest of the engine's state) and

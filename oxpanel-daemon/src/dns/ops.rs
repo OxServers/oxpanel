@@ -236,24 +236,19 @@ async fn write_zone(
 /// Run rndc with `args`; if the server is not running, start it instead
 /// (it then loads everything from its files).
 async fn rndc(ctx: &Ctx, args: &[&str]) -> Result<()> {
-    let out_path = bind::scratch_file(&ctx.config, "rndc")?;
-    let result = ctx.sys.run(bind::rndc(&ctx.config, &out_path, args)?).await;
-    let text = fsutil::read_optional(&out_path);
-    fsutil::remove_if_exists(&out_path)?;
-    let result = result?;
+    let result = ctx.sys.run(bind::rndc(&ctx.config, args)).await?;
     if result.success() {
         return Ok(());
     }
-    let said = String::from_utf8_lossy(&text?.unwrap_or_default())
-        .trim()
-        .to_owned();
     if !server_active(ctx).await? {
-        warn!(output = %said, "the DNS server is not running; starting it");
+        warn!("the DNS server is not running; starting it");
         return start_server(ctx).await;
     }
     Err(Error::Internal(format!(
-        "rndc {} failed: {said}",
-        args.join(" ")
+        "rndc {} failed ({}); see `journalctl -u {}`",
+        args.join(" "),
+        result.combined_lossy(),
+        bind::SERVICE
     )))
 }
 

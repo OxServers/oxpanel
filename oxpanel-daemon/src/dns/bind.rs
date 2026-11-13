@@ -316,16 +316,15 @@ pub fn checkzone(zone: &str, file: &Path, timeout: Duration) -> CommandSpec {
 }
 
 /// `rndc <args>` against the server, run in a transient unit: the daemon
-/// has no network, and the control channel is TCP on the loopback. The
-/// output goes to a root-only file (systemd opens it), never a pipe.
-pub fn rndc(cfg: &Config, out: &Path, args: &[&str]) -> Result<CommandSpec> {
+/// has no network, and the control channel is TCP on the loopback. Its
+/// output is discarded: under SELinux rndc runs in `ndc_t`, which may not
+/// write to a file systemd opened for it; the exit status says enough, and
+/// the server logs what it did with the command.
+pub fn rndc(cfg: &Config, args: &[&str]) -> CommandSpec {
     let l = Layout::new(&cfg.dns);
     let mut cmd = CommandSpec::new(bin::SYSTEMD_RUN, RNDC_TIMEOUT)
         .args(["--wait", "--collect", "--quiet"])
-        .arg(format!(
-            "--property=StandardOutput=truncate:{}",
-            safe_path_str(out)?
-        ));
+        .arg("--property=StandardOutput=null");
     for p in [
         "CapabilityBoundingSet=",
         "ProtectSystem=strict",
@@ -337,12 +336,11 @@ pub fn rndc(cfg: &Config, out: &Path, args: &[&str]) -> Result<CommandSpec> {
     ] {
         cmd = cmd.arg(format!("--property={p}"));
     }
-    Ok(cmd
-        .arg("--")
+    cmd.arg("--")
         .arg(bin::RNDC)
         .arg("-c")
         .arg(l.rndc_conf())
-        .args(args))
+        .args(args)
 }
 
 /// A fresh output file for a transient unit, in the root-only scratch
@@ -457,7 +455,7 @@ zone \"signed.example\" {
     }
 
     #[test]
-    fn exact_argv_of_the_checkers_and_rndc() -> Result<()> {
+    fn exact_argv_of_the_checkers_and_rndc() {
         let t = Duration::from_secs(5);
         let argv = |c: &CommandSpec| -> Vec<String> {
             let (p, a) = c.exec_plan();
@@ -493,17 +491,13 @@ zone \"signed.example\" {
         );
         let cfg = Config::default();
         assert_eq!(
-            argv(&rndc(
-                &cfg,
-                Path::new("/run/oxpanel/scratch/rndc-1.out"),
-                &["reload", "example.com"]
-            )?),
+            argv(&rndc(&cfg, &["reload", "example.com"])),
             [
                 "/usr/bin/systemd-run",
                 "--wait",
                 "--collect",
                 "--quiet",
-                "--property=StandardOutput=truncate:/run/oxpanel/scratch/rndc-1.out",
+                "--property=StandardOutput=null",
                 "--property=CapabilityBoundingSet=",
                 "--property=ProtectSystem=strict",
                 "--property=ProtectHome=yes",
@@ -519,6 +513,5 @@ zone \"signed.example\" {
                 "example.com"
             ]
         );
-        Ok(())
     }
 }

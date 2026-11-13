@@ -1686,6 +1686,10 @@ CONF
   check "its MX still answers, its site's A does not" bash -c "test \"\$(dig +short @127.0.0.1 dnsa.oxtest MX | wc -l)\" = 2 && test -z \"\$(dig +short @127.0.0.1 dnsa.oxtest A)\""
   check "reset to defaults removes the tenant's records" bash -c "oxpanel-ctl dns zone-reset dnsa.oxtest --tenant dnsa | grep -q '^zone=dnsa.oxtest .* records=0 '"
   for z in dnsa.oxtest sig.parent.oxtest; do check "delete zone $z" grep -q '^deleted=true' <(oxpanel-ctl dns zone-delete "$z" --tenant dnsa); done
+  # The sites of the earlier sections got zones when DNS hosting was switched
+  # on; switching it off again (below) leaves zones alone, so they go first.
+  oxpanel-ctl dns zone-list | sed -n 's/^zone=\([^ ]*\) tenant=\([^ ]*\) .*/\1 \2/p' > "$DT/zones.left"
+  while read -r z t; do oxpanel-ctl dns zone-delete "$z" --tenant "$t" >/dev/null; done < "$DT/zones.left"
   left="$(ls -A /var/lib/oxpanel-dns/zones /var/lib/oxpanel-dns/keys | grep -v -e '^catalog.oxpanel.invalid.zone' -e '^/' -e '^$' || true)"
   [ -z "$left" ] || echo "left behind: $left"
   check "no zone file or key left" test -z "$left"
