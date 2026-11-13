@@ -629,6 +629,9 @@ needs to confirm a site is live, poll it.
 | `/var/lib/oxpanel-backups/<tenant>/<id>/` | `root 0700`, files `0600` | one backup: `home.tar.gz`, `records.json`, `manifest.json` (written last; a directory without it is not a backup) |
 | `oxpanel-job-<id>.service` | transient | a running backup or restore (in the tenant's slice); gone once the daemon has recorded its result |
 | SELinux hosts | | `semanage fcontext` equivalence `<docroot> = /usr/share/nginx/html` (labels the tree `httpd_sys_content_t`; a plain rule would be overridden by `file_contexts.homedirs`) |
+| `/var/lib/oxpanel/dns-zones/<zone>.json` | `root 0600` | DNS zone record: tenant, serial, the tenant's records, DNSSEC on/off |
+| `/etc/named/oxpanel/` | `root:named 0750`, files `0640` | OxPanel's BIND configuration (`named.conf`, `zones.conf`, `rndc.conf`) and keys (`rndc.key`, `transfer.key` — secrets) |
+| `/var/lib/oxpanel-dns/{zones,keys,data}` | `root:named 0750`; keys `named 0700` | zone files (and the server's signed copies), DNSSEC keys (private halves `named 0600`), the server's working directory; SELinux `named_cache_t` |
 
 Records are the source of truth for *what OxPanel owns*. Back up
 `/var/lib/oxpanel` together with `/home` and `/etc/nginx/oxpanel.d`. The
@@ -883,6 +886,201 @@ system's figure instead of walking the home. If the option is ever lost, the
 kernel stops enforcing the limits and `host reconcile` reports every tenant
 with a disk limit (`DISK_QUOTA_DRIFT`).
 
+### 9.2 DNS hosting: this host as the name server of its customers' domains
+
+With DNS hosting on, the host answers authoritatively for its tenants'
+domains: every site gets a zone by itself (for its registrable domain:
+`shop.example.co.uk` → `example.co.uk`) with address records pointing at
+this host, and customers add their own records (mail, verification, …)
+through the panel. The server is BIND, which OxPanel runs as its own
+service, `oxpanel-dns.service`, with its own configuration in
+`/etc/named/oxpanel` and `/var/lib/oxpanel-dns`; the distribution's
+`/etc/named.conf` and `named.service` are not used (leave `named.service`
+disabled: both want port 53).
+
+**What you need.** Two name-server host names under a domain you control,
+e.g. `ns1.example.net` and `ns2.example.net`; this host's public address(es);
+port 53 open for TCP *and* UDP; ideally a second server as secondary (below).
+
+```sh
+# The RPM recommends these; install them if they are missing.
+sudo dnf -y install bind bind-utils publicsuffix-list
+sudo tee -a /etc/oxpanel/daemon.env >/dev/null <<'EOF'
+OXPANEL_DNS=true
+OXPANEL_DNS_NAMESERVERS=ns1.example.net,ns2.example.net
+OXPANEL_DNS_SOA_CONTACT=hostmaster@example.net
+# The PUBLIC addresses: behind NAT, not the interface's private address.
+OXPANEL_DNS_IPV4=203.0.113.10
+OXPANEL_DNS_IPV6=2001:db8::10
+EOF
+sudo oxpanel-daemon --check-config && sudo systemctl restart oxpanel-daemon
+oxpanel-ctl host info | grep ^dns          # dns=true dns_available=true dns_server_running=true …
+sudo firewall-cmd --permanent --add-service=dns && sudo firewall-cmd --reload   # 53/tcp and 53/udp
+```
+
+At start the daemon writes the server's configuration, generates its keys,
+creates zones for the sites that exist, and starts `oxpanel-dns.service`.
+`dns_warning=` lines in `host info` tell you what is missing (one name
+server only, no secondary, a stock `named.service` running).
+
+**At the registrar of `example.net`** (the domain of the name servers):
+register `ns1.example.net` and `ns2.example.net` as *host records* with
+**glue** — `ns1` → `203.0.113.10` (this host), `ns2` → the secondary's
+address (or this host's again, see below). Inside the zone of `example.net`
+the same names need address records: if `example.net` is hosted here,
+`oxpanel-ctl dns zone-create example.net --tenant <operator tenant>` and
+`dns record-add example.net --tenant … --name ns1 --type a --value 203.0.113.10`
+(and `ns2`). **At the registrar of each customer domain**, its name servers
+are set to `ns1.example.net` and `ns2.example.net` — nothing else, no glue.
+`oxpanel-ctl dns zone-check <zone> --tenant <t>` then reports
+`delegation=DELEGATED`; anything else comes with what to change.
+
+**One server as ns1 and ns2.** Both names may point at this host. That
+works — resolvers get their answers — but there is no redundancy: when the
+host is down, the domains do not resolve at all, including their mail.
+Some registrars refuse two names on one address. `host info` flags it.
+
+**A secondary name server** (any BIND, Knot or PowerDNS server; it need not
+be an OxPanel host). Zones reach it by NOTIFY and zone transfer signed with
+the TSIG key OxPanel generated, and it learns which zones exist from
+OxPanel's catalog zone, so it is configured once. On the primary:
+
+```sh
+echo 'OXPANEL_DNS_SECONDARIES=198.51.100.20' | sudo tee -a /etc/oxpanel/daemon.env
+sudo systemctl restart oxpanel-daemon
+# Copy the key to the secondary over a secure channel (it is a secret: root:named 0640):
+sudo scp /etc/named/oxpanel/transfer.key root@198.51.100.20:/etc/named/oxpanel-transfer.key
+# The secondary transfers over TCP 53 from this host: allow it if the firewall restricts 53.
+```
+
+On a BIND secondary (`/etc/named.conf`, AlmaLinux paths; it must listen
+publicly and allow queries — `listen-on port 53 { any; }; allow-query { any; };
+recursion no;`):
+
+```
+include "/etc/named/oxpanel-transfer.key";      // root:named 0640
+server 203.0.113.10 { keys { "oxpanel-transfer"; }; };
+options {
+    // … your options, plus:
+    catalog-zones {
+        zone "catalog.oxpanel.invalid"
+            default-masters { 203.0.113.10 key "oxpanel-transfer"; }
+            zone-directory "/var/named/slaves";
+    };
+};
+zone "catalog.oxpanel.invalid" {
+    type slave;
+    file "/var/named/slaves/oxpanel-catalog.db";
+    masters { 203.0.113.10 key "oxpanel-transfer"; };
+};
+```
+
+Every zone created on the primary appears on the secondary within seconds,
+deleted ones go, and signed zones are served signed. A secondary without
+catalog support needs a `zone` statement per zone (`oxpanel-ctl dns
+zone-list`). `host reconcile` reports a secondary serving an older serial
+(`DNS_SECONDARY_DRIFT`); `dns zone-check` shows each server's serial. To
+rotate the key: remove `/etc/named/oxpanel/transfer.key`, restart the daemon
+(it makes a new one), copy it to every secondary again.
+
+**Zones and records** (what the panel does through the API):
+
+```sh
+oxpanel-ctl dns zone-list --tenant acme
+oxpanel-ctl dns zone-show acme.example --tenant acme     # every record; the engine's are protected=true
+oxpanel-ctl dns record-add acme.example --tenant acme --name blog --type cname --value acme.blogs.example.net
+oxpanel-ctl dns record-add acme.example --tenant acme --name @ --type caa --caa-tag issue --value letsencrypt.org
+oxpanel-ctl dns record-update acme.example 7 --tenant acme --name blog --type cname --value new.blogs.example.net
+oxpanel-ctl dns record-remove acme.example 7 --tenant acme
+oxpanel-ctl dns zone-reset acme.example --tenant acme    # only the engine's records remain
+oxpanel-ctl vhost set other.example --tenant acme --no-dns   # this domain's DNS stays elsewhere
+```
+
+Names are relative to the zone (`@`, `www`, `_dmarc`); host names absolute.
+The engine keeps the SOA, the apex NS records and the address records of
+the tenant's sites; they cannot be overwritten (to point a site's name at a
+CDN, opt the site out with `--no-dns` or drop that name from the site). A
+zone created for a site goes with its last site, unless the customer added
+records to it: those keep working (its mail, say) until the zone is
+deleted (`dns zone-delete`). A suspended tenant's zones keep answering,
+unchanged (its sites answer 503); they can be changed again after resume.
+`tenant delete` is refused while the tenant has zones.
+
+**Worked example: mail at an external provider.** OxPanel does not host
+mail (yet), so no mail records are created by default. For a provider that
+gives these values:
+
+```sh
+Z="--tenant acme acme.example"
+# Mail servers, by priority
+oxpanel-ctl dns record-add $Z --name @ --type mx --priority 10 --value mx1.mailhost.example
+oxpanel-ctl dns record-add $Z --name @ --type mx --priority 20 --value mx2.mailhost.example
+# SPF (one TXT at the apex; long values are split into 255-byte strings by the engine)
+oxpanel-ctl dns record-add $Z --name @ --type txt --value "v=spf1 include:_spf.mailhost.example ~all"
+# DKIM: either the key as TXT (save the provider's "v=DKIM1; k=rsa; p=…" in a file) …
+oxpanel-ctl dns record-add $Z --name s1._domainkey --type txt --value-file dkim-s1.txt
+# … or, if the provider hosts the key, a CNAME
+oxpanel-ctl dns record-add $Z --name s2._domainkey --type cname --value s2.domainkey.u123.mailhost.example
+# DMARC
+oxpanel-ctl dns record-add $Z --name _dmarc --type txt --value "v=DMARC1; p=quarantine; rua=mailto:dmarc@acme.example"
+# Domain verification and autodiscovery, if the provider asks for them
+oxpanel-ctl dns record-add $Z --name @ --type txt --value "mailhost-verification=4f1c2a"
+oxpanel-ctl dns record-add $Z --name _autodiscover._tcp --type srv --priority 0 --weight 1 --port 443 --value autodiscover.mailhost.example
+# A domain that sends no mail at all: a null MX
+# oxpanel-ctl dns record-add $Z --name @ --type mx --priority 0 --value .
+dig +short MX acme.example @203.0.113.10       # check
+```
+
+An MX must name a host with an address, never a CNAME; an MX pointing at a
+name inside the zone needs that name's A/AAAA record first (the server's
+checker refuses it otherwise, with its reason).
+
+**DNSSEC.** Per zone; BIND generates the key, signs, and keeps the
+signatures fresh by itself (ECDSA P-256, NSEC3):
+
+```sh
+oxpanel-ctl dns dnssec acme.example on --tenant acme
+oxpanel-ctl dns zone-show acme.example --tenant acme | grep -E 'dnssec=|^ds=|^dnskey='
+# dnssec=signed … ds=acme.example. IN DS 29363 13 2 79D3…   ← give this to the registrar
+oxpanel-ctl dns zone-check acme.example --tenant acme      # ds_at_parent=1 ds_matches=true once published
+```
+
+The key is kept for as long as the zone is signed (no automatic rollover),
+so the DS at the registrar never has to change. **Switching off — in this
+order:** remove the DS at the registrar; wait until it has expired from
+resolvers' caches (its TTL; one to two days to be safe); then
+`dns dnssec <zone> off`. The engine refuses while the parent still
+publishes the DS (the domain would stop resolving for every validating
+resolver), and refuses without `--force` when it cannot check. Switching on
+again creates a new key: a new DS for the registrar.
+
+**Backups.** Zones are engine records (`/var/lib/oxpanel/dns-zones`), not
+tenant files, so tenant backups do not contain them; back up
+`/var/lib/oxpanel` (with the rest of the engine's state) and
+`/var/lib/oxpanel-dns/keys` (signing keys: a signed zone restored without
+them is signed with a new key, i.e. a new DS at the registrar).
+
+**My domain does not resolve — checklist.**
+
+1. `oxpanel-ctl dns zone-check <zone> --tenant <t>`: `delegation=` and the
+   `guidance=` line. `ELSEWHERE`/`PARTIAL`: fix the name servers at the
+   registrar (changes take up to the parent's TTL, often hours).
+   `NOT_FOUND`: the domain is not registered (or misspelt).
+2. `dig @<this host's public address> <zone> SOA` from *another* network:
+   no answer → port 53 TCP/UDP closed (`firewall-cmd --list-services`,
+   cloud security groups) or `oxpanel-dns` not running
+   (`systemctl status oxpanel-dns`, `journalctl -u oxpanel-dns`).
+3. `REFUSED` for the zone: it does not exist here (`dns zone-list`) or the
+   site opted out (`vhost list` shows `dns_zone=opted-out`); a site inside
+   another tenant's zone gets no records (`dns_zone=-`).
+4. `SERVFAIL` from public resolvers but answers from this host: a DS at the
+   registrar that does not match the zone's key (DNSSEC was switched off or
+   on again): `dns zone-check` shows `ds_matches=false`; put the current DS
+   at the registrar or remove it.
+5. The name servers' own names do not resolve: glue missing at the
+   registrar of their domain, or no A record for `ns1`/`ns2` in that zone.
+6. `host reconcile`: a zone the server does not serve, a secondary behind.
+
 ## 10. Troubleshooting
 
 | Symptom | Cause / fix |
@@ -923,6 +1121,10 @@ with a disk limit (`DISK_QUOTA_DRIFT`).
 | `FailedPrecondition: disk quotas are not available: …` | The file system holding `/home` does not enforce user quotas; the message says what to change (§9.1). |
 | `FailedPrecondition: SFTP is not available on this host: …` | sshd is missing, rejected the drop-in, or would not apply it (e.g. `sshd_config` has no `Include /etc/ssh/sshd_config.d/*.conf`); the message says which. |
 | SFTP login fails with "Permission denied (publickey)" | Wrong key, tenant suspended (no keys file), or the key was removed. `journalctl -u sshd` shows sshd's reason. |
+| `FailedPrecondition: DNS hosting is not available on this host: …` | The message names what is missing: `OXPANEL_DNS=true` and its settings (§9.2), `dnf install bind`, or `dnf install publicsuffix-list`. |
+| A customer's domain does not resolve | See the checklist at the end of §9.2 (`oxpanel-ctl dns zone-check` first). |
+| `InvalidArgument: the DNS server rejected the zone: …` | BIND's own checker refused the change (its words follow, e.g. an MX pointing at a name of the zone without an address); nothing was changed or reloaded. |
+| `FailedPrecondition: the parent zone still publishes a DS record …` | DNSSEC can only be switched off after the DS is removed at the registrar and has expired from caches (§9.2). |
 | SFTP connection is closed before authentication | OpenSSH 9.8+ (AlmaLinux 9.8 ships 9.9) briefly blocks an address after repeated failed logins (`PerSourcePenalties`); it lifts by itself. This applies to the host's whole sshd, not only tenants. |
 
 ## 11. Development and testing

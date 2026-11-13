@@ -17,6 +17,7 @@ if [ "${SKIP_INSTALL:-0}" != 1 ]; then
   install -m0755 /work/target/release/oxpanel-ctl /usr/bin/oxpanel-ctl
   install -Dm0755 /work/target/release/oxpanel-acme /usr/libexec/oxpanel/oxpanel-acme
   install -Dm0644 /work/packaging/systemd/oxpanel-daemon.service /etc/systemd/system/oxpanel-daemon.service
+  install -Dm0644 /work/packaging/systemd/oxpanel-dns.service /etc/systemd/system/oxpanel-dns.service
   install -Dm0644 /work/packaging/sysusers.d/oxpanel.conf /usr/lib/sysusers.d/oxpanel.conf
   install -Dm0644 /work/packaging/tmpfiles.d/oxpanel.conf /usr/lib/tmpfiles.d/oxpanel.conf
   install -Dm0640 /work/packaging/daemon.env /etc/oxpanel/daemon.env
@@ -1414,6 +1415,289 @@ check "a missing web-server account is refused" bash -c '! OXPANEL_WEB_USER=nosu
 check "root as the web-server account is refused" bash -c '! OXPANEL_WEB_USER=root /usr/sbin/oxpanel-daemon --check-config >/dev/null 2>&1'
 check "a tenant as the web-server account is refused" bash -c '! OXPANEL_WEB_USER=bob /usr/sbin/oxpanel-daemon --check-config >/dev/null 2>&1'
 check "a missing socket group is refused" bash -c '! OXPANEL_SOCKET_GROUP=nosuchgrp1 /usr/sbin/oxpanel-daemon --check-config >/dev/null 2>&1'
+
+echo "== DNS hosting"
+if [ -x /usr/sbin/named ] && [ -x /usr/bin/dig ] && [ -f /usr/share/publicsuffix/public_suffix_list.dat ]; then
+  DT=/root/dns-test; rm -rf "$DT"; mkdir -p "$DT"
+  P=127.0.0.1
+  dq() { dig +norec +time=2 +tries=2 @"$P" "$@"; }
+  ds() { dig +short +norec +time=2 +tries=2 @"$P" "$@"; }
+  sec() { dig +short +norec +time=2 +tries=2 @"$P" -p 853 "$@"; }
+  soa_serial() { dig +short +norec +time=2 +tries=1 @"$P" ${2:+-p "$2"} "$1" SOA | awk '{print $3}'; }
+  zone_file() { cat "/var/lib/oxpanel-dns/zones/$1.zone"; }
+  eventually() { local n="$1"; shift; for _ in $(seq 1 "$n"); do "$@" >/dev/null 2>&1 && return 0; sleep 0.5; done; "$@"; }
+  check "DNS hosting is off by default" grep -q '^dns=false ' <(oxpanel-ctl host info)
+  check_not "a zone is refused while DNS hosting is off" oxpanel-ctl dns zone-create dnsa.oxtest --tenant alice
+  check "--check-config refuses DNS hosting without its settings" bash -c 'OXPANEL_DNS=true /usr/sbin/oxpanel-daemon --check-config 2>&1 | grep -q OXPANEL_DNS_NAMESERVERS'
+  cp -p /etc/oxpanel/daemon.env "$DT/daemon.env.bak"
+  printf '%s\n' OXPANEL_DNS=true OXPANEL_DNS_NAMESERVERS=ns1.oxtest.example,ns2.oxtest.example \
+    OXPANEL_DNS_SOA_CONTACT=hostmaster@oxtest.example OXPANEL_DNS_IPV4=192.0.2.80 OXPANEL_DNS_IPV6=2001:db8::80 \
+    OXPANEL_DNS_SECONDARIES=127.0.0.1:853 OXPANEL_DNS_CHECK_RESOLVER=127.0.0.1:853 >> /etc/oxpanel/daemon.env
+  systemctl restart oxpanel-daemon
+  check "the DNS server was set up and started by the daemon" eventually 40 systemctl -q is-active oxpanel-dns
+  check "host info: DNS hosting available, server running" grep -q '^dns=true dns_available=true dns_server_running=true ' <(oxpanel-ctl host info)
+  check "host info: the name servers and addresses" grep -q 'nameservers=ns1.oxtest.example,ns2.oxtest.example secondaries=127.0.0.1:853 ipv4=192.0.2.80 ipv6=2001:db8::80' <(oxpanel-ctl host info)
+  check "host info: no warnings (a secondary is configured)" bash -c '! oxpanel-ctl host info | grep -q ^dns_warning='
+  check "configuration owned root:named 0640" test "$(stat -c '%U:%G %a' /etc/named/oxpanel/named.conf /etc/named/oxpanel/transfer.key /etc/named/oxpanel/rndc.key | sort -u)" = "root:named 640"
+  check "the distribution's named.conf is untouched" bash -c '! rpm -V bind | grep -q " /etc/named.conf$"'
+  check "the stock named.service is not running" bash -c '! systemctl -q is-active named'
+  check "named runs as named" test "$(ps -o user= -C named | sort -u)" = "named"
+  check "version is hidden" bash -c '! dig +short @127.0.0.1 version.bind CH TXT | grep -qi bind'
+  check "recursion is refused (not an open resolver)" grep -q 'status: REFUSED' <(dq +rec example.org A)
+  check "no recursion offered" bash -c '! dig +rec @127.0.0.1 example.org A | grep -q "flags:.* ra"'
+
+  # A plain secondary (a second BIND instance, as an operator would set one
+  # up elsewhere): the transfer key, the primary, and the catalog. Port 853
+  # is labelled dns_port_t by the stock policy.
+  install -d -o named -g named -m 0770 /var/named/slaves/oxtest
+  cat > /etc/named/oxtest-secondary.conf <<'CONF'
+include "/etc/named/oxpanel/transfer.key";
+options {
+    directory "/var/named/slaves/oxtest";
+    pid-file none;
+    session-keyfile none;
+    listen-on port 853 { 127.0.0.1; };
+    listen-on-v6 { none; };
+    recursion no;
+    dnssec-validation no;
+    catalog-zones {
+        zone "catalog.oxpanel.invalid" default-masters { 127.0.0.1 key "oxpanel-transfer"; } zone-directory "/var/named/slaves/oxtest";
+    };
+};
+controls { };
+server 127.0.0.1 { keys { "oxpanel-transfer"; }; };
+zone "catalog.oxpanel.invalid" { type slave; file "/var/named/slaves/oxtest/catalog.db"; masters { 127.0.0.1 key "oxpanel-transfer"; }; };
+// Not served by OxPanel: a parent for the DNSSEC test, and a domain delegated elsewhere.
+zone "parent.oxtest" { type master; file "/var/named/slaves/oxtest/parent.oxtest.db"; };
+zone "elsewhere.oxtest" { type master; file "/var/named/slaves/oxtest/elsewhere.oxtest.db"; };
+CONF
+  printf 'parent.oxtest. 60 IN SOA ns.parent.oxtest. h.parent.oxtest. 1 60 60 600 60\nparent.oxtest. 60 IN NS ns.parent.oxtest.\nns.parent.oxtest. 60 IN A 192.0.2.53\n' > /var/named/slaves/oxtest/parent.oxtest.db
+  printf 'elsewhere.oxtest. 60 IN SOA ns1.other.example. h.other.example. 1 60 60 600 60\nelsewhere.oxtest. 60 IN NS ns1.other.example.\nelsewhere.oxtest. 60 IN NS ns2.other.example.\n' > /var/named/slaves/oxtest/elsewhere.oxtest.db
+  chown named:named /var/named/slaves/oxtest/*.db
+  [ "$(getenforce 2>/dev/null)" = Enforcing ] && restorecon -R /etc/named/oxtest-secondary.conf /var/named/slaves/oxtest
+  check "the test secondary's configuration is valid" named-checkconf /etc/named/oxtest-secondary.conf
+  check "start the test secondary" systemd-run --unit=oxtest-dns-secondary --quiet /usr/sbin/named -f -u named -c /etc/named/oxtest-secondary.conf
+  check "the test secondary answers" eventually 20 bash -c "dig +short @127.0.0.1 -p 853 parent.oxtest SOA | grep -q ns.parent.oxtest"
+
+  echo "-- zones follow sites"
+  for t in dnsa dnsb; do oxpanel-ctl tenant create "$t" --memory 128M >/dev/null; done
+  check "site dnsa.oxtest with aliases" grep -q '^changed=true' <(oxpanel-ctl vhost set dnsa.oxtest --tenant dnsa --alias www.dnsa.oxtest --no-auto-https)
+  check "the site reports its zone" grep -q ' dns_zone=dnsa.oxtest$' <(oxpanel-ctl vhost list --tenant dnsa)
+  check "a zone was created for the site" grep -q '^zone=dnsa.oxtest tenant=dnsa automatic=true ' <(oxpanel-ctl dns zone-list)
+  check "SOA from the configured name server and contact" grep -q '^ns1.oxtest.example. hostmaster.oxtest.example. [0-9]* 7200 3600 1209600 3600$' <(ds dnsa.oxtest SOA)
+  check "NS records of the configured name servers" test "$(ds dnsa.oxtest NS | sort | tr '\n' ' ')" = "ns1.oxtest.example. ns2.oxtest.example. "
+  check "A of the apex" test "$(ds dnsa.oxtest A)" = 192.0.2.80
+  check "AAAA of the apex" test "$(ds dnsa.oxtest AAAA)" = 2001:db8::80
+  check "A of the www alias" test "$(ds www.dnsa.oxtest A)" = 192.0.2.80
+  check "answers are authoritative" grep -q 'flags: qr aa' <(dq dnsa.oxtest A)
+  check "a name nobody created is NXDOMAIN" grep -q 'status: NXDOMAIN' <(dq nope.dnsa.oxtest A)
+  check "the zone file is root's, 0644" test "$(stat -c '%U %a' /var/lib/oxpanel-dns/zones/dnsa.oxtest.zone)" = "root 644"
+  check "the secondary got the zone through the catalog" eventually 40 bash -c "test \"\$(dig +short @127.0.0.1 -p 853 dnsa.oxtest A)\" = 192.0.2.80"
+  check "and serves the primary's serial" eventually 40 bash -c "test \"\$(dig +short @127.0.0.1 -p 853 dnsa.oxtest SOA | awk '{print \$3}')\" = \"\$(dig +short @127.0.0.1 dnsa.oxtest SOA | awk '{print \$3}')\""
+  s1="$(soa_serial dnsa.oxtest)"
+  check "an alias added later gets its records" grep -q '^changed=true' <(oxpanel-ctl vhost set dnsa.oxtest --tenant dnsa --alias www.dnsa.oxtest --alias shop.dnsa.oxtest --no-auto-https)
+  check "shop.dnsa.oxtest resolves" eventually 10 bash -c "test \"\$(dig +short @127.0.0.1 shop.dnsa.oxtest A)\" = 192.0.2.80"
+  check "the serial increased" test "$(soa_serial dnsa.oxtest)" -gt "$s1"
+  check "the secondary follows the change (NOTIFY + transfer)" eventually 40 bash -c "test \"\$(dig +short @127.0.0.1 -p 853 shop.dnsa.oxtest A)\" = 192.0.2.80"
+  check "an alias removed loses its records" grep -q '^changed=true' <(oxpanel-ctl vhost set dnsa.oxtest --tenant dnsa --alias www.dnsa.oxtest --no-auto-https)
+  check "shop.dnsa.oxtest is gone" eventually 10 bash -c "dig +norec @127.0.0.1 shop.dnsa.oxtest A | grep -q 'status: NXDOMAIN'"
+  check "an opted-out site gets no zone" bash -c "oxpanel-ctl vhost set optout.oxtest --tenant dnsb --no-dns --no-auto-https | grep -q ' dns_zone=opted-out$' && ! oxpanel-ctl dns zone-list | grep -q '^zone=optout.oxtest '"
+  check "the zone apex comes from the public suffix list" bash -c "oxpanel-ctl vhost set shop.dnsb.co.uk --tenant dnsb --no-auto-https | grep -q ' dns_zone=dnsb.co.uk$'"
+  check "a site of tenant B inside tenant A's zone gets no records" bash -c "oxpanel-ctl vhost set blog.dnsa.oxtest --tenant dnsb --no-auto-https | grep -q ' dns_zone=-$' && dig +norec @127.0.0.1 blog.dnsa.oxtest A | grep -q 'status: NXDOMAIN'"
+
+  echo "-- records"
+  add() { oxpanel-ctl dns record-add dnsa.oxtest --tenant dnsa "$@"; }
+  check "MX at the apex (external mail provider)" grep -q '^changed=true' <(add --name @ --type mx --priority 10 --value mx1.mail.example.net)
+  check "second MX" grep -q '^changed=true' <(add --name @ --type mx --priority 20 --value mx2.mail.example.net.)
+  check "MX on a subdomain" grep -q '^changed=true' <(add --name lists --type mx --priority 5 --value mx.lists.example.net)
+  check "dig: MX with priorities" test "$(ds dnsa.oxtest MX | sort | tr '\n' ' ')" = "10 mx1.mail.example.net. 20 mx2.mail.example.net. "
+  check "dig: subdomain MX" test "$(ds lists.dnsa.oxtest MX)" = "5 mx.lists.example.net."
+  SPF="v=spf1 include:_spf.mail.example.net include:spf.protection.example.org$(for i in $(seq 1 16); do printf ' ip4:198.51.100.%s' "$i"; done) ip6:2001:db8::/32 -all"
+  check "SPF longer than 255 characters" test "${#SPF}" -gt 255
+  check "SPF as TXT" grep -q '^changed=true' <(add --name @ --type txt --value "$SPF")
+  check "dig: SPF arrives whole (split into 255-byte strings)" test "$(dig +short @127.0.0.1 dnsa.oxtest TXT | grep spf1 | sed 's/" "//g; s/^"//; s/"$//')" = "$SPF"
+  check "dig: SPF is two character-strings" test "$(dig +short @127.0.0.1 dnsa.oxtest TXT | grep spf1 | grep -o '" "' | wc -l)" = 1
+  openssl genrsa 2048 2>/dev/null | openssl rsa -pubout 2>/dev/null | grep -v '^-----' | tr -d '\n' > "$DT/dkim.b64"
+  printf 'v=DKIM1; k=rsa; p=%s' "$(cat "$DT/dkim.b64")" > "$DT/dkim.txt"
+  check "DKIM (2048-bit key) as TXT on selector._domainkey" grep -q '^changed=true' <(add --name s1._domainkey --type txt --value-file "$DT/dkim.txt")
+  check "dig: the DKIM key arrives whole" test "$(dig +short @127.0.0.1 s1._domainkey.dnsa.oxtest TXT | sed 's/" "//g; s/^"//; s/"$//')" = "$(cat "$DT/dkim.txt")"
+  check "DKIM as CNAME (provider-hosted key)" grep -q '^changed=true' <(add --name s2._domainkey --type cname --value s2.domainkey.u123.mail.example.net)
+  check "dig: DKIM CNAME" test "$(ds s2._domainkey.dnsa.oxtest CNAME)" = "s2.domainkey.u123.mail.example.net."
+  check "DMARC on _dmarc" grep -q '^changed=true' <(add --name _dmarc --type txt --value "v=DMARC1; p=quarantine; rua=mailto:dmarc@dnsa.oxtest")
+  check "dig: DMARC" test "$(ds _dmarc.dnsa.oxtest TXT)" = '"v=DMARC1; p=quarantine; rua=mailto:dmarc@dnsa.oxtest"'
+  check "verification TXT" grep -q '^changed=true' <(add --name @ --type txt --value "provider-verification=4f1c2a")
+  check "verification CNAME" grep -q '^changed=true' <(add --name a1b2c3 --type cname --value verify.mail.example.net)
+  check "SRV for autodiscover" grep -q '^changed=true' <(add --name _autodiscover._tcp --type srv --priority 0 --weight 1 --port 443 --value autodiscover.mail.example.net)
+  check "dig: SRV" test "$(ds _autodiscover._tcp.dnsa.oxtest SRV)" = "0 1 443 autodiscover.mail.example.net."
+  check "CNAME" grep -q '^changed=true' <(add --name docs --type cname --value docs.example.net)
+  check "dig: CNAME" test "$(ds docs.dnsa.oxtest CNAME)" = "docs.example.net."
+  check "CAA" grep -q '^changed=true' <(add --name @ --type caa --caa-tag issue --value letsencrypt.org)
+  check "dig: CAA" test "$(ds dnsa.oxtest CAA)" = '0 issue "letsencrypt.org"'
+  check "A and AAAA records of the tenant's own" bash -c "oxpanel-ctl dns record-add dnsa.oxtest --tenant dnsa --name api --type a --value 198.51.100.7 | grep -q ^changed=true && oxpanel-ctl dns record-add dnsa.oxtest --tenant dnsa --name api --type aaaa --value 2001:db8::7 | grep -q ^changed=true"
+  check "dig: A and AAAA" test "$(ds api.dnsa.oxtest A) $(ds api.dnsa.oxtest AAAA)" = "198.51.100.7 2001:db8::7"
+  check "wildcard" grep -q '^changed=true' <(add --name '*.dev' --type a --value 198.51.100.8)
+  check "dig: wildcard" test "$(ds anything.dev.dnsa.oxtest A)" = 198.51.100.8
+  check "NS delegation of a subdomain, with glue" bash -c "oxpanel-ctl dns record-add dnsa.oxtest --tenant dnsa --name sub --type ns --value ns1.sub.dnsa.oxtest | grep -q ^changed=true && oxpanel-ctl dns record-add dnsa.oxtest --tenant dnsa --name ns1.sub --type a --value 198.51.100.53 | grep -q ^changed=true"
+  check "dig: a referral for the delegated name" bash -c "dig +norec @127.0.0.1 x.sub.dnsa.oxtest A | grep -q 'AUTHORITY: 1' && dig +norec @127.0.0.1 x.sub.dnsa.oxtest A | grep -q 'sub.dnsa.oxtest.*NS.*ns1.sub.dnsa.oxtest'"
+  check "a repeated record changes nothing" grep -q '^changed=false' <(add --name docs --type cname --value docs.example.net)
+  id="$(add --name tmp --type txt --value one | awk -F'[= ]' '/^id=/{print $2}')"
+  check "change a record" grep -q '^changed=true' <(oxpanel-ctl dns record-update dnsa.oxtest "$id" --tenant dnsa --name tmp --type txt --value two)
+  check "dig: changed" test "$(ds tmp.dnsa.oxtest TXT)" = '"two"'
+  check "remove a record" grep -q '^removed=true' <(oxpanel-ctl dns record-remove dnsa.oxtest "$id" --tenant dnsa)
+  check "dig: removed" bash -c "dig +norec @127.0.0.1 tmp.dnsa.oxtest TXT | grep -q 'status: NXDOMAIN'"
+  check "the engine's records are listed as protected" bash -c "oxpanel-ctl dns zone-show dnsa.oxtest --tenant dnsa | grep -q '^id=0 name=www type=A .* protected=true origin=site:dnsa.oxtest '"
+  check "TXT text with zone-file syntax stays literal text" grep -q '^changed=true' <(add --name lit --type txt --value '$INCLUDE /etc/shadow ; ( ) "q" \e')
+  check "dig: literal" test "$(ds lit.dnsa.oxtest TXT)" = '"$INCLUDE /etc/shadow ; ( ) \"q\" \\e"'
+
+  echo "-- refusals: protection, rules, injection"
+  before="$(sha256sum /var/lib/oxpanel-dns/zones/dnsa.oxtest.zone)"
+  check_not "A at a site's name (protected)" add --name www --type a --value 198.51.100.9
+  check_not "CNAME at a site's name (protected)" add --name www --type cname --value x.example.net
+  check_not "CNAME at the apex" add --name @ --type cname --value x.example.net
+  check_not "NS at the apex (protected)" add --name @ --type ns --value ns.evil.example
+  check_not "a second record beside a CNAME" add --name docs --type txt --value x
+  check_not "MX pointing at a CNAME" add --name @ --type mx --priority 30 --value docs.dnsa.oxtest
+  check_not "a record under a delegation" add --name x.sub --type txt --value x
+  check_not "a fully-qualified name where a relative one is meant" add --name www.dnsa.oxtest --type txt --value x
+  for bad in $'a\nb' 'a;b' '$INCLUDE' '$GENERATE' '(' ')' 'a"b' 'a\b' 'a b' "$(printf 'a%.0s' $(seq 1 64))" '..' '-x' 'x.*' '@.x'; do
+    check_not "record name '$(printf %q "$bad")' is refused" add --name "$bad" --type txt --value x
+  done
+  for bad in $'1.2.3.4\nevil. 1 IN A 6.6.6.6' '1.2.3.4 ; x' '1.2.3' '0.0.0.0' '01.2.3.4'; do
+    check_not "A value '$(printf %q "$bad")' is refused" add --name inj --type a --value "$bad"
+  done
+  for bad in $'x.example.net\nevil' 'x.example.net;' 'x example.net' '(x.example.net)' '"x.example.net"' '$INCLUDE' 'localhost' '192.0.2.1'; do
+    check_not "CNAME target '$(printf %q "$bad")' is refused" add --name inj --type cname --value "$bad"
+  done
+  check_not "TXT with a line break is refused" add --name inj --type txt --value $'a\nevil. 1 IN A 6.6.6.6'
+  check_not "TXT with a tab is refused" add --name inj --type txt --value $'a\tb'
+  check_not "TXT over 4000 characters is refused" add --name inj --type txt --value "$(head -c 4001 /dev/zero | tr '\0' a)"
+  check_not "CAA value with a quote is refused" add --name @ --type caa --caa-tag issue --value 'le"; x'
+  check_not "a TTL below 60 is refused" add --name inj --type a --value 198.51.100.1 --ttl 59
+  check_not "an MX priority beyond 65535 is refused" add --name @ --type mx --priority 70000 --value mx.example.net
+  check "nothing reached the zone file" test "$(sha256sum /var/lib/oxpanel-dns/zones/dnsa.oxtest.zone)" = "$before"
+
+  echo "-- tenants"
+  check_not "tenant B cannot read tenant A's zone" oxpanel-ctl dns zone-show dnsa.oxtest --tenant dnsb
+  check_not "tenant B cannot add a record to it" oxpanel-ctl dns record-add dnsa.oxtest --tenant dnsb --name evil --type a --value 6.6.6.6
+  check_not "tenant B cannot reset it" oxpanel-ctl dns zone-reset dnsa.oxtest --tenant dnsb
+  check "tenant B's delete of it is a no-op" grep -q '^deleted=false' <(oxpanel-ctl dns zone-delete dnsa.oxtest --tenant dnsb)
+  check_not "tenant B cannot create the zone" oxpanel-ctl dns zone-create dnsa.oxtest --tenant dnsb
+  check_not "tenant B cannot create a zone inside it" oxpanel-ctl dns zone-create evil.dnsa.oxtest --tenant dnsb
+  check_not "nobody can create a zone for a public suffix" oxpanel-ctl dns zone-create co.uk --tenant dnsb
+  check "tenant A's zone is intact" test "$(sha256sum /var/lib/oxpanel-dns/zones/dnsa.oxtest.zone)" = "$before"
+
+  echo "-- validation, reloads, serials"
+  check "the zone transfer is refused to strangers" bash -c "dig @127.0.0.1 dnsa.oxtest AXFR | grep -qi 'transfer failed'"
+  check "the zone transfer works with the TSIG key" bash -c "dig -k /etc/named/oxpanel/transfer.key @127.0.0.1 dnsa.oxtest AXFR | grep -q 'mx1.mail.example.net'"
+  check "the catalog is not readable by strangers" bash -c "! dig +short @127.0.0.1 catalog.oxpanel.invalid AXFR | grep -q PTR && dig @127.0.0.1 catalog.oxpanel.invalid SOA | grep -q 'status: REFUSED'"
+  # An MX pointing at a host of the zone that has no address: it passes the
+  # engine's own rules, the server's checker refuses the zone, nothing is
+  # activated.
+  served="$(soa_serial dnsa.oxtest)"
+  out="$(oxpanel-ctl dns record-add dnsa.oxtest --tenant dnsa --name @ --type mx --priority 40 --value nohost.dnsa.oxtest 2>&1 || true)"
+  echo "$out" | head -3
+  check "a zone the server's checker rejects is refused with its reason" grep -qi "rejected the zone.*nohost.dnsa.oxtest.*has no address records" <<<"$out"
+  check "and never activated (file and served serial unchanged)" bash -c "test \"\$(sha256sum /var/lib/oxpanel-dns/zones/dnsa.oxtest.zone)\" = \"$before\" && test \"\$(dig +short @127.0.0.1 dnsa.oxtest SOA | awk '{print \$3}')\" = $served"
+  check "the zone is unchanged in the record too" bash -c "! oxpanel-ctl dns zone-show dnsa.oxtest --tenant dnsa | grep -q 'nohost'"
+  check "site dnsb2.oxtest with a zone of its own" grep -q '^changed=true' <(oxpanel-ctl vhost set dnsb2.oxtest --tenant dnsb --no-auto-https)
+  sleep 1.2; since="$(date '+%Y-%m-%d %H:%M:%S')"; sleep 1.2
+  check "a change" grep -q '^changed=true' <(add --name reloaded --type txt --value yes)
+  check "reloads exactly the changed zone" eventually 10 bash -c "journalctl -u oxpanel-dns --since '$since' --no-pager | grep -q \"received control channel command 'reload dnsa.oxtest'\""
+  check "and no other" bash -c "! journalctl -u oxpanel-dns --since '$since' --no-pager | grep -q 'dnsb2.oxtest/IN: loaded serial'"
+  s2="$(soa_serial dnsa.oxtest)"
+  systemctl restart oxpanel-daemon
+  check "after a daemon restart the zone keeps its serial" test "$(soa_serial dnsa.oxtest)" = "$s2"
+  check "and the next change increases it" bash -c "oxpanel-ctl dns record-add dnsa.oxtest --tenant dnsa --name after-restart --type txt --value x | grep -q ^changed=true && test \"\$(dig +short @127.0.0.1 dnsa.oxtest SOA | awk '{print \$3}')\" -gt $s2"
+  systemctl restart oxpanel-dns
+  check "after a DNS server restart the zone is served again" eventually 20 bash -c "test \"\$(dig +short @127.0.0.1 dnsa.oxtest A)\" = 192.0.2.80"
+  check "the delegation check (resolver: the secondary) says delegated" grep -q '^zone=dnsa.oxtest delegation=DELEGATED ' <(oxpanel-ctl dns zone-check dnsa.oxtest --tenant dnsa)
+  check "primary and secondary serials are reported" eventually 20 bash -c "oxpanel-ctl dns zone-check dnsa.oxtest --tenant dnsa | grep -q '^server=127.0.0.1:853 serial=[1-9][0-9]* status=ok$'"
+  oxpanel-ctl vhost set elsewhere.oxtest --tenant dnsb --no-auto-https >/dev/null
+  check "a domain delegated elsewhere is reported with guidance" bash -c "oxpanel-ctl dns zone-check elsewhere.oxtest --tenant dnsb | tee /dev/stderr | grep -q '^zone=elsewhere.oxtest delegation=ELSEWHERE nameservers_seen=ns1.other.example,ns2.other.example' && oxpanel-ctl dns zone-check elsewhere.oxtest --tenant dnsb | grep -q '^guidance=.*set the domain.s name servers to ns1.oxtest.example, ns2.oxtest.example'"
+  oxpanel-ctl vhost remove elsewhere.oxtest >/dev/null
+  check "no drift" eventually 20 bash -c "oxpanel-ctl host reconcile | grep -q '^drifts=0$'"
+  echo '; hand edit' >> /var/lib/oxpanel-dns/zones/dnsa.oxtest.zone
+  check "a hand-edited zone file is drift" grep -q '^kind=DRIFT_KIND_DNS_ZONE_DRIFT subject=dnsa.oxtest ' <(oxpanel-ctl host reconcile)
+  touch /var/lib/oxpanel-dns/zones/stray.zone
+  check "a stray file is an orphan" grep -q '^kind=DRIFT_KIND_ORPHAN_DNS_FILE ' <(oxpanel-ctl host reconcile)
+  rm -f /var/lib/oxpanel-dns/zones/stray.zone
+  systemctl restart oxpanel-daemon
+  check "a restart re-renders the zone file" eventually 20 bash -c "oxpanel-ctl host reconcile | grep -q '^drifts=0$'"
+
+  echo "-- DNSSEC"
+  check "an explicit zone below another domain" grep -q '^created=true' <(oxpanel-ctl dns zone-create sig.parent.oxtest --tenant dnsa)
+  oxpanel-ctl dns record-add sig.parent.oxtest --tenant dnsa --name www --type a --value 198.51.100.20 >/dev/null
+  check "switch DNSSEC on" grep -q '^zone=sig.parent.oxtest .* dnssec=' <(oxpanel-ctl dns dnssec sig.parent.oxtest on --tenant dnsa)
+  check "the server generates the key and signs" eventually 40 bash -c "oxpanel-ctl dns zone-show sig.parent.oxtest --tenant dnsa | grep -q ' dnssec=signed '"
+  check "dig +dnssec returns RRSIGs" eventually 20 bash -c "dig +dnssec +norec @127.0.0.1 www.sig.parent.oxtest A | grep -q 'RRSIG.*A 13 '"
+  check "NSEC3 proves non-existence" eventually 20 bash -c "dig +dnssec +norec @127.0.0.1 nope.sig.parent.oxtest A | grep -q NSEC3"
+  ds_engine="$(oxpanel-ctl dns zone-show sig.parent.oxtest --tenant dnsa | sed -n 's/^ds=//p')"
+  dig +norec @127.0.0.1 sig.parent.oxtest DNSKEY > "$DT/dnskey.txt"
+  check "the DS the engine reports is what the server's tools compute" test "$(dnssec-dsfromkey -2 -f "$DT/dnskey.txt" sig.parent.oxtest | head -1)" = "$ds_engine"
+  awk '$4=="DNSKEY" && $5==257 {k=""; for(i=8;i<=NF;i++) k=k $i; printf "trust-anchors { sig.parent.oxtest. static-key 257 3 13 \"%s\"; };\n", k}' "$DT/dnskey.txt" > "$DT/anchor.conf"
+  check "a validating resolver check (delv, the zone's own trust anchor) succeeds" bash -c "delv @127.0.0.1 -a $DT/anchor.conf +root=sig.parent.oxtest www.sig.parent.oxtest A | grep -q 'fully validated'"
+  check "a record added after signing is signed too" bash -c "oxpanel-ctl dns record-add sig.parent.oxtest --tenant dnsa --name late --type txt --value signed-later | grep -q ^changed=true"
+  check "dig: its RRSIG" eventually 20 bash -c "dig +dnssec +norec @127.0.0.1 late.sig.parent.oxtest TXT | grep -q 'RRSIG.*TXT 13 '"
+  check "delv validates it" eventually 20 bash -c "delv @127.0.0.1 -a $DT/anchor.conf +root=sig.parent.oxtest late.sig.parent.oxtest TXT | grep -q 'fully validated'"
+  check "the secondary serves the signed zone" eventually 40 bash -c "dig +dnssec +norec @127.0.0.1 -p 853 late.sig.parent.oxtest TXT | grep -q 'RRSIG.*TXT 13 '"
+  check "the private key belongs to the server's account, mode 0600" test "$(stat -c '%U %a' /var/lib/oxpanel-dns/keys/sig.parent.oxtest/*.private)" = "named 600"
+  check_not "a tenant cannot read the signing keys" as_user dnsa cat /var/lib/oxpanel-dns/keys/sig.parent.oxtest/*.private
+  check_not "a tenant cannot even list them" as_user dnsa ls /var/lib/oxpanel-dns/keys
+  check "no private key in a response" bash -c "! oxpanel-ctl dns zone-show sig.parent.oxtest --tenant dnsa | grep -qi private"
+  systemctl restart oxpanel-daemon oxpanel-dns
+  check "signing survives daemon and server restarts" eventually 40 bash -c "dig +dnssec +norec @127.0.0.1 www.sig.parent.oxtest A | grep -q 'RRSIG.*A 13 '"
+  check "with the same key (same DS)" test "$(oxpanel-ctl dns zone-show sig.parent.oxtest --tenant dnsa | sed -n 's/^ds=//p')" = "$ds_engine"
+  # The parent publishes the DS: switching DNSSEC off must be refused.
+  dsrr="$(echo "$ds_engine" | sed 's/^sig.parent.oxtest. IN DS /sig.parent.oxtest. 60 IN DS /')"
+  printf 'parent.oxtest. 60 IN SOA ns.parent.oxtest. h.parent.oxtest. 2 60 60 600 60\nparent.oxtest. 60 IN NS ns.parent.oxtest.\nns.parent.oxtest. 60 IN A 192.0.2.53\nsig.parent.oxtest. 60 IN NS ns1.oxtest.example.\n%s\n' "$dsrr" > /var/named/slaves/oxtest/parent.oxtest.db
+  systemctl kill -s HUP oxtest-dns-secondary
+  check "the parent now publishes the DS" eventually 20 bash -c "dig +short @127.0.0.1 -p 853 sig.parent.oxtest DS | grep -q ' 13 2 '"
+  check "the check sees the DS at the parent and that it matches" eventually 20 bash -c "oxpanel-ctl dns zone-check sig.parent.oxtest --tenant dnsa | grep -q 'ds_checked=true ds_at_parent=1 ds_matches=true'"
+  out="$(oxpanel-ctl dns dnssec sig.parent.oxtest off --tenant dnsa 2>&1 || true)"
+  check "switching DNSSEC off is refused while the parent publishes the DS" grep -q 'still publishes a DS record' <<<"$out"
+  check_not "even with --force" oxpanel-ctl dns dnssec sig.parent.oxtest off --tenant dnsa --force
+  check "the zone is still signed" grep -q ' dnssec=signed ' <(oxpanel-ctl dns zone-show sig.parent.oxtest --tenant dnsa)
+  printf 'parent.oxtest. 60 IN SOA ns.parent.oxtest. h.parent.oxtest. 3 60 60 600 60\nparent.oxtest. 60 IN NS ns.parent.oxtest.\nns.parent.oxtest. 60 IN A 192.0.2.53\n' > /var/named/slaves/oxtest/parent.oxtest.db
+  systemctl kill -s HUP oxtest-dns-secondary
+  check "the DS is withdrawn at the parent" eventually 20 bash -c "dig @127.0.0.1 -p 853 sig.parent.oxtest DS | grep -q 'ANSWER: 0'"
+  signed_serial="$(soa_serial sig.parent.oxtest)"
+  check "now DNSSEC can be switched off" grep -q ' dnssec=off ' <(oxpanel-ctl dns dnssec sig.parent.oxtest off --tenant dnsa)
+  check "no more signatures" eventually 20 bash -c "! dig +dnssec +norec @127.0.0.1 www.sig.parent.oxtest A | grep -q RRSIG"
+  check "the unsigned zone has a higher serial than the signed one had" test "$(soa_serial sig.parent.oxtest)" -gt "$signed_serial"
+  check "the secondary takes the unsigned zone" eventually 40 bash -c "! dig +dnssec +norec @127.0.0.1 -p 853 www.sig.parent.oxtest A | grep -q RRSIG && test \"\$(dig +short @127.0.0.1 -p 853 www.sig.parent.oxtest A)\" = 198.51.100.20"
+  check "the keys are gone" test ! -e /var/lib/oxpanel-dns/keys/sig.parent.oxtest
+
+  echo "-- suspension and deletion"
+  check "suspend dnsa" grep -q '^changed=true' <(oxpanel-ctl tenant suspend dnsa)
+  check "a suspended tenant's zone keeps answering" test "$(ds dnsa.oxtest A)" = 192.0.2.80
+  check "its mail records too" test "$(ds dnsa.oxtest MX | wc -l)" = 2
+  site_answers() { [ "$(code_of "$1" /)" = "$2" ]; }
+  check "its site answers 503" eventually 20 site_answers dnsa.oxtest 503
+  check_not "its zone cannot be changed" add --name frozen --type txt --value x
+  check "resume dnsa" grep -q '^changed=true' <(oxpanel-ctl tenant resume dnsa)
+  check "changes are possible again" grep -q '^changed=true' <(add --name thawed --type txt --value x)
+  check_not "a tenant with zones cannot be deleted" oxpanel-ctl tenant delete dnsb --remove-home
+  for d in dnsb2.oxtest shop.dnsb.co.uk optout.oxtest blog.dnsa.oxtest; do oxpanel-ctl vhost remove "$d" >/dev/null; done
+  check "the automatic zones of removed sites are gone" bash -c "! oxpanel-ctl dns zone-list --tenant dnsb | grep -q ."
+  check "and no longer answered" grep -q 'status: REFUSED' <(dq dnsb2.oxtest SOA)
+  check "the secondary drops them too (catalog)" eventually 40 bash -c "dig +norec @127.0.0.1 -p 853 dnsb2.oxtest SOA | grep -q 'status: REFUSED'"
+  check "now dnsb can be deleted" grep -q '^deleted=true' <(oxpanel-ctl tenant delete dnsb --remove-home)
+  check "removing the last site keeps a zone with the tenant's records" bash -c "oxpanel-ctl vhost remove dnsa.oxtest | grep -q ^removed=true && oxpanel-ctl dns zone-show dnsa.oxtest --tenant dnsa | grep -q '^zone=dnsa.oxtest .* sites=-'"
+  check "its MX still answers, its site's A does not" bash -c "test \"\$(dig +short @127.0.0.1 dnsa.oxtest MX | wc -l)\" = 2 && test -z \"\$(dig +short @127.0.0.1 dnsa.oxtest A)\""
+  check "reset to defaults removes the tenant's records" bash -c "oxpanel-ctl dns zone-reset dnsa.oxtest --tenant dnsa | grep -q '^zone=dnsa.oxtest .* records=0 '"
+  for z in dnsa.oxtest sig.parent.oxtest; do check "delete zone $z" grep -q '^deleted=true' <(oxpanel-ctl dns zone-delete "$z" --tenant dnsa); done
+  check "no zone file left" test -z "$(ls /var/lib/oxpanel-dns/zones | grep -v '^catalog.oxpanel.invalid.zone')"
+  check "dnsa deleted" grep -q '^deleted=true' <(oxpanel-ctl tenant delete dnsa --remove-home)
+  check "no drift after DNS hosting" eventually 40 bash -c "oxpanel-ctl host reconcile | grep -q '^drifts=0$'"
+  systemctl stop oxtest-dns-secondary 2>/dev/null || true
+  rm -rf /var/named/slaves/oxtest /etc/named/oxtest-secondary.conf
+  cp -p "$DT/daemon.env.bak" /etc/oxpanel/daemon.env
+  systemctl disable --now oxpanel-dns >/dev/null 2>&1
+  systemctl restart oxpanel-daemon
+  check "DNS hosting off again" grep -q '^dns=false ' <(oxpanel-ctl host info)
+else
+  echo "skip - BIND, dig or the public suffix list not installed"
+fi
 
 echo "== teardown"
 check "vhost removed" grep -q '^removed=true' <(oxpanel-ctl vhost remove example.test)

@@ -23,6 +23,13 @@ check "SFTP password login works after reboot" bash -c 'for i in $(seq 1 30); do
 if grep -q ' disk_max=67108864 ' tenants.pre; then
   check "bootb's disk limit is enforced after reboot" bash -c 'u=$(id -u bootb); xfs_quota -x -c "report -u -n -N -b -L $u -U $u" "$(findmnt -no TARGET -T /home)" | grep -qE "^#$u +[0-9]+ +65536 +65536 "'
 fi
+if [ -s dns_serial.pre ]; then
+  eventually "OxPanel's DNS server is back after the reboot" 60 1 systemctl -q is-active oxpanel-dns
+  eventually "the signed zone answers after reboot" 60 1 bash -c "dig +dnssec +norec @127.0.0.1 boota.test MX | grep -q 'RRSIG.*MX 13 '"
+  check "its serial did not go back" test "$(dig +short +norec @127.0.0.1 boota.test SOA | awk '{print $3}')" -ge "$(cat dns_serial.pre)"
+  check "the same signing key (same DS) after reboot" test "$(oxpanel-ctl dns zone-show boota.test --tenant boota | sed -n 's/^ds=//p')" = "$(cat dns_ds.pre)"
+  check "the site's address record after reboot" test "$(dig +short +norec @127.0.0.1 boota.test A)" = 192.0.2.60
+fi
 check "no drift after reboot" bash -c "oxpanel-ctl host reconcile | grep -q '^drifts=0$'"
 check "boota slice loaded with its MemoryMax" test "$(systemctl show -p MemoryMax --value oxpanel-tenant-boota.slice)" = 268435456
 check "boota slice CPUWeight" test "$(systemctl show -p CPUWeight --value oxpanel-tenant-boota.slice)" = 40
@@ -34,5 +41,13 @@ check "no daemon errors on this boot" bash -c '! journalctl -b -u oxpanel-daemon
 n=$(avc_count); if [ "$n" = 0 ]; then ok "zero AVC denials on this boot"; else avc_dump; fail "$n AVC denial(s) on this boot"; fi
 check "unknown host still closed" test "$(curl -s -H 'Host: nobody.test' http://127.0.0.1/; echo "rc=$?")" = "rc=52"
 for d in boota.test bootb.test bootphp.test bootnode.test; do check "remove $d" bash -c "oxpanel-ctl vhost remove $d | grep -q '^removed=true'"; done
+if [ -s dns_serial.pre ]; then
+  check "delete the signed zone (it holds the tenant's MX)" ctl_ok '^deleted=true' oxpanel-ctl dns zone-delete boota.test --tenant boota
+  check "no zone left" test -z "$(oxpanel-ctl dns zone-list)"
+  cp -p dns-daemon.env.bak /etc/oxpanel/daemon.env
+  systemctl disable --now oxpanel-dns >/dev/null 2>&1
+  systemctl restart oxpanel-daemon
+  eventually "daemon back with DNS hosting off" 60 0.5 bash -c "oxpanel-ctl host info | grep -q '^dns=false '"
+fi
 for t in boota bootb; do check "delete $t" bash -c "oxpanel-ctl tenant delete $t --remove-home | grep -q '^deleted=true'"; done
 phase_end

@@ -410,6 +410,17 @@ pub(super) fn remove_zone_files(ctx: &Ctx, zone: &Domain) -> Result<()> {
     remove_signing_state(ctx, zone)
 }
 
+/// The journal the server keeps of the unsigned side of a signed zone.
+pub(super) fn remove_raw_journal(ctx: &Ctx, zone: &Domain) -> Result<()> {
+    let base = Layout::new(&ctx.config.dns).zone_file(zone);
+    for ext in [".jnl", ".jbk"] {
+        let mut p = base.clone().into_os_string();
+        p.push(ext);
+        fsutil::remove_if_exists(std::path::Path::new(&p))?;
+    }
+    Ok(())
+}
+
 /// The signed copy, journals and keys of a zone that is no longer signed.
 pub(super) fn remove_signing_state(ctx: &Ctx, zone: &Domain) -> Result<()> {
     let l = Layout::new(&ctx.config.dns);

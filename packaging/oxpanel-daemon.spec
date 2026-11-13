@@ -40,6 +40,11 @@ Recommends:     xfsprogs
 # only suggested: dnf does not install them by itself.
 Suggests:       mariadb-server
 Suggests:       php-mysqlnd
+# DNS hosting (off until OXPANEL_DNS=true): BIND from AppStream, run by OxPanel
+# as oxpanel-dns.service, and the public suffix list that decides the apex of
+# automatic zones. Without them DNS hosting is reported unavailable.
+Recommends:     bind
+Recommends:     publicsuffix-list
 Requires:       policycoreutils
 Requires:       policycoreutils-python-utils
 Requires:       libselinux-utils
@@ -63,6 +68,7 @@ install -D -m 0755 target/release/oxpanel-daemon %{buildroot}%{_sbindir}/oxpanel
 install -D -m 0755 target/release/oxpanel-ctl    %{buildroot}%{_bindir}/oxpanel-ctl
 install -D -m 0755 target/release/oxpanel-acme   %{buildroot}%{_libexecdir}/oxpanel/oxpanel-acme
 install -D -m 0644 packaging/systemd/oxpanel-daemon.service %{buildroot}%{_unitdir}/oxpanel-daemon.service
+install -D -m 0644 packaging/systemd/oxpanel-dns.service %{buildroot}%{_unitdir}/oxpanel-dns.service
 install -D -m 0644 packaging/sysusers.d/oxpanel.conf %{buildroot}%{_sysusersdir}/oxpanel.conf
 install -D -m 0644 packaging/tmpfiles.d/oxpanel.conf %{buildroot}%{_tmpfilesdir}/oxpanel.conf
 install -D -m 0640 packaging/daemon.env %{buildroot}%{_sysconfdir}/oxpanel/daemon.env
@@ -85,9 +91,13 @@ if /usr/sbin/selinuxenabled 2>/dev/null; then /usr/sbin/semodule -i %{_datadir}/
 # The ACME challenge directory was created (by tmpfiles above) before the module
 # that labels it for the web server was loaded.
 if /usr/sbin/selinuxenabled 2>/dev/null; then /usr/sbin/restorecon -R /var/lib/oxpanel-acme /etc/pki/oxpanel || :; fi
+# DNS hosting directories exist only once DNS hosting was used (the daemon
+# creates and labels them); an upgrade relabels them with the current module.
+if /usr/sbin/selinuxenabled 2>/dev/null; then for d in /var/lib/oxpanel-dns /etc/named/oxpanel; do [ -d "$d" ] && /usr/sbin/restorecon -R "$d" || :; done; fi
 
 %preun
 %systemd_preun oxpanel-daemon.service
+%systemd_preun oxpanel-dns.service
 
 %postun
 %systemd_postun_with_restart oxpanel-daemon.service
@@ -102,6 +112,7 @@ if [ "$1" -eq 0 ] && /usr/sbin/selinuxenabled 2>/dev/null; then /usr/sbin/semodu
 %dir %{_libexecdir}/oxpanel
 %{_libexecdir}/oxpanel/oxpanel-acme
 %{_unitdir}/oxpanel-daemon.service
+%{_unitdir}/oxpanel-dns.service
 %{_sysusersdir}/oxpanel.conf
 %{_tmpfilesdir}/oxpanel.conf
 %dir %attr(0750,root,oxpanel) %{_sysconfdir}/oxpanel

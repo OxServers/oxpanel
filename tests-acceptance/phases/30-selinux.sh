@@ -21,6 +21,10 @@ check "application runtime directories are labelled for the web server" bash -c 
 check "ACME challenge directory is web content" bash -c "ls -dZ /var/lib/oxpanel-acme/challenges | grep -q ':httpd_sys_content_t:'"
 check "the rest of the ACME directory is not" bash -c "ls -dZ /var/lib/oxpanel-acme/issued /var/lib/oxpanel-acme/account | grep -c ':var_lib_t:' | grep -qx 2"
 check "certificate directory is cert_t" bash -c "ls -dZ /etc/pki/oxpanel | grep -q ':cert_t:'"
+if [ -d /var/lib/oxpanel-dns ]; then
+  check "DNS data directory is named_cache_t" bash -c "ls -dZ /var/lib/oxpanel-dns /var/lib/oxpanel-dns/zones /var/lib/oxpanel-dns/keys | grep -c ':named_cache_t:' | grep -qx 3"
+  check "DNS server configuration is named_conf_t" bash -c "ls -Z /etc/named/oxpanel/named.conf /etc/named/oxpanel/transfer.key | grep -c ':named_conf_t:' | grep -qx 2"
+fi
 check "matchpathcon agrees" bash -c "matchpathcon /home/selx/public_html | grep -q httpd_sys_content_t"
 info "labels: $(ls -dZ /home/selx /home/selx/public_html | awk '{print $1}' | tr '\n' ' ')"
 check "docroot labelled httpd_sys_content_t" bash -c "ls -dZ /home/selx/public_html | grep -q ':httpd_sys_content_t:'"

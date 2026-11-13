@@ -554,6 +554,112 @@
   unit backup retention_keeps_the_newest_backups_and_delete_is_idempotent
   sh tests-integration/run-inside.sh retention keeps the newest 7
 
+[DNS hosting] Authoritative DNS server
+  unit dns/tests a_missing_dns_server_is_refused_before_anything_is_created
+  unit dns/tests opted_out_sites_and_a_disabled_host_get_nothing
+  unit dns/bind the_server_configuration_is_authoritative_only_and_hardened
+  sh tests-integration/run-inside.sh the DNS server was set up and started by the daemon
+  sh tests-integration/run-inside.sh the distribution's named.conf is untouched
+  sh tests-integration/run-inside.sh a zone is refused while DNS hosting is off
+[DNS hosting] Hardened server
+  unit dns/bind the_server_configuration_is_authoritative_only_and_hardened
+  sh tests-integration/run-inside.sh recursion is refused (not an open resolver)
+  sh tests-integration/run-inside.sh version is hidden
+  sh tests-integration/run-inside.sh the zone transfer is refused to strangers
+  sh tests-integration/run-inside.sh named runs as named
+  sh tests-integration/run-inside.sh the catalog is not readable by strangers
+[DNS hosting] Name servers
+  unit dns/config off_by_default_and_complete_when_on
+  unit dns/config incomplete_or_bad_settings_are_refused
+  unit dns/tests host_facts_flag_a_single_server
+  sh tests-integration/run-inside.sh --check-config refuses DNS hosting without its settings
+  sh tests-integration/run-inside.sh host info: the name servers and addresses
+  sh tests-integration/run-inside.sh NS records of the configured name servers
+[DNS hosting] Secondaries
+  unit dns/bind keys_are_random_and_checked_without_showing_them
+  unit dns/zone the_catalog_lists_members_by_hashed_label
+  sh tests-integration/run-inside.sh the secondary got the zone through the catalog
+  sh tests-integration/run-inside.sh the secondary follows the change (NOTIFY + transfer)
+  sh tests-integration/run-inside.sh the zone transfer works with the TSIG key
+  sh tests-integration/run-inside.sh the secondary drops them too (catalog)
+[DNS hosting] Automatic zones
+  unit dns/tests a_site_gets_a_zone_for_its_registrable_domain
+  unit dns/tests zones_follow_alias_changes_and_go_with_their_last_site
+  unit dns/psl registrable_domains_follow_the_list_algorithm
+  sh tests-integration/run-inside.sh a zone was created for the site
+  sh tests-integration/run-inside.sh an alias added later gets its records
+  sh tests-integration/run-inside.sh the zone apex comes from the public suffix list
+  sh tests-integration/run-inside.sh an opted-out site gets no zone
+[DNS hosting] Zones
+  unit dns/tests tenants_cannot_reach_into_each_others_zones
+  unit dns/tests a_zone_with_tenant_records_outlives_its_sites
+  sh tests-integration/run-inside.sh tenant B cannot add a record to it
+  sh tests-integration/run-inside.sh tenant B cannot create a zone inside it
+  sh tests-integration/run-inside.sh nobody can create a zone for a public suffix
+  sh tests-integration/run-inside.sh a site of tenant B inside tenant A's zone gets no records
+  sh tests-integration/run-inside.sh reset to defaults removes the tenant's records
+[DNS hosting] Records
+  unit dns/rr every_type_renders_one_exact_line
+  unit dns/rr names_cannot_escape_the_zone_or_carry_syntax
+  unit dns/rr host_names_and_types_follow_the_dns_rules
+  unit dns/proptests any_accepted_record_is_one_clean_line
+  unit dns/proptests a_zone_file_holds_exactly_what_was_asked
+  unit dns/tests engine_records_are_protected_and_the_dns_rules_hold
+  sh tests-integration/run-inside.sh dig: SRV
+  sh tests-integration/run-inside.sh dig: CAA
+  sh tests-integration/run-inside.sh dig: a referral for the delegated name
+  sh tests-integration/run-inside.sh nothing reached the zone file
+[DNS hosting] Protected records
+  unit dns/tests engine_records_are_protected_and_the_dns_rules_hold
+  unit dns/zone a_zone_file_is_exactly_its_records
+  sh tests-integration/run-inside.sh A at a site's name (protected)
+  sh tests-integration/run-inside.sh NS at the apex (protected)
+  sh tests-integration/run-inside.sh the engine's records are listed as protected
+[DNS hosting] External mail
+  unit dns/tests records_for_an_external_mail_provider
+  unit dns/rr txt_is_split_into_255_byte_strings_and_escaped
+  sh tests-integration/run-inside.sh dig: SPF arrives whole (split into 255-byte strings)
+  sh tests-integration/run-inside.sh dig: the DKIM key arrives whole
+  sh tests-integration/run-inside.sh dig: DMARC
+  sh tests-integration/run-inside.sh MX pointing at a CNAME
+[DNS hosting] Validate → activate → roll back
+  unit dns/tests a_rejected_zone_is_never_activated
+  unit dns/bind exact_argv_of_the_checkers_and_rndc
+  sh tests-integration/run-inside.sh a zone the server's checker rejects is refused with its reason
+  sh tests-integration/run-inside.sh and never activated (file and served serial unchanged)
+  sh tests-integration/run-inside.sh reloads exactly the changed zone
+[DNS hosting] Serials
+  unit dns/zone serials_only_ever_increase
+  unit dns/tests serials_increase_and_identical_requests_change_nothing
+  sh tests-integration/run-inside.sh after a daemon restart the zone keeps its serial
+  sh tests-integration/run-inside.sh the serial increased
+[DNS hosting] DNSSEC
+  unit dns/tests dnssec_on_and_safely_off
+  unit dns/dnssec ds_and_key_tag_match_the_dns_server_tools
+  sh tests-integration/run-inside.sh dig +dnssec returns RRSIGs
+  sh tests-integration/run-inside.sh a validating resolver check (delv, the zone's own trust anchor) succeeds
+  sh tests-integration/run-inside.sh switching DNSSEC off is refused while the parent publishes the DS
+  sh tests-integration/run-inside.sh the secondary serves the signed zone
+  sh tests-integration/run-inside.sh a tenant cannot read the signing keys
+[DNS hosting] Outside checks
+  unit dns/tests the_check_reports_delegation_in_plain_words
+  unit dns/wire soa_ns_and_ds_answers_are_read
+  unit dns/proptests hostile_responses_never_panic
+  sh tests-integration/run-inside.sh the delegation check (resolver: the secondary) says delegated
+  sh tests-integration/run-inside.sh a domain delegated elsewhere is reported with guidance
+[DNS hosting] Tenant lifecycle
+  unit dns/tests suspension_freezes_zones_that_keep_answering
+  unit dns/tests deleting_a_tenant_is_refused_while_it_has_zones
+  sh tests-integration/run-inside.sh a suspended tenant's zone keeps answering
+  sh tests-integration/run-inside.sh a tenant with zones cannot be deleted
+[DNS hosting] Reconciliation
+  unit dns/tests reconcile_sees_files_server_and_secondaries
+  sh tests-integration/run-inside.sh a hand-edited zone file is drift
+  sh tests-integration/run-inside.sh a stray file is an orphan
+[DNS hosting] SELinux
+  sh tests-acceptance/phases/30-selinux.sh DNS data directory is named_cache_t
+  sh tests-acceptance/phases/60-reboot-post.sh the signed zone answers after reboot
+
 [API, transport and authentication] gRPC over a UNIX socket only
   it grpc_uds full_tenant_and_vhost_lifecycle_over_uds
   sh tests-integration/run-inside.sh socket is root:oxpanel 0660

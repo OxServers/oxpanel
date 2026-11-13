@@ -583,7 +583,7 @@ pub async fn converge(ctx: &Ctx) {
         Ok(Some(n)) => info!(zones = n, "DNS hosting converged"),
         Ok(None) => {}
         Err(e) => {
-            warn!(error = %e, "could not converge DNS hosting; see `oxpanel-ctl host reconcile`")
+            warn!(error = %e, "could not converge DNS hosting; see `oxpanel-ctl host reconcile`");
         }
     }
 }
@@ -795,7 +795,13 @@ impl DnsService {
         let tenant = Username::parse_field(tenant, "tenant")?;
         let zone = Domain::parse_field(zone, "zone")?;
         let _guard = self.ctx.lock.lock().await;
-        require_available(&self.ctx).await?;
+        // Zones can be cleaned up after DNS hosting was switched off, as long
+        // as the server is there to stop serving them.
+        if !self.ctx.sys.is_installed(bin::NAMED).await {
+            return Err(Error::DnsUnavailable(
+                "the DNS server is not installed: dnf install bind".to_owned(),
+            ));
+        }
         let rec = match self.store().load(&zone)? {
             Some(r) if r.tenant == tenant.as_str() => r,
             _ => return Ok(false),
@@ -991,6 +997,12 @@ impl DnsService {
         // configuration, not before.
         next.loaded_serial = 0;
         let mut saved = ops::apply_zone_unloaded(&self.ctx, &rec, next, floor).await?;
+        if !enabled {
+            // The journal of the unsigned side describes the zone as it was
+            // signed: loaded with the new file, it would be out of sync and
+            // the server would refuse to load the zone at all.
+            ops::remove_raw_journal(&self.ctx, &zone)?;
+        }
         ops::apply_server(&self.ctx).await?;
         saved.loaded_serial = saved.serial;
         self.store().save(&saved)?;

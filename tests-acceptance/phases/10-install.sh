@@ -47,6 +47,12 @@ case "$INSTALL" in
   *) fail "unknown INSTALL=$INSTALL";;
 esac
 
+# DNS hosting is optional: the RPM recommends BIND and the public suffix list
+# (installed with it by default); the checks query the server with the BIND
+# tools, which an operator installs the same way.
+[ "$INSTALL" = rpm ] && check "BIND and the public suffix list came with the package (Recommends)" rpm -q bind publicsuffix-list
+check "DNS tools for the checks (dig, delv, dnssec-dsfromkey)" dnf -y -q install bind bind-utils bind-dnssec-utils publicsuffix-list
+
 # Tenant databases are optional; set MariaDB up exactly as HANDBOOK §3.5 says.
 handbook_block "### 3.5 " > install-mariadb.sh
 [ -s install-mariadb.sh ] || fail "could not extract the §3.5 MariaDB block from HANDBOOK.md"

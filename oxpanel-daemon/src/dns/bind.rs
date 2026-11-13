@@ -229,7 +229,7 @@ pub fn render_zones_conf(zones: &[(Domain, bool)], l: &Layout) -> Result<String>
 zone \"{CATALOG_ZONE}\" {{
     type master;
     file \"{}\";
-    allow-query {{ 127.0.0.1; ::1; key \"{TRANSFER_KEY}\"; }};
+    allow-query {{ key \"{TRANSFER_KEY}\"; }};
     allow-transfer {{ key \"{TRANSFER_KEY}\"; }};
 }};
 ",
@@ -302,10 +302,15 @@ pub fn checkconf(l: &Layout, timeout: Duration) -> CommandSpec {
 
 /// `named-checkzone` with the server's own strictness for primary zones:
 /// host-name rules (`check-names fail`), MX and SRV records that point at a
-/// CNAME refused; integrity checks only inside the zone (no lookups).
+/// CNAME refused; integrity checks only inside the zone (no lookups). One
+/// step stricter than the server: an MX record pointing at a name of the
+/// zone that has no address is refused (`-m fail`) rather than loaded with
+/// a warning, because mail to it could never be delivered.
 pub fn checkzone(zone: &str, file: &Path, timeout: Duration) -> CommandSpec {
     CommandSpec::new(bin::NAMED_CHECKZONE, timeout)
-        .args(["-k", "fail", "-M", "fail", "-S", "fail", "-i", "local"])
+        .args([
+            "-k", "fail", "-m", "fail", "-M", "fail", "-S", "fail", "-i", "local",
+        ])
         .arg(zone)
         .arg(file)
 }
@@ -414,7 +419,7 @@ mod tests {
 zone \"catalog.oxpanel.invalid\" {
     type master;
     file \"/var/lib/oxpanel-dns/zones/catalog.oxpanel.invalid.zone\";
-    allow-query { 127.0.0.1; ::1; key \"oxpanel-transfer\"; };
+    allow-query { key \"oxpanel-transfer\"; };
     allow-transfer { key \"oxpanel-transfer\"; };
 };
 zone \"example.com\" {
@@ -473,6 +478,8 @@ zone \"signed.example\" {
             [
                 "/usr/sbin/named-checkzone",
                 "-k",
+                "fail",
+                "-m",
                 "fail",
                 "-M",
                 "fail",

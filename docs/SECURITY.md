@@ -153,6 +153,23 @@ operator granted that uid; arbitrary field values.
   handshake. Sites without a certificate, and port 80 unless a site redirects,
   are in the clear. sshd (SFTP, tenants confined to a chroot) is the other
   exposure the engine configures.
+* DNS hosting (off by default) exposes port 53 (TCP and UDP) through
+  `oxpanel-dns.service`, BIND in its packaged `named_t` domain under a
+  hardened unit. It answers authoritatively for hosted zones only: no
+  recursion and no cache for anybody (no open resolver, nothing to poison),
+  response-rate limiting against reflection, version and host name hidden,
+  no dynamic updates. Zone transfers and the catalog of hosted domains need
+  the TSIG key (`hmac-sha256`, root:named 0640, never in argv, logs or
+  responses); NOTIFY goes only to configured secondaries. The control
+  channel listens on the loopback with a root-only key; the daemon reaches
+  it through `rndc` in a transient unit, keeping its own `PrivateNetwork`.
+  Every zone file is rendered from validated records (one line per record,
+  no `$` directive; property-tested against arbitrary input) and checked by
+  `named-checkzone` before the server sees it. A tenant can only change its
+  own zones; zones never overlap, never are a public suffix, and never
+  cover another tenant's sites. DNSSEC private keys belong to the server's
+  account (0600) and are never read by the engine. The delegation and DS
+  checks run in a transient unit under a dynamic unprivileged user.
 
 ## 4. What the tests prove, by layer
 
@@ -222,6 +239,15 @@ Stated plainly, in order of how much they matter.
     from tenant code, or feed the backup worker a hostile archive. Each of
     these is tried in `tests-integration/run-inside.sh` (container and VM),
     not from inside a tenant's PHP, Node.js or Python code as phase 80 does.
+12. **DNS: first come, first served.** A tenant can create the zone of any
+    registrable domain no other tenant holds or has a site in, whether or
+    not it owns the domain. Publicly that only matters once the registry
+    delegates the domain to this host's name servers; on this host it
+    blocks the real owner's zone until the operator deletes it. There is no
+    proof of ownership beyond `CheckDnsZone`'s delegation report. DNS
+    injection is tried in `run-inside.sh` (every field), not from tenant
+    code in phase 80; the DNS server's response-rate limiting is enabled but
+    its effect under attack is not measured.
 
 ## 6. Defects found by the testing work
 

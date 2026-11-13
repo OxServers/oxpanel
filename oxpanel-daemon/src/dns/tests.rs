@@ -184,9 +184,11 @@ www.shop.example.co.uk. 3600 IN A 203.0.113.10
     // Validated with the server's own checker, on a staging copy.
     let checks = h.argvs(bin::NAMED_CHECKZONE);
     assert!(
-        checks.iter().any(|a| a[..9]
+        checks.iter().any(|a| a[..11]
             == [
                 "-k",
+                "fail",
+                "-m",
                 "fail",
                 "-M",
                 "fail",
@@ -196,7 +198,7 @@ www.shop.example.co.uk. 3600 IN A 203.0.113.10
                 "local",
                 "example.co.uk"
             ]
-            && a[9].ends_with("/staging/example.co.uk.zone")),
+            && a[11].ends_with("/staging/example.co.uk.zone")),
         "{checks:?}"
     );
     assert!(!h.argvs(bin::NAMED_CHECKCONF).is_empty());
