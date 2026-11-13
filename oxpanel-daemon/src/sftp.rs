@@ -1471,10 +1471,7 @@ mod tests {
             .calls()
             .iter()
             .filter(|c| c.program == program)
-            .map(|c| {
-                String::from_utf8_lossy(c.stdin.as_ref().map_or(&[][..], Secret::expose))
-                    .into_owned()
-            })
+            .map(|c| String::from_utf8_lossy(c.stdin.as_deref().unwrap_or_default()).into_owned())
             .collect()
     }
 

@@ -387,6 +387,73 @@
   sh tests-integration/run-inside.sh SELinux: uploaded file is httpd_sys_content_t
   sh tests-acceptance/phases/60-reboot-post.sh SFTP login works after reboot
 
+[Databases (MariaDB)] Optional, detected
+  unit db unavailable_mariadb_is_refused_before_anything_is_recorded
+  unit db/mariadb state_is_parsed_from_the_clients_batch_output
+  it grpc_uds database_rpcs_over_uds
+  sh tests-integration/run-inside.sh host info reports MariaDB
+  sh tests-integration/run-inside.sh MariaDB does not listen on the network
+[Databases (MariaDB)] Databases and users per tenant
+  unit db create_database_runs_the_exact_client_and_statement
+  unit db password_change_and_user_deletion_run_exact_statements
+  unit db deleting_a_database_revokes_it_first
+  it grpc_uds database_rpcs_over_uds
+  sh tests-integration/run-inside.sh database created
+  sh tests-integration/run-inside.sh database user created (password on stdin)
+  sh tests-integration/run-inside.sh PHP writes and reads its own database, and nothing else
+  sh tests-integration/run-inside.sh database size is reported
+[Databases (MariaDB)] Names that cannot collide
+  unit validate db_names_belong_to_exactly_one_tenant
+  unit validate db_names_reject_injection_reserved_and_foreign_names
+  unit db names_are_namespaced_and_hostile_input_never_reaches_the_server
+  unit records database_records_round_trip_and_cannot_cross_tenants
+  sh tests-integration/run-inside.sh grant across tenants is refused
+[Databases (MariaDB)] Own it or leave it
+  unit db foreign_objects_are_never_adopted_or_dropped
+  unit db interrupted_requests_are_completed_by_repeating_them
+  sh tests-integration/run-inside.sh a database OxPanel did not create is never adopted
+  sh tests-integration/run-inside.sh nor dropped
+[Databases (MariaDB)] Least privilege
+  unit db/mariadb no_privilege_that_reaches_beyond_the_database
+  unit db/mariadb grant_patterns_match_only_their_own_database
+  unit db grants_stay_inside_the_tenant_and_escape_wildcards
+  sh tests-integration/run-inside.sh the account holds no global privilege
+  sh tests-integration/run-inside.sh no GRANT OPTION, FILE, SUPER or PROCESS
+  sh tests-integration/run-inside.sh user cannot read mysql.*
+  sh tests-integration/run-inside.sh user cannot reach another tenant's database
+  sh tests-integration/run-inside.sh user cannot read files
+[Databases (MariaDB)] No SQL injection, no secret leaks
+  unit db/mariadb statements_quote_identifiers_and_escape_grant_wildcards
+  unit db/mariadb password_hash_is_what_mariadb_computes
+  unit db/mariadb only_server_error_lines_survive_and_secrets_lose_their_text
+  unit db create_user_sends_only_the_hash_and_only_on_stdin
+  unit db a_failing_secret_statement_reveals_nothing
+  unit validate db_password_bounds_and_redaction
+  unit system/command secret_input_is_never_printed
+  sh tests-integration/run-inside.sh a password full of SQL metacharacters works
+  sh tests-integration/run-inside.sh no password in any process argv or the MariaDB process list
+  sh tests-integration/run-inside.sh no password and no password hash in the daemon journal
+[Databases (MariaDB)] Limits
+  unit db caps_per_tenant_are_enforced_before_anything_is_created
+  sh tests-integration/run-inside.sh the account is local only, with a connection limit
+[Databases (MariaDB)] Tenant lifecycle
+  unit db suspension_locks_accounts_and_tenant_deletion_is_refused
+  sh tests-integration/run-inside.sh suspension locks the tenant's database accounts
+  sh tests-integration/run-inside.sh suspension ends open sessions
+  sh tests-integration/run-inside.sh resume unlocks them
+  sh tests-integration/run-inside.sh a tenant with databases cannot be deleted
+[Databases (MariaDB)] Reconciliation
+  unit db reconcile_reports_what_was_changed_by_hand
+  sh tests-integration/run-inside.sh reconcile reports privileges added by hand
+  sh tests-integration/run-inside.sh a missing account is drift
+  sh tests-integration/run-inside.sh an unrecorded object with a tenant prefix is drift
+[Databases (MariaDB)] SELinux
+  sh tests-integration/run-inside.sh PHP writes and reads its own database, and nothing else
+  sh tests-integration/run-inside.sh an application (its own SELinux domain) reaches the MariaDB socket
+[Databases (MariaDB)] Ready for more engines
+  unit db create_database_runs_the_exact_client_and_statement
+  unit records database_records_round_trip_and_cannot_cross_tenants
+
 [API, transport and authentication] gRPC over a UNIX socket only
   it grpc_uds full_tenant_and_vhost_lifecycle_over_uds
   sh tests-integration/run-inside.sh socket is root:oxpanel 0660

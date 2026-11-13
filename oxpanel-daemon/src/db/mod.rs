@@ -957,6 +957,7 @@ mod tests {
             .join("nginx")
             .join("conf.d")
             .join("00-oxpanel.conf");
+        crate::config::sandbox_feature_paths(&mut cfg, dir.path());
         configure(&mut cfg);
         for d in [&cfg.home_base, &cfg.systemd_unit_dir] {
             std::fs::create_dir_all(d).unwrap_or_else(|e| panic!("{e}"));
@@ -979,6 +980,10 @@ mod tests {
                 .await
                 .unwrap_or_else(|e| panic!("{e}"));
         }
+        // As the daemon does at start: the sshd drop-in is in place.
+        crate::sftp::converge_all(&h.ctx)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
         h.sys.clear_calls();
         h
     }

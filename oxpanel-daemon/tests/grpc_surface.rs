@@ -77,6 +77,16 @@ fn scope_table() -> BTreeMap<&'static str, Scope> {
         ("ListSftpKeys", Scope::Read),
         ("SetSftpPassword", Scope::VHost),
         ("ClearSftpPassword", Scope::VHost),
+        // Databases (db stream; managing a site's database is site management)
+        ("CreateDatabase", Scope::VHost),
+        ("ListDatabases", Scope::Read),
+        ("DeleteDatabase", Scope::VHost),
+        ("CreateDatabaseUser", Scope::VHost),
+        ("ListDatabaseUsers", Scope::Read),
+        ("SetDatabaseUserPassword", Scope::VHost),
+        ("DeleteDatabaseUser", Scope::VHost),
+        ("GrantDatabaseAccess", Scope::VHost),
+        ("RevokeDatabaseAccess", Scope::VHost),
     ]
     .into_iter()
     .collect()
