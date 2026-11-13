@@ -27,6 +27,9 @@
 //! - [`files`]    — the file manager: a tenant's files managed through the
 //!   API; [`files_worker`], [`files_tree`] and [`files_archive`] are the
 //!   half that runs as the tenant.
+//! - [`task`]     — scheduled tasks (systemd timers running as the tenant);
+//!   [`php_settings`] — per-site PHP settings; [`backup_schedule`] —
+//!   backups the engine starts by itself.
 //! - [`host`]     — host information and record ↔ OS reconciliation.
 //! - [`auth`]     — peer-credential gate for the UNIX socket.
 //! - [`server`]   — gRPC ↔ domain mapping.
@@ -47,6 +50,7 @@ pub mod app;
 pub mod auth;
 pub mod auto_https;
 pub mod backup;
+pub mod backup_schedule;
 pub mod config;
 pub mod ctx;
 pub mod db;
@@ -60,12 +64,14 @@ pub mod host;
 pub mod lifecycle;
 pub mod nginx;
 pub mod php;
+pub mod php_settings;
 pub mod quota;
 pub mod records;
 pub mod server;
 pub mod sftp;
 pub mod system;
 pub mod systemd;
+pub mod task;
 pub mod tenant;
 pub mod tls;
 pub mod validate;

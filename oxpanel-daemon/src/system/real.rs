@@ -73,6 +73,9 @@ impl System for RealSystem {
             .env_clear()
             .env("PATH", CHILD_PATH)
             .env("LC_ALL", "C")
+            // Times a tool prints are UTC whatever the host's zone: systemctl
+            // prints a timer's next elapse only as text (task::parse_status).
+            .env("TZ", "UTC")
             .stdin(if spec.stdin.is_some() {
                 Stdio::piped()
             } else {

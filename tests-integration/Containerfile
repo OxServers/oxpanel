@@ -78,3 +78,5 @@ RUN dnf -y install epel-release \
     && dnf -y install --setopt=install_weak_deps=False ShellCheck rpmlint \
     && dnf -y remove epel-release \
     && dnf clean all && rm -rf /var/cache/dnf
+# PHP's command-line interpreter, for scheduled tasks that run PHP scripts.
+RUN dnf -y install --setopt=install_weak_deps=False php-cli && dnf clean all && rm -rf /var/cache/dnf

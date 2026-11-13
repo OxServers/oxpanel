@@ -1158,14 +1158,15 @@ impl BackupService {
         Ok((job, true))
     }
 
-    /// Start (or stop) the tenant's PHP pool and applications, unless the
-    /// tenant is suspended: then they stay stopped.
+    /// Start (or stop) the tenant's PHP pool, applications and scheduled
+    /// tasks, unless the tenant is suspended: then they stay stopped.
     async fn set_services(&self, tenant: &TenantRecord, running: bool) -> Result<()> {
         if tenant.suspended {
             return Ok(());
         }
         crate::php::set_running(&self.ctx, tenant, running).await?;
-        crate::app::set_running_all(&self.ctx, tenant, running).await
+        crate::app::set_running_all(&self.ctx, tenant, running).await?;
+        crate::task::set_running_all(&self.ctx, tenant, running).await
     }
 
     /// The record of the (existing) `tenant`'s backup `id`. Retained

@@ -148,6 +148,7 @@ fn tenant_record(name: &Username, home: &Path) -> TenantRecord {
         suspended: false,
         sftp_keys: Vec::new(),
         sftp_password: false,
+        php_limits: oxpanel_daemon::php_settings::PhpLimits::default(),
     }
 }
 
@@ -406,7 +407,7 @@ proptest! {
                 suspended: mode == 3, access_log: access, error_log: error,
                 php_socket: (mode == 1).then_some(php_sock),
                 app_socket: (mode == 2).then_some(app_sock),
-                acme_challenge_dir: Path::new("/var/lib/oxpanel-acme/challenges"), tls: None,
+                acme_challenge_dir: Path::new("/var/lib/oxpanel-acme/challenges"), tls: None, php_tuning: None,
             })
         };
         let out = render(&d, &aliases, &name, &docroot, &access, &error, &php_sock, &app_sock).expect("valid inputs render");
@@ -459,7 +460,7 @@ proptest! {
             access_log: &p[1], error_log: &p[2],
             php_socket: (mode == 1).then_some(p[3].as_path()),
             app_socket: (mode == 2).then_some(p[4].as_path()),
-            acme_challenge_dir: Path::new("/var/lib/oxpanel-acme/challenges"), tls: None,
+            acme_challenge_dir: Path::new("/var/lib/oxpanel-acme/challenges"), tls: None, php_tuning: None,
         });
         let reference = block(&good.iter().map(PathBuf::from).collect::<Vec<_>>()).expect("reference");
         if let Ok(out) = block(&paths) {
@@ -623,6 +624,7 @@ proptest! {
             hsts: false,
             tls: None,
             auto_https: oxpanel_daemon::records::AutoHttpsChoice::On,
+            php_settings: oxpanel_daemon::php_settings::PhpSettings::default(),
         };
         store.save_vhost(&v).expect("save vhost");
         prop_assert_eq!(store.load_vhost(&d).expect("load"), Some(v));
@@ -657,6 +659,7 @@ proptest! {
             config_path: PathBuf::from("/x"), created_at_unix: 0, php: false, app: None,
             redirect_https: false, hsts: false, tls: None,
             auto_https: oxpanel_daemon::records::AutoHttpsChoice::On,
+            php_settings: oxpanel_daemon::php_settings::PhpSettings::default(),
         };
         let _ = store.save_vhost(&v);
         // Everything that exists is inside the two record directories.

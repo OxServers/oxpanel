@@ -2,6 +2,8 @@
 
 use tonic::service::interceptor::InterceptedService;
 
+mod essentials;
+
 /// Largest request the daemon will decode. Every message is a handful of
 /// short strings; anything bigger is a mistake or an attack.
 pub const MAX_REQUEST_BYTES: usize = 256 * 1024;
@@ -51,6 +53,9 @@ pub struct Engine {
     files: FileService,
     /// Largest upload, as `StartUpload` reports it.
     files_upload_max: u64,
+    tasks: crate::task::TaskService,
+    schedules: crate::backup_schedule::ScheduleService,
+    ctx: Ctx,
 }
 
 /// Interceptor type used by [`Engine::into_service`].
@@ -69,7 +74,13 @@ impl Engine {
             lifecycle: LifecycleService::new(ctx.clone(), BackupService::new(ctx.clone())),
             files: FileService::new(ctx.clone()),
             files_upload_max: ctx.config.files.upload_max_bytes,
-            host: HostService::new(ctx),
+            tasks: crate::task::TaskService::new(ctx.clone()),
+            schedules: crate::backup_schedule::ScheduleService::new(
+                ctx.clone(),
+                BackupService::new(ctx.clone()),
+            ),
+            host: HostService::new(ctx.clone()),
+            ctx,
         }
     }
 
@@ -189,6 +200,9 @@ fn drift_to(d: &Drift) -> pb::Drift {
         DriftKind::BackupIncomplete => pb::DriftKind::BackupIncomplete,
         DriftKind::DatabaseTrashDrift => pb::DriftKind::DatabaseTrashDrift,
         DriftKind::OrphanDatabaseTrash => pb::DriftKind::OrphanDatabaseTrash,
+        DriftKind::TaskUnitDrift => pb::DriftKind::TaskUnitDrift,
+        DriftKind::OrphanTaskUnit => pb::DriftKind::OrphanTaskUnit,
+        DriftKind::OrphanBackupSchedule => pb::DriftKind::OrphanBackupSchedule,
     };
     pb::Drift {
         kind: kind.into(),
@@ -250,6 +264,9 @@ fn fail(rpc: &'static str, peer: &str, err: Error) -> Status {
         | Error::TooManyFileJobs
         | Error::UploadNotFound(_)
         | Error::TooManyUploads(_)
+        | Error::TaskNotFound { .. }
+        | Error::TaskLimitReached { .. }
+        | Error::PhpNotEnabled(_)
         | Error::NginxInvalid(_) => {
             warn!(rpc, peer, error = %err, "request refused");
             err.into()
@@ -312,6 +329,8 @@ fn tenant_to(rec: &TenantRecord) -> pb::Tenant {
         suspended: rec.suspended,
         sftp_key_count: u32::try_from(rec.sftp_keys.len()).unwrap_or(u32::MAX),
         sftp_password: rec.sftp_password,
+        php_limits: (!rec.php_limits.is_empty())
+            .then(|| essentials::php_limits_to(&rec.php_limits)),
     }
 }
 
@@ -349,6 +368,9 @@ fn vhost_to(rec: &VHostRecord) -> pb::VirtualHost {
         redirect_https: rec.redirect_https,
         hsts: rec.hsts,
         auto_https_opt_out: !rec.auto_https.is_on(),
+        php_settings: essentials::php_settings_to(&rec.php_settings),
+        // Needs the tenant's caps: filled in by Engine::vhosts_out.
+        php_settings_effective: None,
     }
 }
 
@@ -557,7 +579,7 @@ impl OxPanelEngine for Engine {
             self.tls.auto_https_soon(rec.domain.clone());
         }
         Ok(Response::new(pb::ConfigureVirtualHostResponse {
-            vhost: Some(vhost_to(&rec)),
+            vhost: self.vhosts_out(std::slice::from_ref(&rec)).pop(),
             created,
         }))
     }
@@ -589,7 +611,7 @@ impl OxPanelEngine for Engine {
             .await
             .map_err(|e| fail("ListVirtualHosts", &peer, e))?;
         Ok(Response::new(pb::ListVirtualHostsResponse {
-            vhosts: recs.iter().map(vhost_to).collect(),
+            vhosts: self.vhosts_out(&recs),
         }))
     }
 
@@ -753,7 +775,7 @@ impl OxPanelEngine for Engine {
         const RPC: &str = "GetHostInfo";
         let peer = self.authorise(&req, RPC, Scope::Read)?;
         let i = self.host.info().await.map_err(|e| fail(RPC, &peer, e))?;
-        Ok(Response::new(pb::HostInfo {
+        let mut info = pb::HostInfo {
             daemon_version: env!("CARGO_PKG_VERSION").to_owned(),
             selinux_enabled: i.selinux,
             dry_run: i.dry_run,
@@ -796,7 +818,10 @@ impl OxPanelEngine for Engine {
             backup_disk_free_bytes: i.backup_disk_free_bytes,
             backup_keep: i.backup_keep,
             database_trash_days: i.db_trash_days,
-        }))
+            ..pb::HostInfo::default()
+        };
+        self.essentials_info(&mut info, i.php_cli);
+        Ok(Response::new(info))
     }
 
     async fn reconcile(
@@ -1792,6 +1817,71 @@ impl OxPanelEngine for Engine {
         Ok(Response::new(pb::ListFileJobsResponse {
             jobs: jobs.iter().map(file_job_to).collect(),
         }))
+    }
+
+    // --- Scheduled tasks, PHP settings, scheduled backups (server/essentials.rs)
+
+    async fn put_scheduled_task(
+        &self,
+        req: Request<pb::PutScheduledTaskRequest>,
+    ) -> Result<Response<pb::PutScheduledTaskResponse>, Status> {
+        self.put_scheduled_task_rpc(req).await
+    }
+
+    async fn delete_scheduled_task(
+        &self,
+        req: Request<pb::DeleteScheduledTaskRequest>,
+    ) -> Result<Response<pb::DeleteScheduledTaskResponse>, Status> {
+        self.delete_scheduled_task_rpc(req).await
+    }
+
+    async fn list_scheduled_tasks(
+        &self,
+        req: Request<pb::ListScheduledTasksRequest>,
+    ) -> Result<Response<pb::ListScheduledTasksResponse>, Status> {
+        self.list_scheduled_tasks_rpc(req).await
+    }
+
+    async fn run_scheduled_task(
+        &self,
+        req: Request<pb::RunScheduledTaskRequest>,
+    ) -> Result<Response<pb::RunScheduledTaskResponse>, Status> {
+        self.run_scheduled_task_rpc(req).await
+    }
+
+    async fn read_scheduled_task_log(
+        &self,
+        req: Request<pb::ReadScheduledTaskLogRequest>,
+    ) -> Result<Response<pb::ReadScheduledTaskLogResponse>, Status> {
+        self.read_scheduled_task_log_rpc(req).await
+    }
+
+    async fn set_php_settings(
+        &self,
+        req: Request<pb::SetPhpSettingsRequest>,
+    ) -> Result<Response<pb::SetPhpSettingsResponse>, Status> {
+        self.set_php_settings_rpc(req).await
+    }
+
+    async fn set_tenant_php_limits(
+        &self,
+        req: Request<pb::SetTenantPhpLimitsRequest>,
+    ) -> Result<Response<pb::UpdateTenantResponse>, Status> {
+        self.set_tenant_php_limits_rpc(req).await
+    }
+
+    async fn set_backup_schedule(
+        &self,
+        req: Request<pb::SetBackupScheduleRequest>,
+    ) -> Result<Response<pb::BackupSchedule>, Status> {
+        self.set_backup_schedule_rpc(req).await
+    }
+
+    async fn get_backup_schedule(
+        &self,
+        req: Request<pb::GetBackupScheduleRequest>,
+    ) -> Result<Response<pb::BackupSchedule>, Status> {
+        self.get_backup_schedule_rpc(req).await
     }
 }
 

@@ -26,10 +26,11 @@ use crate::ctx::Ctx;
 use crate::error::{Error, Result};
 use crate::fsutil;
 use crate::nginx::safe_path_str;
-use crate::records::TenantRecord;
+use crate::php_settings::PhpSettings;
+use crate::records::{TenantRecord, VHostRecord};
 use crate::system::{bin, CommandSpec};
 use crate::systemd;
-use crate::validate::Username;
+use crate::validate::{Domain, Username};
 
 const HEADER_UNIT: &str = "# Managed by oxpanel-daemon. Manual edits will be overwritten.\n";
 const HEADER_CONF: &str = "; Managed by oxpanel-daemon. Manual edits will be overwritten.\n";
@@ -70,6 +71,88 @@ impl PoolFiles {
     }
 }
 
+/// The socket of a site's own pool (a site with PHP settings, see
+/// [`render_pool_conf_with_sites`]).
+pub fn site_socket_path(name: &Username, domain: &Domain) -> PathBuf {
+    PathBuf::from(format!("/run/{RUNTIME_SUBDIR}/{name}/{domain}.sock"))
+}
+
+/// A site that gets a pool of its own, with its effective settings.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SitePool {
+    pub domain: Domain,
+    pub settings: PhpSettings,
+}
+
+/// The sites of `tenant` that get a pool of their own: PHP on and settings
+/// set. `pending` stands in for the stored record of its domain (a change
+/// not saved yet), and is added if it has none. Settings are clamped to the
+/// tenant's caps (see [`crate::php_settings::effective`]).
+pub fn site_pools(
+    cfg: &crate::config::Config,
+    tenant: &TenantRecord,
+    vhosts: &[VHostRecord],
+    pending: Option<&VHostRecord>,
+) -> Result<Vec<SitePool>> {
+    let caps = tenant.php_limits.resolve(&cfg.essentials.php_max);
+    let mut sites: Vec<&VHostRecord> = vhosts
+        .iter()
+        .filter(|v| v.tenant == tenant.username)
+        .filter(|v| pending.is_none_or(|p| p.domain != v.domain))
+        .collect();
+    sites.extend(pending.filter(|p| p.tenant == tenant.username));
+    let mut out: Vec<SitePool> = sites
+        .into_iter()
+        .filter(|v| v.php && !v.php_settings.is_empty())
+        .map(|v| {
+            Ok(SitePool {
+                domain: Domain::parse(&v.domain)?,
+                settings: crate::php_settings::effective(&v.php_settings, &caps),
+            })
+        })
+        .collect::<Result<_>>()?;
+    out.sort_by(|a, b| a.domain.as_str().cmp(b.domain.as_str()));
+    Ok(out)
+}
+
+/// The FPM configuration with a pool for every site in `sites` after the
+/// tenant's default pool. Each site pool repeats the default pool's
+/// hardening and adds the site's settings; it has its own socket, so a
+/// setting of one site never applies to another. Without sites this is
+/// exactly [`render_pool_conf`].
+pub fn render_pool_conf_with_sites(
+    tenant: &TenantRecord,
+    name: &Username,
+    web_user: &str,
+    sites: &[SitePool],
+) -> Result<String> {
+    use std::fmt::Write as _;
+    let home = safe_path_str(&tenant.home)?;
+    let mut out = render_pool_conf(tenant, name, web_user)?;
+    for site in sites {
+        let sock = site_socket_path(name, &site.domain);
+        let display_errors = if site.settings.display_errors {
+            "on"
+        } else {
+            "off"
+        };
+        let _ = write!(
+            out,
+            "\n; Site {domain}: its own pool, for its own PHP settings (SetPhpSettings).\n{}{}",
+            pool_section(
+                site.domain.as_str(),
+                safe_path_str(&sock)?,
+                web_user,
+                home,
+                display_errors
+            ),
+            crate::php_settings::pool_lines(&site.settings)?,
+            domain = site.domain,
+        );
+    }
+    Ok(out)
+}
+
 /// The FPM configuration: one `[global]` section and one pool.
 pub fn render_pool_conf(tenant: &TenantRecord, name: &Username, web_user: &str) -> Result<String> {
     let home = safe_path_str(&tenant.home)?;
@@ -83,7 +166,22 @@ error_log = syslog
 syslog.ident = oxpanel-php-{name}
 log_level = notice
 
-[{name}]
+{}",
+        pool_section(name.as_str(), sock, web_user, home, "off")
+    ))
+}
+
+/// One pool: its socket, process manager and the hardening every pool of
+/// OxPanel carries. `section` and the paths are validated names.
+fn pool_section(
+    section: &str,
+    sock: &str,
+    web_user: &str,
+    home: &str,
+    display_errors: &str,
+) -> String {
+    format!(
+        "[{section}]
 listen = {sock}
 ; Only the web server may connect; other tenants cannot.
 listen.acl_users = {web_user}
@@ -101,10 +199,10 @@ php_admin_value[upload_tmp_dir] = /tmp
 php_admin_value[session.save_path] = /tmp
 php_admin_value[sys_temp_dir] = /tmp
 php_admin_flag[log_errors] = on
-php_admin_flag[display_errors] = off
+php_admin_flag[display_errors] = {display_errors}
 php_admin_flag[allow_url_include] = off
 "
-    ))
+    )
 }
 
 /// The service unit that runs the tenant's FPM instance.
@@ -168,7 +266,11 @@ fn systemctl(ctx: &Ctx) -> CommandSpec {
 /// Write the pool's files and make sure the instance runs (unless the tenant
 /// is suspended). Idempotent; a changed file restarts the instance.
 /// The caller holds the mutation lock. Returns whether a file changed.
-pub async fn ensure_pool(ctx: &Ctx, tenant: &TenantRecord) -> Result<bool> {
+pub async fn ensure_pool(
+    ctx: &Ctx,
+    tenant: &TenantRecord,
+    pending: Option<&VHostRecord>,
+) -> Result<bool> {
     if !ctx.sys.is_installed(bin::PHP_FPM).await {
         return Err(Error::PhpUnavailable);
     }
@@ -177,9 +279,10 @@ pub async fn ensure_pool(ctx: &Ctx, tenant: &TenantRecord) -> Result<bool> {
     let files = PoolFiles::for_tenant(&cfg.php_conf_dir, &cfg.systemd_unit_dir, &name);
     let unit = unit_name(&name);
     fsutil::ensure_dir(&cfg.php_conf_dir, DIR_MODE)?;
+    let sites = site_pools(cfg, tenant, &ctx.store.list_vhosts()?, pending)?;
     let conf_changed = fsutil::write_atomic(
         &files.conf,
-        render_pool_conf(tenant, &name, &cfg.web_user)?.as_bytes(),
+        render_pool_conf_with_sites(tenant, &name, &cfg.web_user, &sites)?.as_bytes(),
         FILE_MODE,
     )?;
     let unit_changed = fsutil::write_atomic(
@@ -279,6 +382,7 @@ mod tests {
                 suspended: false,
                 sftp_keys: Vec::new(),
                 sftp_password: false,
+                php_limits: crate::php_settings::PhpLimits::default(),
             },
             n,
         )
@@ -323,6 +427,108 @@ mod tests {
             assert!(u.lines().any(|l| l == line), "missing line: {line}");
         }
         assert!(!u.contains("User=root"));
+        Ok(())
+    }
+
+    #[test]
+    fn a_site_with_settings_gets_its_own_hardened_pool() -> Result<()> {
+        let (t, n) = tenant("alice");
+        let plain = render_pool_conf(&t, &n, "nginx")?;
+        assert_eq!(
+            render_pool_conf_with_sites(&t, &n, "nginx", &[])?,
+            plain,
+            "a tenant without settings keeps exactly its configuration"
+        );
+        let site = SitePool {
+            domain: Domain::parse("shop.example.com")?,
+            settings: PhpSettings {
+                memory_limit_mb: Some(256),
+                display_errors: true,
+                ..PhpSettings::default()
+            },
+        };
+        let c = render_pool_conf_with_sites(&t, &n, "nginx", &[site])?;
+        assert!(
+            c.starts_with(&plain),
+            "the default pool comes first, unchanged"
+        );
+        let tail = &c[plain.len()..];
+        assert_eq!(
+            tail,
+            "
+; Site shop.example.com: its own pool, for its own PHP settings (SetPhpSettings).
+[shop.example.com]
+listen = /run/oxpanel-php/alice/shop.example.com.sock
+; Only the web server may connect; other tenants cannot.
+listen.acl_users = nginx
+pm = ondemand
+pm.max_children = 8
+pm.process_idle_timeout = 60s
+pm.max_requests = 500
+catch_workers_output = yes
+decorate_workers_output = no
+clear_env = yes
+security.limit_extensions = .php
+php_admin_value[open_basedir] = /home/alice/:/tmp/:/usr/share/php/:/usr/share/pear/
+; The unit has a private /tmp, so these are per tenant.
+php_admin_value[upload_tmp_dir] = /tmp
+php_admin_value[session.save_path] = /tmp
+php_admin_value[sys_temp_dir] = /tmp
+php_admin_flag[log_errors] = on
+php_admin_flag[display_errors] = on
+php_admin_flag[allow_url_include] = off
+php_value[memory_limit] = 256M
+"
+        );
+        assert_eq!(
+            site_socket_path(&n, &Domain::parse("shop.example.com")?),
+            PathBuf::from("/run/oxpanel-php/alice/shop.example.com.sock")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn site_pools_follow_pending_changes_and_the_tenants_caps() -> Result<()> {
+        let (mut t, _) = tenant("alice");
+        t.php_limits.memory_limit_mb = 128;
+        let cfg = crate::config::Config::default();
+        let vhost = |domain: &str, php: bool, mb: Option<u32>| VHostRecord {
+            version: 1,
+            domain: domain.into(),
+            tenant: "alice".into(),
+            document_root: "public_html".into(),
+            aliases: vec![],
+            config_path: PathBuf::from("/x"),
+            created_at_unix: 0,
+            php,
+            app: None,
+            redirect_https: false,
+            hsts: false,
+            tls: None,
+            auto_https: crate::records::AutoHttpsChoice::On,
+            php_settings: PhpSettings {
+                memory_limit_mb: mb,
+                ..PhpSettings::default()
+            },
+        };
+        let stored = vec![
+            vhost("b.example", true, Some(512)),
+            vhost("a.example", true, None),
+            vhost("c.example", false, Some(64)),
+        ];
+        let sites = site_pools(&cfg, &t, &stored, None)?;
+        assert_eq!(sites.len(), 1, "PHP on and settings set");
+        assert_eq!(sites.first().map(|s| s.domain.as_str()), Some("b.example"));
+        assert_eq!(
+            sites.first().and_then(|s| s.settings.memory_limit_mb),
+            Some(128),
+            "clamped to the cap"
+        );
+        // A pending change replaces the stored record of its domain.
+        let pending = vhost("b.example", true, None);
+        assert!(site_pools(&cfg, &t, &stored, Some(&pending))?.is_empty());
+        let new = vhost("d.example", true, Some(64));
+        assert_eq!(site_pools(&cfg, &t, &stored, Some(&new))?.len(), 2);
         Ok(())
     }
 

@@ -227,6 +227,33 @@ service OxPanelEngine {
   rpc ExtractArchive(ExtractArchiveRequest) returns (FileJob);
   rpc GetFileJob(GetFileJobRequest) returns (FileJob);
   rpc ListFileJobs(ListFileJobsRequest) returns (ListFileJobsResponse);
+  // --- Scheduled tasks, PHP settings per site, scheduled backups ---------
+  // Create or replace a scheduled task of a tenant (what hosting customers
+  // call a cron job). It runs as the tenant, in the tenant's slice and
+  // sandbox, with a time limit, never overlapping with itself. Idempotent.
+  rpc PutScheduledTask(PutScheduledTaskRequest) returns (PutScheduledTaskResponse);
+  // Remove a scheduled task (a running instance is stopped).
+  rpc DeleteScheduledTask(DeleteScheduledTaskRequest) returns (DeleteScheduledTaskResponse);
+  // A tenant's scheduled tasks with their last run and next run.
+  rpc ListScheduledTasks(ListScheduledTasksRequest) returns (ListScheduledTasksResponse);
+  // Start a task now (whether or not it is enabled). Returns at once; a run
+  // in progress is not started a second time. Refused while the tenant is
+  // suspended.
+  rpc RunScheduledTask(RunScheduledTaskRequest) returns (RunScheduledTaskResponse);
+  // The end of a task's output (from the journal).
+  rpc ReadScheduledTaskLog(ReadScheduledTaskLogRequest) returns (ReadScheduledTaskLogResponse);
+  // Replace the PHP settings of one PHP-enabled site (an empty `settings`
+  // clears them). Only the settings of PhpSettings exist; every value is
+  // checked against the host's maxima and the tenant's own caps.
+  rpc SetPhpSettings(SetPhpSettingsRequest) returns (SetPhpSettingsResponse);
+  // Set a tenant's caps on PHP settings (a plan). 0 = the host maximum.
+  rpc SetTenantPhpLimits(SetTenantPhpLimitsRequest) returns (UpdateTenantResponse);
+  // Set when the engine backs a tenant up by itself (off, daily, weekly, or
+  // the host default). Scheduled backups are ordinary backups: same limits,
+  // same keep-count.
+  rpc SetBackupSchedule(SetBackupScheduleRequest) returns (BackupSchedule);
+  // The tenant's effective backup schedule, next run and last result.
+  rpc GetBackupSchedule(GetBackupScheduleRequest) returns (BackupSchedule);
 }
 
 // Per-tenant resource limits, applied through systemd (cgroups v2).
@@ -277,6 +304,9 @@ message Tenant {
   uint32 sftp_key_count = 11;
   // The tenant has an SFTP password. (SFTP access: a key or a password.)
   bool sftp_password = 12;
+  // Caps on the PHP settings of the tenant's sites (SetTenantPhpLimits);
+  // 0 = the host maximum.
+  PhpLimits php_limits = 13;
 }
 
 enum TenantState {
@@ -367,6 +397,11 @@ message VirtualHost {
   bool hsts = 10;
   // The site is excluded from Automatic HTTPS (see GetAutoHttpsStatus).
   bool auto_https_opt_out = 11;
+  // PHP settings as set with SetPhpSettings (0 / empty = PHP's default).
+  PhpSettings php_settings = 12;
+  // What applies: the settings clamped to the tenant's caps, with
+  // post_max_size filled in when only upload_max_filesize was given.
+  PhpSettings php_settings_effective = 13;
 }
 
 enum AppRuntime {
@@ -553,6 +588,20 @@ message HostInfo {
   // 29..=31 were set aside for databases and are still unused.
   // Days a deleted database stays in a tenant's trash before it is purged.
   uint32 database_trash_days = 35;
+  // PHP's command-line interpreter (php-cli) is installed: PHP scheduled
+  // tasks can be created.
+  bool php_cli_available = 36;
+  // Host maxima of the PHP settings (OXPANEL_PHP_MAX_*).
+  PhpLimits php_limits = 37;
+  // Scheduled tasks: most per tenant, shortest interval in minutes, longest
+  // time limit in seconds.
+  uint32 task_max_per_tenant = 38;
+  uint32 task_min_interval_minutes = 39;
+  uint32 task_max_timeout_seconds = 40;
+  // Scheduled backups run on this host (OXPANEL_BACKUP_SCHEDULES), and what
+  // tenants without a choice of their own get (OXPANEL_BACKUP_SCHEDULE_DEFAULT).
+  bool backup_schedules_enabled = 41;
+  BackupFrequency backup_schedule_default = 42;
 }
 
 // Database engines OxPanel can manage. More will follow (PostgreSQL,
@@ -651,6 +700,13 @@ enum DriftKind {
   DRIFT_KIND_DATABASE_TRASH_DRIFT = 30;
   // An oxpanel_trash_* schema on the server that no trash record accounts for.
   DRIFT_KIND_ORPHAN_DATABASE_TRASH = 31;
+  // A scheduled task's service or timer unit is missing or differs from
+  // what its record renders.
+  DRIFT_KIND_TASK_UNIT_DRIFT = 32;
+  // An oxpanel-task-* unit that no task record accounts for.
+  DRIFT_KIND_ORPHAN_TASK_UNIT = 33;
+  // A backup schedule record for a tenant that does not exist.
+  DRIFT_KIND_ORPHAN_BACKUP_SCHEDULE = 34;
 }
 
 message Drift {
@@ -1641,4 +1697,246 @@ message ListFileJobsRequest {
 message ListFileJobsResponse {
   // Oldest first; the last 50 per tenant are kept.
   repeated FileJob jobs = 1;
+}
+
+// --- Scheduled tasks -----------------------------------------------------
+
+// What a task runs. The interpreter is always the engine's choice of a
+// system binary; nothing the caller sends is interpreted by a shell.
+enum TaskKind {
+  TASK_KIND_UNSPECIFIED = 0;
+  // /usr/bin/php -f <home>/<script> -- <args> (needs php-cli).
+  TASK_KIND_PHP = 1;
+  // /usr/bin/node <home>/<script> <args>.
+  TASK_KIND_NODE = 2;
+  // /usr/bin/python3 <home>/<script> <args>, or the interpreter of
+  // `virtualenv` when one is given.
+  TASK_KIND_PYTHON = 3;
+  // Fetch `url` (one of the tenant's own sites, served by this host).
+  TASK_KIND_URL = 4;
+}
+
+enum TaskScheduleForm {
+  TASK_SCHEDULE_FORM_UNSPECIFIED = 0;
+  // Every `interval` minutes: 1, 2, 3, 4, 5, 6, 10, 12, 15, 20 or 30, and
+  // at least the host minimum (HostInfo.task_min_interval_minutes).
+  TASK_SCHEDULE_FORM_EVERY_MINUTES = 1;
+  // Every `interval` hours (1, 2, 3, 4, 6, 8 or 12) at `minute`.
+  TASK_SCHEDULE_FORM_EVERY_HOURS = 2;
+  // Every day at `hour`:`minute`.
+  TASK_SCHEDULE_FORM_DAILY = 3;
+  // Every week on `weekday` at `hour`:`minute`.
+  TASK_SCHEDULE_FORM_WEEKLY = 4;
+  // Every month on `day_of_month` (1-28) at `hour`:`minute`.
+  TASK_SCHEDULE_FORM_MONTHLY = 5;
+}
+
+message TaskSchedule {
+  TaskScheduleForm form = 1;
+  uint32 interval = 2;
+  uint32 minute = 3;
+  uint32 hour = 4;
+  // 0 = Sunday ... 6 = Saturday.
+  uint32 weekday = 5;
+  uint32 day_of_month = 6;
+  // IANA time zone of `hour`/`minute` (e.g. "Europe/Berlin"). Empty = UTC.
+  string time_zone = 7;
+}
+
+message ScheduledTaskSpec {
+  // a-z, 0-9 and '-', 1-32 characters, starting with a letter or digit;
+  // unique per tenant.
+  string name = 1;
+  TaskKind kind = 2;
+  // PHP, NODE, PYTHON: the script, relative to the tenant home.
+  string script = 3;
+  // Arguments passed to the script (at most 16, each at most 256 bytes of
+  // printable ASCII without double or single quotes, backtick, backslash,
+  // dollar or percent sign).
+  repeated string args = 4;
+  // PYTHON: a virtualenv directory relative to the home (e.g.
+  // "apps/api/.venv"); empty = the system's python3.
+  string virtualenv = 5;
+  // URL: http(s)://<one of the tenant's server names>/<path and query>.
+  string url = 6;
+  TaskSchedule schedule = 7;
+  // Time limit; the task is ended (with everything it started) when it
+  // runs longer. 0 = 300 s; 10 .. HostInfo.task_max_timeout_seconds.
+  uint32 timeout_seconds = 8;
+  // Not run on its schedule (RunScheduledTask still runs it).
+  bool disabled = 9;
+}
+
+message ScheduledTask {
+  string tenant = 1;
+  ScheduledTaskSpec spec = 2;
+  // The systemd calendar expression the schedule became.
+  string calendar = 3;
+  // The service unit that runs it.
+  string unit = 4;
+  bool running = 5;
+  // The last run since the host started (absent if none).
+  google.protobuf.Timestamp last_started = 6;
+  google.protobuf.Timestamp last_finished = 7;
+  // systemd's result of the last run: "success", "exit-code", "timeout",
+  // "signal", "core-dump", ...; empty if it has not run.
+  string last_result = 8;
+  // Exit status of the last run.
+  int32 last_exit_status = 9;
+  // When the timer fires next (absent while disabled or suspended).
+  google.protobuf.Timestamp next_run = 10;
+}
+
+message PutScheduledTaskRequest {
+  string tenant = 1;
+  ScheduledTaskSpec spec = 2;
+}
+
+message PutScheduledTaskResponse {
+  ScheduledTask task = 1;
+  // false when the task already had exactly this specification.
+  bool changed = 2;
+}
+
+message DeleteScheduledTaskRequest {
+  string tenant = 1;
+  string name = 2;
+}
+
+message DeleteScheduledTaskResponse {
+  bool deleted = 1;
+}
+
+message ListScheduledTasksRequest {
+  string tenant = 1;
+}
+
+message ListScheduledTasksResponse {
+  repeated ScheduledTask tasks = 1;
+}
+
+message RunScheduledTaskRequest {
+  string tenant = 1;
+  string name = 2;
+}
+
+message RunScheduledTaskResponse {
+  // false when the task was already running (it is not started twice).
+  bool started = 1;
+}
+
+message ReadScheduledTaskLogRequest {
+  string tenant = 1;
+  string name = 2;
+}
+
+message ReadScheduledTaskLogResponse {
+  string text = 1;
+}
+
+// --- PHP settings per site ----------------------------------------------
+
+// The PHP settings a site may change. 0 / false / empty = PHP's default.
+message PhpSettings {
+  // memory_limit in MiB (16 .. max).
+  uint32 memory_limit_mb = 1;
+  // upload_max_filesize in MiB (1 .. max).
+  uint32 upload_max_filesize_mb = 2;
+  // post_max_size in MiB (1 .. max, at least upload_max_filesize).
+  uint32 post_max_size_mb = 3;
+  // max_execution_time in seconds (1 .. max). On Linux PHP counts the
+  // script's CPU time, not time spent waiting.
+  uint32 max_execution_time_seconds = 4;
+  // max_input_time in seconds (1 .. max).
+  uint32 max_input_time_seconds = 5;
+  // max_input_vars (100 .. max).
+  uint32 max_input_vars = 6;
+  // display_errors on (default off).
+  bool display_errors = 7;
+  // date.timezone, an IANA zone such as "Europe/Berlin".
+  string date_timezone = 8;
+}
+
+// Upper bounds of PHP settings: the host maxima, or a tenant's caps (where
+// 0 = the host maximum).
+message PhpLimits {
+  uint32 memory_limit_mb = 1;
+  // Applies to upload_max_filesize and post_max_size.
+  uint32 upload_max_filesize_mb = 2;
+  uint32 max_execution_time_seconds = 3;
+  uint32 max_input_time_seconds = 4;
+  uint32 max_input_vars = 5;
+}
+
+message SetPhpSettingsRequest {
+  string domain = 1;
+  PhpSettings settings = 2;
+}
+
+message SetPhpSettingsResponse {
+  VirtualHost vhost = 1;
+  bool changed = 2;
+}
+
+message SetTenantPhpLimitsRequest {
+  string username = 1;
+  PhpLimits limits = 2;
+}
+
+// --- Scheduled backups ---------------------------------------------------
+
+enum BackupFrequency {
+  // In SetBackupSchedule: follow the host default.
+  BACKUP_FREQUENCY_UNSPECIFIED = 0;
+  BACKUP_FREQUENCY_OFF = 1;
+  BACKUP_FREQUENCY_DAILY = 2;
+  BACKUP_FREQUENCY_WEEKLY = 3;
+}
+
+enum ScheduledBackupResult {
+  // No scheduled backup has run yet.
+  SCHEDULED_BACKUP_RESULT_NONE = 0;
+  SCHEDULED_BACKUP_RESULT_RUNNING = 1;
+  SCHEDULED_BACKUP_RESULT_SUCCEEDED = 2;
+  SCHEDULED_BACKUP_RESULT_FAILED = 3;
+  // Could not start yet (the host's job limit, or another job of the
+  // tenant is running); tried again at the next check.
+  SCHEDULED_BACKUP_RESULT_DEFERRED = 4;
+}
+
+message SetBackupScheduleRequest {
+  string tenant = 1;
+  BackupFrequency frequency = 2;
+  // Hour of day, UTC (0-23); absent = assigned by the engine within the
+  // host's backup window.
+  optional uint32 hour = 3;
+  // Weekly: 0 = Sunday ... 6 = Saturday; absent = assigned by the engine.
+  optional uint32 weekday = 4;
+}
+
+message GetBackupScheduleRequest {
+  string tenant = 1;
+}
+
+message BackupSchedule {
+  string tenant = 1;
+  // What applies (never UNSPECIFIED).
+  BackupFrequency frequency = 2;
+  // The tenant has no choice of its own: the host default applies.
+  bool host_default = 3;
+  // When, in UTC. The minute is always assigned by the engine.
+  uint32 hour = 4;
+  uint32 minute = 5;
+  uint32 weekday = 6;
+  bool hour_assigned = 7;
+  bool weekday_assigned = 8;
+  // Absent when the frequency is OFF or scheduled backups are off on the host.
+  google.protobuf.Timestamp next_run = 9;
+  // The last scheduled attempt.
+  google.protobuf.Timestamp last_run = 10;
+  string last_job_id = 11;
+  ScheduledBackupResult last_result = 12;
+  string last_message = 13;
+  // Scheduled backups run on this host at all.
+  bool enabled_on_host = 14;
 }

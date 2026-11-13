@@ -182,10 +182,15 @@ impl VHostService {
             // The certificate is not part of the request: it stays as it is.
             tls: existing.as_ref().and_then(|e| e.tls.clone()),
             auto_https: req.auto_https,
+            // Not part of the request either (SetPhpSettings): kept.
+            php_settings: existing
+                .as_ref()
+                .map(|e| e.php_settings.clone())
+                .unwrap_or_default(),
         };
         // The pool must be listening before Nginx is told to use it.
         let pool_changed = if rec.php {
-            php::ensure_pool(&self.ctx, &tenant_rec).await?
+            php::ensure_pool(&self.ctx, &tenant_rec, Some(&rec)).await?
         } else if rec.app.is_some() {
             app::ensure_app(&self.ctx, &tenant_rec, &rec).await?
         } else {
@@ -199,7 +204,10 @@ impl VHostService {
         if record_changed {
             self.ctx.store.save_vhost(&rec)?;
         }
-        let switched_off = self.drop_switched_off(&tenant_rec, &domain, &rec).await?;
+        let switched_off = self.drop_switched_off(&tenant_rec, &domain, &rec).await?
+            || self
+                .drop_site_pool(&tenant_rec, existing.as_ref(), &rec)
+                .await?;
         let changed = changed || record_changed || switched_off;
         if changed {
             info!(%domain, %tenant, root = %abs_root.display(), php = rec.php, app = rec.app.as_ref().map_or("-", |a| a.runtime.as_str()), "virtual host configured");
@@ -231,6 +239,25 @@ impl VHostService {
             app::remove_app(&self.ctx, domain).await?
         };
         Ok(pool_removed || app_removed)
+    }
+
+    /// A site that had its own PHP pool (settings) and no longer runs PHP:
+    /// its pool section goes from the tenant's FPM configuration, if the
+    /// instance stays for other sites. Returns whether anything changed.
+    async fn drop_site_pool(
+        &self,
+        tenant_rec: &TenantRecord,
+        before: Option<&VHostRecord>,
+        rec: &VHostRecord,
+    ) -> Result<bool> {
+        let had_pool = before.is_some_and(|b| b.php && !b.php_settings.is_empty());
+        let cfg = &self.ctx.config;
+        let name = Username::parse(&tenant_rec.username)?;
+        let files = php::PoolFiles::for_tenant(&cfg.php_conf_dir, &cfg.systemd_unit_dir, &name);
+        if !had_pool || rec.php || !files.unit.exists() {
+            return Ok(false);
+        }
+        php::ensure_pool(&self.ctx, tenant_rec, Some(rec)).await
     }
 
     /// Every server name must be unique across the whole host.
@@ -375,7 +402,15 @@ impl VHostService {
         fsutil::remove_if_exists(&error_log)?;
         if rec.php {
             if let Some(t) = self.ctx.store.load_tenant(&Username::parse(&rec.tenant)?)? {
-                self.remove_pool_if_unused(&t, Some(&domain)).await?;
+                let removed = self.remove_pool_if_unused(&t, Some(&domain)).await?;
+                // The instance stays for other sites: this site's own pool goes.
+                let gone = VHostRecord {
+                    php: false,
+                    ..rec.clone()
+                };
+                if !removed {
+                    self.drop_site_pool(&t, Some(&rec), &gone).await?;
+                }
             }
         }
         // Whatever the record says: a unit for this name must not outlive the site.
@@ -511,6 +546,98 @@ impl VHostService {
             all.retain(|v| v.tenant == t.as_str());
         }
         Ok(all)
+    }
+
+    /// Replace the PHP settings of a PHP-enabled site (empty = PHP's
+    /// defaults again). Validated against the tenant's caps before anything
+    /// is touched; then the tenant's FPM configuration (the site's own pool)
+    /// and the site's server block are rendered, validated and activated,
+    /// and only then is the record saved — repeating the request completes
+    /// an interrupted one. Returns the record and whether anything changed.
+    pub async fn set_php_settings(
+        &self,
+        domain: &str,
+        raw: &crate::php_settings::RawSettings,
+    ) -> Result<(VHostRecord, bool)> {
+        let domain = Domain::parse(domain)?;
+        let _guard = self.ctx.lock.lock().await;
+        let cfg = &self.ctx.config;
+        let current = self
+            .ctx
+            .store
+            .load_vhost(&domain)?
+            .ok_or_else(|| Error::VHostNotFound(domain.to_string()))?;
+        let name = Username::parse_field(&current.tenant, "tenant")?;
+        let tenant = self
+            .ctx
+            .store
+            .load_tenant(&name)?
+            .ok_or_else(|| Error::TenantNotFound(name.to_string()))?;
+        if tenant.state != TenantState::Ready {
+            return Err(Error::TenantNotReady(name.to_string()));
+        }
+        let caps = tenant.php_limits.resolve(&cfg.essentials.php_max);
+        let settings = crate::php_settings::parse(raw, &caps, &cfg.essentials.zoneinfo_dir)?;
+        if !current.php {
+            return Err(Error::PhpNotEnabled(domain.to_string()));
+        }
+        let rec = VHostRecord {
+            php_settings: settings,
+            ..current.clone()
+        };
+        let pool_changed = php::ensure_pool(&self.ctx, &tenant, Some(&rec)).await?;
+        let block = render_vhost(cfg, &tenant, &rec)?;
+        let conf_changed = nginx::install_config(
+            self.ctx.sys.as_ref(),
+            &rec.config_path,
+            &block,
+            cfg.command_timeout,
+        )
+        .await?;
+        let record_changed = rec != current;
+        if record_changed {
+            self.ctx.store.save_vhost(&rec)?;
+            info!(%domain, tenant = %name, "PHP settings changed");
+        }
+        Ok((rec, pool_changed || conf_changed || record_changed))
+    }
+
+    /// Replace a tenant's caps on PHP settings (0 = the host maximum; each
+    /// within the host maxima). Sites keep the values they asked for; what
+    /// is rendered is clamped to the new caps at once (the tenant's FPM
+    /// configuration and server blocks are re-rendered and activated).
+    pub async fn set_tenant_php_limits(
+        &self,
+        username: &str,
+        raw: &crate::php_settings::PhpLimits,
+    ) -> Result<(TenantRecord, bool)> {
+        let name = Username::parse(username)?;
+        let limits =
+            crate::php_settings::PhpLimits::parse_caps(raw, &self.ctx.config.essentials.php_max)?;
+        let _guard = self.ctx.lock.lock().await;
+        let mut tenant = self
+            .ctx
+            .store
+            .load_tenant(&name)?
+            .ok_or_else(|| Error::TenantNotFound(name.to_string()))?;
+        if tenant.state != TenantState::Ready {
+            return Err(Error::TenantNotReady(name.to_string()));
+        }
+        let changed = tenant.php_limits != limits;
+        tenant.php_limits = limits;
+        // Rendered first, saved last: a failure leaves the old caps in force
+        // and the request can simply be repeated.
+        let cfg = &self.ctx.config;
+        let files = php::PoolFiles::for_tenant(&cfg.php_conf_dir, &cfg.systemd_unit_dir, &name);
+        if files.unit.exists() {
+            php::ensure_pool(&self.ctx, &tenant, None).await?;
+        }
+        sync_tenant_configs(&self.ctx, &tenant, false).await?;
+        if changed {
+            self.ctx.store.save_tenant(&tenant)?;
+            info!(tenant = %name, "PHP caps changed");
+        }
+        Ok((tenant, changed))
     }
 
     /// After a restore replaced files in the tenant's home: give every
@@ -684,7 +811,24 @@ pub(crate) fn render_vhost(
         .map(|a| Domain::parse_field(a, "aliases"))
         .collect::<Result<Vec<Domain>>>()?;
     let (access_log, error_log) = log_paths(cfg, &domain);
-    let socket = vhost.php.then(|| php::socket_path(&name));
+    // A site with PHP settings is served by its own pool (php::site_pools).
+    let own_pool = vhost.php && !vhost.php_settings.is_empty();
+    let socket = vhost.php.then(|| {
+        if own_pool {
+            php::site_socket_path(&name, &domain)
+        } else {
+            php::socket_path(&name)
+        }
+    });
+    let php_tuning = if own_pool {
+        let caps = tenant.php_limits.resolve(&cfg.essentials.php_max);
+        crate::php_settings::nginx_tuning(&crate::php_settings::effective(
+            &vhost.php_settings,
+            &caps,
+        ))
+    } else {
+        None
+    };
     let app_socket = vhost.app.as_ref().map(|_| app::socket_path(&domain));
     let challenges = crate::acme::challenge_dir(cfg);
     let certificate = crate::tls::cert_path(&cfg.tls_dir, &domain);
@@ -707,6 +851,7 @@ pub(crate) fn render_vhost(
         app_socket: app_socket.as_deref(),
         acme_challenge_dir: &challenges,
         tls,
+        php_tuning,
     })
 }
 
@@ -2165,6 +2310,250 @@ mod tests {
                 .configure(app_req("example.com", "alice", AppRuntime::Node))
                 .await?;
         }
+        Ok(())
+    }
+
+    fn systemctl_and_nginx(h: &Harness) -> Vec<Vec<String>> {
+        h.sys
+            .calls()
+            .iter()
+            .filter(|c| c.program == bin::SYSTEMCTL || c.program == bin::NGINX)
+            .map(|c| {
+                let mut v = vec![c.program.to_owned()];
+                v.extend(args(c));
+                v
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn php_settings_get_their_own_pool_and_nginx_follows() -> Result<()> {
+        use crate::php_settings::RawSettings;
+        let h = harness(false).await;
+        for d in ["shop.example.com", "blog.example.com"] {
+            h.vhosts
+                .configure(VHostRequest {
+                    php: true,
+                    ..req(d, "alice")
+                })
+                .await?;
+        }
+        let conf = h.config.php_conf_dir.join("alice.conf");
+        let site = h.config.nginx_conf_dir.join("shop.example.com.conf");
+        let blog = h.config.nginx_conf_dir.join("blog.example.com.conf");
+        let read = |p: &Path| std::fs::read_to_string(p).unwrap_or_default();
+        let (pool_before, site_before, blog_before) = (read(&conf), read(&site), read(&blog));
+        h.sys.clear_calls();
+        let (rec, changed) = h
+            .vhosts
+            .set_php_settings(
+                "shop.example.com",
+                &RawSettings {
+                    memory_limit_mb: 256,
+                    upload_max_filesize_mb: 64,
+                    max_execution_time_secs: 120,
+                    ..RawSettings::default()
+                },
+            )
+            .await?;
+        assert!(changed);
+        assert_eq!(rec.php_settings.memory_limit_mb, Some(256));
+        // The instance restarts with the new pool; Nginx is validated, then reloaded.
+        assert_eq!(
+            systemctl_and_nginx(&h),
+            vec![
+                vec![
+                    "/usr/bin/systemctl",
+                    "enable",
+                    "--",
+                    "oxpanel-php-alice.service"
+                ],
+                vec![
+                    "/usr/bin/systemctl",
+                    "restart",
+                    "--",
+                    "oxpanel-php-alice.service"
+                ],
+                vec!["/usr/sbin/nginx", "-t", "-q"],
+                vec!["/usr/bin/systemctl", "reload-or-restart", "nginx.service"],
+            ]
+        );
+        let pool = read(&conf);
+        assert!(
+            pool.starts_with(&pool_before),
+            "the default pool is unchanged"
+        );
+        assert!(pool.contains(
+            "\n[shop.example.com]\nlisten = /run/oxpanel-php/alice/shop.example.com.sock\n"
+        ));
+        assert!(pool.ends_with(
+            "php_value[memory_limit] = 256M\nphp_value[upload_max_filesize] = 64M\nphp_value[post_max_size] = 65M\nphp_value[max_execution_time] = 120\n"
+        ));
+        let block = read(&site);
+        assert!(block.contains("fastcgi_pass unix:/run/oxpanel-php/alice/shop.example.com.sock;"));
+        assert!(block.contains("    client_max_body_size 65m;\n"));
+        assert!(block.contains("        fastcgi_read_timeout 150s;\n"));
+        assert_ne!(block, site_before);
+        assert_eq!(read(&blog), blog_before, "the other site is untouched");
+        // Repeating it changes nothing.
+        h.sys.clear_calls();
+        let (_, changed) = h
+            .vhosts
+            .set_php_settings(
+                "shop.example.com",
+                &RawSettings {
+                    memory_limit_mb: 256,
+                    upload_max_filesize_mb: 64,
+                    max_execution_time_secs: 120,
+                    ..RawSettings::default()
+                },
+            )
+            .await?;
+        assert!(!changed);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn php_settings_survive_reconfiguration_and_follow_the_plan() -> Result<()> {
+        use crate::php_settings::{PhpLimits, RawSettings};
+        let h = harness(false).await;
+        h.vhosts
+            .configure(VHostRequest {
+                php: true,
+                ..req("shop.example.com", "alice")
+            })
+            .await?;
+        let conf = h.config.php_conf_dir.join("alice.conf");
+        let site = h.config.nginx_conf_dir.join("shop.example.com.conf");
+        let read = |p: &Path| std::fs::read_to_string(p).unwrap_or_default();
+        let (pool_before, site_before) = (read(&conf), read(&site));
+        h.vhosts
+            .set_php_settings(
+                "shop.example.com",
+                &RawSettings {
+                    memory_limit_mb: 256,
+                    ..RawSettings::default()
+                },
+            )
+            .await?;
+        // ConfigureVirtualHost keeps the settings.
+        let (rec, _) = h
+            .vhosts
+            .configure(VHostRequest {
+                php: true,
+                ..req("shop.example.com", "alice")
+            })
+            .await?;
+        assert_eq!(rec.php_settings.memory_limit_mb, Some(256));
+        // A plan's cap clamps what is rendered at once; the request stays.
+        let (t, changed) = h
+            .vhosts
+            .set_tenant_php_limits(
+                "alice",
+                &PhpLimits {
+                    memory_limit_mb: 128,
+                    ..PhpLimits::default()
+                },
+            )
+            .await?;
+        assert!(changed && t.php_limits.memory_limit_mb == 128);
+        assert!(read(&conf).contains("php_value[memory_limit] = 128M\n"));
+        assert!(h
+            .vhosts
+            .set_php_settings(
+                "shop.example.com",
+                &RawSettings {
+                    memory_limit_mb: 256,
+                    ..RawSettings::default()
+                },
+            )
+            .await
+            .is_err());
+        // Clearing them restores exactly the configuration of before.
+        h.vhosts
+            .set_php_settings("shop.example.com", &RawSettings::default())
+            .await?;
+        assert_eq!(read(&conf), pool_before);
+        assert_eq!(read(&site), site_before);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn php_settings_are_refused_before_anything_changes() -> Result<()> {
+        use crate::php_settings::RawSettings;
+        let h = harness(false).await;
+        h.vhosts
+            .configure(req("static.example.com", "alice"))
+            .await?;
+        h.sys.clear_calls();
+        let some = RawSettings {
+            memory_limit_mb: 64,
+            ..RawSettings::default()
+        };
+        assert!(matches!(
+            h.vhosts.set_php_settings("static.example.com", &some).await,
+            Err(Error::PhpNotEnabled(_))
+        ));
+        assert!(matches!(
+            h.vhosts.set_php_settings("nope.example.com", &some).await,
+            Err(Error::VHostNotFound(_))
+        ));
+        h.vhosts
+            .configure(VHostRequest {
+                php: true,
+                ..req("static.example.com", "alice")
+            })
+            .await?;
+        h.sys.clear_calls();
+        for bad in [
+            RawSettings {
+                memory_limit_mb: 1_000_000,
+                ..RawSettings::default()
+            },
+            RawSettings {
+                date_timezone: "Europe/Berlin\nphp_admin_value[open_basedir]=/".into(),
+                ..RawSettings::default()
+            },
+        ] {
+            assert!(matches!(
+                h.vhosts.set_php_settings("static.example.com", &bad).await,
+                Err(Error::InvalidInput { .. })
+            ));
+        }
+        assert!(h.sys.calls().is_empty(), "nothing was run");
+        // Switching PHP off drops the site's pool; removing the site too.
+        h.vhosts
+            .set_php_settings("static.example.com", &some)
+            .await?;
+        h.vhosts
+            .configure(VHostRequest {
+                php: true,
+                ..req("other.example.com", "alice")
+            })
+            .await?;
+        let conf = h.config.php_conf_dir.join("alice.conf");
+        assert!(std::fs::read_to_string(&conf)
+            .unwrap_or_default()
+            .contains("[static.example.com]"));
+        h.vhosts
+            .configure(req("static.example.com", "alice"))
+            .await?;
+        assert!(!std::fs::read_to_string(&conf)
+            .unwrap_or_default()
+            .contains("[static.example.com]"));
+        h.vhosts
+            .configure(VHostRequest {
+                php: true,
+                ..req("static.example.com", "alice")
+            })
+            .await?;
+        assert!(std::fs::read_to_string(&conf)
+            .unwrap_or_default()
+            .contains("[static.example.com]"));
+        h.vhosts.remove("static.example.com").await?;
+        assert!(!std::fs::read_to_string(&conf)
+            .unwrap_or_default()
+            .contains("[static.example.com]"));
         Ok(())
     }
 }

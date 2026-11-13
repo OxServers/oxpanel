@@ -233,7 +233,7 @@ The package installs:
 
 ```sh
 sudo dnf module enable -y nodejs:22        # Node.js applications need version 22 or newer
-sudo dnf install -y gcc git nginx shadow-utils util-linux acl policycoreutils policycoreutils-python-utils libselinux-utils logrotate tar gzip openssl ca-certificates php-fpm nodejs npm
+sudo dnf install -y gcc git nginx shadow-utils util-linux acl policycoreutils policycoreutils-python-utils libselinux-utils logrotate tar gzip openssl ca-certificates php-fpm php-cli nodejs npm
 # SELinux: sites live under tenant homes, so the web server must be allowed to traverse and read them.
 if sudo selinuxenabled; then sudo setsebool -P httpd_enable_homedirs=on httpd_read_user_content=on httpd_unified=on; fi
 curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal && source ~/.cargo/env
@@ -366,6 +366,17 @@ valid. After editing: `sudo systemctl restart oxpanel-daemon`.
 | `OXPANEL_ACME_EAB_FILE` | *(none)* | External Account Binding for authorities that require it: a root-owned `0600` file with `kid=…` and `hmac_key=…` lines. Passed to the client as a systemd credential. |
 | `OXPANEL_AUTO_HTTPS` | `true` | Automatic HTTPS: every site gets a certificate by itself (§6). `false` switches it off for the whole host; single sites opt out with `vhost set --no-auto-https`. |
 | `OXPANEL_ACME_RENEW_DAYS` | `30` | Renew ACME certificates this many days (1–60) before expiry; checked 5 minutes after start and every 12 hours. |
+| `OXPANEL_TASK_MAX_PER_TENANT` | `20` | Most scheduled tasks one tenant may have (0–1000; 0 = none). |
+| `OXPANEL_TASK_MIN_INTERVAL_MINUTES` | `5` | Shortest "every N minutes" interval a task may have (1–1440). |
+| `OXPANEL_TASK_MAX_TIMEOUT_SECS` | `3600` | Longest time limit a task may be given (10–86400; a task's own default is 300). |
+| `OXPANEL_PHP_MAX_MEMORY_MB` | `1024` | Highest `memory_limit` a site may set (MiB). The tenant's `MemoryMax` is the real ceiling either way. |
+| `OXPANEL_PHP_MAX_UPLOAD_MB` | `256` | Highest `upload_max_filesize` and `post_max_size` (MiB). |
+| `OXPANEL_PHP_MAX_EXECUTION_SECS` / `OXPANEL_PHP_MAX_INPUT_TIME_SECS` | `300` / `300` | Highest `max_execution_time` / `max_input_time`. |
+| `OXPANEL_PHP_MAX_INPUT_VARS` | `10000` | Highest `max_input_vars`. Lowering any maximum takes effect at the next daemon start (sites are re-rendered clamped). |
+| `OXPANEL_BACKUP_SCHEDULES` | `true` | Whether the engine starts scheduled backups at all. `false` keeps every schedule but runs none. |
+| `OXPANEL_BACKUP_SCHEDULE_DEFAULT` | `off` | Schedule of tenants that have none of their own: `off`, `daily` or `weekly`. **`daily` is recommended for production** (§9). |
+| `OXPANEL_BACKUP_WINDOW` | `01-05` | UTC hours (inclusive) in which the engine places backups whose hour nobody chose. |
+| `OXPANEL_BACKUP_SCHEDULE_CHECK_SECS` | `300` | How often the scheduler looks for due backups (5–3600); it also looks at start-up. |
 | `OXPANEL_LOG` | `info` | `tracing` filter: `info`, `debug`, `oxpanel_daemon=trace`, … |
 | `OXPANEL_DRY_RUN` | `false` | Use the in-memory fake OS (development only — see §11). |
 
@@ -644,6 +655,31 @@ sudo oxpanel-ctl backup restore acme b1794571200123 --keep-existing --wait
 sudo oxpanel-ctl backup restore-db acme b1794571200123 acme_shop acme_shopold --wait
 sudo oxpanel-ctl backup delete acme b1794571200123
 
+# Back the tenant up every night by itself (the engine does it, also while the
+# panel is down): at 03:MM UTC, the minute chosen by the engine to spread tenants.
+# Without --hour the engine picks an hour in OXPANEL_BACKUP_WINDOW.
+sudo oxpanel-ctl backup-schedule set acme daily --hour 3
+# tenant=acme frequency=daily host_default=false at=03:17UTC weekday=thu(assigned) next_run=1794649020 last_run=0 last_job=- last_result=none enabled_on_host=true
+sudo oxpanel-ctl backup-schedule set acme weekly --weekday sun   # or off, or default (the host's)
+sudo oxpanel-ctl backup-schedule show acme                       # next run, last result and why
+
+# Scheduled tasks (cron jobs): a script of the tenant's, run as the tenant in its
+# limits and sandbox, with a time limit (default 300 s), never twice at once.
+# Schedules: "every 15m", "every 2h at :30", "hourly at :05", "daily 03:30",
+# "weekly sun 03:30", "monthly 1 03:30" (--tz Europe/Berlin; default UTC).
+sudo oxpanel-ctl task set acme wp-cron --url https://acme.example/wp-cron.php --schedule 'every 15m'
+sudo oxpanel-ctl task set acme report --php scripts/report.php --arg --full --schedule 'daily 03:30' --tz Europe/Berlin --timeout 600
+sudo oxpanel-ctl task set acme sync --python apps/api/sync.py --venv apps/api/.venv --schedule 'every 2h at :10'
+sudo oxpanel-ctl task list acme     # last start/end, result (success, exit-code, timeout…), exit status, next run
+sudo oxpanel-ctl task run acme report && sudo oxpanel-ctl task log acme report
+sudo oxpanel-ctl task delete acme sync
+
+# PHP settings of one site (only these exist; no options = PHP's defaults again).
+# The site gets its own PHP pool; Nginx's upload size and timeouts follow.
+sudo oxpanel-ctl php set acme.example --memory-limit 256M --upload-max 64M --max-execution-time 120 --timezone Europe/Berlin
+# A plan's caps for the tenant (0 / absent = the host maximum)
+sudo oxpanel-ctl php limits acme --memory-limit 512M --upload-max 128M
+
 # A final backup kept for 6 months (or --retain-days 1-366) after the
 # deletion, then removed automatically
 sudo oxpanel-ctl backup create acme --retain-months 6 --wait
@@ -826,6 +862,10 @@ needs to confirm a site is live, poll it.
 | `/var/lib/oxpanel/backups/<id>.json`, `/var/lib/oxpanel/jobs/<id>.json` | `root 0600` | backup records (members, sizes, SHA-256) and backup/restore job records |
 | `/var/lib/oxpanel-backups/<tenant>/<id>/` | `root 0700`, files `0600` | one backup: `home.tar.gz`, `records.json`, `manifest.json` (written last; a directory without it is not a backup) |
 | `oxpanel-job-<id>.service` | transient | a running backup or restore (in the tenant's slice); gone once the daemon has recorded its result |
+| `/var/lib/oxpanel/tasks/<tenant>.<name>.json` | `root 0600` | scheduled task record: what it runs, schedule, time zone, time limit, on/off |
+| `/etc/systemd/system/oxpanel-task-<tenant>-<name>.{service,timer}` | `root 0644` | the task's oneshot service (`User=<tenant>`, in the tenant slice) and its timer (enabled into `timers.target`) |
+| `/var/lib/oxpanel/backup-schedules/<tenant>.json` | `root 0600` | a tenant's backup schedule and the scheduler's state (last slot, run, job, result) |
+| `/run/oxpanel-php/<username>/<domain>.sock` | `<t>:<t>` + ACL `user:nginx:rw-` | the own pool of a site with PHP settings (the pool section is in the tenant's `/etc/oxpanel-php/<username>.conf`) |
 | SELinux hosts | | `semanage fcontext` equivalence `<docroot> = /usr/share/nginx/html` (labels the tree `httpd_sys_content_t`; a plain rule would be overridden by `file_contexts.homedirs`) |
 
 Records are the source of truth for *what OxPanel owns*. Back up
@@ -863,6 +903,41 @@ overwrites them, and `host reconcile` reports the edit as drift.
 **Suspending a tenant** — `tenant suspend` / `tenant resume`. Suspension is a
 web-serving state: sites answer `503` with `Retry-After: 3600`. The account,
 files and limits are unchanged, and `tenant get` shows `suspended=true`.
+
+**Scheduled backups** — the engine starts them itself (`backup-schedule
+set`), daily or weekly at a UTC hour and an engine-chosen minute, also while
+the panel is down; tenants without their own choice follow
+`OXPANEL_BACKUP_SCHEDULE_DEFAULT`, which is `off` as shipped — set it to
+`daily` on a production host. They are ordinary backups: the same limits
+(one job per tenant, 4 on the host, the free-space reserve) and the same
+keep-count, so a series of nightly backups replaces itself; `backup retain`
+the one to keep longer. Suspended tenants are backed up too. After the host
+was off, the most recent missed slot runs once at start-up. `backup-schedule
+show` tells the last result: `failed` with the reason (the next night runs
+anyway), `deferred` when the job limit was reached (tried again every check).
+
+**Scheduled tasks** — `task set` writes a oneshot service and a timer per
+task (`oxpanel-task-<tenant>-<name>.{service,timer}`); `systemctl
+list-timers 'oxpanel-task-*'` shows them all. A task runs as the tenant in its
+slice (it counts against the tenant's memory and task limits), in the same
+sandbox and SELinux domain as an application, and is killed with everything
+it started at its time limit. PHP tasks need `php-cli` (the RPM recommends
+it; `host info` shows `php_cli=true`) and use the CLI's `php.ini` — the
+per-site PHP settings below apply to the web, not to tasks. Missed runs (the
+host was off) are not caught up. Last-run facts come from systemd and start
+empty after a reboot; the output stays in the journal (`task log`).
+
+**PHP settings per site** — `php set` changes `memory_limit`,
+`upload_max_filesize`, `post_max_size`, `max_execution_time`,
+`max_input_time`, `max_input_vars`, `display_errors` and `date.timezone`
+for one site, within the host maxima (`OXPANEL_PHP_MAX_*`) and the tenant's
+caps (`php limits`). The site gets a pool of its own inside the tenant's FPM
+instance, so one site's settings never reach another. They are the defaults
+a script starts with, not a security boundary: a script may raise
+`memory_limit` with `ini_set` as on any PHP host, and the tenant's
+`MemoryMax` is the real limit. `max_execution_time` counts CPU time: a script
+waiting on a database or the network is not cut by it (Nginx's FastCGI timeout,
+execution time + 30 s, still applies).
 
 **PHP** — needs the `php-fpm` package (the RPM recommends it; `host info` shows
 `php=true`). OxPanel uses the PHP version the host has installed; to change it,
@@ -940,6 +1015,9 @@ What to do with each finding:
 | `BACKUP_ARCHIVE_MISSING` / `_MODIFIED` | A backup's directory, manifest or member is gone, or a member's size (or the manifest) no longer matches the record. Such a backup cannot be trusted; a restore from it is refused by the checksum. | `backup delete` it. |
 | `BACKUP_INCOMPLETE` | A backup record that was never completed and has no running job (or a job without a backup record). | `backup delete` the backup id. |
 | `ORPHAN_BACKUP_ARCHIVE` | A directory under the backup store that no record accounts for. | Inspect and remove by hand. |
+| `TASK_UNIT_DRIFT` | A scheduled task's service or timer was edited or removed, its timer is enabled although the task is off or the tenant suspended (or the reverse), or a task record names a tenant that does not exist. | Repeat `task set` with the task's settings (or `task delete`). |
+| `ORPHAN_TASK_UNIT` | An `oxpanel-task-*` unit that no task record accounts for. | Inspect; `systemctl disable --now` and remove by hand. |
+| `ORPHAN_BACKUP_SCHEDULE` | A backup schedule record for a tenant that no longer exists. | Remove `/var/lib/oxpanel/backup-schedules/<tenant>.json`. |
 
 **Backups** — `backup create` starts a job in a transient unit
 (`oxpanel-job-<id>.service`, in the tenant's slice, lowest CPU/IO priority)
@@ -949,8 +1027,7 @@ root, belonging to someone else) are skipped and named in the job's output.
 A backup is refused (`RESOURCE_EXHAUSTED`) when the home would not fit with
 `OXPANEL_BACKUP_MIN_FREE_BYTES` to spare; at most 4 jobs run on the host and
 one per tenant. Only the newest `OXPANEL_BACKUP_KEEP` backups of a tenant are
-kept. Scheduling is the panel's job (or cron:
-`oxpanel-ctl backup create <tenant>`). A tenant with backups cannot be
+kept. A tenant with backups cannot be
 deleted until they are deleted or *retained* (`backup retain <tenant> <id>
 --months 1..12`, or `backup create --retain-months N`): retained backups
 outlive the tenant, are hidden from any later tenant of the same name, and

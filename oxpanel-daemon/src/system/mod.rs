@@ -84,6 +84,12 @@ pub mod bin {
     pub const RMDIR: &str = "/usr/bin/rmdir";
     /// Optional: only needed for disk quotas (XFS).
     pub const XFS_QUOTA: &str = "/usr/sbin/xfs_quota";
+    /// Optional: PHP's command-line interpreter (php-cli), for PHP scheduled
+    /// tasks. Executed by systemd in a task's unit, never by the daemon.
+    pub const PHP_CLI: &str = "/usr/bin/php";
+    /// Fetches the URL of a URL scheduled task, in the task's unit as the
+    /// tenant (curl-minimal on AlmaLinux 9). Never run by the daemon.
+    pub const CURL: &str = "/usr/bin/curl";
 }
 
 /// A resolved account from the system user database.
