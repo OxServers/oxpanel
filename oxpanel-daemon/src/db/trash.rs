@@ -144,28 +144,27 @@ impl DbService {
             return Ok(Deleted::Vanished);
         }
         // 3. Definitions captured and recorded before anything is dropped.
-        let mut trash = match pending {
-            Some(t) => t,
-            None => {
-                let objects = self.complete_capture(&schema, &listed, early).await?;
-                let id = new_trash_id(&self.ctx)?;
-                let now = now_unix();
-                let t = DbTrashRecord {
-                    version: RECORD_VERSION,
-                    id: id.to_string(),
-                    name: rec.name.clone(),
-                    tenant: rec.tenant.clone(),
-                    engine: rec.engine,
-                    deleted_at_unix: now,
-                    purge_at_unix: now
-                        .saturating_add(u64::from(self.ctx.config.db_trash_days) * 86_400),
-                    size_bytes: size,
-                    state: TrashState::Moving,
-                    objects,
-                };
-                self.ctx.store.save_trash(&t)?;
-                t
-            }
+        let mut trash = if let Some(t) = pending {
+            t
+        } else {
+            let objects = self.complete_capture(&schema, &listed, early).await?;
+            let id = new_trash_id(&self.ctx)?;
+            let now = now_unix();
+            let t = DbTrashRecord {
+                version: RECORD_VERSION,
+                id: id.to_string(),
+                name: rec.name.clone(),
+                tenant: rec.tenant.clone(),
+                engine: rec.engine,
+                deleted_at_unix: now,
+                purge_at_unix: now
+                    .saturating_add(u64::from(self.ctx.config.db_trash_days) * 86_400),
+                size_bytes: size,
+                state: TrashState::Moving,
+                objects,
+            };
+            self.ctx.store.save_trash(&t)?;
+            t
         };
         // 4. Move: triggers and views dropped, all tables in one RENAME,
         //    the schema (with its routines and events) dropped.
@@ -363,8 +362,8 @@ impl DbService {
         } else {
             Vec::new()
         };
-        let script = content::create_schema(&target)
-            + &content::rename_tables(&source, &target, &tables);
+        let script =
+            content::create_schema(&target) + &content::rename_tables(&source, &target, &tables);
         mariadb::run_hardened(&self.ctx, script).await?;
         let mut issues = objects::recreate(&self.ctx, &target, &tenant, &trash.objects).await?;
         issues.extend(objects::drop_foreign(&self.ctx, &target, &tenant).await?);
@@ -490,12 +489,14 @@ pub fn spawn_purger(ctx: Ctx) {
     tokio::spawn(async move {
         loop {
             // Nothing to do (and no MariaDB needed) without trash.
-            let any = ctx.store.list_trash().map(|t| !t.is_empty()).unwrap_or(true);
+            let any = ctx.store.list_trash().map_or(true, |t| !t.is_empty());
             if any {
                 match purge_overdue(&ctx).await {
                     Ok(0) => {}
                     Ok(n) => info!(purged = n, "overdue deleted databases purged"),
-                    Err(e) => warn!(error = %e, "could not purge overdue deleted databases; will retry"),
+                    Err(e) => {
+                        warn!(error = %e, "could not purge overdue deleted databases; will retry")
+                    }
                 }
             }
             tokio::time::sleep(std::time::Duration::from_secs(3600)).await;
@@ -552,7 +553,9 @@ pub async fn drop_everything(ctx: &Ctx, tenant: &TenantRecord) -> Result<()> {
         script.push_str(&sql::drop_database(&DbName::parse(&d.name, "name")?));
     }
     for t in &trash {
-        script.push_str(&content::drop_schema(&Schema::of_trash(&TrashId::parse(&t.id)?)));
+        script.push_str(&content::drop_schema(&Schema::of_trash(&TrashId::parse(
+            &t.id,
+        )?)));
     }
     if !script.is_empty() {
         mariadb::run_hardened(ctx, script).await?;
@@ -561,7 +564,8 @@ pub async fn drop_everything(ctx: &Ctx, tenant: &TenantRecord) -> Result<()> {
         ctx.store.delete_db_user(&DbName::parse(&u.name, "name")?)?;
     }
     for d in &databases {
-        ctx.store.delete_database(&DbName::parse(&d.name, "name")?)?;
+        ctx.store
+            .delete_database(&DbName::parse(&d.name, "name")?)?;
     }
     for t in &trash {
         ctx.store.delete_trash(&TrashId::parse(&t.id)?)?;
@@ -579,10 +583,10 @@ pub fn drifts(
 ) {
     let now = now_unix();
     for t in trash {
-        let schema = TrashId::parse(&t.id).map(|id| id.schema()).unwrap_or_default();
-        let problem = if !tenants.iter().any(|x| x.username == t.tenant) {
-            Some(format!("tenant '{}' has no record", t.tenant))
-        } else {
+        let schema = TrashId::parse(&t.id)
+            .map(|id| id.schema())
+            .unwrap_or_default();
+        let problem = if tenants.iter().any(|x| x.username == t.tenant) {
             match &t.state {
                 TrashState::Moving => Some(
                     "moving the database into the trash was interrupted; repeat DeleteDatabase"
@@ -599,6 +603,8 @@ pub fn drifts(
                 ),
                 TrashState::Trashed => None,
             }
+        } else {
+            Some(format!("tenant '{}' has no record", t.tenant))
         };
         if let Some(detail) = problem {
             out.push(Drift::new(

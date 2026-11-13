@@ -127,16 +127,17 @@ impl LifecycleService {
             return Err(Error::TooManyJobs);
         }
         let id = new_job_id(&self.ctx)?;
-        let mut job = JobRecord::start(&id, JobKind::DeleteTenant, name.as_str(), "", String::new());
+        let mut job =
+            JobRecord::start(&id, JobKind::DeleteTenant, name.as_str(), "", String::new());
         job.final_backup_retain_days = final_backup_retain_days;
         // Once the tenant is being deleted, no final backup is taken any more
         // (it was either complete before, or not asked for).
-        job.phase = if final_backup_retain_days != 0 && rec.state == TenantState::Ready {
+        if final_backup_retain_days != 0 && rec.state == TenantState::Ready {
             PHASE_FINAL_BACKUP
         } else {
             PHASE_REMOVING
         }
-        .to_owned();
+        .clone_into(&mut job.phase);
         self.ctx.store.save_job(&job)?;
         drop(guard);
         info!(job = %id, tenant = %name, final_backup_days = final_backup_retain_days, "tenant deletion started");
@@ -261,13 +262,19 @@ impl LifecycleService {
                 self.finish(
                     job,
                     JobState::Failed,
-                    format!("the final backup failed ({}); nothing was deleted", child.message),
+                    format!(
+                        "the final backup failed ({}); nothing was deleted",
+                        child.message
+                    ),
                 )?;
                 Ok(true)
             }
             JobState::Succeeded => {
                 let _guard = self.ctx.lock.lock().await;
-                let backup = self.ctx.store.load_backup(&BackupId::parse(&child.backup_id)?)?;
+                let backup = self
+                    .ctx
+                    .store
+                    .load_backup(&BackupId::parse(&child.backup_id)?)?;
                 let kept = backup.is_some_and(|b| {
                     b.state == BackupState::Ready && b.retain_until_unix > now_unix()
                 });
@@ -275,12 +282,15 @@ impl LifecycleService {
                     self.finish(
                         job,
                         JobState::Failed,
-                        format!("the final backup {} is not complete and retained; nothing was deleted", child.backup_id),
+                        format!(
+                            "the final backup {} is not complete and retained; nothing was deleted",
+                            child.backup_id
+                        ),
                     )?;
                     return Ok(true);
                 }
                 job.backup_id = child.backup_id;
-                job.phase = PHASE_REMOVING.to_owned();
+                PHASE_REMOVING.clone_into(&mut job.phase);
                 self.ctx.store.save_job(&job)?;
                 info!(job = %id, tenant = %name, backup = %job.backup_id, "final backup complete and retained; removing the tenant");
                 Ok(false)

@@ -151,7 +151,10 @@ fn parse_hex_text(s: &str) -> Option<String> {
 }
 
 fn hex(text: &str) -> String {
-    text.bytes().map(|b| format!("{b:02X}")).collect()
+    text.bytes().fold(String::new(), |mut s, b| {
+        let _ = write!(s, "{b:02X}");
+        s
+    })
 }
 
 /// As the client's batch output escapes a field.
@@ -253,7 +256,8 @@ impl FakeMariaDb {
         statement: &str,
         stdout: &mut String,
     ) -> Result<(), String> {
-        let syntax = || format!("1064 (42000): You have an error in your SQL syntax near '{statement}'");
+        let syntax =
+            || format!("1064 (42000): You have an error in your SQL syntax near '{statement}'");
         if let Some(rest) = statement.strip_prefix("USE ") {
             let (db, _) = parse_quoted(rest).ok_or_else(syntax)?;
             if !self.schemata.contains(&db) {
@@ -302,7 +306,9 @@ impl FakeMariaDb {
         } else if let Some((kind, rest)) = s
             .strip_prefix("DROP ")
             .and_then(|r| r.split_once(" IF EXISTS "))
-            .filter(|(kind, _)| ["TRIGGER", "VIEW", "PROCEDURE", "FUNCTION", "EVENT"].contains(kind))
+            .filter(|(kind, _)| {
+                ["TRIGGER", "VIEW", "PROCEDURE", "FUNCTION", "EVENT"].contains(kind)
+            })
         {
             let (schema, name, _) = parse_qualified(rest).ok_or_else(syntax)?;
             if let Some(c) = self.content.get_mut(&schema) {
@@ -374,7 +380,9 @@ impl FakeMariaDb {
         for (fs, ft, ts, _) in &moves {
             let present = self.content.get(fs).is_some_and(|c| c.tables.contains(ft));
             if !present {
-                return Some(Err(format!("1146 (42S02): Table '{fs}.{ft}' doesn't exist")));
+                return Some(Err(format!(
+                    "1146 (42S02): Table '{fs}.{ft}' doesn't exist"
+                )));
             }
             let triggered = self
                 .content
@@ -467,7 +475,11 @@ impl FakeMariaDb {
             for kind in kinds {
                 for ((k, name), o) in &c.objects {
                     if k == kind {
-                        let tag = if tag.is_empty() { kind.to_lowercase() } else { tag.to_owned() };
+                        let tag = if tag.is_empty() {
+                            kind.to_lowercase()
+                        } else {
+                            tag.to_owned()
+                        };
                         let _ = writeln!(out, "{tag}\t{}\t{}", hex(name), hex(&o.definer));
                     }
                 }

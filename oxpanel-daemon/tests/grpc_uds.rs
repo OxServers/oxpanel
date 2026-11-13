@@ -1263,6 +1263,10 @@ async fn database_rpcs_over_uds() {
         assert!(r.trash_id.starts_with('t') && r.purge_at.is_some(), "{r:?}");
         trashed.push(r.trash_id);
     }
+    let (alice_trash, bob_trash) = (
+        trashed.first().cloned().unwrap_or_default(),
+        trashed.get(1).cloned().unwrap_or_default(),
+    );
     // The name is free at once; the database waits in the tenant's trash.
     let trash = client
         .list_database_trash(pb::ListDatabaseTrashRequest {
@@ -1272,15 +1276,19 @@ async fn database_rpcs_over_uds() {
         .expect("list trash")
         .into_inner();
     assert_eq!(
-        trash.databases.iter().map(|t| (t.id.as_str(), t.name.as_str())).collect::<Vec<_>>(),
-        vec![(trashed[0].as_str(), "alice_wp")]
+        trash
+            .databases
+            .iter()
+            .map(|t| (t.id.as_str(), t.name.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(alice_trash.as_str(), "alice_wp")]
     );
     // Restoring needs a new name of the same tenant; another tenant's trash
     // is not found.
     let err = client
         .restore_database_trash(pb::RestoreDatabaseTrashRequest {
             tenant: "alice".into(),
-            trash_id: trashed[0].clone(),
+            trash_id: alice_trash.clone(),
             new_name: String::new(),
         })
         .await
@@ -1289,7 +1297,7 @@ async fn database_rpcs_over_uds() {
     let err = client
         .restore_database_trash(pb::RestoreDatabaseTrashRequest {
             tenant: "alice".into(),
-            trash_id: trashed[1].clone(),
+            trash_id: bob_trash,
             new_name: "alice_bobs".into(),
         })
         .await
@@ -1298,13 +1306,16 @@ async fn database_rpcs_over_uds() {
     let restored = client
         .restore_database_trash(pb::RestoreDatabaseTrashRequest {
             tenant: "alice".into(),
-            trash_id: trashed[0].clone(),
+            trash_id: alice_trash,
             new_name: "alice_back".into(),
         })
         .await
         .expect("restore")
         .into_inner();
-    assert_eq!(restored.database.map(|d| d.name), Some("alice_back".to_owned()));
+    assert_eq!(
+        restored.database.map(|d| d.name),
+        Some("alice_back".to_owned())
+    );
     let again = client
         .delete_database(pb::DeleteDatabaseRequest {
             name: "alice_back".into(),

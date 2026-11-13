@@ -327,7 +327,7 @@ impl FakeSystem {
 
     /// The tables and objects of a schema on the emulated server (`None`
     /// when it does not exist): `(tables, [(KIND, name, definer)])`.
-    pub fn mariadb_schema(&self, name: &str) -> Option<(Vec<String>, Vec<(String, String, String)>)> {
+    pub fn mariadb_schema(&self, name: &str) -> Option<SchemaContent> {
         let i = self.inner.lock().ok()?;
         let schema = i.mariadb.as_ref()?.schema(name)?;
         Some((
@@ -715,6 +715,10 @@ fn create_private_dir(path: &Path) -> std::io::Result<()> {
     std::fs::create_dir_all(path)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
 }
+
+/// What [`FakeSystem::mariadb_schema`] reports: tables, and objects as
+/// `(KIND, name, definer)`.
+pub type SchemaContent = (Vec<String>, Vec<(String, String, String)>);
 
 #[tonic::async_trait]
 impl System for FakeSystem {

@@ -647,11 +647,9 @@ pub fn parse_objects(text: &str) -> Result<SchemaObjects> {
             "procedure" => K::Procedure,
             "function" => K::Function,
             "event" => K::Event,
-            other => {
-                return Err(Error::Internal(format!(
-                    "the database holds a {other} ('{name}'), which OxPanel cannot keep; drop it first"
-                )))
-            }
+            other => return Err(Error::Internal(format!(
+                "the database holds a {other} ('{name}'), which OxPanel cannot keep; drop it first"
+            ))),
         };
         out.objects.push(Listed {
             kind,
@@ -668,13 +666,14 @@ pub fn parse_objects(text: &str) -> Result<SchemaObjects> {
 pub mod content {
     use super::{hex_text, quote, Schema};
     use crate::records::DbObjectKind;
+    use std::fmt::Write as _;
 
     /// `SHOW CREATE …` of each object, after `USE`: views come out without
     /// the database name, so they can be re-created under another one.
     pub fn show_create(schema: &Schema, objects: &[(DbObjectKind, String)]) -> String {
         let mut s = format!("USE `{}`;\n", schema.as_str());
         for (kind, name) in objects {
-            s.push_str(&format!("SHOW CREATE {} {};\n", kind.keyword(), quote(name)));
+            let _ = writeln!(s, "SHOW CREATE {} {};", kind.keyword(), quote(name));
         }
         s
     }

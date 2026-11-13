@@ -648,7 +648,12 @@ fn dump(
         let _ = std::fs::remove_file(output);
         why
     };
-    let failed = |what: String| Failure::new(EXIT_DUMP, format!("the dump of database {database} failed: {what}"));
+    let failed = |what: String| {
+        Failure::new(
+            EXIT_DUMP,
+            format!("the dump of database {database} failed: {what}"),
+        )
+    };
     let mut dumper = spawn_streaming(
         &mariadb_dump(socket, database),
         Stdio::null(),
@@ -659,8 +664,13 @@ fn dump(
     let Some(dumped) = dumper.stdout.take() else {
         return Err(discard(failed("no pipe".into())));
     };
-    let mut gz = spawn_streaming(&gzip(false), Stdio::from(dumped), Stdio::piped(), Stdio::inherit())
-        .map_err(|e| discard(failed(e.to_string())))?;
+    let mut gz = spawn_streaming(
+        &gzip(false),
+        Stdio::from(dumped),
+        Stdio::piped(),
+        Stdio::inherit(),
+    )
+    .map_err(|e| discard(failed(e.to_string())))?;
     let copied = match gz.stdout.take() {
         Some(stream) => copy_hashed(stream, &mut file, max_bytes),
         None => Err(CopyError::Io(std::io::Error::other("no pipe"))),
@@ -675,7 +685,9 @@ fn dump(
                 format!("the archive and the dumps would exceed the {max_bytes} bytes available"),
             )))
         }
-        Err(CopyError::Io(e)) => return Err(discard(Failure::internal(Error::io("write", output, e)))),
+        Err(CopyError::Io(e)) => {
+            return Err(discard(Failure::internal(Error::io("write", output, e))))
+        }
     };
     for (program, status) in [(bin::MARIADB_DUMP, dump_status), (bin::GZIP, gz_status)] {
         match status {
@@ -732,10 +744,18 @@ fn restore_db(
 ) -> std::result::Result<(), Failure> {
     let archive = open_verified(input, sha256, size)?;
     let failed = |what: String| {
-        Failure::new(EXIT_LOAD, format!("loading the dump into {database} failed: {what}"))
+        Failure::new(
+            EXIT_LOAD,
+            format!("loading the dump into {database} failed: {what}"),
+        )
     };
-    let mut gz = spawn_streaming(&gzip(true), Stdio::from(archive), Stdio::piped(), Stdio::inherit())
-        .map_err(|e| failed(e.to_string()))?;
+    let mut gz = spawn_streaming(
+        &gzip(true),
+        Stdio::from(archive),
+        Stdio::piped(),
+        Stdio::inherit(),
+    )
+    .map_err(|e| failed(e.to_string()))?;
     let Some(sql) = gz.stdout.take() else {
         return Err(failed("no pipe".into()));
     };
@@ -1246,6 +1266,12 @@ mod tests {
         for bad in ["", "merge", "KEEP"] {
             assert!(restore(bad).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn database_restore_arguments_are_parsed_strictly() {
+        let parse =
+            |args: &[&str]| Task::parse(&args.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>());
         let restore_db = |uid: Option<&'static str>, database: &'static str| {
             let mut a = vec!["worker", "restore-db"];
             a.extend(uid);
@@ -1264,7 +1290,10 @@ mod tests {
             parse(&a)
         };
         assert!(restore_db(None, "abc_old").is_ok());
-        assert!(restore_db(Some("20000"), "abc_old").is_err(), "no uid in this mode");
+        assert!(
+            restore_db(Some("20000"), "abc_old").is_err(),
+            "no uid in this mode"
+        );
         for bad in ["mysql", "abc_old;DROP", "", "abc_old`"] {
             assert!(restore_db(None, bad).is_err(), "{bad:?}");
         }
@@ -1275,7 +1304,10 @@ mod tests {
         let socket = Path::new("/var/lib/mysql/mysql.sock");
         let dump = mariadb_dump(socket, "alice_wp");
         assert_eq!(dump.program, bin::MARIADB_DUMP);
-        assert_eq!(dump.run_as, None, "unix_socket authenticates root by being root");
+        assert_eq!(
+            dump.run_as, None,
+            "unix_socket authenticates root by being root"
+        );
         assert_eq!(
             strings(&dump.args),
             vec![
@@ -1294,7 +1326,9 @@ mod tests {
                 "alice_wp",
             ]
         );
-        assert!(!strings(&dump.args).iter().any(|a| a.contains("routines") || a.contains("events") || a.contains("password")));
+        assert!(!strings(&dump.args)
+            .iter()
+            .any(|a| a.contains("routines") || a.contains("events") || a.contains("password")));
         let load = mariadb_load(socket, "alice_old");
         assert_eq!((load.program, load.run_as), (bin::MARIADB, None));
         assert_eq!(

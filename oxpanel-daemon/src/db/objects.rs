@@ -37,6 +37,8 @@
 //! An object that is not re-created is returned as an [`ObjectIssue`] with
 //! its definition; table data never depends on it.
 
+use std::fmt::Write as _;
+
 use tracing::{info, warn};
 
 use super::mariadb::{self, content, hex_text, Schema, SchemaObjects};
@@ -132,10 +134,14 @@ pub async fn capture(
 /// The first delimiter of the form `?oxpanel-end-<n>?` that does not occur in
 /// `text`.
 pub fn delimiter_for(text: &str) -> String {
-    (0u32..)
-        .map(|n| format!("?oxpanel-end-{n}?"))
-        .find(|d| !text.contains(d.as_str()))
-        .unwrap_or_default()
+    let mut n: u64 = 0;
+    loop {
+        let d = format!("?oxpanel-end-{n}?");
+        if !text.contains(d.as_str()) {
+            return d;
+        }
+        n += 1;
+    }
 }
 
 /// The script that re-creates one trigger, routine or event in `schema`.
@@ -147,16 +153,14 @@ pub fn replay_script(schema: &Schema, def: &DbObjectDef) -> Option<String> {
     let delimiter = delimiter_for(&def.definition);
     let mut s = format!("SET SESSION sql_mode = {};\n", hex_text(&def.sql_mode));
     if def.kind == DbObjectKind::Event && !def.time_zone.is_empty() {
-        s.push_str(&format!(
-            "SET SESSION time_zone = {};\n",
-            hex_text(&def.time_zone)
-        ));
+        let _ = writeln!(s, "SET SESSION time_zone = {};", hex_text(&def.time_zone));
     }
-    s.push_str(&format!(
+    let _ = write!(
+        s,
         "USE `{}`;\nDELIMITER {delimiter}\n{}\n{delimiter}\n",
         schema.as_str(),
         def.definition
-    ));
+    );
     Some(s)
 }
 
@@ -219,16 +223,16 @@ pub async fn recreate(
             ));
         }
     }
-    let (mut views, others): (Vec<&DbObjectDef>, Vec<&DbObjectDef>) =
-        pending.into_iter().partition(|d| d.kind == DbObjectKind::View);
+    let (mut views, others): (Vec<&DbObjectDef>, Vec<&DbObjectDef>) = pending
+        .into_iter()
+        .partition(|d| d.kind == DbObjectKind::View);
     // Views in rounds until a round creates none.
     loop {
         let mut failed = Vec::new();
         let mut last_errors = Vec::new();
         let before = views.len();
         for def in views {
-            match mariadb::run_hardened(ctx, content::create_view(schema, &def.definition)).await
-            {
+            match mariadb::run_hardened(ctx, content::create_view(schema, &def.definition)).await {
                 Ok(_) => {}
                 Err(e) => {
                     last_errors.push(refused(e)?);
@@ -352,7 +356,8 @@ mod tests {
 
     #[test]
     fn replay_scripts_are_exact_and_refuse_client_commands() {
-        let schema = Schema::of_db(&DbName::parse("alice_wp", "n").unwrap_or_else(|e| panic!("{e}")));
+        let schema =
+            Schema::of_db(&DbName::parse("alice_wp", "n").unwrap_or_else(|e| panic!("{e}")));
         // The body that fooled `mariadb-dump | mariadb` on MariaDB 10.5.
         let evil = "CREATE DEFINER=`alice_app`@`localhost` PROCEDURE `p`()\nBEGIN SELECT 1; END --\u{1} ;; CREATE DATABASE pwned ;;";
         assert_eq!(
@@ -361,11 +366,20 @@ mod tests {
                 "SET SESSION sql_mode = CONVERT(X'5354524943545F5452414E535F5441424C4553' USING utf8mb4);\nUSE `alice_wp`;\nDELIMITER ?oxpanel-end-0?\n{evil}\n?oxpanel-end-0?\n"
             ))
         );
-        let event = replay_script(&schema, &def(DbObjectKind::Event, "CREATE EVENT e ON SCHEDULE EVERY 1 DAY DO SELECT 1"))
-            .unwrap_or_default();
+        let event = replay_script(
+            &schema,
+            &def(
+                DbObjectKind::Event,
+                "CREATE EVENT e ON SCHEDULE EVERY 1 DAY DO SELECT 1",
+            ),
+        )
+        .unwrap_or_default();
         assert!(event.contains("SET SESSION time_zone = CONVERT(X'53595354454D' USING utf8mb4);\n"));
         for unsafe_text in ["BEGIN \\C gbk END", "BEGIN \0 END"] {
-            assert_eq!(replay_script(&schema, &def(DbObjectKind::Trigger, unsafe_text)), None);
+            assert_eq!(
+                replay_script(&schema, &def(DbObjectKind::Trigger, unsafe_text)),
+                None
+            );
         }
     }
 
@@ -390,21 +404,30 @@ mod tests {
             "alice_app@localhost",
             "p\tANSI\tCREATE PROCEDURE `p`()\\nBEGIN SELECT 'a\\tb'; END\tutf8mb4\tc\td",
         )?;
-        assert_eq!(p.definition, "CREATE PROCEDURE `p`()\nBEGIN SELECT 'a\tb'; END");
+        assert_eq!(
+            p.definition,
+            "CREATE PROCEDURE `p`()\nBEGIN SELECT 'a\tb'; END"
+        );
         let e = parse_show_create(
             DbObjectKind::Event,
             "ev",
             "alice_app@localhost",
             "ev\tANSI\t+00:00\tCREATE EVENT `ev` ON SCHEDULE EVERY 1 DAY DO SELECT 1\tutf8mb4\tc\td",
         )?;
-        assert_eq!((e.time_zone.as_str(), e.sql_mode.as_str()), ("+00:00", "ANSI"));
+        assert_eq!(
+            (e.time_zone.as_str(), e.sql_mode.as_str()),
+            ("+00:00", "ANSI")
+        );
         let v = parse_show_create(
             DbObjectKind::View,
             "v",
             "alice_app@localhost",
             "v\tCREATE VIEW `v` AS select 1 AS `1`\tutf8mb4\tc",
         )?;
-        assert_eq!((v.sql_mode.as_str(), v.definition.as_str()), ("", "CREATE VIEW `v` AS select 1 AS `1`"));
+        assert_eq!(
+            (v.sql_mode.as_str(), v.definition.as_str()),
+            ("", "CREATE VIEW `v` AS select 1 AS `1`")
+        );
         // Another object's row, or no definition, is refused.
         assert!(parse_show_create(DbObjectKind::View, "w", "", "v\tCREATE VIEW x").is_err());
         assert!(parse_show_create(DbObjectKind::Function, "f", "", "f\tANSI\tNULL").is_err());

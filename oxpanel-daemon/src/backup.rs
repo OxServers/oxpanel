@@ -41,11 +41,11 @@ use serde::{Deserialize, Serialize};
 use tracing::{error, info, warn};
 
 use crate::ctx::Ctx;
+use crate::db::mariadb::{self, Schema};
+use crate::db::objects;
 use crate::error::{Error, Result};
 use crate::fsutil;
 use crate::nginx::safe_path_str;
-use crate::db::mariadb::{self, Schema};
-use crate::db::objects;
 use crate::records::{
     now_unix, AppRuntime, BackupDatabase, BackupMember, BackupRecord, BackupState, DatabaseRecord,
     DbObjectDef, DbState, JobKind, JobRecord, JobState, OnExisting, SiteResult, TenantRecord,
@@ -623,7 +623,6 @@ impl BackupService {
             .saturating_add(sizes.values().copied().sum::<u64>());
 
         let guard = self.ctx.lock.lock().await;
-        let cfg = &self.ctx.config;
         let tenant_rec = self.ready_tenant(name)?;
         if let Some(job) = self.job_in_flight(name, parent)? {
             return match job.kind {
@@ -640,7 +639,7 @@ impl BackupService {
         let captured = self.capture_objects(&databases).await?;
 
         let (id, job_id) = self.new_ids()?;
-        let dir = backup_path(&cfg.backup_dir, name, &id);
+        let dir = backup_path(&self.ctx.config.backup_dir, name, &id);
         let vhosts: Vec<VHostRecord> = self
             .ctx
             .store
@@ -681,9 +680,7 @@ impl BackupService {
             unit_name(&job_id),
         );
         job.started_at_unix = backup.created_at_unix;
-        if let Some(parent) = parent {
-            job.parent_job = parent.to_string();
-        }
+        job.parent_job = parent.map(ToString::to_string).unwrap_or_default();
         // Records first: whatever happens next, a restarted daemon knows
         // there is a job to finish and a directory to account for.
         self.ctx.store.save_backup(&backup)?;
@@ -697,7 +694,7 @@ impl BackupService {
             max_bytes: room,
             venvs,
             databases: databases.iter().map(|d| d.name.clone()).collect(),
-            socket: cfg.mariadb_socket.clone(),
+            socket: self.ctx.config.mariadb_socket.clone(),
         };
         let started = self
             .prepare_backup_dir(name, &dir, &tenant_rec, &vhosts, &captured)
@@ -902,7 +899,10 @@ impl BackupService {
             .iter()
             .find(|d| d.name == database.as_str())
             .ok_or_else(|| {
-                Error::invalid("database", format!("backup {id} holds no database '{database}'"))
+                Error::invalid(
+                    "database",
+                    format!("backup {id} holds no database '{database}'"),
+                )
             })?;
         if let Some(job) = self.job_in_flight(&name, None)? {
             let same = job.kind == JobKind::RestoreDatabase
@@ -922,7 +922,9 @@ impl BackupService {
             .members
             .iter()
             .find(|m| m.name == entry.dump_member)
-            .ok_or_else(|| Error::Internal(format!("backup {id} lacks member {}", entry.dump_member)))?;
+            .ok_or_else(|| {
+                Error::Internal(format!("backup {id} lacks member {}", entry.dump_member))
+            })?;
         // Refused before anything is recorded: MariaDB unusable, the name taken.
         let server = mariadb::snapshot(&self.ctx).await?;
         crate::db::trash::claimable(&self.ctx, &server, &name, new_name)?;
@@ -1003,7 +1005,10 @@ impl BackupService {
                     if issues.is_empty() {
                         String::new()
                     } else {
-                        format!(" ({} stored objects were not re-created, see object_issues)", issues.len())
+                        format!(
+                            " ({} stored objects were not re-created, see object_issues)",
+                            issues.len()
+                        )
                     }
                 );
                 job.object_issues = issues;
@@ -2180,7 +2185,13 @@ mod tests {
             .map(str::to_owned),
         );
         assert_eq!(run.first().map(args), Some(expected));
+        Ok(())
+    }
 
+    #[tokio::test]
+    async fn a_backup_in_flight_is_listed_but_neither_restorable_nor_deletable() -> Result<()> {
+        let h = harness(false).await;
+        let (job, _) = h.backups.create("alice", 0, 0).await?;
         // In flight: listed as CREATING, not restorable, not deletable.
         let listed = h.backups.list("alice").await?;
         assert_eq!(listed.len(), 1);
@@ -2925,7 +2936,13 @@ mod tests {
             h.backups.retain("alice", &other, 1, 0).await,
             Err(Error::BackupNotFound { .. })
         ));
-        assert!(h.backups.retain("bob", &other, 1, 0).await?.retain_until_unix > 0);
+        assert!(
+            h.backups
+                .retain("bob", &other, 1, 0)
+                .await?
+                .retain_until_unix
+                > 0
+        );
 
         // Deleting bob: refused while an ordinary backup is left.
         assert!(matches!(

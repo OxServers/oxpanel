@@ -542,10 +542,10 @@ impl DbService {
 pub fn tenant_has_objects(ctx: &Ctx, tenant: &Username) -> Result<bool> {
     Ok(trash::tenant_has_trash(ctx, tenant)?
         || ctx
-        .store
-        .list_databases()?
-        .iter()
-        .any(|d| d.tenant == tenant.as_str())
+            .store
+            .list_databases()?
+            .iter()
+            .any(|d| d.tenant == tenant.as_str())
         || ctx
             .store
             .list_db_users()?
@@ -1112,7 +1112,10 @@ mod tests {
             Err(Error::DbNotManaged { .. })
         ));
         // No record, so "delete" finds nothing and touches nothing.
-        assert_eq!(h.db.delete_database("alice_legacy").await?, trash::Deleted::NotFound);
+        assert_eq!(
+            h.db.delete_database("alice_legacy").await?,
+            trash::Deleted::NotFound
+        );
         assert!(!h.db.delete_user("alice_legacy").await?);
         assert!(mutations(&h).is_empty());
         assert!(h.ctx.store.list_databases()?.is_empty());
@@ -1409,7 +1412,10 @@ mod tests {
                 .map(|u| u.grants.clone()),
             Some(vec!["alice_shop".to_owned()])
         );
-        assert_eq!(h.db.delete_database("alice_wp").await?, trash::Deleted::NotFound);
+        assert_eq!(
+            h.db.delete_database("alice_wp").await?,
+            trash::Deleted::NotFound
+        );
         assert_eq!(h.host.reconcile().await?, vec![]);
         Ok(())
     }
