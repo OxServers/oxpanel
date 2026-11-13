@@ -581,6 +581,13 @@ xfs_quota: cannot setup path for mount /dev/nonexistent: No such file or directo
             .collect::<Vec<String>>()]
         );
         assert_eq!(usage(&h.ctx, 20000).await?.map(|r| r.inodes_used), Some(13));
+        // A failing report degrades to the old measurement instead of failing.
+        h.sys.script_failure(
+            bin::SYSTEMD_RUN,
+            1,
+            "Failed to start transient service unit",
+        );
+        assert_eq!(h.tenants.usage("alice").await?.disk_usage_bytes, 8192);
         // Not enforced: the old measurement.
         h.sys.set_quota_enforced(false);
         assert_eq!(h.tenants.usage("alice").await?.disk_usage_bytes, 8192);

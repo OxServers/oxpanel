@@ -389,14 +389,20 @@ impl TenantService {
         let (memory_current_bytes, cpu_usage_nsec, tasks_current) =
             parse_cgroup_usage(&show.stdout_lossy());
         // The quota system knows without walking the tree, when it is on.
-        if let Some(row) = quota::usage(&self.ctx, rec.uid).await? {
-            return Ok(TenantUsage {
-                memory_current_bytes,
-                cpu_usage_nsec,
-                tasks_current,
-                disk_usage_bytes: row.used_bytes,
-                measured_at_unix: now_unix(),
-            });
+        match quota::usage(&self.ctx, rec.uid).await {
+            Ok(Some(row)) => {
+                return Ok(TenantUsage {
+                    memory_current_bytes,
+                    cpu_usage_nsec,
+                    tasks_current,
+                    disk_usage_bytes: row.used_bytes,
+                    measured_at_unix: now_unix(),
+                })
+            }
+            Ok(None) => {}
+            Err(e) => {
+                warn!(tenant = %name, error = %e, "quota report failed; measuring the home instead");
+            }
         }
         // -x: stay on the home's file system; du never follows symlinks.
         let du = self
