@@ -316,6 +316,7 @@
 [HTTPS (certificates)] Reconciliation
   unit tls reconcile_covers_certificate_files
   unit auto_https state_goes_with_the_site_and_strays_are_drift
+  unit auto_https a_run_that_outlives_its_site_leaves_no_state_behind
   sh tests-integration/run-inside.sh reconcile reports the edited certificate and the opened key
   sh tests-integration/run-inside.sh reconcile reports the stray file
   sh tests-integration/run-inside.sh no drift after healing

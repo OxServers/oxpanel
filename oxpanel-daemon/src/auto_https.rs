@@ -407,6 +407,20 @@ impl TlsService {
         Ok(out)
     }
 
+    /// Save the site's state, unless the site was removed while this run
+    /// waited for its pre-check or order (minutes, without the mutation
+    /// lock). Its removal, under that lock, already dropped the state;
+    /// writing it now would leave an orphan (`ORPHAN_AUTO_HTTPS_STATE`, found
+    /// by acceptance phase 20 when a site was removed within seconds of
+    /// being configured).
+    async fn save_if_site_exists(&self, domain: &Domain, rec: &AutoHttpsRecord) -> Result<()> {
+        let _guard = self.ctx.lock.lock().await;
+        if self.ctx.store.load_vhost(domain)?.is_some() {
+            save(&self.ctx.config, domain, rec)?;
+        }
+        Ok(())
+    }
+
     /// Do what `domain` needs. `None` when nothing was attempted (not
     /// eligible, nothing to do, or everything backing off).
     async fn auto_https_site(
@@ -439,7 +453,7 @@ impl TlsService {
             rec.last_error = Some(bounded(&format!(
                 "certificates cannot be requested on this host: {reason}"
             )));
-            save(cfg, domain, &rec)?;
+            self.save_if_site_exists(domain, &rec).await?;
             return Ok(Some(not_issued(vhost, reason)));
         }
         let checked = {
@@ -450,7 +464,7 @@ impl TlsService {
             Ok(c) => c,
             Err(e) => {
                 rec.last_error = Some(bounded(&e.to_string()));
-                save(cfg, domain, &rec)?;
+                self.save_if_site_exists(domain, &rec).await?;
                 return Ok(Some(not_issued(vhost, e.to_string())));
             }
         };
@@ -466,7 +480,7 @@ impl TlsService {
                 .find(|(n, _)| n == domain)
                 .map_or("not checked", |(_, w)| w.as_str());
             rec.last_error = Some(bounded(&format!("{domain}: {why}")));
-            save(cfg, domain, &rec)?;
+            self.save_if_site_exists(domain, &rec).await?;
             info!(%domain, reason = why, "automatic HTTPS: the domain does not validate yet; nothing ordered");
             return Ok(Some(not_issued(vhost, output)));
         }
@@ -482,13 +496,13 @@ impl TlsService {
         {
             rec.last_error = None;
             rec.names.retain(|n, _| vhost.all_names().any(|m| m == n));
-            save(cfg, domain, &rec)?;
+            self.save_if_site_exists(domain, &rec).await?;
             return Ok(Some(not_issued(vhost, output)));
         }
         let ordered = self.order(domain, Some(&checked.passed)).await;
         let outcome = record_order(domain, &mut rec, &checked.passed, ordered, now, output);
         rec.names.retain(|n, _| vhost.all_names().any(|m| m == n));
-        save(cfg, domain, &rec)?;
+        self.save_if_site_exists(domain, &rec).await?;
         outcome.map(Some)
     }
 }
@@ -890,6 +904,28 @@ mod tests {
                 );
             }
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_run_that_outlives_its_site_leaves_no_state_behind() -> Result<()> {
+        let h = harness().await;
+        let d = Domain::parse("example.com")?;
+        let rec = AutoHttpsRecord::default();
+        h.tls.save_if_site_exists(&d, &rec).await?;
+        assert!(state_path(&h.ctx.config, &d).exists());
+        h.vhosts.remove("example.com").await?;
+        assert!(!state_path(&h.ctx.config, &d).exists(), "removal drops it");
+        // What a pre-check that finished after the removal used to do.
+        h.tls.save_if_site_exists(&d, &rec).await?;
+        assert!(
+            !state_path(&h.ctx.config, &d).exists(),
+            "a late run does not bring it back"
+        );
+        assert!(HostService::new(h.ctx.clone())
+            .reconcile()
+            .await?
+            .is_empty());
         Ok(())
     }
 
