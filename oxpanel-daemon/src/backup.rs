@@ -1517,6 +1517,8 @@ mod tests {
             .join("nginx")
             .join("conf.d")
             .join("00-oxpanel.conf");
+        crate::config::sandbox_feature_paths(&mut cfg, dir.path());
+        cfg.backup_dir = dir.path().join("backups");
         cfg.backup_keep = 2;
         for d in [
             &cfg.home_base,
@@ -1549,6 +1551,10 @@ mod tests {
                 php: true,
                 ..VHostRequest::default()
             })
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
+        // As the daemon does at start: the sshd drop-in is in place.
+        crate::sftp::converge_all(&h.ctx)
             .await
             .unwrap_or_else(|e| panic!("{e}"));
         h.sys.clear_calls();

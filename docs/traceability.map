@@ -438,6 +438,7 @@
   sh tests-integration/run-inside.sh the account is local only, with a connection limit
 [Databases (MariaDB)] Tenant lifecycle
   unit db suspension_locks_accounts_and_tenant_deletion_is_refused
+  unit tenant one_tenant_with_every_feature_through_suspend_resume_and_delete
   sh tests-integration/run-inside.sh suspension locks the tenant's database accounts
   sh tests-integration/run-inside.sh suspension ends open sessions
   sh tests-integration/run-inside.sh resume unlocks them
@@ -453,6 +454,102 @@
 [Databases (MariaDB)] Ready for more engines
   unit db create_database_runs_the_exact_client_and_statement
   unit records database_records_round_trip_and_cannot_cross_tenants
+
+[Backups and restores] Jobs
+  unit backup create_starts_a_sandboxed_worker_in_the_tenants_slice
+  unit backup jobs_are_limited_per_host_resumed_after_a_restart_and_pruned
+  unit backup unit_states_are_read_from_systemctl_show
+  sh tests-integration/run-inside.sh the job runs in its own unit
+  sh tests-integration/run-inside.sh a repeated request returns the running job
+  sh tests-integration/run-inside.sh the worker outlives the daemon
+  sh tests-integration/run-inside.sh the restarted daemon finishes the backup
+[Backups and restores] Contents
+  unit backup a_finished_backup_is_sealed_with_checksums_and_a_manifest
+  sh tests-integration/run-inside.sh listed READY with its members and sites
+  sh tests-integration/run-inside.sh the manifest lists the checksum
+  sh tests-integration/run-inside.sh the records member describes the tenant and its sites
+[Backups and restores] Left out, and said so
+  unit backup excluded_directories_are_relative_deduplicated_and_outermost
+  unit backup exclusions_are_recorded_in_the_record_and_the_manifest
+  unit worker create_reads_as_the_tenant_and_follows_nothing
+  unit worker a_real_archive_round_trips_and_damage_is_detected
+  sh tests-integration/run-inside.sh the archive contains no node_modules
+  sh tests-integration/run-inside.sh the archive contains no virtualenv
+  sh tests-integration/run-inside.sh the manifest names what was left out
+  sh tests-integration/run-inside.sh the listing counts what was left out
+  sh tests-integration/run-inside.sh download caches are left out
+[Backups and restores] Read as the tenant
+  unit worker create_reads_as_the_tenant_and_follows_nothing
+  sh tests-integration/run-inside.sh the archiver runs as the tenant, not root
+  sh tests-integration/run-inside.sh a symlink to /etc/shadow is stored as a symlink
+  sh tests-integration/run-inside.sh a FIFO is stored as a FIFO, never opened
+  sh tests-integration/run-inside.sh a file the tenant cannot read is not archived
+  sh tests-integration/run-inside.sh no content of /etc/shadow or the root-only file in the archive
+  sh tests-integration/run-inside.sh a 10 GiB sparse file costs almost nothing
+[Backups and restores] Charged to the tenant
+  unit backup create_starts_a_sandboxed_worker_in_the_tenants_slice
+  sh tests-integration/run-inside.sh the job is charged to the tenant's slice
+[Backups and restores] Root-only storage, bounded
+  unit backup requests_that_cannot_succeed_are_refused_before_anything_is_created
+  unit backup retention_keeps_the_newest_backups_and_delete_is_idempotent
+  unit worker copy_hashes_counts_and_enforces_the_limit
+  sh tests-integration/run-inside.sh backup store is root-only
+  sh tests-integration/run-inside.sh archive, manifest and records are root-only
+  sh tests-integration/run-inside.sh the tenant cannot list the backup store
+  sh tests-integration/run-inside.sh retention keeps the newest 7
+[Backups and restores] Never half-written
+  unit backup a_failed_or_interrupted_backup_leaves_nothing_behind
+  unit backup a_worker_that_cannot_be_started_fails_the_job_cleanly
+  unit worker result_files_sit_next_to_their_member
+  sh tests-integration/run-inside.sh a killed worker fails the job (exit 5)
+  sh tests-integration/run-inside.sh and leaves no backup behind
+  sh tests-integration/run-inside.sh no worker leftovers in the backup
+[Backups and restores] Integrity
+  unit worker a_real_archive_round_trips_and_damage_is_detected
+  sh tests-integration/run-inside.sh a corrupted archive is refused (exit 5)
+  sh tests-integration/run-inside.sh a truncated archive is refused
+  sh tests-integration/run-inside.sh nothing was restored from a damaged archive
+[Backups and restores] Restore as the tenant
+  unit worker extract_writes_as_the_tenant_into_the_home_only
+  unit worker restore_counts_are_read_from_the_workers_last_line
+  unit backup restore_verifies_stops_services_and_puts_the_site_back
+  unit backup restores_report_counts_and_rebuild_the_applications
+  unit backup a_failed_restore_still_puts_the_site_back_and_says_why
+  sh tests-integration/run-inside.sh a restore must say what happens to existing files
+  sh tests-integration/run-inside.sh it reports restored and skipped entries
+  sh tests-integration/run-inside.sh a file changed since the backup is kept
+  sh tests-integration/run-inside.sh nothing is reported skipped when overwriting
+  sh tests-integration/run-inside.sh the restore reports both applications rebuilt
+  sh tests-integration/run-inside.sh node_modules was reinstalled as the tenant
+  sh tests-integration/run-inside.sh the virtualenv was recreated as the tenant
+  sh tests-integration/run-inside.sh nothing is written through a symlink to /etc ($mode)
+  sh tests-integration/run-inside.sh a member owned by root is owned by the tenant ($mode)
+[Backups and restores] Tenant isolation
+  unit backup one_tenants_backup_cannot_be_restored_or_deleted_through_another
+  sh tests-integration/run-inside.sh bob cannot be restored from alice's backup
+  sh tests-integration/run-inside.sh bob cannot delete alice's backup
+  sh tests-integration/run-inside.sh another tenant cannot read it either
+[Backups and restores] Lifecycle
+  unit backup a_suspended_tenant_can_be_backed_up_and_restored_but_stays_stopped
+  unit backup a_tenant_with_backups_or_a_running_job_cannot_be_deleted
+  unit tenant one_tenant_with_every_feature_through_suspend_resume_and_delete
+  sh tests-integration/run-inside.sh a suspended tenant can be backed up
+  sh tests-integration/run-inside.sh a tenant with backups cannot be deleted
+[Backups and restores] Retained backups
+  unit backup retained_backups_skip_the_count_and_outlive_their_tenant
+  unit backup retained_backups_are_restored_deleted_and_expired_by_the_operator
+  sh tests-integration/run-inside.sh a tenant with only retained backups can be deleted
+  sh tests-integration/run-inside.sh does not see them
+  sh tests-integration/run-inside.sh the operator restores the final backup into the re-created account
+  sh tests-integration/run-inside.sh a backup past its date is removed when the daemon starts
+[Backups and restores] Reconciliation
+  unit backup retained_backups_skip_the_count_and_outlive_their_tenant
+  sh tests-integration/run-inside.sh a grown archive is drift
+  sh tests-integration/run-inside.sh a directory without a record is drift
+  sh tests-integration/run-inside.sh backups are not drift
+[Backups and restores] Scheduling
+  unit backup retention_keeps_the_newest_backups_and_delete_is_idempotent
+  sh tests-integration/run-inside.sh retention keeps the newest 7
 
 [API, transport and authentication] gRPC over a UNIX socket only
   it grpc_uds full_tenant_and_vhost_lifecycle_over_uds

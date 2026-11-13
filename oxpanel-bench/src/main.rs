@@ -105,6 +105,7 @@ async fn start(uid_max: u32) -> Result<Daemon, BoxError> {
     cfg.acme_dir = p.join("acme");
     cfg.sftp_keys_dir = p.join("sftp-keys");
     cfg.sshd_dropin_file = p.join("sshd_config.d").join("60-oxpanel.conf");
+    cfg.backup_dir = p.join("backups");
     cfg.uid_max = uid_max;
     for d in [
         &cfg.home_base,

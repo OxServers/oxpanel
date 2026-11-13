@@ -318,6 +318,7 @@ mod tests {
     fn harness(enforced: bool) -> Harness {
         let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
         let mut cfg = Config::default();
+        crate::config::sandbox_feature_paths(&mut cfg, dir.path());
         cfg.state_dir = dir.path().join("state");
         cfg.home_base = dir.path().join("home");
         cfg.systemd_unit_dir = dir.path().join("systemd");

@@ -324,6 +324,14 @@ impl TenantService {
     /// Suspend or resume: every virtual host of the tenant is re-rendered
     /// (503 while suspended), validated and activated; only then is the
     /// record updated, so an interrupted attempt is simply repeated.
+    ///
+    /// The order across features (docs/superpowers/specs/2026-11-13-integration-design.md):
+    /// suspend: the sites answer 503 first, then the tenant's processes stop
+    /// (PHP, applications), then its access is cut (SFTP keys, password and
+    /// sessions; database accounts locked and their sessions killed, last,
+    /// when nothing is left that could reconnect). Resume is the reverse:
+    /// access, then processes, then the sites — so no request sees a 502 and
+    /// nothing starts that cannot reach its database.
     pub async fn set_suspended(
         &self,
         username: &str,
@@ -334,11 +342,8 @@ impl TenantService {
         let mut rec = self.load_ready(&name)?;
         let changed = rec.suspended != suspended;
         rec.suspended = suspended;
-        // Resume: PHP is back before the sites are. Suspend: the sites
-        // answer 503 before PHP stops. Either way no request sees a 502.
         if changed && !suspended {
-            // Database accounts first: PHP and applications connect at start.
-            crate::db::set_locked_all(&self.ctx, &rec, false).await?;
+            self.restore_access(&rec).await?;
             crate::php::set_running(&self.ctx, &rec, true).await?;
             crate::app::set_running_all(&self.ctx, &rec, true).await?;
         }
@@ -347,28 +352,55 @@ impl TenantService {
             if suspended {
                 crate::php::set_running(&self.ctx, &rec, false).await?;
                 crate::app::set_running_all(&self.ctx, &rec, false).await?;
-                // Last: by now nothing of the tenant's is running that could
+                // The keys file goes away, the password hash is locked and
+                // running sessions are ended.
+                sftp::suspend_access(&self.ctx, &rec).await?;
+                // Last: nothing of the tenant's is running that could
                 // reconnect; its database accounts are locked and their
                 // sessions ended.
                 crate::db::set_locked_all(&self.ctx, &rec, true).await?;
-            }
-            // SFTP follows the sites: the keys file goes away and the
-            // password hash is locked with the suspension (and running
-            // sessions are ended); both return with the resumption.
-            if suspended {
-                sftp::suspend_access(&self.ctx, &rec).await?;
-            } else if sftp::has_access(&rec) {
-                // The sites are back already; a host whose sshd cannot take
-                // the keys right now must not keep them down. `Reconcile`
-                // reports the missing keys file until access is restored.
-                if let Err(e) = sftp::ensure_access(&self.ctx, &rec).await {
-                    warn!(tenant = %name, error = %e, "resumed, but SFTP access could not be restored");
-                }
             }
             self.ctx.store.save_tenant(&rec)?;
             info!(tenant = %name, suspended, "suspension changed");
         }
         Ok((rec, changed))
+    }
+
+    /// Resume, first step: database accounts are unlocked (PHP and
+    /// applications connect as they start) and SFTP access is given back.
+    async fn restore_access(&self, rec: &TenantRecord) -> Result<()> {
+        crate::db::set_locked_all(&self.ctx, rec, false).await?;
+        if sftp::has_access(rec) {
+            // A host whose sshd cannot take the keys right now must not keep
+            // the sites down. `Reconcile` reports the missing keys file until
+            // access is restored (a password stays locked until then).
+            if let Err(e) = sftp::ensure_access(&self.ctx, rec).await {
+                warn!(tenant = %rec.username, error = %e, "resuming, but SFTP access could not be restored");
+            }
+        }
+        Ok(())
+    }
+
+    /// Why a tenant cannot be deleted yet, if it cannot: it still owns
+    /// virtual hosts, databases or database users, backups that are not
+    /// retained, or a backup or restore job is running. Reads records only.
+    fn refuse_deletion(&self, name: &Username) -> Result<()> {
+        if self
+            .ctx
+            .store
+            .list_vhosts()?
+            .iter()
+            .any(|v| v.tenant == name.as_str())
+        {
+            return Err(Error::TenantHasVHosts(name.to_string()));
+        }
+        // Databases are data: dropping them is always an explicit request.
+        if crate::db::tenant_has_objects(&self.ctx, name)? {
+            return Err(Error::TenantHasDatabases(name.to_string()));
+        }
+        // Backups are the tenant's data too: they are deleted explicitly,
+        // never as a side effect, and no job may be in flight.
+        crate::backup::refuse_tenant_deletion(&self.ctx, name)
     }
 
     /// Memory, CPU and task counts from systemd (tenant slice plus login
@@ -447,22 +479,8 @@ impl TenantService {
             }
             return Ok(false);
         };
-        if self
-            .ctx
-            .store
-            .list_vhosts()?
-            .iter()
-            .any(|v| v.tenant == rec.username)
-        {
-            return Err(Error::TenantHasVHosts(name.to_string()));
-        }
-        // Databases are data: dropping them is always an explicit request.
-        if crate::db::tenant_has_objects(&self.ctx, &name)? {
-            return Err(Error::TenantHasDatabases(name.to_string()));
-        }
-        // Backups are the tenant's data too: they are deleted explicitly,
-        // never as a side effect, and no job may be in flight.
-        crate::backup::refuse_tenant_deletion(&self.ctx, &name)?;
+        // Every refusal before anything is changed or destroyed.
+        self.refuse_deletion(&name)?;
         if rec.state != TenantState::Deleting {
             rec.state = TenantState::Deleting;
             self.ctx.store.save_tenant(&rec)?;
@@ -521,6 +539,7 @@ mod tests {
     fn harness() -> Harness {
         let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
         let mut cfg = Config::default();
+        crate::config::sandbox_feature_paths(&mut cfg, dir.path());
         cfg.state_dir = dir.path().join("state");
         cfg.home_base = dir.path().join("home");
         cfg.systemd_unit_dir = dir.path().join("systemd");
@@ -1023,6 +1042,318 @@ mod tests {
         );
         assert!(calls.iter().all(|c| c.run_as.is_none()));
         Ok(())
+    }
+
+    /// A tenant using every feature at once, for
+    /// [`one_tenant_with_every_feature_through_suspend_resume_and_delete`].
+    struct Everything {
+        _dir: tempfile::TempDir,
+        sys: Arc<FakeSystem>,
+        ctx: Ctx,
+        tenants: TenantService,
+        vhosts: crate::vhost::VHostService,
+        db: crate::db::DbService,
+        backups: crate::backup::BackupService,
+        host: crate::host::HostService,
+        backup_id: String,
+    }
+
+    /// Every external command since the last `clear_calls`, program first.
+    fn argvs(sys: &FakeSystem) -> Vec<Vec<String>> {
+        sys.calls()
+            .iter()
+            .map(|c| {
+                std::iter::once(c.program.to_owned())
+                    .chain(c.args.iter().map(|a| a.to_string_lossy().into_owned()))
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Index of the first command `what` matches; panics with the whole list
+    /// if there is none.
+    fn first(calls: &[Vec<String>], what: impl Fn(&[String]) -> bool, label: &str) -> usize {
+        calls
+            .iter()
+            .position(|c| what(c))
+            .unwrap_or_else(|| panic!("no {label} in {calls:#?}"))
+    }
+
+    fn is_program(c: &[String], program: &str) -> bool {
+        c.first().is_some_and(|p| p == program)
+    }
+
+    fn mentions(c: &[String], word: &str) -> bool {
+        c.iter().any(|a| a == word)
+    }
+
+    /// `systemctl <verb> … <unit>`.
+    fn systemctl(c: &[String], verb: &str, unit: &str) -> bool {
+        is_program(c, bin::SYSTEMCTL) && mentions(c, verb) && mentions(c, unit)
+    }
+
+    /// alice with a PHP site (and an uploaded certificate), a Node.js
+    /// application, an SFTP key and password, a database and a database
+    /// user with access to it, and one finished backup.
+    async fn everything() -> Result<Everything> {
+        use crate::records::{AppRuntime, DbEngine};
+        use crate::vhost::{AppRequest, VHostRequest};
+        let dir = tempfile::tempdir().map_err(|e| Error::io("tempdir", "/tmp", e))?;
+        let p = dir.path();
+        let mut cfg = Config::default();
+        cfg.state_dir = p.join("state");
+        cfg.home_base = p.join("home");
+        cfg.systemd_unit_dir = p.join("systemd");
+        cfg.nginx_log_dir = p.join("log");
+        cfg.php_conf_dir = p.join("php");
+        cfg.nginx_conf_dir = p.join("nginx").join("oxpanel.d");
+        cfg.nginx_include_file = p.join("nginx").join("conf.d").join("00-oxpanel.conf");
+        crate::config::sandbox_feature_paths(&mut cfg, p);
+        for d in [
+            &cfg.home_base,
+            &cfg.systemd_unit_dir,
+            &p.join("nginx").join("conf.d"),
+        ] {
+            std::fs::create_dir_all(d).map_err(|e| Error::io("mkdir", d, e))?;
+        }
+        let sys = Arc::new(FakeSystem::new());
+        sys.install_mariadb();
+        let ctx = Ctx::new(cfg, sys.clone(), false);
+        ctx.store.init()?;
+        crate::sftp::converge_all(&ctx).await?;
+        let tenants = TenantService::new(ctx.clone());
+        let vhosts = crate::vhost::VHostService::new(ctx.clone());
+        let db = crate::db::DbService::new(ctx.clone());
+        let backups = crate::backup::BackupService::new(ctx.clone())
+            .with_poll_interval(std::time::Duration::from_secs(3600));
+        tenants.create("alice", Limits::default(), "").await?;
+        let site = |domain: &str| VHostRequest {
+            domain: domain.into(),
+            tenant: "alice".into(),
+            ..VHostRequest::default()
+        };
+        vhosts
+            .configure(VHostRequest {
+                aliases: vec!["www.example.com".into()],
+                php: true,
+                ..site("example.com")
+            })
+            .await?;
+        vhosts
+            .configure(VHostRequest {
+                app: Some(AppRequest {
+                    runtime: AppRuntime::Node,
+                    root: String::new(),
+                    entry: String::new(),
+                }),
+                ..site("app.example.com")
+            })
+            .await?;
+        crate::tls::TlsService::new(ctx.clone())
+            .install(crate::tls::tests::upload(
+                &crate::tls::tests::good_cert(),
+                &crate::system::fake_tls::fake_private_key("k1"),
+            ))
+            .await?;
+        let sftp = crate::sftp::SftpService::new(ctx.clone());
+        sftp.add_key("alice", crate::sftp::tests::KEY_A, "laptop")
+            .await?;
+        sftp.set_password("alice", "correct horse battery staple")
+            .await?;
+        db.create_database("alice", "alice_wp", DbEngine::Mariadb)
+            .await?;
+        db.create_user("alice", "alice_app", "db-password-123", DbEngine::Mariadb)
+            .await?;
+        db.grant("alice_app", "alice_wp").await?;
+        let (job, started) = backups.create("alice", 0).await?;
+        assert!(started);
+        assert!(
+            backups
+                .step(&crate::validate::JobId::parse(&job.id)?)
+                .await?
+        );
+        let host = crate::host::HostService::new(ctx.clone());
+        assert!(host.reconcile().await?.is_empty(), "everything in place");
+        Ok(Everything {
+            _dir: dir,
+            sys,
+            ctx,
+            tenants,
+            vhosts,
+            db,
+            backups,
+            host,
+            backup_id: job.backup_id,
+        })
+    }
+
+    impl Everything {
+        fn keys_file(&self) -> Result<PathBuf> {
+            let rec = self
+                .ctx
+                .store
+                .load_tenant(&Username::parse("alice")?)?
+                .ok_or_else(|| Error::TenantNotFound("alice".into()))?;
+            Ok(crate::sftp::SftpPaths::for_tenant(&self.ctx.config, &rec)?.keys_file)
+        }
+
+        /// Suspend: sites answer 503, then PHP and the application stop,
+        /// then SFTP (password locked, sessions ended), databases last.
+        async fn suspend(&self) -> Result<()> {
+            self.sys.clear_calls();
+            self.tenants.set_suspended("alice", true).await?;
+            let calls = argvs(&self.sys);
+            let order = [
+                first(&calls, |c| mentions(c, "reload-or-restart"), "nginx reload"),
+                first(
+                    &calls,
+                    |c| systemctl(c, "disable", "oxpanel-php-alice.service"),
+                    "PHP stop",
+                ),
+                first(
+                    &calls,
+                    |c| systemctl(c, "disable", "oxpanel-app-app.example.com.service"),
+                    "application stop",
+                ),
+                first(
+                    &calls,
+                    |c| is_program(c, bin::USERMOD) && mentions(c, "--lock"),
+                    "password lock",
+                ),
+                first(
+                    &calls,
+                    |c| mentions(c, "stop") && mentions(c, "user-20000.slice"),
+                    "end of sessions",
+                ),
+                first(&calls, |c| is_program(c, bin::MARIADB), "database lock"),
+            ];
+            assert!(order.is_sorted(), "suspend order {order:?}");
+            assert!(
+                self.sys
+                    .mariadb_scripts()
+                    .iter()
+                    .any(|s| s.contains("ACCOUNT LOCK") && s.contains("KILL USER")),
+                "database accounts locked and their sessions ended"
+            );
+            assert!(
+                !self.keys_file()?.exists(),
+                "no SFTP key works while suspended"
+            );
+            assert!(
+                self.host.reconcile().await?.is_empty(),
+                "suspended is not drift"
+            );
+            Ok(())
+        }
+
+        /// Resume: the reverse — access, then processes, then the sites.
+        async fn resume(&self) -> Result<()> {
+            self.sys.clear_calls();
+            self.tenants.set_suspended("alice", false).await?;
+            let calls = argvs(&self.sys);
+            let order = [
+                first(&calls, |c| is_program(c, bin::MARIADB), "database unlock"),
+                first(
+                    &calls,
+                    |c| is_program(c, bin::USERMOD) && mentions(c, "--unlock"),
+                    "password unlock",
+                ),
+                first(
+                    &calls,
+                    |c| systemctl(c, "enable", "oxpanel-php-alice.service"),
+                    "PHP start",
+                ),
+                first(
+                    &calls,
+                    |c| systemctl(c, "enable", "oxpanel-app-app.example.com.service"),
+                    "application start",
+                ),
+                first(&calls, |c| mentions(c, "reload-or-restart"), "nginx reload"),
+            ];
+            assert!(order.is_sorted(), "resume order {order:?}");
+            assert!(self
+                .sys
+                .mariadb_scripts()
+                .iter()
+                .any(|s| s.contains("ACCOUNT UNLOCK")));
+            assert!(self.keys_file()?.exists(), "SFTP keys work again");
+            assert!(self.host.reconcile().await?.is_empty(), "resumed: no drift");
+            Ok(())
+        }
+
+        /// A deletion that must be refused, changing and running nothing.
+        async fn refused(&self, expect: fn(&Error) -> bool) -> Result<()> {
+            self.sys.clear_calls();
+            match self.tenants.delete("alice", true).await {
+                Err(e) => assert!(expect(&e), "{e}"),
+                Ok(deleted) => panic!("deletion went through: {deleted}"),
+            }
+            assert!(
+                self.sys.calls().is_empty(),
+                "a refused deletion runs nothing"
+            );
+            let rec = self.ctx.store.load_tenant(&Username::parse("alice")?)?;
+            assert!(rec.is_some_and(|r| r.state == TenantState::Ready));
+            Ok(())
+        }
+
+        /// Delete: every refusal (sites, databases, backups) before anything
+        /// is destroyed; then SFTP access goes before the account, and the
+        /// retained backup outlives the tenant.
+        async fn delete(&self) -> Result<()> {
+            self.refused(|e| matches!(e, Error::TenantHasVHosts(_)))
+                .await?;
+            self.vhosts.remove("example.com").await?;
+            self.vhosts.remove("app.example.com").await?;
+            self.refused(|e| matches!(e, Error::TenantHasDatabases(_)))
+                .await?;
+            self.db.delete_user("alice_app").await?;
+            self.db.delete_database("alice_wp").await?;
+            self.refused(|e| matches!(e, Error::TenantHasBackups(_)))
+                .await?;
+            self.backups.retain("alice", &self.backup_id, 1).await?;
+            self.sys.clear_calls();
+            assert!(self.tenants.delete("alice", true).await?);
+            let calls = argvs(&self.sys);
+            let sessions = first(
+                &calls,
+                |c| mentions(c, "stop") && mentions(c, "user-20000.slice"),
+                "end of sessions",
+            );
+            let userdel = first(&calls, |c| is_program(c, bin::USERDEL), "userdel");
+            assert!(sessions < userdel, "SFTP access goes before the account");
+            assert!(self
+                .ctx
+                .store
+                .load_tenant(&Username::parse("alice")?)?
+                .is_none());
+            assert!(
+                self.backups
+                    .list_retained()
+                    .await?
+                    .iter()
+                    .any(|b| b.id == self.backup_id && b.tenant_deleted),
+                "the retained backup outlives the tenant, detached"
+            );
+            assert!(
+                self.host.reconcile().await?.is_empty(),
+                "nothing left behind"
+            );
+            Ok(())
+        }
+    }
+
+    /// One tenant using every feature at once — a PHP site with an uploaded
+    /// certificate, a Node.js application, an SFTP key and password, a
+    /// database and a database user, and a backup — through suspension,
+    /// resumption and deletion, with the order across the feature modules
+    /// asserted (see `TenantService::set_suspended`).
+    #[tokio::test]
+    async fn one_tenant_with_every_feature_through_suspend_resume_and_delete() -> Result<()> {
+        let all = everything().await?;
+        all.suspend().await?;
+        all.resume().await?;
+        all.delete().await
     }
 
     #[test]

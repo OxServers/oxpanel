@@ -191,6 +191,7 @@ pub fn sandbox_config(dir: &Path) -> Config {
     cfg.acme_dir = dir.join("acme");
     cfg.sftp_keys_dir = dir.join("sftp-keys");
     cfg.sshd_dropin_file = dir.join("sshd_config.d").join("60-oxpanel.conf");
+    cfg.backup_dir = dir.join("backups");
     for d in [
         &cfg.home_base,
         &cfg.systemd_unit_dir,

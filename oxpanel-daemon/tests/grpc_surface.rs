@@ -87,6 +87,16 @@ fn scope_table() -> BTreeMap<&'static str, Scope> {
         ("DeleteDatabaseUser", Scope::VHost),
         ("GrantDatabaseAccess", Scope::VHost),
         ("RevokeDatabaseAccess", Scope::VHost),
+        // Backups (backup stream; restoring a retained backup of a deleted
+        // tenant and deleting a backup need the strongest scope)
+        ("CreateBackup", Scope::Tenant),
+        ("ListBackups", Scope::Read),
+        ("DeleteBackup", Scope::Delete),
+        ("RestoreBackup", Scope::Tenant),
+        ("GetJob", Scope::Read),
+        ("RetainBackup", Scope::Tenant),
+        ("ListRetainedBackups", Scope::Read),
+        ("RestoreRetainedBackup", Scope::Delete),
     ]
     .into_iter()
     .collect()
