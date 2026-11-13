@@ -1581,7 +1581,8 @@ PY
   lcsql lcz_app lcz_one "CREATE TABLE t (a INT); INSERT INTO t VALUES (7)"
   LZT="$(trash_of "$(oxpanel-ctl db delete lcz_old)")"
   printf 'from-the-file-manager' | oxpanel-ctl files write lcz fm.txt >/dev/null
-  oxpanel-ctl files cp lcz fm.txt fm-copy.txt --wait >/dev/null
+  oxpanel-ctl files mkdir lcz copies >/dev/null
+  oxpanel-ctl files cp lcz copies fm.txt --wait >/dev/null
   check "the customer has a file-manager job in its history" grep -q '"tenant": "lcz"' <(cat /var/lib/oxpanel/file-jobs/*.json 2>/dev/null)
   out="$(timeout 300 oxpanel-ctl backup create lcz --wait)" || true
   LZB="$(backup_of "$out")"
