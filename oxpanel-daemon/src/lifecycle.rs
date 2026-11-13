@@ -214,7 +214,9 @@ impl LifecycleService {
                 )?;
             }
             Err(e) => {
-                error!(job = %id, tenant = %name, error = %e, "tenant deletion stopped");
+                // Reported in the job (and completed by repeating the
+                // request), like a failed backup: a warning, not an error.
+                warn!(job = %id, tenant = %name, error = %e, "tenant deletion stopped");
                 self.finish(
                     job,
                     JobState::Failed,

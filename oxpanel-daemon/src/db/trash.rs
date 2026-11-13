@@ -27,8 +27,8 @@ use crate::ctx::Ctx;
 use crate::error::{Error, Result};
 use crate::host::{Drift, DriftKind};
 use crate::records::{
-    now_unix, DatabaseRecord, DbState, DbTrashRecord, ObjectIssue, TenantRecord, TrashState,
-    RECORD_VERSION,
+    now_unix, DatabaseRecord, DbObjectDef, DbState, DbTrashRecord, ObjectIssue, TenantRecord,
+    TrashState, RECORD_VERSION,
 };
 use crate::validate::{DbName, TrashId, Username, TRASH_SCHEMA_PREFIX};
 
@@ -118,12 +118,26 @@ impl DbService {
         if pending.is_none() && rec.state != DbState::Deleting {
             self.refuse_over_cap(name.tenant(), size)?;
         }
+        // Captured while the grants still exist: once a view's definer has
+        // lost its privileges, the server shows the view's stored, fully
+        // qualified text, which names the old database.
+        let early = if pending.is_none() && on_server && rec.state != DbState::Deleting {
+            Some(objects::capture(&self.ctx, &schema, &listed, true).await?)
+        } else {
+            None
+        };
         // 2. Nobody reaches it any more: grants revoked, holders' sessions ended.
         if rec.state != DbState::Deleting {
             rec.state = DbState::Deleting;
             self.ctx.store.save_database(&rec)?;
         }
         self.take_away(&rec, &name, &server).await?;
+        // What is there now (an object made in between is kept too).
+        let listed = if on_server {
+            mariadb::objects(&self.ctx, &schema).await?
+        } else {
+            listed
+        };
         if !on_server && pending.is_none() {
             self.ctx.store.delete_database(&name)?;
             warn!(tenant = %rec.tenant, database = %name, "database record removed; the server had no such database");
@@ -133,7 +147,7 @@ impl DbService {
         let mut trash = match pending {
             Some(t) => t,
             None => {
-                let objects = objects::capture(&self.ctx, &schema, &listed, true).await?;
+                let objects = self.complete_capture(&schema, &listed, early).await?;
                 let id = new_trash_id(&self.ctx)?;
                 let now = now_unix();
                 let t = DbTrashRecord {
@@ -176,6 +190,37 @@ impl DbService {
         self.ctx.store.delete_database(&name)?;
         info!(tenant = %rec.tenant, database = %name, trash = %id, bytes = trash.size_bytes, objects = trash.objects.len(), "database moved to the trash");
         Ok(Deleted::Trashed(Box::new(trash)))
+    }
+
+    /// The definitions captured before the grants were revoked, brought up
+    /// to date with what `listed` (taken afterwards) holds: objects dropped
+    /// in between are left out, objects made in between are captured now.
+    async fn complete_capture(
+        &self,
+        schema: &Schema,
+        listed: &mariadb::SchemaObjects,
+        early: Option<Vec<DbObjectDef>>,
+    ) -> Result<Vec<DbObjectDef>> {
+        let Some(mut defs) = early else {
+            return objects::capture(&self.ctx, schema, listed, true).await;
+        };
+        let missing = mariadb::SchemaObjects {
+            tables: Vec::new(),
+            objects: listed
+                .objects
+                .iter()
+                .filter(|o| !defs.iter().any(|d| d.kind == o.kind && d.name == o.name))
+                .cloned()
+                .collect(),
+        };
+        defs.retain(|d| {
+            listed
+                .objects
+                .iter()
+                .any(|o| o.kind == d.kind && o.name == d.name)
+        });
+        defs.extend(objects::capture(&self.ctx, schema, &missing, true).await?);
+        Ok(defs)
     }
 
     /// The tenant's users lose every grant on `name`, and the sessions of

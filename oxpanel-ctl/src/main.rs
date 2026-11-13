@@ -156,9 +156,26 @@ enum DbCmd {
         #[arg(long, default_value = "")]
         tenant: String,
     },
-    /// Drop a database OxPanel created, with everything in it.
+    /// Move a database to its tenant's trash (the name is free at once; it
+    /// is purged automatically after the host's trash period).
     Delete {
         name: String,
+    },
+    /// The tenant's deleted databases, oldest first.
+    TrashList {
+        tenant: String,
+    },
+    /// Bring a deleted database back under a NEW name of the same tenant.
+    /// It gets no grants.
+    TrashRestore {
+        tenant: String,
+        trash_id: String,
+        new_name: String,
+    },
+    /// Purge one deleted database, or all of the tenant's (no id).
+    TrashPurge {
+        tenant: String,
+        trash_id: Option<String>,
     },
     /// Create a database user. The password is read from standard input
     /// (one line), never from the command line.
@@ -247,6 +264,20 @@ enum TenantCmd {
         /// Also remove the home directory.
         #[arg(long)]
         remove_home: bool,
+        /// Delete it with everything it has (sites, databases, SFTP access,
+        /// backups that are not retained, the home); needs --confirm.
+        #[arg(long)]
+        cascade: bool,
+        /// With --cascade: the tenant's name again.
+        #[arg(long)]
+        confirm: Option<String>,
+        /// With --cascade: take a final backup first and keep it this many
+        /// days (1-366); nothing is deleted unless it completes.
+        #[arg(long, default_value_t = 0, requires = "cascade")]
+        final_backup_days: u32,
+        /// With --cascade: wait for the job; exits with status 5 if it failed.
+        #[arg(long, requires = "cascade")]
+        wait: bool,
     },
 }
 
@@ -270,6 +301,9 @@ struct LimitArgs {
     /// Number of files and directories (kernel quota). 0 = unlimited.
     #[arg(long, default_value_t = 0)]
     inodes: u64,
+    /// Most the database trash may hold, e.g. 1G. 0 = the disk limit.
+    #[arg(long, value_parser = parse_size, default_value = "0")]
+    db_trash: u64,
 }
 
 #[derive(Subcommand, Debug)]
@@ -420,7 +454,7 @@ impl From<LimitArgs> for pb::ResourceLimits {
             tasks_max: l.tasks_max,
             disk_max_bytes: l.disk,
             inodes_max: l.inodes,
-            db_trash_max_bytes: 0,
+            db_trash_max_bytes: l.db_trash,
         }
     }
 }
@@ -581,7 +615,19 @@ async fn run_db(
                 .delete_database(pb::DeleteDatabaseRequest { name })
                 .await?
                 .into_inner();
-            say!("deleted={}", r.deleted);
+            if r.trash_id.is_empty() {
+                say!("deleted={}", r.deleted);
+            } else {
+                say!(
+                    "deleted={} trash_id={} purge_at={}",
+                    r.deleted,
+                    r.trash_id,
+                    r.purge_at.as_ref().map_or(0, |ts| ts.seconds)
+                );
+            }
+        }
+        DbCmd::TrashList { .. } | DbCmd::TrashRestore { .. } | DbCmd::TrashPurge { .. } => {
+            run_db_trash(c, cmd).await?;
         }
         DbCmd::UserCreate {
             name,
@@ -629,6 +675,75 @@ async fn run_db(
         DbCmd::Grant { .. } | DbCmd::Revoke { .. } => run_db_access(c, cmd).await?,
     }
     Ok(ExitCode::SUCCESS)
+}
+
+fn print_issue(i: &pb::DatabaseObjectIssue) {
+    say!(
+        "not-recreated kind={} name={} reason={}",
+        i.kind,
+        i.name,
+        i.reason
+    );
+}
+
+/// `db trash-list`, `db trash-restore` and `db trash-purge`.
+async fn run_db_trash(
+    c: &mut OxPanelEngineClient<Channel>,
+    cmd: DbCmd,
+) -> Result<(), tonic::Status> {
+    match cmd {
+        DbCmd::TrashList { tenant } => {
+            let r = c
+                .list_database_trash(pb::ListDatabaseTrashRequest { tenant })
+                .await?
+                .into_inner();
+            for t in &r.databases {
+                say!(
+                    "{} {} size={} deleted_at={} purge_at={} objects={}",
+                    t.id,
+                    t.name,
+                    t.size_bytes,
+                    t.deleted_at.as_ref().map_or(0, |ts| ts.seconds),
+                    t.purge_at.as_ref().map_or(0, |ts| ts.seconds),
+                    t.object_count
+                );
+            }
+            say!("total={} cap={}", r.total_bytes, r.cap_bytes);
+        }
+        DbCmd::TrashRestore {
+            tenant,
+            trash_id,
+            new_name,
+        } => {
+            let r = c
+                .restore_database_trash(pb::RestoreDatabaseTrashRequest {
+                    tenant,
+                    trash_id,
+                    new_name,
+                })
+                .await?
+                .into_inner();
+            say!(
+                "restored={}",
+                r.database.as_ref().map_or("-", |d| d.name.as_str())
+            );
+            for i in &r.object_issues {
+                print_issue(i);
+            }
+        }
+        DbCmd::TrashPurge { tenant, trash_id } => {
+            let r = c
+                .purge_database_trash(pb::PurgeDatabaseTrashRequest {
+                    tenant,
+                    trash_id: trash_id.unwrap_or_default(),
+                })
+                .await?
+                .into_inner();
+            say!("purged={}", r.purged);
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// `db grant` and `db revoke`.
@@ -746,20 +861,44 @@ async fn run_tenant(
                 u.measured_at.as_ref().map_or(0, |ts| ts.seconds),
             );
         }
-        TenantCmd::Delete {
+        cmd @ TenantCmd::Delete { .. } => return delete_tenant(c, cmd).await,
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `tenant delete`, with or without `--cascade`.
+async fn delete_tenant(
+    c: &mut OxPanelEngineClient<Channel>,
+    cmd: TenantCmd,
+) -> Result<ExitCode, tonic::Status> {
+    let TenantCmd::Delete {
+        username,
+        remove_home,
+        cascade,
+        confirm,
+        final_backup_days,
+        wait,
+    } = cmd
+    else {
+        return Ok(ExitCode::SUCCESS);
+    };
+    let r = c
+        .delete_tenant(pb::DeleteTenantRequest {
             username,
             remove_home,
-        } => {
-            let r = c
-                .delete_tenant(pb::DeleteTenantRequest {
-                    username,
-                    remove_home,
-                    ..Default::default()
-                })
-                .await?
-                .into_inner();
-            say!("deleted={}", r.deleted);
-        }
+            cascade,
+            confirm_username: confirm.unwrap_or_default(),
+            final_backup_retain_days: final_backup_days,
+        })
+        .await?
+        .into_inner();
+    if !cascade {
+        say!("deleted={}", r.deleted);
+    } else if let Some(job) = r.job {
+        say!("started={}", r.started);
+        return follow_job(c, job, wait).await;
+    } else {
+        say!("deleted=false");
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -1275,17 +1414,49 @@ enum BackupCmd {
         /// says, also after the tenant is deleted (e.g. a final backup).
         #[arg(long, default_value_t = 0)]
         retain_months: u32,
+        /// The same in days, 1-366 (not together with --retain-months).
+        #[arg(long, default_value_t = 0)]
+        retain_days: u32,
         /// Wait for the job to finish; exits with status 5 if it failed.
         #[arg(long)]
         wait: bool,
     },
-    /// Keep a complete backup for 1-12 months from now (also after the
-    /// tenant is deleted); then the engine removes it.
+    /// Keep a complete backup for 1-12 months or 1-366 days from now (also
+    /// after the tenant is deleted); then the engine removes it.
     Retain {
         tenant: String,
         backup_id: String,
-        #[arg(long)]
+        #[arg(long, default_value_t = 0)]
         months: u32,
+        #[arg(long, default_value_t = 0)]
+        days: u32,
+    },
+    /// Restore one database of one of the tenant's backups under a NEW name
+    /// of the tenant; prints the job.
+    RestoreDb {
+        tenant: String,
+        backup_id: String,
+        database: String,
+        new_name: String,
+        /// Wait for the job to finish; exits with status 5 if it failed.
+        #[arg(long)]
+        wait: bool,
+    },
+    /// Restore one database of a retained backup of a DELETED tenant into an
+    /// existing tenant, under a new name of that tenant.
+    RestoreRetainedDb {
+        backup_id: String,
+        /// The deleted tenant the backup was taken from.
+        #[arg(long)]
+        from: String,
+        /// The existing tenant that receives the database.
+        #[arg(long)]
+        to: String,
+        database: String,
+        new_name: String,
+        /// Wait for the job to finish; exits with status 5 if it failed.
+        #[arg(long)]
+        wait: bool,
     },
     /// Every retained backup, including those of deleted tenants.
     ListRetained,
@@ -1377,6 +1548,18 @@ fn print_job(j: &pb::Job) {
             j.message.as_str()
         },
     );
+    for (key, value) in [
+        ("database", &j.database),
+        ("new_name", &j.new_name),
+        ("phase", &j.phase),
+    ] {
+        if !value.is_empty() {
+            say!("{key}={value}");
+        }
+    }
+    for i in &j.object_issues {
+        print_issue(i);
+    }
 }
 
 fn print_backup(b: &pb::Backup) {
@@ -1407,6 +1590,15 @@ fn print_backup(b: &pb::Backup) {
         },
         b.excluded_count,
     );
+    for d in &b.databases {
+        say!(
+            "  database {} size={} dump={} objects={}",
+            d.name,
+            d.size_bytes,
+            d.dump_member,
+            d.objects_member
+        );
+    }
 }
 
 /// Print the job; with `wait`, poll it until it has ended, then print its
@@ -1476,13 +1668,14 @@ async fn run_retained(
             tenant,
             backup_id,
             months,
+            days,
         } => {
             let b = c
                 .retain_backup(pb::RetainBackupRequest {
                     tenant,
                     backup_id,
                     retain_months: months,
-                    retain_days: 0,
+                    retain_days: days,
                 })
                 .await?
                 .into_inner();
@@ -1516,6 +1709,26 @@ async fn run_retained(
                 .into_inner();
             return follow_start(c, r, wait).await;
         }
+        BackupCmd::RestoreRetainedDb {
+            backup_id,
+            from,
+            to,
+            database,
+            new_name,
+            wait,
+        } => {
+            let r = c
+                .restore_retained_backup_database(pb::RestoreRetainedBackupDatabaseRequest {
+                    backup_id,
+                    source_tenant: from,
+                    target_tenant: to,
+                    database,
+                    new_name,
+                })
+                .await?
+                .into_inner();
+            return follow_start(c, r, wait).await;
+        }
         _ => {}
     }
     Ok(ExitCode::SUCCESS)
@@ -1529,13 +1742,14 @@ async fn run_backup(
         BackupCmd::Create {
             tenant,
             retain_months,
+            retain_days,
             wait,
         } => {
             let r = c
                 .create_backup(pb::CreateBackupRequest {
                     tenant,
                     retain_months,
-                    retain_days: 0,
+                    retain_days,
                 })
                 .await?
                 .into_inner();
@@ -1557,6 +1771,24 @@ async fn run_backup(
                 .into_inner();
             return follow_start(c, r, wait).await;
         }
+        BackupCmd::RestoreDb {
+            tenant,
+            backup_id,
+            database,
+            new_name,
+            wait,
+        } => {
+            let r = c
+                .restore_backup_database(pb::RestoreBackupDatabaseRequest {
+                    tenant,
+                    backup_id,
+                    database,
+                    new_name,
+                })
+                .await?
+                .into_inner();
+            return follow_start(c, r, wait).await;
+        }
         BackupCmd::Job { job_id, wait } => {
             let job = c.get_job(pb::GetJobRequest { job_id }).await?.into_inner();
             return follow_job(c, job, wait).await;
@@ -1573,7 +1805,8 @@ async fn run_backup(
         }
         cmd @ (BackupCmd::Retain { .. }
         | BackupCmd::ListRetained
-        | BackupCmd::RestoreRetained { .. }) => return run_retained(c, cmd).await,
+        | BackupCmd::RestoreRetained { .. }
+        | BackupCmd::RestoreRetainedDb { .. }) => return run_retained(c, cmd).await,
         BackupCmd::Delete {
             tenant,
             backup_id,

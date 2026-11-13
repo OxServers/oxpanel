@@ -220,6 +220,8 @@ fn fail(rpc: &'static str, peer: &str, err: Error) -> Status {
         | Error::DbObjectUnusable { .. }
         | Error::DbLimitReached { .. }
         | Error::TenantHasDatabases(_)
+        | Error::DbTrashFull { .. }
+        | Error::TrashNotFound { .. }
         | Error::BackupNotFound { .. }
         | Error::BackupNotReady(_)
         | Error::JobNotFound(_)
