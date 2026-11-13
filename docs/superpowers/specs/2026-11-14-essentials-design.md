@@ -298,8 +298,13 @@ first run is the next slot (no stampede on upgrade).
   dispute about payment; the data should be protected until the account is
   deleted. The operator can switch a tenant's schedule off.
 - **Host switch and default**: `OXPANEL_BACKUP_SCHEDULES=true` (the loop runs)
-  and `OXPANEL_BACKUP_SCHEDULE_DEFAULT=daily` (what tenants without a choice
-  get). With the switch off, schedules are kept but nothing runs.
+  and `OXPANEL_BACKUP_SCHEDULE_DEFAULT=off` (what tenants without a choice
+  get). With the switch off, schedules are kept but nothing runs. The
+  default is `off`, not `daily`, so that upgrading a host does not start
+  filling its backup disk on its own, and so that test tenants on the
+  acceptance VM never get a backup the tests did not ask for (a run crossing
+  a tenant's assigned hour would otherwise race the checks). The handbook
+  recommends `daily` for production hosts; it is one line in `daemon.env`.
 - **Scope**: `SetBackupSchedule` needs the `tenant` scope, like `CreateBackup`;
   `GetBackupSchedule` needs `read`.
 - Deleting a tenant removes its schedule record.

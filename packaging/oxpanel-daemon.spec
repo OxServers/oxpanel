@@ -25,6 +25,9 @@ Requires:       tar
 Requires:       gzip
 # PHP is optional: without php-fpm, virtual hosts are static only.
 Recommends:     php-fpm
+# PHP scheduled tasks run PHP's command-line interpreter; without it they are
+# refused (other tasks still work). URL tasks use curl (curl-minimal is enough).
+Recommends:     php-cli
 # Likewise optional: Node.js applications need Node.js 22 or newer. AlmaLinux 9
 # only offers that as a module stream, so these are satisfied (and installed)
 # only after `dnf module enable nodejs:22`. (Python 3 is part of the base system.)

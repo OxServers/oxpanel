@@ -189,6 +189,37 @@
 [PHP (per-tenant PHP-FPM)] Reconciliation
   unit host reports_php_pool_drift_and_orphans
   sh tests-integration/run-inside.sh php pool is not drift
+  sh tests-integration/run-inside.sh no drift with site pools
+[PHP (per-tenant PHP-FPM)] Settings per site
+  unit php_settings values_are_bounded_by_the_caps_and_rendered_by_the_engine
+  unit php_settings out_of_bounds_values_are_refused
+  unit vhost php_settings_are_refused_before_anything_changes
+  unit vhost php_settings_survive_reconfiguration_and_follow_the_plan
+  it essentials_properties accepted_php_settings_render_only_known_lines
+  sh tests-integration/run-inside.sh every setting takes effect in a real request
+  sh tests-integration/run-inside.sh a value above the host maximum is refused
+  sh tests-integration/run-inside.sh a time zone that would inject a directive is refused
+  sh tests-integration/run-inside.sh a site without PHP has no PHP settings
+[PHP (per-tenant PHP-FPM)] Applied in a pool of the site's own
+  unit php a_site_with_settings_gets_its_own_hardened_pool
+  unit php site_pools_follow_pending_changes_and_the_tenants_caps
+  unit vhost php_settings_get_their_own_pool_and_nginx_follows
+  unit php_settings records_without_settings_serialise_to_nothing
+  sh tests-integration/run-inside.sh the site gets its own pool and socket
+  sh tests-integration/run-inside.sh the tenant's other site keeps the default pool
+  sh tests-integration/run-inside.sh clearing the settings restores exactly the files of before
+[PHP (per-tenant PHP-FPM)] Nginx follows
+  unit nginx php_tuning_raises_the_body_size_and_timeouts_and_nothing_else
+  unit vhost php_settings_get_their_own_pool_and_nginx_follows
+  sh tests-integration/run-inside.sh by default a 3 MiB upload is refused by the web server
+  sh tests-integration/run-inside.sh the web server follows: an upload larger than the old limit succeeds
+  sh tests-integration/run-inside.sh the execution-time limit cuts a CPU-bound script
+[PHP (per-tenant PHP-FPM)] Host maxima and plan caps
+  unit php_settings tenant_caps_lie_within_the_host_maxima_and_clamp_later
+  unit config parses_essentials_settings
+  unit vhost php_settings_survive_reconfiguration_and_follow_the_plan
+  sh tests-integration/run-inside.sh a plan's cap is set
+  sh tests-integration/run-inside.sh and applies at once
 
 [Node.js and Python applications] Opt-in per virtual host
   unit vhost app_requests_are_validated_before_anything_happens
@@ -237,6 +268,59 @@
 [Node.js and Python applications] Reconciliation
   unit host reports_app_unit_drift_and_orphans
   sh tests-integration/run-inside.sh applications are not drift
+
+[Scheduled tasks] What a task runs
+  unit task every_kind_executes_a_system_binary
+  unit task the_per_tenant_limit_and_preconditions_are_checked_first
+  sh tests-integration/run-inside.sh its output is readable, it ran as the tenant with its arguments
+  sh tests-integration/run-inside.sh systemd executes env, a system binary, for the virtualenv
+  sh tests-integration/run-inside.sh it ran as the tenant and could not read another tenant
+  sh tests-integration/run-inside.sh run now fetches it through this host's web server
+[Scheduled tasks] Runs as the tenant
+  unit task php_task_units_are_exact
+  sh tests-integration/run-inside.sh the task runs as the tenant, in its slice
+  sh tests-integration/run-inside.sh confined and counted in the tenant's slice
+  sh tests-integration/run-inside.sh it is counted in the tenant's slice
+[Scheduled tasks] Nothing injectable
+  unit task injection_attempts_in_every_field_are_refused
+  unit task url_injection_attempts_are_refused
+  unit task a_record_that_was_tampered_with_is_never_rendered
+  it essentials_properties accepted_arguments_survive_unit_quoting_exactly
+  it essentials_properties an_accepted_url_is_plain_and_pinned_to_this_host
+  it essentials_properties a_task_name_never_escapes_its_unit_name
+  sh tests-integration/run-inside.sh refused requests created no unit
+  sh tests-integration/run-inside.sh a URL of another tenant's site is refused
+[Scheduled tasks] Schedules
+  unit task schedules_map_onto_calendar_expressions
+  unit task schedules_outside_the_allow_list_are_refused
+  it essentials_properties an_accepted_schedule_renders_to_a_plain_calendar_expression
+  sh tests-integration/run-inside.sh the timer spreads its start with a fixed random delay
+  sh tests-integration/run-inside.sh systemd accepts the calendar expression
+  sh tests-integration/run-inside.sh the Python task ran again by its timer
+[Scheduled tasks] Time limit, no overlap
+  sh tests-integration/run-inside.sh it is ended at its time limit
+  sh tests-integration/run-inside.sh nothing it started outlives it
+  sh tests-integration/run-inside.sh while it runs, a second start is refused (no overlap)
+[Scheduled tasks] Status, output, run now
+  unit task status_comes_from_systemctl_show
+  unit task run_now_starts_without_blocking_and_reads_the_journal
+  sh tests-integration/run-inside.sh a task whose script is gone fails visibly
+  sh tests-integration/run-inside.sh a timer run is recorded like a manual one
+[Scheduled tasks] Lifecycle
+  unit task put_writes_units_enables_the_timer_and_is_idempotent
+  unit task delete_suspend_resume_and_tenant_removal
+  sh tests-integration/run-inside.sh suspending the tenant stops and disables every timer
+  sh tests-integration/run-inside.sh resuming enables the timers of enabled tasks again
+  sh tests-integration/run-inside.sh a plain delete removes the tenant's tasks
+  sh tests-integration/run-inside.sh the cascade removes tasks, units and the schedule
+[Scheduled tasks] SELinux
+  sh tests-integration/run-inside.sh it runs in the application domain
+  sh tests-acceptance/phases/70-soak.sh zero AVC denials
+[Scheduled tasks] Reconciliation
+  unit task reconcile_reports_edited_missing_and_orphan_units
+  sh tests-integration/run-inside.sh an edited task unit is drift
+  sh tests-integration/run-inside.sh a stray task unit is an orphan
+  sh tests-integration/run-inside.sh no drift after suspend and resume
 
 [HTTPS (certificates)] Bring your own certificate
   unit tls install_verifies_with_openssl_writes_root_only_key_and_serves_https
@@ -555,7 +639,22 @@
   sh tests-integration/run-inside.sh backups are not drift
 [Backups and restores] Scheduling
   unit backup retention_keeps_the_newest_backups_and_delete_is_idempotent
+  unit backup_schedule slots_are_the_most_recent_scheduled_instants
+  unit backup_schedule the_engine_spreads_tenants_within_the_window
+  unit backup_schedule busy_hosts_defer_and_off_means_off
+  it essentials_properties the_backup_slot_is_the_latest_instant_of_the_schedule
   sh tests-integration/run-inside.sh retention keeps the newest 7
+  sh tests-integration/run-inside.sh a daily schedule at HH:MM UTC, the minute assigned
+  sh tests-integration/run-inside.sh weekly with a chosen weekday
+[Backups and restores] Scheduled backups: catch-up and results
+  unit backup_schedule after_downtime_only_the_most_recent_slot_is_due
+  unit backup_schedule first_sight_starts_nothing_then_due_slots_run_once
+  unit backup_schedule a_failing_backup_is_recorded_and_does_not_stop_the_next
+  sh tests-integration/run-inside.sh after downtime the scheduler catches up with one backup
+  sh tests-integration/run-inside.sh and only one, at the next rounds too
+  sh tests-integration/run-inside.sh a scheduled backup that cannot run is recorded as failed
+  sh tests-integration/run-inside.sh and the next run is still scheduled
+  sh tests-integration/run-inside.sh a schedule of a tenant that does not exist is an orphan
 
 [API, transport and authentication] gRPC over a UNIX socket only
   it grpc_uds full_tenant_and_vhost_lifecycle_over_uds

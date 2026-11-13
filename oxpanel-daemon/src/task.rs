@@ -810,12 +810,53 @@ pub struct TaskStatus {
     pub next_run: u64,
 }
 
-/// `@1731580000` (from `--timestamp=unix`) to seconds; anything else is 0.
-fn unix_stamp(v: &str) -> u64 {
-    v.strip_prefix('@')
-        .and_then(|s| s.split('.').next())
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(0)
+/// A time as `systemctl show` prints it, to UNIX seconds: `@1731580000`
+/// (`--timestamp=unix`), or `Fri 2026-11-13 20:47:00 UTC` — systemd 252
+/// prints a timer's next elapse that way whatever `--timestamp` says, in the
+/// zone of its environment, which the daemon sets to UTC for every command.
+/// Anything else (empty, `n/a`, another zone) is 0: unknown.
+fn unix_stamp(text: &str) -> u64 {
+    if let Some(secs) = text.strip_prefix('@') {
+        return secs
+            .split('.')
+            .next()
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0);
+    }
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let [_weekday, date, time, "UTC"] = words.as_slice() else {
+        return 0;
+    };
+    let num = |n: &str| n.parse::<i64>().ok();
+    let mut dates = date.split('-').map(num);
+    let mut times = time.split('.').next().unwrap_or("").split(':').map(num);
+    let (
+        Some(Some(year)),
+        Some(Some(month)),
+        Some(Some(day)),
+        Some(Some(hour)),
+        Some(Some(minute)),
+        Some(Some(second)),
+    ) = (
+        dates.next(),
+        dates.next(),
+        dates.next(),
+        times.next(),
+        times.next(),
+        times.next(),
+    )
+    else {
+        return 0;
+    };
+    // Days from the civil date (Howard Hinnant's algorithm).
+    let year = if month <= 2 { year - 1 } else { year };
+    let era = year.div_euclid(400);
+    let year_of_era = year - era * 400;
+    let month_index = if month > 2 { month - 3 } else { month + 9 };
+    let day_of_year = (153 * month_index + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    let days = era * 146_097 + day_of_era - 719_468;
+    u64::try_from(days * 86_400 + hour * 3600 + minute * 60 + second).unwrap_or(0)
 }
 
 /// Parse `systemctl show` output for a task's service and timer.
@@ -1766,6 +1807,15 @@ WantedBy=timers.target
                 next_run: 1_794_572_100,
             }
         );
+        assert_eq!(unix_stamp("Fri 2026-11-13 20:47:00 UTC"), 1_794_602_820);
+        assert_eq!(unix_stamp("Thu 1970-01-01 00:00:01 UTC"), 1);
+        assert_eq!(unix_stamp("Sat 2024-02-29 12:00:00 UTC"), 1_709_208_000);
+        assert_eq!(
+            unix_stamp("Sat 2026-11-14 01:47:00 PKT"),
+            0,
+            "not UTC: unknown"
+        );
+        assert_eq!(unix_stamp("n/a"), 0);
         let never = "Id=oxpanel-task-alice-job.service\nActiveState=inactive\nResult=success\nExecMainStartTimestamp=\nExecMainStatus=0\n\nId=oxpanel-task-alice-job.timer\nNextElapseUSecRealtime=\n";
         assert_eq!(parse_status(never, &units), TaskStatus::default());
         let running = "Id=oxpanel-task-alice-job.service\nActiveState=activating\nResult=success\nExecMainStartTimestamp=@5\n";

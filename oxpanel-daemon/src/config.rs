@@ -155,7 +155,7 @@ impl Default for Essentials {
             task_max_timeout_secs: 3600,
             php_max: crate::php_settings::PhpLimits::HOST_DEFAULT,
             backup_schedules: true,
-            backup_schedule_default: crate::backup_schedule::Frequency::Daily,
+            backup_schedule_default: crate::backup_schedule::Frequency::Off,
             backup_window: (1, 5),
             backup_schedule_check: Duration::from_secs(300),
         }
@@ -1040,7 +1040,7 @@ mod tests {
         assert!(e.backup_schedules);
         assert_eq!(
             e.backup_schedule_default,
-            crate::backup_schedule::Frequency::Daily
+            crate::backup_schedule::Frequency::Off
         );
         assert_eq!(e.backup_window, (1, 5));
         assert_eq!(e.backup_schedule_check, Duration::from_secs(300));

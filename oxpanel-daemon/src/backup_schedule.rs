@@ -609,7 +609,7 @@ mod tests {
             assert!((1..=5).contains(&e.hour), "{e:?}");
             assert!(e.minute < 60 && e.weekday < 7);
             assert!(e.host_default && e.hour_assigned && e.weekday_assigned);
-            assert_eq!(e.frequency, Frequency::Daily, "the host default");
+            assert_eq!(e.frequency, Frequency::Off, "the host default");
             minutes.insert((e.hour, e.minute));
         }
         assert!(
@@ -648,6 +648,7 @@ mod tests {
         cfg.home_base = dir.path().join("home");
         cfg.systemd_unit_dir = dir.path().join("systemd");
         cfg.backup_keep = 2;
+        cfg.essentials.backup_schedule_default = Frequency::Daily;
         for d in [&cfg.home_base, &cfg.systemd_unit_dir] {
             std::fs::create_dir_all(d).unwrap_or_else(|e| panic!("{e}"));
         }

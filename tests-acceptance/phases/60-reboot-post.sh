@@ -23,6 +23,10 @@ check "SFTP password login works after reboot" bash -c 'for i in $(seq 1 30); do
 if grep -q ' disk_max=67108864 ' tenants.pre; then
   check "bootb's disk limit is enforced after reboot" bash -c 'u=$(id -u bootb); xfs_quota -x -c "report -u -n -N -b -L $u -U $u" "$(findmnt -no TARGET -T /home)" | grep -qE "^#$u +[0-9]+ +65536 +65536 "'
 fi
+eventually "the scheduled task's timer came back by itself after reboot" 60 0.5 systemctl -q is-active oxpanel-task-boota-nightly.timer
+check "the task runs after reboot, as the tenant" bash -c 'oxpanel-ctl task run boota nightly | grep -q "^started=true" && for i in $(seq 1 100); do oxpanel-ctl task log boota nightly | grep -q "task-42 $(id -u boota)" && exit 0; sleep 0.2; done; exit 1'
+eventually "a site's PHP settings apply after reboot" 60 0.5 http_body_is bootphp.test /mem.php 200M
+check "the backup schedule survived the reboot" ctl_ok 'frequency=daily host_default=false at=[0-9]{2}:[0-9]{2}UTC ' oxpanel-ctl backup-schedule show bootb
 check "no drift after reboot" bash -c "oxpanel-ctl host reconcile | grep -q '^drifts=0$'"
 check "boota slice loaded with its MemoryMax" test "$(systemctl show -p MemoryMax --value oxpanel-tenant-boota.slice)" = 268435456
 check "boota slice CPUWeight" test "$(systemctl show -p CPUWeight --value oxpanel-tenant-boota.slice)" = 40

@@ -1681,6 +1681,247 @@ else
   echo "skip - MariaDB not installed"
 fi
 
+echo "== essentials: scheduled tasks, PHP settings per site, scheduled backups"
+cp -p /etc/oxpanel/daemon.env /root/daemon.env.ess
+# For this section only: tasks may run every minute, and the backup
+# scheduler looks every 5 seconds (both are host settings).
+printf 'OXPANEL_TASK_MIN_INTERVAL_MINUTES=1\nOXPANEL_BACKUP_SCHEDULE_CHECK_SECS=5\n' >> /etc/oxpanel/daemon.env
+systemctl restart oxpanel-daemon
+oxpanel-ctl tenant create ess --memory 512M --tasks-max 256 >/dev/null
+oxpanel-ctl tenant create essb >/dev/null
+as_user essb sh -c 'echo secret-of-essb > /home/essb/secret.txt'
+check "host info reports the essentials settings" grep -q ' task_max_per_tenant=20 task_min_interval=1m task_max_timeout=3600s backup_schedules=true backup_schedule_default=off' <(oxpanel-ctl host info)
+# The line of task $2 of tenant $1; wait until it has run and ended with result $3.
+task_line() { oxpanel-ctl task list "$1" | grep "^task=$2 "; }
+task_settled() { local i; for i in $(seq 1 300); do task_line "$1" "$2" | grep -qE "running=false last_started=[1-9][0-9]* last_finished=[0-9]+ last_result=$3 " && return 0; sleep 0.2; done; task_line "$1" "$2"; return 1; }
+lines_of() { if [ -f "$1" ]; then wc -l < "$1"; else echo 0; fi; }
+export -f task_line task_settled lines_of
+
+echo "-- scheduled tasks: PHP, Python and Node.js scripts as the tenant"
+as_user ess sh -c 'mkdir -p /home/ess/cron && cat > /home/ess/cron/job.php' <<'PHP'
+<?php
+file_put_contents(__DIR__ . '/ran-php.txt', date('c') . "\n", FILE_APPEND);
+$cg = trim(@file_get_contents('/proc/self/cgroup'));
+echo 'php-task user=' . getenv('USER') . ' args=' . implode(',', array_slice($argv, 1))
+  . ' other=' . (@file_get_contents('/home/essb/secret.txt') === false ? 'blocked' : 'READABLE')
+  . ' etc=' . (@file_put_contents('/etc/oxpanel-task-probe', 'x') === false ? 'blocked' : 'WRITABLE')
+  . ' socket=' . (@stream_socket_client('unix:///run/oxpanel/oxpanel.sock') === false ? 'blocked' : 'OPEN')
+  . ' slice=' . (strpos($cg, 'oxpanel-tenant-ess.slice') !== false ? 'tenant' : $cg) . "\n";
+PHP
+as_user ess sh -c 'cat > /home/ess/cron/job.py' <<'PY'
+import os, sys
+with open(os.path.join(os.path.dirname(__file__), "ran-py.txt"), "a") as f:
+    f.write("ran\n")
+print(f"py-task uid={os.getuid()} prefix={sys.prefix} args={','.join(sys.argv[1:])}", flush=True)
+PY
+as_user ess sh -c 'cat > /home/ess/cron/job.js' <<'JS'
+const fs = require('fs');
+let other = 'blocked';
+try { fs.readFileSync('/home/essb/secret.txt'); other = 'READABLE'; } catch (e) {}
+console.log(`node-task uid=${process.getuid()} other=${other} args=${process.argv.slice(2).join(',')}`);
+JS
+check "the tenant's virtualenv is created as the tenant" as_user ess /usr/bin/python3 -m venv /home/ess/venv
+TP=oxpanel-task-ess-phpjob
+TPY=oxpanel-task-ess-pyjob
+TN=oxpanel-task-ess-nodejob
+if [ -x /usr/bin/php ]; then
+  out="$(oxpanel-ctl task set ess phpjob --php cron/job.php --arg one --arg 'two words' --arg=--three --schedule 'every 1m')"; echo "$out"
+  check "a PHP task is created" bash -c 'grep -q "^changed=true" <<<"$1" && grep -q "calendar=\"\*-\*-\* \*:00/01:00\"" <<<"$1"' _ "$out"
+  check "its service and timer are written" test -f "/etc/systemd/system/$TP.service" -a -f "/etc/systemd/system/$TP.timer"
+  check "the timer is enabled and active" bash -c 'systemctl -q is-enabled "$1.timer" && systemctl -q is-active "$1.timer"' _ "$TP"
+  check "the task runs as the tenant, in its slice" bash -c 'test "$(systemctl show -p User --value "$1.service")" = ess && test "$(systemctl show -p Slice --value "$1.service")" = oxpanel-tenant-ess.slice' _ "$TP"
+  check "the timer spreads its start with a fixed random delay" bash -c 'test "$(systemctl show -p RandomizedDelayUSec --value "$1.timer")" = 59s && test "$(systemctl show -p FixedRandomDelay --value "$1.timer")" = yes' _ "$TP"
+  check "the time limit is the default 300 s" test "$(systemctl show -p TimeoutStartUSec --value "$TP.service")" = 5min
+  check "run now starts it" grep -q '^started=true' <(oxpanel-ctl task run ess phpjob)
+  check "it ran and succeeded" task_settled ess phpjob success
+  check "its output is readable, it ran as the tenant with its arguments, confined and counted in the tenant's slice" grep -q 'php-task user=ess args=one,two words,--three other=blocked etc=blocked socket=blocked slice=tenant' <(oxpanel-ctl task log ess phpjob)
+  check "the file it wrote belongs to the tenant" test "$(stat -c %U /home/ess/cron/ran-php.txt)" = ess
+  check "the next run is known" bash -c 'task_line ess phpjob | grep -qE " next_run=[1-9]"'
+else
+  echo "skip - php-cli is not installed: PHP tasks are refused"
+  check "a PHP task is refused without php-cli" bash -c '! oxpanel-ctl task set ess phpjob --php cron/job.php --schedule "every 1m" 2>&1 | grep -q changed='
+fi
+out="$(oxpanel-ctl task set ess pyjob --python cron/job.py --venv venv --arg x --schedule 'every 1m')"; echo "$out"
+check "a Python task with the tenant's virtualenv is created" grep -q '^changed=true' <<<"$out"
+check "systemd executes env, a system binary, for the virtualenv" grep -q 'path=/usr/bin/env ; argv\[\]=/usr/bin/env /home/ess/venv/bin/python /home/ess/cron/job.py x ;' <(systemctl show -p ExecStart --value "$TPY.service")
+check "run now runs the Python task" grep -q '^started=true' <(oxpanel-ctl task run ess pyjob)
+check "the Python task succeeded" task_settled ess pyjob success
+check "it ran as the tenant in its virtualenv" grep -q "py-task uid=$(id -u ess) prefix=/home/ess/venv args=x" <(oxpanel-ctl task log ess pyjob)
+check "a Node.js task is created" grep -q '^changed=true' <(oxpanel-ctl task set ess nodejob --node cron/job.js --arg a --schedule 'daily 03:00' --tz Europe/Berlin)
+check "its calendar carries the time zone" grep -q '^OnCalendar=\*-\*-\* 03:00:00 Europe/Berlin$' "/etc/systemd/system/$TN.timer"
+check "systemd accepts the calendar expression" bash -c 'systemctl show -p TimersCalendar --value "$1.timer" | grep -q "Europe/Berlin"' _ "$TN"
+check "run now runs the Node.js task" grep -q '^started=true' <(oxpanel-ctl task run ess nodejob)
+check "the Node.js task succeeded" task_settled ess nodejob success
+check "it ran as the tenant and could not read another tenant" grep -q "node-task uid=$(id -u ess) other=blocked args=a" <(oxpanel-ctl task log ess nodejob)
+TASKS_SINCE=$(date +%s)
+PHP_RUNS=$(lines_of /home/ess/cron/ran-php.txt); PY_RUNS=$(lines_of /home/ess/cron/ran-py.txt)
+
+echo "-- scheduled tasks: time limit, no overlap, a missing script"
+as_user ess sh -c 'cat > /home/ess/cron/slow.py' <<'PY'
+import subprocess, time
+subprocess.Popen(["sleep", "300"])  # a child that would outlive the task
+print("slow-task started", flush=True)
+time.sleep(300)
+PY
+check "a task with a 10 s limit" grep -q '^changed=true' <(oxpanel-ctl task set ess slow --python cron/slow.py --schedule 'daily 04:00' --timeout 10)
+check "run now starts it" grep -q '^started=true' <(oxpanel-ctl task run ess slow)
+check "while it runs, a second start is refused (no overlap)" bash -c 'for i in $(seq 1 50); do task_line ess slow | grep -q "running=true" && break; sleep 0.1; done; grep -q "^started=false" <(oxpanel-ctl task run ess slow)'
+check "it is counted in the tenant's slice" bash -c 'for i in $(seq 1 50); do p=$(pgrep -u ess -f slow.py | head -1); if [ -n "$p" ] && grep -q oxpanel-tenant-ess.slice "/proc/$p/cgroup" && [ "$(systemctl show -p TasksCurrent --value oxpanel-tenant-ess.slice)" -ge 1 ] 2>/dev/null; then exit 0; fi; sleep 0.1; done; systemctl show -p TasksCurrent oxpanel-tenant-ess.slice; cat /proc/$p/cgroup; exit 1'
+if selinuxenabled 2>/dev/null; then
+  check "it runs in the application domain" bash -c 'ps -eo label,user,args | grep "slow.py" | grep -v grep | grep -q "oxpanel_app_t"'
+fi
+check "it is ended at its time limit" task_settled ess slow timeout
+check "nothing it started outlives it" bash -c '! pgrep -u ess -f "sleep 300" && ! pgrep -u ess -f slow.py'
+check "a task whose script is gone fails visibly" bash -c 'oxpanel-ctl task set ess gone --php cron/nope.php --schedule "daily 05:00" >/dev/null || oxpanel-ctl task set ess gone --node cron/nope.js --schedule "daily 05:00" >/dev/null; oxpanel-ctl task run ess gone | grep -q "^started=true" && task_settled ess gone exit-code && oxpanel-ctl task log ess gone | grep -qiE "could not open input file|cannot find module"'
+
+echo "-- scheduled tasks: every field refuses injection"
+before_units="$(ls /etc/systemd/system | grep -c '^oxpanel-task-' || true)"
+for bad in "x;y" "X" "-x" "a b" $'job\nUser=root' "job.x" "../x" "$(printf 'a%.0s' $(seq 1 33))"; do
+  check_not "task name '${bad//$'\n'/\\n}' is refused" oxpanel-ctl task set ess "$bad" --node cron/job.js --schedule 'every 1m'
+done
+for bad in "/etc/passwd" "../essb/secret.txt" $'cron/job.js\nExecStartPre=/bin/sh' "cron/job.js; id" 'cron/$(id).js' "cron/a b.js"; do
+  check_not "script '${bad//$'\n'/\\n}' is refused" oxpanel-ctl task set ess inj --node "$bad" --schedule 'every 1m'
+done
+for bad in 'a"b' "a'b" 'a`id`' 'a\nb' '$HOME' '${HOME}' '%h' $'a\nb' $'a\tb'; do
+  check_not "argument '${bad//$'\n'/\\n}' is refused" oxpanel-ctl task set ess inj --node cron/job.js --arg "$bad" --schedule 'every 1m'
+done
+for bad in 'every 7m' 'every 5h' 'daily 24:00' 'weekly sun 25:00' 'monthly 29 01:00' 'monthly 0 01:00'; do
+  check_not "schedule '$bad' is refused" oxpanel-ctl task set ess inj --node cron/job.js --schedule "$bad"
+done
+for bad in $'UTC\nOnCalendar=*:*' 'Mars/Base' '../../etc/passwd' 'leapseconds' 'Europe/Berlin;x'; do
+  check_not "time zone '${bad//$'\n'/\\n}' is refused" oxpanel-ctl task set ess inj --node cron/job.js --schedule 'daily 01:00' --tz "$bad"
+done
+check_not "a virtualenv outside the home is refused" oxpanel-ctl task set ess inj --python cron/job.py --venv ../../usr --schedule 'every 1m'
+check_not "a time limit beyond the host's is refused" oxpanel-ctl task set ess inj --node cron/job.js --schedule 'every 1m' --timeout 99999
+check_not "a task for a tenant that does not exist is refused" oxpanel-ctl task set nosuchtenant inj --node cron/job.js --schedule 'every 1m'
+check "refused requests created no unit" test "$(ls /etc/systemd/system | grep -c '^oxpanel-task-' || true)" = "$before_units"
+
+echo "-- scheduled tasks: a URL of the tenant's own site"
+out="$(oxpanel-ctl vhost set ess.test --tenant ess --php)"
+oxpanel-ctl vhost set essb.test --tenant essb >/dev/null
+as_user ess sh -c 'cat > /home/ess/public_html/hit.php' <<'PHP'
+<?php file_put_contents(__DIR__ . '/../hits.txt', ($_GET['x'] ?? '-') . "\n", FILE_APPEND); echo "hit";
+PHP
+check_not "a URL of another tenant's site is refused" oxpanel-ctl task set ess url --url 'http://essb.test/' --schedule 'every 1m'
+check_not "a URL with a port is refused" oxpanel-ctl task set ess url --url 'http://ess.test:8080/' --schedule 'every 1m'
+check_not "a URL with shell or unit syntax is refused" oxpanel-ctl task set ess url --url 'http://ess.test/$(id)' --schedule 'every 1m'
+check "a URL task of its own site is created" grep -q '^changed=true' <(oxpanel-ctl task set ess url --url 'http://ess.test/hit.php?x=a%2Fb' --schedule 'hourly at :07')
+check "run now fetches it through this host's web server" bash -c 'oxpanel-ctl task run ess url | grep -q "^started=true" && task_settled ess url success'
+check "the request reached the tenant's site" grep -qx 'a/b' /home/ess/hits.txt
+check "the task reports the status" grep -q 'HTTP 200, 3 bytes' <(oxpanel-ctl task log ess url)
+
+echo "-- scheduled tasks: suspension, reconciliation"
+check "no drift with tasks" grep -q '^drifts=0$' <(oxpanel-ctl host reconcile)
+cp -p "/etc/systemd/system/$TN.service" /root/task-unit.bak
+echo "# edited" >> "/etc/systemd/system/$TN.service"
+check "an edited task unit is drift" grep -q 'kind=DRIFT_KIND_TASK_UNIT_DRIFT subject=ess/nodejob' <(oxpanel-ctl host reconcile)
+cp -p /root/task-unit.bak "/etc/systemd/system/$TN.service"
+touch /etc/systemd/system/oxpanel-task-stray-x.timer
+check "a stray task unit is an orphan" grep -q 'kind=DRIFT_KIND_ORPHAN_TASK_UNIT' <(oxpanel-ctl host reconcile)
+rm -f /etc/systemd/system/oxpanel-task-stray-x.timer
+check "disabling a task disables its timer" bash -c 'oxpanel-ctl task set ess nodejob --node cron/job.js --arg a --schedule "daily 03:00" --tz Europe/Berlin --disabled >/dev/null && ! systemctl -q is-enabled "$1.timer" && ! systemctl -q is-active "$1.timer"' _ "$TN"
+check "suspending the tenant stops and disables every timer" bash -c 'oxpanel-ctl tenant suspend ess >/dev/null && ! systemctl -q is-active "$1.timer" && ! systemctl -q is-enabled "$1.timer"' _ "$TPY"
+check_not "run now is refused while suspended" oxpanel-ctl task run ess pyjob
+check "resuming enables the timers of enabled tasks again" bash -c 'oxpanel-ctl tenant resume ess >/dev/null && systemctl -q is-active "$1.timer" && systemctl -q is-enabled "$1.timer" && ! systemctl -q is-enabled "$2.timer"' _ "$TPY" "$TN"
+check "no drift after suspend and resume" grep -q '^drifts=0$' <(oxpanel-ctl host reconcile)
+check "deleting a task removes its units" bash -c 'oxpanel-ctl task delete ess gone | grep -q "^deleted=true" && test ! -e /etc/systemd/system/oxpanel-task-ess-gone.service && test ! -e /etc/systemd/system/oxpanel-task-ess-gone.timer'
+check "deleting it again is a no-op" grep -q '^deleted=false' <(oxpanel-ctl task delete ess gone)
+
+echo "-- PHP settings per site"
+as_user ess sh -c 'cat > /home/ess/public_html/ini.php' <<'PHP'
+<?php foreach (['memory_limit', 'upload_max_filesize', 'post_max_size', 'max_execution_time', 'max_input_time', 'max_input_vars', 'display_errors', 'date.timezone'] as $k) echo "$k=" . ini_get($k) . "\n";
+PHP
+as_user ess sh -c 'cat > /home/ess/public_html/upload.php' <<'PHP'
+<?php echo 'size=' . ($_FILES['f']['size'] ?? 'none') . ' error=' . ($_FILES['f']['error'] ?? 'none');
+PHP
+as_user ess sh -c 'cat > /home/ess/public_html/busy.php' <<'PHP'
+<?php $t = microtime(true); while (microtime(true) - $t < 8) { $x = sqrt(mt_rand()); } echo "finished";
+PHP
+head -c 3145728 /dev/urandom > /root/upload-3m.bin
+oxpanel-ctl vhost set ess2.test --tenant ess --php >/dev/null
+# The ini lines of ess.test's ini.php include every line given (polled: Nginx reloads).
+ini_has() { local i body want ok; for i in $(seq 1 50); do body="$(curl -s -H 'Host: ess.test' http://127.0.0.1/ini.php)"; ok=1; for want in "$@"; do grep -qxE -- "$want" <<<"$body" || ok=0; done; [ "$ok" = 1 ] && return 0; sleep 0.1; done; echo "$body"; return 1; }
+export -f ini_has
+ess_pool_before="$(sha256sum < /etc/oxpanel-php/ess.conf)"
+ess_conf_before="$(sha256sum < /etc/nginx/oxpanel.d/ess.test.conf)"
+upload_code() { curl -s -o /dev/null -w '%{http_code}' -H 'Host: ess.test' -F "f=@/root/upload-3m.bin" http://127.0.0.1/upload.php; }
+check "by default a 3 MiB upload is refused by the web server" test "$(upload_code)" = 413
+DEFAULTS=(memory_limit=128M upload_max_filesize=2M post_max_size=8M max_execution_time=30 max_input_time=60 max_input_vars=1000 'display_errors=(0|off|)')
+check "by default the site runs with PHP's settings" ini_has "${DEFAULTS[@]}"
+out="$(oxpanel-ctl php set ess.test --memory-limit 256M --upload-max 8M --max-execution-time 2 --max-input-time 30 --max-input-vars 2000 --display-errors --timezone Europe/Berlin)"; echo "$out"
+check "the settings are stored and reported with what applies" bash -c 'grep -q "^changed=true" <<<"$1" && grep -q "php.memory_limit=256M .* effective.post_max_size=9M" <<<"$1"' _ "$out"
+check "the site gets its own pool and socket" bash -c 'grep -q "^\[ess.test\]$" /etc/oxpanel-php/ess.conf && grep -q "fastcgi_pass unix:/run/oxpanel-php/ess/ess.test.sock;" /etc/nginx/oxpanel.d/ess.test.conf'
+SET=(upload_max_filesize=8M post_max_size=9M max_execution_time=2 max_input_time=30 max_input_vars=2000 'display_errors=(1|on|On)' date.timezone=Europe/Berlin)
+check "every setting takes effect in a real request" ini_has memory_limit=256M "${SET[@]}"
+check "the web server follows: an upload larger than the old limit succeeds" bash -c 'test "$(curl -s -H "Host: ess.test" -F "f=@/root/upload-3m.bin" http://127.0.0.1/upload.php)" = "size=3145728 error=0"'
+check "the execution-time limit cuts a CPU-bound script" bash -c 'b="$(curl -s -m 30 -H "Host: ess.test" http://127.0.0.1/busy.php)"; ! grep -q finished <<<"$b" && grep -q "Maximum execution time of 2 second" <<<"$b"'
+check "the tenant's other site keeps the default pool" grep -q 'fastcgi_pass unix:/run/oxpanel-php/ess/php.sock;' /etc/nginx/oxpanel.d/ess2.test.conf
+check_not "a value above the host maximum is refused" oxpanel-ctl php set ess.test --memory-limit 100G
+check_not "a value below the minimum is refused" oxpanel-ctl php set ess.test --max-input-vars 50
+check_not "post_max_size below upload_max_filesize is refused" oxpanel-ctl php set ess.test --upload-max 64M --post-max 8M
+check_not "an unknown time zone is refused" oxpanel-ctl php set ess.test --timezone Mars/Base
+check_not "a time zone that would inject a directive is refused" oxpanel-ctl php set ess.test --timezone $'UTC\nphp_admin_value[open_basedir]=/'
+check_not "a site without PHP has no PHP settings" oxpanel-ctl php set essb.test --memory-limit 256M
+check "a plan's cap is set" grep -q "php_limits.memory_limit=128M" <(oxpanel-ctl php limits ess --memory-limit 128M)
+check "and applies at once" ini_has memory_limit=128M "${SET[@]}"
+check_not "and a value above it is refused" oxpanel-ctl php set ess.test --memory-limit 256M
+check "no drift with site pools" grep -q '^drifts=0$' <(oxpanel-ctl host reconcile)
+check "clearing the settings restores exactly the files of before" bash -c 'oxpanel-ctl php limits ess >/dev/null && oxpanel-ctl php set ess.test | grep -q "php=default" && test "$(sha256sum < /etc/oxpanel-php/ess.conf)" = "$1" && test "$(sha256sum < /etc/nginx/oxpanel.d/ess.test.conf)" = "$2"' _ "$ess_pool_before" "$ess_conf_before"
+check "and the site runs with PHP's defaults again" ini_has "${DEFAULTS[@]}"
+rm -f /root/upload-3m.bin
+
+echo "-- scheduled tasks ran on their schedule meanwhile"
+if [ -x /usr/bin/php ]; then
+  check "the PHP task ran again by its timer" bash -c 'for i in $(seq 1 180); do test "$(lines_of /home/ess/cron/ran-php.txt)" -gt "$1" && exit 0; sleep 1; done; exit 1' _ "$PHP_RUNS"
+fi
+check "the Python task ran again by its timer" bash -c 'for i in $(seq 1 180); do test "$(lines_of /home/ess/cron/ran-py.txt)" -gt "$1" && exit 0; sleep 1; done; exit 1' _ "$PY_RUNS"
+check "a timer run is recorded like a manual one" task_settled ess pyjob success
+info_elapsed=$(( $(date +%s) - TASKS_SINCE )); echo "info - timers fired within ${info_elapsed}s"
+
+echo "-- scheduled backups"
+SCH=/var/lib/oxpanel/backup-schedules/ess.json
+check "by default a tenant follows the host default (off)" grep -q '^tenant=ess frequency=off host_default=true ' <(oxpanel-ctl backup-schedule show ess)
+# Twelve hours from now, so that no slot passes while these checks run.
+SH=$(( ($(date -u +%-H) + 12) % 24 )); SHH=$(printf %02d "$SH")
+out="$(oxpanel-ctl backup-schedule set ess daily --hour "$SH")"; echo "$out"
+check "a daily schedule at HH:MM UTC, the minute assigned" bash -c 'grep -qE "^tenant=ess frequency=daily host_default=false at='"$SHH"':[0-5][0-9]UTC weekday=[a-z]+\(assigned\) next_run=[1-9][0-9]* last_run=0 last_job=- last_result=none enabled_on_host=true$" <<<"$1"' _ "$out"
+check "the schedule record is root-only" test "$(stat -c %a "$SCH")" = 600
+check "setting it starts nothing at once" bash -c 'sleep 7; test -z "$(oxpanel-ctl backup list ess)"'
+# The host was off for three days: the last handled slot lies three days back.
+rewind_schedule() { python3 -c 'import json,sys; p=sys.argv[1]; r=json.load(open(p)); r["last_slot_unix"]-=3*86400; json.dump(r,open(p,"w"))' "$SCH"; }
+schedule_result() { local i; for i in $(seq 1 120); do oxpanel-ctl backup-schedule show ess | grep -q " last_result=$1 " && return 0; sleep 1; done; oxpanel-ctl backup-schedule show ess; return 1; }
+systemctl stop oxpanel-daemon; rewind_schedule; systemctl start oxpanel-daemon
+check "after downtime the scheduler catches up with one backup" schedule_result succeeded
+check "exactly one backup was made" test "$(oxpanel-ctl backup list ess | grep -c '^backup=')" = 1
+check "and only one, at the next rounds too" bash -c 'sleep 12; test "$(oxpanel-ctl backup list ess | grep -c "^backup=")" = 1'
+check "the result names the job and the run" grep -qE 'last_run=[1-9][0-9]* last_job=j[0-9]+ last_result=succeeded' <(oxpanel-ctl backup-schedule show ess)
+systemctl stop oxpanel-daemon
+echo 'OXPANEL_BACKUP_MIN_FREE_BYTES=999999999999999999' >> /etc/oxpanel/daemon.env
+rewind_schedule
+systemctl start oxpanel-daemon
+check "a scheduled backup that cannot run is recorded as failed" schedule_result failed
+check "with its reason" grep -q '^last_message=not enough free space' <(oxpanel-ctl backup-schedule show ess)
+check "and the next run is still scheduled" grep -qE ' next_run=[1-9][0-9]* ' <(oxpanel-ctl backup-schedule show ess)
+check "a failed run leaves no backup behind" test "$(oxpanel-ctl backup list ess | grep -c '^backup=')" = 1
+sed -i '/^OXPANEL_BACKUP_MIN_FREE_BYTES=999999999999999999$/d' /etc/oxpanel/daemon.env
+systemctl restart oxpanel-daemon
+check "weekly with a chosen weekday" grep -qE "^tenant=ess frequency=weekly host_default=false at=$SHH:[0-5][0-9]UTC weekday=tue " <(oxpanel-ctl backup-schedule set ess weekly --hour "$SH" --weekday tue)
+check_not "an hour beyond 23 is refused" oxpanel-ctl backup-schedule set ess daily --hour 24
+check "back to the host default" grep -q 'frequency=off host_default=true' <(oxpanel-ctl backup-schedule set ess default)
+touch /var/lib/oxpanel/backup-schedules/ghost.json; echo '{"version":1,"tenant":"ghost"}' > /var/lib/oxpanel/backup-schedules/ghost.json
+check "a schedule of a tenant that does not exist is an orphan" grep -q 'kind=DRIFT_KIND_ORPHAN_BACKUP_SCHEDULE subject=ghost' <(oxpanel-ctl host reconcile)
+rm -f /var/lib/oxpanel/backup-schedules/ghost.json
+
+echo "-- deleting tenants removes their tasks and schedules"
+check "a task of essb" grep -q '^changed=true' <(oxpanel-ctl task set essb b --python cron/x.py --schedule 'daily 01:00')
+oxpanel-ctl vhost remove essb.test >/dev/null
+check "a plain delete removes the tenant's tasks" bash -c 'oxpanel-ctl tenant delete essb --remove-home | grep -q "^deleted=true" && test ! -e /etc/systemd/system/oxpanel-task-essb-b.timer && test -z "$(ls /var/lib/oxpanel/tasks | grep "^essb\.")"'
+check "the cascade removes tasks, units and the schedule" bash -c 'timeout 300 oxpanel-ctl tenant delete ess --cascade --confirm ess --wait | grep -q state=JOB_STATE_SUCCEEDED && test -z "$(ls /etc/systemd/system | grep "^oxpanel-task-ess-")" && test -z "$(ls /var/lib/oxpanel/tasks)" && test ! -e /var/lib/oxpanel/backup-schedules/ess.json'
+check "no timer of a deleted tenant is left in systemd" bash -c '! systemctl list-timers --all --no-legend "oxpanel-task-*" | grep -q .'
+check "no drift after the essentials checks" grep -q '^drifts=0$' <(oxpanel-ctl host reconcile)
+cp -p /root/daemon.env.ess /etc/oxpanel/daemon.env
+systemctl restart oxpanel-daemon
+
 echo "== teardown"
 check "vhost removed" grep -q '^removed=true' <(oxpanel-ctl vhost remove example.test)
 check "config gone" test ! -e /etc/nginx/oxpanel.d/example.test.conf

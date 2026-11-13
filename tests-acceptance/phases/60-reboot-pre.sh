@@ -24,6 +24,13 @@ check "SFTP password for bootb" ctl_ok '^password=set' oxpanel-ctl sftp set-pass
 if oxpanel-ctl host info | grep -q ' disk_quota=true '; then
   check "disk limit for bootb" ctl_ok '^changed=true' oxpanel-ctl tenant set-limits bootb --memory 128M --disk 64M
 fi
+as_user boota sh -c 'echo "console.log(\"task-42 \" + process.getuid())" > /home/boota/task.js'
+check "a scheduled task for boota" ctl_ok '^changed=true' oxpanel-ctl task set boota nightly --node task.js --schedule 'daily 04:00'
+as_user bootb sh -c 'echo "<?php echo ini_get(\"memory_limit\");" > /home/bootb/phpsite/mem.php'
+check "PHP settings for bootphp.test" ctl_ok '^changed=true' oxpanel-ctl php set bootphp.test --memory-limit 200M
+eventually "bootphp.test runs with them" 30 0.2 http_body_is bootphp.test /mem.php 200M
+# Twelve hours from now: no scheduled backup may start during the test.
+check "a daily backup schedule for bootb" ctl_ok 'frequency=daily' oxpanel-ctl backup-schedule set bootb daily --hour $(( ($(date -u +%-H) + 12) % 24 ))
 cat /proc/sys/kernel/random/boot_id > boot_id.pre
 oxpanel-ctl tenant list > tenants.pre
 oxpanel-ctl vhost list > vhosts.pre
