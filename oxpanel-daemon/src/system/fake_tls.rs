@@ -150,6 +150,39 @@ pub(super) fn openssl(args: &[OsString], generated: &mut u32) -> (i32, String, S
     }
 }
 
+/// Names the fake pre-check treats as not resolving.
+pub const FAKE_UNRESOLVABLE_PREFIX: &str = "nx";
+
+/// The client's `--mode precheck`: every name passes except those starting
+/// with [`FAKE_UNRESOLVABLE_PREFIX`].
+fn precheck(args: &[String]) -> (i32, String) {
+    let Some(out) = value(args, "--out") else {
+        return (2, "--out is required".to_owned());
+    };
+    let mut report = String::new();
+    for (i, a) in args.iter().enumerate() {
+        if a != "--domain" {
+            continue;
+        }
+        let Some(name) = args.get(i + 1) else {
+            continue;
+        };
+        if name.starts_with(FAKE_UNRESOLVABLE_PREFIX) {
+            report.push_str("skip ");
+            report.push_str(name);
+            report.push_str(" the name does not resolve\n");
+        } else {
+            report.push_str("ok ");
+            report.push_str(name);
+            report.push('\n');
+        }
+    }
+    match std::fs::write(out, report) {
+        Ok(()) => (0, String::new()),
+        Err(e) => (1, format!("cannot write the report: {e}")),
+    }
+}
+
 /// The ACME client inside its transient unit: "obtains" a certificate for
 /// the names of the signing request, valid from an hour ago for `lifetime`
 /// seconds, and delivers it. Returns the exit code and what was printed.
@@ -158,6 +191,9 @@ pub(super) fn acme_client(args: &[OsString], lifetime: u64) -> (i32, String) {
         .iter()
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
+    if args.iter().any(|a| a == "precheck") {
+        return precheck(&args);
+    }
     let (Some(csr), Some(out)) = (
         decode(value(&args, "--csr"), "fake-csr"),
         value(&args, "--out"),

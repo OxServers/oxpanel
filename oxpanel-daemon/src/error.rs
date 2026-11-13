@@ -146,7 +146,7 @@ impl Error {
     }
 
     /// True when the error is the caller's fault (safe to return in full).
-    fn is_client_error(&self) -> bool {
+    pub fn is_client_error(&self) -> bool {
         matches!(
             self,
             Self::InvalidInput { .. }

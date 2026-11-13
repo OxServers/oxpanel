@@ -46,6 +46,8 @@ use crate::validate::Domain;
 
 /// The account the ACME client runs as.
 pub const ACME_USER: &str = "oxpanel-acme";
+/// Name of the systemd credential carrying the External Account Binding.
+pub const EAB_CREDENTIAL: &str = "oxpanel-acme-eab";
 /// Upper bound for one certificate request (the gRPC deadline is 300 s).
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(270);
 /// What the transient unit is told; a little under ours so systemd ends it first.
@@ -115,7 +117,29 @@ pub async fn unavailable_reason(ctx: &Ctx) -> Result<Option<String>> {
             return Ok(Some(format!("the directory {} is missing", dir.display())));
         }
     }
+    if let Some(file) = &cfg.acme_eab_file {
+        if let Some(problem) = eab_file_problem(file) {
+            return Ok(Some(format!(
+                "OXPANEL_ACME_EAB_FILE {}: {problem}",
+                file.display()
+            )));
+        }
+    }
     Ok(None)
+}
+
+/// The External Account Binding file holds a secret: it must be a regular
+/// file that only the daemon's own account (root) can read.
+fn eab_file_problem(file: &std::path::Path) -> Option<&'static str> {
+    use std::os::unix::fs::MetadataExt as _;
+    match std::fs::symlink_metadata(file) {
+        Err(_) => Some("is missing"),
+        Ok(md) if !md.is_file() => Some("is not a regular file"),
+        Ok(md) if md.uid() != nix::unistd::geteuid().as_raw() || md.mode() & 0o077 != 0 => {
+            Some("must be owned by root and readable by root only (chmod 600)")
+        }
+        Ok(_) => None,
+    }
 }
 
 /// Refuse a request the host cannot serve before anything is created.
@@ -126,17 +150,21 @@ pub async fn preflight(ctx: &Ctx) -> Result<()> {
     }
 }
 
-/// Generate a fresh private key for `vhost` (kept aside until the certificate
-/// arrives) and the signing request for its domain and aliases. The caller
-/// holds the mutation lock. Returns the names the certificate is requested for.
-pub async fn prepare(ctx: &Ctx, vhost: &VHostRecord) -> Result<Vec<Domain>> {
-    let cfg = &ctx.config;
-    let timeout = cfg.command_timeout;
-    let domain = Domain::parse(&vhost.domain)?;
-    let mut names = vec![domain.clone()];
+/// The domain of `vhost` followed by its aliases.
+pub fn server_names(vhost: &VHostRecord) -> Result<Vec<Domain>> {
+    let mut names = vec![Domain::parse(&vhost.domain)?];
     for alias in &vhost.aliases {
         names.push(Domain::parse_field(alias, "aliases")?);
     }
+    Ok(names)
+}
+
+/// Generate a fresh private key for `domain` (kept aside until the
+/// certificate arrives) and the signing request for `names` (the domain
+/// first). The caller holds the mutation lock.
+pub async fn prepare(ctx: &Ctx, domain: &Domain, names: &[Domain]) -> Result<()> {
+    let cfg = &ctx.config;
+    let timeout = cfg.command_timeout;
     let internal = |what: &str| Error::Internal(format!("openssl produced an unusable {what}"));
 
     fsutil::ensure_dir(&cfg.tls_dir, tls::DIR_MODE)?;
@@ -155,7 +183,7 @@ pub async fn prepare(ctx: &Ctx, vhost: &VHostRecord) -> Result<Vec<Domain>> {
         .await?;
     let key = String::from_utf8(key.stdout).map_err(|_| internal("key"))?;
     let key = tls::normalise_pem(&key, PemKind::Key).map_err(|_| internal("key"))?;
-    let pending = tls::pending_key_path(&cfg.tls_dir, &domain);
+    let pending = tls::pending_key_path(&cfg.tls_dir, domain);
     fsutil::write_atomic(&pending, key.as_bytes(), tls::KEY_MODE)?;
 
     // An empty subject: the names are in the subjectAltName extension, and a
@@ -177,30 +205,27 @@ pub async fn prepare(ctx: &Ctx, vhost: &VHostRecord) -> Result<Vec<Domain>> {
         .await?;
     let csr = String::from_utf8(csr.stdout).map_err(|_| internal("signing request"))?;
     let csr = tls::normalise_pem(&csr, PemKind::Csr).map_err(|_| internal("signing request"))?;
-    fsutil::write_atomic(&csr_path(cfg, &domain), csr.as_bytes(), CSR_MODE)?;
+    fsutil::write_atomic(&csr_path(cfg, domain), csr.as_bytes(), CSR_MODE)?;
     // A reply left over from an earlier request must not be taken for this one's.
-    fsutil::remove_if_exists(&issued_path(cfg, &domain))?;
-    Ok(names)
+    fsutil::remove_if_exists(&issued_path(cfg, domain))?;
+    Ok(())
 }
 
-/// Run the ACME client for `domain` in a transient unit and wait for it.
-/// Returns whether it reported success and what it printed; a refusal by the
-/// certificate authority is a result, not an error.
-pub async fn run_client(ctx: &Ctx, domain: &Domain, names: &[Domain]) -> Result<(bool, String)> {
+/// `systemd-run` for one run of the ACME client for `domain`, up to the
+/// program: an unprivileged, sandboxed transient unit that can write only the
+/// client's own directories. `extra` properties are appended.
+fn unit_command(ctx: &Ctx, domain: &Domain, extra: &[String]) -> Result<CommandSpec> {
     let cfg = &ctx.config;
-    let unit = unit_name(domain);
-    let (account, challenges, issued) = (account_dir(cfg), challenge_dir(cfg), issued_dir(cfg));
     let writable = format!(
         "ReadWritePaths={} {} {}",
-        safe_path_str(&account)?,
-        safe_path_str(&challenges)?,
-        safe_path_str(&issued)?
+        safe_path_str(&account_dir(cfg))?,
+        safe_path_str(&challenge_dir(cfg))?,
+        safe_path_str(&issued_dir(cfg))?
     );
-    let started_at = crate::records::now_unix();
     // No `--pipe` (see app::install_dependencies): output goes to the journal.
     let mut cmd = CommandSpec::new(bin::SYSTEMD_RUN, CLIENT_TIMEOUT)
         .args(["--wait", "--collect", "--quiet"])
-        .arg(format!("--unit={unit}"));
+        .arg(format!("--unit={}", unit_name(domain)));
     for property in [
         format!("User={ACME_USER}"),
         format!("Group={ACME_USER}"),
@@ -227,39 +252,26 @@ pub async fn run_client(ctx: &Ctx, domain: &Domain, names: &[Domain]) -> Result<
         "LockPersonality=yes".to_owned(),
         "MemoryDenyWriteExecute=yes".to_owned(),
         "SystemCallArchitectures=native".to_owned(),
-    ] {
+    ]
+    .iter()
+    .chain(extra)
+    {
         cmd = cmd.arg("--property").arg(property);
     }
-    cmd = cmd
-        .arg("--")
-        .arg(bin::OXPANEL_ACME)
-        .arg("--directory")
-        .arg(&cfg.acme_directory_url);
-    if let Some(ca) = &cfg.acme_ca_file {
-        cmd = cmd.arg("--ca-file").arg(safe_path_str(ca)?);
-    }
-    if let Some(email) = &cfg.acme_email {
-        cmd = cmd.arg("--email").arg(email);
-    }
-    cmd = cmd
-        .arg("--account-dir")
-        .arg(&account)
-        .arg("--challenge-dir")
-        .arg(&challenges)
-        .arg("--csr")
-        .arg(csr_path(cfg, domain))
-        .arg("--out")
-        .arg(issued_path(cfg, domain));
-    for name in names {
-        cmd = cmd.arg("--domain").arg(name.as_str());
-    }
+    Ok(cmd.arg("--").arg(bin::OXPANEL_ACME))
+}
+
+/// Run a prepared client command and wait for it. Returns whether it
+/// succeeded and what it printed (read back from the journal).
+async fn run_unit(ctx: &Ctx, domain: &Domain, cmd: CommandSpec) -> Result<(bool, String)> {
+    let unit = unit_name(domain);
+    let started_at = crate::records::now_unix();
     let out = ctx.sys.run(cmd).await?;
     let succeeded = out.success();
-    info!(%domain, succeeded, "ACME client finished");
     let journal = ctx
         .sys
         .run(
-            CommandSpec::new(bin::JOURNALCTL, cfg.command_timeout)
+            CommandSpec::new(bin::JOURNALCTL, ctx.config.command_timeout)
                 .args(["--no-pager", "--output=cat", "--lines"])
                 .arg(LOG_LINES)
                 .arg("--since")
@@ -278,6 +290,135 @@ pub async fn run_client(ctx: &Ctx, domain: &Domain, names: &[Domain]) -> Result<
         output.push_str(&own);
     }
     Ok((succeeded, output))
+}
+
+/// Run the ACME client for `domain` in a transient unit and wait for it.
+/// Returns whether it reported success and what it printed; a refusal by the
+/// certificate authority is a result, not an error.
+pub async fn run_client(ctx: &Ctx, domain: &Domain, names: &[Domain]) -> Result<(bool, String)> {
+    let cfg = &ctx.config;
+    // The binding's secret reaches the client as a systemd credential: systemd
+    // (root) reads the root-only file and shows it to this unit alone.
+    let extra = match &cfg.acme_eab_file {
+        Some(file) => vec![format!(
+            "LoadCredential={EAB_CREDENTIAL}:{}",
+            safe_path_str(file)?
+        )],
+        None => Vec::new(),
+    };
+    let mut cmd = unit_command(ctx, domain, &extra)?
+        .arg("--directory")
+        .arg(&cfg.acme_directory_url);
+    if let Some(ca) = &cfg.acme_ca_file {
+        cmd = cmd.arg("--ca-file").arg(safe_path_str(ca)?);
+    }
+    if let Some(email) = &cfg.acme_email {
+        cmd = cmd.arg("--email").arg(email);
+    }
+    if cfg.acme_eab_file.is_some() {
+        cmd = cmd.arg("--eab");
+    }
+    cmd = cmd
+        .arg("--account-dir")
+        .arg(account_dir(cfg))
+        .arg("--challenge-dir")
+        .arg(challenge_dir(cfg))
+        .arg("--csr")
+        .arg(csr_path(cfg, domain))
+        .arg("--out")
+        .arg(issued_path(cfg, domain));
+    for name in names {
+        cmd = cmd.arg("--domain").arg(name.as_str());
+    }
+    let (succeeded, output) = run_unit(ctx, domain, cmd).await?;
+    info!(%domain, succeeded, "ACME client finished");
+    Ok((succeeded, output))
+}
+
+/// Outcome of a pre-check: which names would pass HTTP-01 from here.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Precheck {
+    pub passed: Vec<Domain>,
+    /// Names that would fail, with the reason in plain words.
+    pub skipped: Vec<(Domain, String)>,
+}
+
+/// The pre-check report the client writes for `domain`.
+fn precheck_path(cfg: &Config, domain: &Domain) -> PathBuf {
+    issued_dir(cfg).join(format!("{domain}.precheck"))
+}
+
+/// Upper bound for a pre-check report and for one reason in it.
+const MAX_PRECHECK_BYTES: u64 = 64 * 1024;
+const MAX_REASON_CHARS: usize = 200;
+
+/// Ask the client (which has the network the daemon lacks) whether each of
+/// `names` resolves and reaches this server under the challenge path, the way
+/// the authority would check it. Nothing is sent to the authority. A name the
+/// report does not mention counts as skipped.
+pub async fn run_precheck(ctx: &Ctx, domain: &Domain, names: &[Domain]) -> Result<Precheck> {
+    let cfg = &ctx.config;
+    let out = precheck_path(cfg, domain);
+    fsutil::remove_if_exists(&out)?;
+    let mut cmd = unit_command(ctx, domain, &[])?
+        .args(["--mode", "precheck", "--challenge-dir"])
+        .arg(challenge_dir(cfg))
+        .arg("--out")
+        .arg(&out);
+    for name in names {
+        cmd = cmd.arg("--domain").arg(name.as_str());
+    }
+    let (succeeded, output) = run_unit(ctx, domain, cmd).await?;
+    let report = fsutil::read_untrusted(&out, MAX_PRECHECK_BYTES)?;
+    fsutil::remove_if_exists(&out)?;
+    let Some(bytes) = report.filter(|_| succeeded) else {
+        let why = output.lines().last().unwrap_or("the pre-check did not run");
+        return Err(Error::AcmeUnavailable(format!(
+            "the reachability check failed: {}",
+            printable(why)
+        )));
+    };
+    let report = String::from_utf8_lossy(&bytes).into_owned();
+    Ok(parse_precheck(&report, names))
+}
+
+/// Control characters out, length bounded: the text came from an
+/// unprivileged process.
+fn printable(s: &str) -> String {
+    s.chars()
+        .filter(|c| !c.is_control())
+        .take(MAX_REASON_CHARS)
+        .collect()
+}
+
+/// Read a pre-check report, believing it only about the names that were asked.
+fn parse_precheck(report: &str, names: &[Domain]) -> Precheck {
+    let mut verdicts: std::collections::BTreeMap<&str, Option<String>> =
+        std::collections::BTreeMap::new();
+    for line in report.lines() {
+        let mut parts = line.splitn(3, ' ');
+        match (parts.next(), parts.next(), parts.next()) {
+            (Some("ok"), Some(name), None) => {
+                verdicts.entry(name).or_insert(None);
+            }
+            (Some("skip"), Some(name), reason) => {
+                verdicts.insert(name, Some(printable(reason.unwrap_or("no reason given"))));
+            }
+            _ => {}
+        }
+    }
+    let mut result = Precheck::default();
+    for name in names {
+        match verdicts.get(name.as_str()) {
+            Some(None) => result.passed.push(name.clone()),
+            Some(Some(reason)) => result.skipped.push((name.clone(), reason.clone())),
+            None => result.skipped.push((
+                name.clone(),
+                "the reachability check did not report it".into(),
+            )),
+        }
+    }
+    result
 }
 
 /// The chain the client delivered for `domain`, if any. The file belongs to

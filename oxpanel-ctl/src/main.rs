@@ -173,6 +173,10 @@ enum VhostCmd {
         /// year: enable only once HTTPS is there to stay.
         #[arg(long)]
         hsts: bool,
+        /// Exclude the site from Automatic HTTPS (which otherwise gets it a
+        /// certificate by itself when switched on for the host).
+        #[arg(long)]
+        no_auto_https: bool,
     },
     /// Restart the site's application (after putting new code in place).
     RestartApp {
@@ -229,6 +233,18 @@ enum CertCmd {
     Renew,
     /// Show a virtual host's certificate.
     Show { domain: String },
+    /// Automatic HTTPS: certificates for every site without asking.
+    #[command(subcommand)]
+    Auto(AutoCmd),
+}
+
+#[derive(Subcommand, Debug)]
+enum AutoCmd {
+    /// Run it now: for one site (ignoring back-off) or for every site.
+    /// Exits with status 4 when a site is left without a certificate.
+    Run { domain: Option<String> },
+    /// What it has done and will do, per site.
+    Status { domain: Option<String> },
 }
 
 #[derive(clap::ValueEnum, Debug, Clone, Copy)]
@@ -493,11 +509,13 @@ async fn run_vhost(
             app_entry,
             redirect_https,
             hsts,
+            no_auto_https,
         } => {
             let r = c
                 .configure_virtual_host(pb::ConfigureVirtualHostRequest {
                     redirect_https,
                     hsts,
+                    auto_https_opt_out: no_auto_https,
                     domain,
                     tenant,
                     document_root: root,
@@ -567,7 +585,11 @@ async fn run_vhost(
 /// One line about a virtual host's certificate (`certificate=-` when none).
 fn print_certificate(v: &pb::VirtualHost) {
     let Some(c) = &v.certificate else {
-        say!("domain={} certificate=-", v.domain);
+        say!(
+            "domain={} certificate=- auto_https={}",
+            v.domain,
+            if v.auto_https_opt_out { "off" } else { "on" }
+        );
         return;
     };
     let not_before = c.not_before.as_ref().map_or(0, |t| t.seconds);
@@ -588,7 +610,7 @@ fn print_certificate(v: &pb::VirtualHost) {
         }
     };
     say!(
-        "domain={} certificate=present source={} not_before={} not_after={} expires_in_days={} names={} uncovered={} redirect_https={} hsts={} issuer={}",
+        "domain={} certificate=present source={} not_before={} not_after={} expires_in_days={} names={} uncovered={} redirect_https={} hsts={} auto_https={} issuer={}",
         v.domain,
         source,
         not_before,
@@ -598,8 +620,82 @@ fn print_certificate(v: &pb::VirtualHost) {
         list(&c.uncovered_names),
         v.redirect_https,
         v.hsts,
+        if v.auto_https_opt_out { "off" } else { "on" },
         c.issuer,
     );
+}
+
+/// One line per site, then one indented line per skipped name.
+fn print_auto_https(s: &pb::AutoHttpsStatus) {
+    let state = pb::AutoHttpsState::try_from(s.state).map_or("unknown", |k| {
+        k.as_str_name().trim_start_matches("AUTO_HTTPS_STATE_")
+    });
+    let list = |names: &[String]| {
+        if names.is_empty() {
+            "-".to_owned()
+        } else {
+            names.join(",")
+        }
+    };
+    let when = |t: Option<i64>| t.map_or_else(|| "-".to_owned(), |t| t.to_string());
+    say!(
+        "domain={} auto_https={} covered={} pending={} skipped={} last_attempt={} next_attempt={} last_error={}",
+        s.domain,
+        state.to_ascii_lowercase(),
+        list(&s.covered_names),
+        list(&s.pending_names),
+        list(&s.skipped.iter().map(|k| k.name.clone()).collect::<Vec<_>>()),
+        when(s.last_attempt.as_ref().map(|t| t.seconds)),
+        when(s.next_attempt.as_ref().map(|t| t.seconds)),
+        if s.last_error.is_empty() { "-" } else { s.last_error.as_str() },
+    );
+    for k in &s.skipped {
+        say!(
+            "  skipped name={} failures={} next_attempt={} reason={}",
+            k.name,
+            k.failures,
+            when(k.next_attempt.as_ref().map(|t| t.seconds)),
+            k.reason
+        );
+    }
+}
+
+/// `cert auto run|status`.
+async fn run_cert_auto(
+    c: &mut OxPanelEngineClient<Channel>,
+    cmd: AutoCmd,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    match cmd {
+        AutoCmd::Run { domain } => {
+            let r = c
+                .run_auto_https(pb::RunAutoHttpsRequest {
+                    domain: domain.unwrap_or_default(),
+                })
+                .await?
+                .into_inner();
+            let mut failed = false;
+            for s in &r.sites {
+                print_auto_https(s);
+                failed |= s.state == i32::from(pb::AutoHttpsState::Failed);
+            }
+            if failed {
+                return Ok(ExitCode::from(EXIT_INSTALL_FAILED));
+            }
+        }
+        AutoCmd::Status { domain } => {
+            for s in &c
+                .get_auto_https_status(pb::GetAutoHttpsStatusRequest {
+                    domain: domain.unwrap_or_default(),
+                })
+                .await?
+                .into_inner()
+                .sites
+            {
+                print_auto_https(s);
+            }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
 }
 
 async fn run_cert(
@@ -668,6 +764,7 @@ async fn run_cert(
                 return Ok(ExitCode::from(EXIT_INSTALL_FAILED));
             }
         }
+        CertCmd::Auto(cmd) => return run_cert_auto(c, cmd).await,
         CertCmd::Show { domain } => {
             let vhosts = c
                 .list_virtual_hosts(pb::ListVirtualHostsRequest {
@@ -697,7 +794,7 @@ async fn run_host(
                 .await?
                 .into_inner();
             say!(
-                "version={} selinux={} php={} node={} node_version={} python={} dry_run={} tenants={} vhosts={} uid_range={}-{} load={:.2},{:.2},{:.2} memory_total={} memory_free={} home_disk_total={} home_disk_free={} uptime={} tls={} acme={} acme_directory={}",
+                "version={} selinux={} php={} node={} node_version={} python={} dry_run={} tenants={} vhosts={} uid_range={}-{} load={:.2},{:.2},{:.2} memory_total={} memory_free={} home_disk_total={} home_disk_free={} uptime={} tls={} acme={} acme_directory={} auto_https={}",
                 i.daemon_version,
                 i.selinux_enabled,
                 i.php_available,
@@ -724,6 +821,7 @@ async fn run_host(
                 i.tls_available,
                 i.acme_available,
                 i.acme_directory_url,
+                i.auto_https_enabled,
             );
         }
         HostCmd::Reconcile => {

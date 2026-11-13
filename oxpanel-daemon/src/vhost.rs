@@ -57,6 +57,8 @@ pub struct VHostRequest {
     /// Redirect plain HTTP to HTTPS / send HSTS, once a certificate is installed.
     pub redirect_https: bool,
     pub hsts: bool,
+    /// Whether Automatic HTTPS looks after the site.
+    pub auto_https: crate::records::AutoHttpsChoice,
 }
 
 /// An application as requested on the wire; empty strings mean "default".
@@ -179,6 +181,7 @@ impl VHostService {
             hsts: req.hsts,
             // The certificate is not part of the request: it stays as it is.
             tls: existing.as_ref().and_then(|e| e.tls.clone()),
+            auto_https: req.auto_https,
         };
         // The pool must be listening before Nginx is told to use it.
         let pool_changed = if rec.php {
@@ -357,6 +360,7 @@ impl VHostService {
         }
         // Nginx no longer refers to the certificate: it goes with the site.
         crate::tls::remove_material(&self.ctx, &domain)?;
+        crate::auto_https::forget(&self.ctx.config, &domain)?;
         self.ctx.store.delete_vhost(&domain)?;
         // Nginx has reloaded and no longer holds the logs open for this name.
         let (access_log, error_log) = log_paths(cfg, &domain);

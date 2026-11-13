@@ -33,6 +33,8 @@ struct Inner {
     generated_keys: u32,
     /// Lifetime of certificates the fake ACME client delivers; `None` = 90 days.
     acme_lifetime: Option<u64>,
+    /// The fake certificate authority refuses every order.
+    acme_refuses: bool,
 }
 
 #[derive(Debug, Default)]
@@ -106,6 +108,14 @@ impl FakeSystem {
     pub fn set_acme_lifetime(&self, secs: u64) {
         if let Ok(mut i) = self.inner.lock() {
             i.acme_lifetime = Some(secs);
+        }
+    }
+
+    /// Make the fake certificate authority refuse (or accept again) orders.
+    /// The reachability pre-check is not affected.
+    pub fn set_acme_refuses(&self, refuses: bool) {
+        if let Ok(mut i) = self.inner.lock() {
+            i.acme_refuses = refuses;
         }
     }
 
@@ -268,7 +278,11 @@ impl System for FakeSystem {
             }
             // The ACME client in its transient unit (other uses of systemd-run just succeed).
             bin::SYSTEMD_RUN if args.iter().any(|a| a == bin::OXPANEL_ACME) => {
-                let (code, stderr) = super::fake_tls::acme_client(args, i.acme_lifetime.unwrap_or(90 * 86_400));
+                let (code, stderr) = if i.acme_refuses && !args.iter().any(|a| a == "precheck") {
+                    (1, "no certificate: the authority refused (429): too many certificates (urn:ietf:params:acme:error:rateLimited)".to_owned())
+                } else {
+                    super::fake_tls::acme_client(args, i.acme_lifetime.unwrap_or(90 * 86_400))
+                };
                 output(program, code, "", &stderr)
             }
             // systemctl, restorecon, setfacl and anything else: succeed silently.

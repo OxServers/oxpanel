@@ -190,6 +190,8 @@ valid. After editing: `sudo systemctl restart oxpanel-daemon`.
 | `OXPANEL_ACME_DIRECTORY_URL` | Let's Encrypt production | ACME directory, `https://` only (staging: `https://acme-staging-v02.api.letsencrypt.org/directory`). |
 | `OXPANEL_ACME_CA_FILE` | *(system trust store)* | PEM bundle the ACME client trusts for the authority's HTTPS (private/test CA). Must be readable by `oxpanel-acme` and outside `/home` and `/root`. |
 | `OXPANEL_ACME_EMAIL` | *(none)* | Contact address registered with the ACME account. |
+| `OXPANEL_ACME_EAB_FILE` | *(none)* | External Account Binding for authorities that require it: a root-owned `0600` file with `kid=…` and `hmac_key=…` lines. Passed to the client as a systemd credential. |
+| `OXPANEL_AUTO_HTTPS` | `true` | Automatic HTTPS: every site gets a certificate by itself (§6). `false` switches it off for the whole host; single sites opt out with `vhost set --no-auto-https`. |
 | `OXPANEL_ACME_RENEW_DAYS` | `30` | Renew ACME certificates this many days (1–60) before expiry; checked 5 minutes after start and every 12 hours. |
 | `OXPANEL_LOG` | `info` | `tracing` filter: `info`, `debug`, `oxpanel_daemon=trace`, … |
 | `OXPANEL_DRY_RUN` | `false` | Use the in-memory fake OS (development only — see §11). |
@@ -377,6 +379,16 @@ sudo oxpanel-ctl cert install acme.example --chain acme.example.chain.pem --key 
 # Renewed automatically 30 days before expiry; `cert renew` does it now.
 sudo oxpanel-ctl cert request acme.example
 sudo oxpanel-ctl cert show acme.example
+
+# Automatic HTTPS (on by default) does what other panels call automatic SSL:
+# a few seconds after a site is created or gets a new alias, the engine checks
+# that each name points here and asks the authority for a certificate covering
+# the names that do. Nothing to call; but you can look and nudge:
+sudo oxpanel-ctl cert auto status acme.example
+# domain=acme.example auto_https=partial covered=acme.example,www.acme.example pending=- skipped=old.acme.example ...
+#   skipped name=old.acme.example failures=1 next_attempt=1794560000 reason=the name does not resolve
+sudo oxpanel-ctl cert auto run acme.example     # now, ignoring back-off (without a domain: every site)
+sudo oxpanel-ctl vhost set acme.example --tenant acme --no-auto-https   # this site: hands off
 
 # Redirect HTTP to HTTPS; HSTS (browsers remember it for a year — only when HTTPS is there to stay)
 sudo oxpanel-ctl vhost set acme.example --tenant acme --alias www.acme.example --redirect-https --hsts
@@ -600,6 +612,36 @@ Existing connections are closed on restart; the panel should reconnect.
 **Restarting Nginx by hand** is safe; the daemon re-validates the whole
 configuration with `nginx -t` on every change.
 
+**Choosing the certificate authority.** Set it in `/etc/oxpanel/daemon.env`
+and `systemctl restart oxpanel-daemon`; `oxpanel-ctl host info` shows
+`acme_directory=`. Each directory gets its own ACME account automatically.
+
+```sh
+# Let's Encrypt (the default; nothing to set)
+#OXPANEL_ACME_DIRECTORY_URL=https://acme-v02.api.letsencrypt.org/directory
+
+# Let's Encrypt staging, for trying things out (certificates are not trusted by browsers)
+OXPANEL_ACME_DIRECTORY_URL=https://acme-staging-v02.api.letsencrypt.org/directory
+
+# A provider that requires External Account Binding, e.g. ZeroSSL
+# (Google Trust Services: https://dv.acme-v02.api.pki.goog/directory). The provider's
+# dashboard gives an "EAB KID" and an "EAB HMAC key":
+OXPANEL_ACME_DIRECTORY_URL=https://acme.zerossl.com/v2/DV90
+OXPANEL_ACME_EAB_FILE=/etc/oxpanel/acme-eab
+OXPANEL_ACME_EMAIL=hostmaster@example.com
+```
+
+```sh
+sudo install -m 0600 -o root -g root /dev/null /etc/oxpanel/acme-eab
+printf 'kid=%s\nhmac_key=%s\n' '<EAB KID>' '<EAB HMAC key>' | sudo tee /etc/oxpanel/acme-eab >/dev/null
+```
+
+The daemon refuses an EAB file that is not owned by root or that group or
+others can read. The key is given to the ACME client as a systemd credential
+(only that unit can read it) and never appears on a command line, in a log or
+in an API response. (Typing it into `printf` puts it in your shell history;
+paste it into an editor instead if that matters.)
+
 ## 10. Troubleshooting
 
 | Symptom | Cause / fix |
@@ -631,6 +673,7 @@ configuration with `nginx -t` on every change.
 | Site returns 403/404 right after `vhost set` | Reload race (worker swap) — retry after a moment. Persisting 403 with SELinux: check `ausearch -m avc -ts recent`; the docroot should be `httpd_sys_content_t`. |
 | `FailedPrecondition: OpenSSL is not installed` | `sudo dnf install openssl` (the RPM requires it). |
 | `FailedPrecondition: ACME is not available on this host: …` | The message names what is missing: the client binary, the `oxpanel-acme` account (`systemd-sysusers`) or a directory under `/var/lib/oxpanel-acme` (`systemd-tmpfiles --create oxpanel.conf`). `oxpanel-ctl host info` shows `acme=true` once it is in place. |
+| **Why did my site not get a certificate?** | `oxpanel-ctl cert auto status <domain>` says it in plain words. `disabled`: Automatic HTTPS is off for the host (`host info` shows `auto_https=false`) or the site opted out. `suspended`: the tenant is suspended; it catches up on resume. `uploaded`: the site has a valid uploaded certificate, which is never replaced (only an expired one is). `skipped name=… reason=the name does not resolve`: DNS has no record for that name (yet). `…cannot connect to port 80` / `answered "HTTP/1.1 …"` / `serves something else than this server's probe`: the name points at another server, port 80 is closed in the firewall, or something in front (a CDN, a proxy) does not pass `/.well-known/acme-challenge/` through. `the certificate authority refused: …`: the authority's own reason (e.g. a rate limit). Each failing name waits 1 h, 6 h, then 24 h before the next try; fix the cause and run `oxpanel-ctl cert auto run <domain>` to try at once. `certificates cannot be requested on this host`: see the `ACME is not available` row. |
 | `cert request` prints `succeeded=false` | The certificate authority's reason follows the client's output, e.g. DNS of a name does not point here, port 80 is closed, or a rate limit. Try `OXPANEL_ACME_DIRECTORY_URL=https://acme-staging-v02.api.letsencrypt.org/directory` while experimenting. A request sent in the same instant as the `vhost set` that created the site can lose the race with Nginx's reload (`connection` error, EOF): repeat it. The site keeps whatever certificate it had. |
 | `InvalidArgument: certificate rejected: …` | The message says which check failed (key does not belong, expired, not valid for the domain, encrypted key). Nothing was changed. |
 | `openssl s_client -servername <unknown>` fails the handshake | Intended: the 443 catch-all rejects names no site with a certificate owns, so no tenant's certificate is ever shown for them. |

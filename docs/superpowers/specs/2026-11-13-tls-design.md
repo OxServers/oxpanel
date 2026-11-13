@@ -173,6 +173,93 @@ challenge directory is labelled `httpd_sys_content_t` by a `filecon` in
 `var_lib_t`, unreadable for `httpd_t`. The RPM runs `restorecon` on it after
 loading the module (tmpfiles created it earlier).
 
+## Automatic HTTPS
+
+Added at the owner's request after the first version: every site gets a
+certificate by itself and keeps one that covers all of its names, without
+anyone calling `RequestCertificate`.
+
+**Defaults (deliberate).** On for the host (`OXPANEL_AUTO_HTTPS=true`) and on
+for every site (`ConfigureVirtualHostRequest.auto_https_opt_out = false`),
+because the owner's intent is that a new site gets HTTPS by itself. The proto
+field is an *opt-out* so that the protobuf default (false) means "on" and a
+panel that does not know the field gets the intended behaviour. A host with
+public DNS pointing elsewhere (or none) costs nothing but a local check per
+site and back-off, never a request to the authority.
+
+**When it runs.** Three seconds after `ConfigureVirtualHost` (new site or
+changed names) and after `ResumeTenant` for the tenant's sites — late enough
+that Nginx has reloaded, which also removes the reload race of the first
+version; a sweep a minute after start and every 15 minutes; and
+`RunAutoHttps` (`oxpanel-ctl cert auto run [domain]`). The sweep is cheap: a
+site is only touched if a name is uncovered and not backing off.
+
+**What it does for a site** (`auto_https::plan`): nothing for a valid
+uploaded certificate; otherwise, if any server name is neither covered by the
+site's (unexpired) ACME certificate nor backing off, it orders the covered
+names plus those names, the domain first. If the domain itself is uncovered
+and backing off, it waits.
+
+**Uploaded certificates** are never replaced while valid. An *expired*
+uploaded certificate is replaced if the site has Automatic HTTPS on: the site
+is broken for every visitor at that point, and the operator can opt the site
+out to keep full control. Considered and rejected: never touching an uploaded
+certificate (leaves an expired site broken), replacing it before expiry
+(overrides an explicit operator choice).
+
+**Rate limits.** Before the authority is asked, `oxpanel-acme --mode
+precheck` (same unprivileged unit; the daemon keeps `PrivateNetwork=yes`)
+publishes a random probe file in the challenge directory and, for each name,
+resolves it and fetches `http://<name>/.well-known/acme-challenge/<probe>`
+from *every* address it resolves to (at most 4, three tries each, plain
+HTTP/1.1 with the right `Host`, as the authority does). It reports
+`ok <name>` / `skip <name> <reason>` in a file the daemon reads without
+following symlinks and believes only about names it asked for. Then:
+
+- names that fail are left out of the order and backed off: 1 h, 6 h, then
+  every 24 h (per name, counted per consecutive failure);
+- if the domain itself fails, nothing is ordered and no key is made;
+- if every name that passed is already covered, nothing is ordered (adding a
+  broken alias does not re-issue the certificate);
+- a refusal by the authority backs off every name it was asked for.
+
+At most two pre-checks or orders run at once host-wide (a semaphore shared
+with manual requests and renewals), and one site's work is serialised (a
+per-site lock; a manual request now waits for a running automatic one
+instead of being refused). Renewals of sites under Automatic HTTPS go through
+the same path, so an alias that stopped resolving drops out of the renewed
+certificate instead of failing it.
+
+**State** per site in `/var/lib/oxpanel/auto-https/<domain>.json` (root
+`0600`): last attempt, last error in plain words, and per-name failures, next
+attempt and reason. It survives restarts, is removed with the site, and a
+stray file is `ORPHAN_AUTO_HTTPS_STATE` drift. An unreadable file counts as a
+fresh start (it holds only back-off).
+
+**Status** (`GetAutoHttpsStatus`, `oxpanel-ctl cert auto status [domain]`):
+`DISABLED` (host switch off or site opted out), `SUSPENDED`, `UPLOADED`,
+`COVERED`, `PARTIAL` (domain covered, some names skipped), `PENDING`, `FAILED`
+(no certificate yet, retried later); covered, pending and skipped names (with
+reason, failures and next attempt), last and next attempt, last error.
+
+**Naming.** The feature is called "Automatic HTTPS" (`auto_https` in the API,
+configuration and code), deliberately not the name another product uses.
+
+## Choosing the certificate authority; External Account Binding
+
+`OXPANEL_ACME_DIRECTORY_URL` selects any RFC 8555 authority: Let's Encrypt
+(default), its staging directory, ZeroSSL, Google Trust Services, a private
+CA. Providers that require External Account Binding (RFC 8555 §7.3.4) are
+supported through `OXPANEL_ACME_EAB_FILE`: a root-only file with `kid=` and
+`hmac_key=` (base64url, as the providers hand it out). The daemon refuses to
+use it unless it is a regular file owned by root with no group/other bits,
+and passes it to the client with `LoadCredential=` — systemd reads it and
+shows it to that one unit only, so the secret is never an argument, never in
+the daemon's memory beyond the path, never logged, never returned. The client
+adds an HS256 JWS over its account key (`externalAccountBinding`) to
+`newAccount`. The HMAC is checked against RFC 4231 test case 2 in unit tests,
+and end to end against Pebble with `externalAccountBindingRequired`.
+
 ## Reconcile
 
 `TLS_CERTIFICATE_DRIFT`: the certificate file is missing or differs from the
@@ -190,8 +277,9 @@ checked (that needs OpenSSL; reconciliation runs no programs).
 - Deleting a tenant was already refused while it owns virtual hosts, so no
   certificate can outlive its tenant.
 - Changing a site's aliases keeps the certificate; the uncovered ones appear
-  in `uncovered_names` until the operator requests (or uploads) a new one.
-  The engine does not re-request automatically.
+  in `uncovered_names` until a new certificate covers them — obtained by
+  Automatic HTTPS within seconds when it is on for the site, otherwise by
+  the operator.
 
 ## Testing
 
@@ -223,13 +311,23 @@ checked (that needs OpenSSL; reconciliation runs no programs).
   failing validation reported as a result, cleanup. Pebble also rejects 5 %
   of nonces at random, which exercises the client's retry. **Not proven**:
   issuance by the real Let's Encrypt (needs public DNS); the 12-hour timer
-  itself (the same code path is exercised through `RenewCertificates`).
+  itself (the same code path is exercised through `RenewCertificates`), and
+  the 15-minute sweep timer (the sweep itself runs through `RunAutoHttps`).
+- **Automatic HTTPS and EAB, end to end against Pebble** (container and the
+  enforcing VM): a new site gets a certificate with no request; an alias
+  added later is covered; an unresolvable alias is skipped while the rest
+  stays covered, backs off for an hour, the back-off survives a restart and is
+  respected by a full run, while a run for the one site retries; an opted-out
+  site, a suspended tenant and the host-wide switch get nothing; a suspended
+  site catches up on resume; a valid uploaded certificate is left alone;
+  Pebble with `externalAccountBindingRequired` refuses without a binding,
+  the daemon refuses a binding file others can read, and issues with it.
 
 ## Not included
 
-DNS-01 and wildcard certificates from ACME; ACME External Account Binding;
+DNS-01 and wildcard certificates from ACME;
 TLS-ALPN-01; OCSP stapling; per-site TLS settings or client certificates;
-automatic re-request when aliases change; an expiry e-mail of our own (the
+per-site choice of certificate authority; an expiry e-mail of our own (the
 panel reads `not_after`; Let's Encrypt has stopped expiry mails); the
 firewall — port 443 must be opened by the operator
 (`firewall-cmd --add-service=https --permanent && firewall-cmd --reload`).

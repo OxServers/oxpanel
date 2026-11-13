@@ -68,6 +68,12 @@ service OxPanelEngine {
   // Renew every ACME certificate that is due. The engine also does this by
   // itself twice a day.
   rpc RenewCertificates(RenewCertificatesRequest) returns (RenewCertificatesResponse);
+  // Automatic HTTPS: obtain certificates for sites now instead of waiting for
+  // the engine's own schedule. With a domain: that site, ignoring back-off.
+  // Without: every site, respecting back-off. May take minutes.
+  rpc RunAutoHttps(RunAutoHttpsRequest) returns (RunAutoHttpsResponse);
+  // Automatic HTTPS: what it has done and will do for one or all sites.
+  rpc GetAutoHttpsStatus(GetAutoHttpsStatusRequest) returns (GetAutoHttpsStatusResponse);
 }
 
 // Per-tenant resource limits, applied through systemd (cgroups v2).
@@ -166,6 +172,8 @@ message VirtualHost {
   // As requested; they take effect only while a certificate is installed.
   bool redirect_https = 9;
   bool hsts = 10;
+  // The site is excluded from Automatic HTTPS (see GetAutoHttpsStatus).
+  bool auto_https_opt_out = 11;
 }
 
 enum AppRuntime {
@@ -216,6 +224,9 @@ message ConfigureVirtualHostRequest {
   // remember it for a year: enable it only once HTTPS is there to stay.
   // Takes effect only while a certificate is installed.
   bool hsts = 8;
+  // Exclude this site from Automatic HTTPS. Default (false): when Automatic
+  // HTTPS is on for the host, the site gets a certificate by itself.
+  bool auto_https_opt_out = 9;
 }
 
 message ConfigureVirtualHostResponse {
@@ -321,6 +332,8 @@ message HostInfo {
   bool acme_available = 21;
   // The ACME directory certificates are requested from.
   string acme_directory_url = 22;
+  // Automatic HTTPS is switched on for the host (OXPANEL_AUTO_HTTPS).
+  bool auto_https_enabled = 23;
 }
 
 message ReconcileRequest {}
@@ -359,6 +372,8 @@ enum DriftKind {
   DRIFT_KIND_TLS_CERTIFICATE_DRIFT = 14;
   // A file in the OxPanel certificate directory that no virtual host accounts for.
   DRIFT_KIND_ORPHAN_TLS_FILE = 15;
+  // Automatic HTTPS state kept for a virtual host that does not exist.
+  DRIFT_KIND_ORPHAN_AUTO_HTTPS_STATE = 16;
 }
 
 message Drift {
@@ -485,4 +500,65 @@ message CertificateRenewal {
 message RenewCertificatesResponse {
   // One entry per certificate that was due; empty when none was.
   repeated CertificateRenewal renewals = 1;
+}
+
+enum AutoHttpsState {
+  AUTO_HTTPS_STATE_UNSPECIFIED = 0;
+  // Off for the host, or the site opted out.
+  AUTO_HTTPS_STATE_DISABLED = 1;
+  // Names are waiting for their first attempt (or one is running).
+  AUTO_HTTPS_STATE_PENDING = 2;
+  // Every name of the site is covered by an automatic certificate.
+  AUTO_HTTPS_STATE_COVERED = 3;
+  // The domain is covered; some aliases were skipped and are retried later.
+  AUTO_HTTPS_STATE_PARTIAL = 4;
+  // No certificate could be obtained yet; retried later (see next_attempt).
+  AUTO_HTTPS_STATE_FAILED = 5;
+  // The site has a valid uploaded certificate, which is never replaced.
+  AUTO_HTTPS_STATE_UPLOADED = 6;
+  // The tenant is suspended; nothing is requested until it is resumed.
+  AUTO_HTTPS_STATE_SUSPENDED = 7;
+}
+
+message AutoHttpsSkippedName {
+  string name = 1;
+  // Why, in plain words (e.g. "the name does not resolve").
+  string reason = 2;
+  google.protobuf.Timestamp next_attempt = 3;
+  // Consecutive failures; the wait grows 1 h, 6 h, then 24 h.
+  uint32 failures = 4;
+}
+
+message AutoHttpsStatus {
+  string domain = 1;
+  AutoHttpsState state = 2;
+  // Server names the current certificate covers.
+  repeated string covered_names = 3;
+  // Server names left out after failing, waiting for their next attempt.
+  repeated AutoHttpsSkippedName skipped = 4;
+  google.protobuf.Timestamp last_attempt = 5;
+  // Earliest time anything will be tried again; absent if nothing is waiting.
+  google.protobuf.Timestamp next_attempt = 6;
+  // What went wrong last time, in plain words; empty after a success.
+  string last_error = 7;
+  // Server names not covered yet and not backing off: tried at the next run.
+  repeated string pending_names = 8;
+}
+
+message RunAutoHttpsRequest {
+  // Empty: every site.
+  string domain = 1;
+}
+
+message RunAutoHttpsResponse {
+  repeated AutoHttpsStatus sites = 1;
+}
+
+message GetAutoHttpsStatusRequest {
+  // Empty: every site.
+  string domain = 1;
+}
+
+message GetAutoHttpsStatusResponse {
+  repeated AutoHttpsStatus sites = 1;
 }

@@ -22,7 +22,6 @@
 //! The certificate is not part of `ConfigureVirtualHost`: reconfiguring a site
 //! keeps it, removing the site removes it.
 
-use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -475,53 +474,56 @@ fn restore_file(path: &Path, previous: Option<&[u8]>, mode: u32) -> Result<()> {
     }
 }
 
-/// Domains a certificate is being requested for right now. Clones of a
-/// [`TlsService`] share it.
-type InFlight = Arc<std::sync::Mutex<BTreeSet<String>>>;
+/// One lock per site: requests for one site (by hand, by Automatic HTTPS or
+/// by renewal) run one after the other, since they would overwrite each
+/// other's pending key. Clones of a [`TlsService`] share them.
+type SiteLocks =
+    Arc<std::sync::Mutex<std::collections::BTreeMap<String, Arc<tokio::sync::Mutex<()>>>>>;
 
-/// Marks a domain as busy until dropped.
-struct InFlightGuard {
-    set: InFlight,
-    domain: String,
-}
-
-impl InFlightGuard {
-    /// `None` when a request for `domain` is already running.
-    fn claim(set: &InFlight, domain: &Domain) -> Option<Self> {
-        let mut busy = set.lock().ok()?;
-        busy.insert(domain.to_string()).then(|| Self {
-            set: Arc::clone(set),
-            domain: domain.to_string(),
-        })
-    }
-}
-
-impl Drop for InFlightGuard {
-    fn drop(&mut self) {
-        if let Ok(mut busy) = self.set.lock() {
-            busy.remove(&self.domain);
-        }
-    }
-}
+/// At most this many conversations with the certificate authority (or
+/// reachability checks) run at the same time, whatever started them.
+pub const MAX_CONCURRENT_ORDERS: usize = 2;
 
 #[derive(Debug, Clone)]
 pub struct TlsService {
-    ctx: Ctx,
-    in_flight: InFlight,
+    pub(crate) ctx: Ctx,
+    sites: SiteLocks,
+    orders: Arc<tokio::sync::Semaphore>,
 }
 
 impl TlsService {
     pub fn new(ctx: Ctx) -> Self {
         Self {
             ctx,
-            in_flight: InFlight::default(),
+            sites: SiteLocks::default(),
+            orders: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_ORDERS)),
         }
+    }
+
+    /// Wait until no other certificate work runs for `domain`.
+    pub(crate) async fn site_lock(&self, domain: &Domain) -> tokio::sync::OwnedMutexGuard<()> {
+        let lock = {
+            let mut sites = self
+                .sites
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            Arc::clone(sites.entry(domain.to_string()).or_default())
+        };
+        lock.lock_owned().await
+    }
+
+    /// One of the [`MAX_CONCURRENT_ORDERS`] slots for talking to the outside.
+    pub(crate) async fn order_slot(&self) -> Result<tokio::sync::SemaphorePermit<'_>> {
+        self.orders
+            .acquire()
+            .await
+            .map_err(|_| Error::Internal("the certificate order queue is closed".into()))
     }
 
     /// The virtual host and its tenant, which must be ready. A suspended
     /// tenant qualifies: installing or removing a certificate is an
     /// operator's action and changes nothing the tenant can use meanwhile.
-    fn load(&self, domain: &Domain) -> Result<(TenantRecord, VHostRecord)> {
+    pub(crate) fn load(&self, domain: &Domain) -> Result<(TenantRecord, VHostRecord)> {
         let vhost = self
             .ctx
             .store
@@ -621,19 +623,33 @@ impl TlsService {
     /// touches nothing but its own directories.
     pub async fn request(&self, domain: &str) -> Result<AcmeOutcome> {
         let domain = Domain::parse(domain)?;
-        // Two requests for one site would overwrite each other's pending key.
-        let _busy = InFlightGuard::claim(&self.in_flight, &domain).ok_or_else(|| {
-            Error::AcmeUnavailable(format!(
-                "a certificate request for {domain} is already running"
-            ))
-        })?;
+        let _site = self.site_lock(&domain).await;
+        self.order(&domain, None).await
+    }
+
+    /// Order a certificate for `names` (default: the domain and every alias)
+    /// and install it. The caller holds the site's lock.
+    pub(crate) async fn order(
+        &self,
+        domain: &Domain,
+        names: Option<&[Domain]>,
+    ) -> Result<AcmeOutcome> {
+        let domain = domain.clone();
         let names = {
             let _guard = self.ctx.lock.lock().await;
             let (_, vhost) = self.load_active(&domain)?;
             acme::preflight(&self.ctx).await?;
-            acme::prepare(&self.ctx, &vhost).await?
+            let names = match names {
+                Some(n) => n.to_vec(),
+                None => acme::server_names(&vhost)?,
+            };
+            acme::prepare(&self.ctx, &domain, &names).await?;
+            names
         };
-        let ran = acme::run_client(&self.ctx, &domain, &names).await;
+        let ran = {
+            let _slot = self.order_slot().await?;
+            acme::run_client(&self.ctx, &domain, &names).await
+        };
 
         let _guard = self.ctx.lock.lock().await;
         let finished = match ran {
@@ -731,7 +747,13 @@ impl TlsService {
             .collect();
         let mut renewals = Vec::with_capacity(due.len());
         for domain in due {
-            let (succeeded, output) = match self.request(&domain).await {
+            // Sites under Automatic HTTPS renew through it: names that no
+            // longer validate are left out instead of failing the renewal.
+            let renewed = match Domain::parse(&domain) {
+                Ok(d) if self.auto_https_applies(&d)? => self.auto_https_renew(&d).await,
+                _ => self.request(&domain).await,
+            };
+            let (succeeded, output) = match renewed {
                 Ok(outcome) => (outcome.succeeded, outcome.output),
                 Err(e) => {
                     warn!(%domain, error = %e, "certificate renewal failed");
@@ -905,7 +927,7 @@ pub(crate) fn remove_material(ctx: &Ctx, domain: &Domain) -> Result<()> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
     use super::*;
     use crate::config::Config;
@@ -919,30 +941,30 @@ mod tests {
 
     const DAY: u64 = 86_400;
 
-    struct Harness {
-        _dir: tempfile::TempDir,
-        sys: Arc<FakeSystem>,
-        ctx: Ctx,
-        tls: TlsService,
-        vhosts: VHostService,
-        tenants: TenantService,
+    pub(crate) struct Harness {
+        pub(crate) _dir: tempfile::TempDir,
+        pub(crate) sys: Arc<FakeSystem>,
+        pub(crate) ctx: Ctx,
+        pub(crate) tls: TlsService,
+        pub(crate) vhosts: VHostService,
+        pub(crate) tenants: TenantService,
     }
 
     impl Harness {
-        fn cfg(&self) -> &Config {
+        pub(crate) fn cfg(&self) -> &Config {
             &self.ctx.config
         }
-        fn conf(&self, domain: &str) -> String {
+        pub(crate) fn conf(&self, domain: &str) -> String {
             let d = Domain::parse(domain).unwrap();
             std::fs::read_to_string(nginx::conf_path(&self.cfg().nginx_conf_dir, &d)).unwrap()
         }
-        fn cert_file(&self, domain: &str) -> PathBuf {
+        pub(crate) fn cert_file(&self, domain: &str) -> PathBuf {
             cert_path(&self.cfg().tls_dir, &Domain::parse(domain).unwrap())
         }
-        fn key_file(&self, domain: &str) -> PathBuf {
+        pub(crate) fn key_file(&self, domain: &str) -> PathBuf {
             key_path(&self.cfg().tls_dir, &Domain::parse(domain).unwrap())
         }
-        fn record(&self, domain: &str) -> VHostRecord {
+        pub(crate) fn record(&self, domain: &str) -> VHostRecord {
             self.ctx
                 .store
                 .load_vhost(&Domain::parse(domain).unwrap())
@@ -951,7 +973,12 @@ mod tests {
         }
     }
 
-    async fn harness() -> Harness {
+    pub(crate) async fn harness() -> Harness {
+        harness_with(|_| {}).await
+    }
+
+    /// The harness with `adjust` applied to the configuration.
+    pub(crate) async fn harness_with(adjust: impl FnOnce(&mut Config)) -> Harness {
         let dir = tempfile::tempdir().unwrap();
         let p = dir.path();
         let mut cfg = Config::default();
@@ -964,6 +991,7 @@ mod tests {
         cfg.nginx_include_file = p.join("nginx").join("conf.d").join("00-oxpanel.conf");
         cfg.tls_dir = p.join("pki");
         cfg.acme_dir = p.join("acme");
+        adjust(&mut cfg);
         for d in [
             cfg.home_base.clone(),
             cfg.systemd_unit_dir.clone(),
@@ -1011,7 +1039,26 @@ mod tests {
         }
     }
 
-    fn upload(chain: &str, key: &str) -> CertificateUpload {
+    /// A virtual-host record that exists only in memory.
+    pub(crate) fn bare_vhost(domain: &str, aliases: &[&str]) -> VHostRecord {
+        VHostRecord {
+            version: crate::records::RECORD_VERSION,
+            domain: domain.into(),
+            tenant: "alice".into(),
+            document_root: "public_html".into(),
+            aliases: aliases.iter().map(|a| (*a).to_owned()).collect(),
+            config_path: PathBuf::from("/x.conf"),
+            created_at_unix: 0,
+            php: false,
+            app: None,
+            redirect_https: false,
+            hsts: false,
+            tls: None,
+            auto_https: crate::records::AutoHttpsChoice::On,
+        }
+    }
+
+    pub(crate) fn upload(chain: &str, key: &str) -> CertificateUpload {
         CertificateUpload {
             domain: "example.com".into(),
             chain_pem: chain.into(),
@@ -1020,7 +1067,7 @@ mod tests {
     }
 
     /// A certificate for key `k1`, valid now, for example.com and www.
-    fn good_cert() -> String {
+    pub(crate) fn good_cert() -> String {
         let now = now_unix();
         fake_certificate(
             "k1",
@@ -1031,19 +1078,19 @@ mod tests {
         )
     }
 
-    fn args(c: &CommandSpec) -> Vec<String> {
+    pub(crate) fn args(c: &CommandSpec) -> Vec<String> {
         c.args
             .iter()
             .map(|a| a.to_string_lossy().into_owned())
             .collect()
     }
 
-    fn mode(p: &Path) -> u32 {
+    pub(crate) fn mode(p: &Path) -> u32 {
         std::fs::metadata(p).unwrap().permissions().mode() & 0o777
     }
 
     /// No command line may ever carry key material.
-    fn assert_no_key_in_argv(h: &Harness) {
+    pub(crate) fn assert_no_key_in_argv(h: &Harness) {
         for c in h.sys.calls() {
             for a in args(&c) {
                 assert!(!a.contains("PRIVATE KEY"), "key material in argv: {a}");

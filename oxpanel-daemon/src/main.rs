@@ -201,6 +201,7 @@ async fn run(cli: Cli) -> Result<(), Fatal> {
     let incoming = auth::gate(listener, policy, ctx.sys.clone());
     let engine = Engine::new(ctx.clone());
     tokio::spawn(renew_certificates_periodically(engine.tls()));
+    tokio::spawn(auto_https_periodically(engine.tls()));
 
     let shutdown = async {
         let mut term =
@@ -264,6 +265,20 @@ async fn renew_certificates_periodically(tls: TlsService) {
             Err(e) => warn!(error = %e, "could not check certificates for renewal"),
         }
         tokio::time::sleep(EVERY).await;
+    }
+}
+
+/// Automatic HTTPS: a minute after start-up and then every 15 minutes, give
+/// every site that needs one a certificate (back-off decides what is retried).
+async fn auto_https_periodically(tls: TlsService) {
+    if !tls.auto_https_enabled() {
+        info!("automatic HTTPS is off (OXPANEL_AUTO_HTTPS=false)");
+        return;
+    }
+    tokio::time::sleep(oxpanel_daemon::auto_https::FIRST_SWEEP_AFTER).await;
+    loop {
+        tls.auto_https_sweep().await;
+        tokio::time::sleep(oxpanel_daemon::auto_https::SWEEP_EVERY).await;
     }
 }
 

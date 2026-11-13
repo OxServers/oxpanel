@@ -73,6 +73,12 @@ pub struct Config {
     pub acme_email: Option<String>,
     /// ACME certificates are renewed once they expire within this time.
     pub acme_renew_before: Duration,
+    /// Root-only file with the External Account Binding (`kid=`, `hmac_key=`)
+    /// some certificate authorities require. Handed to the ACME client as a
+    /// systemd credential, never as an argument.
+    pub acme_eab_file: Option<PathBuf>,
+    /// Automatic HTTPS: obtain certificates for sites without being asked.
+    pub auto_https: crate::records::AutoHttpsChoice,
 }
 
 /// Let's Encrypt's production directory.
@@ -107,6 +113,9 @@ impl Default for Config {
             acme_ca_file: None,
             acme_email: None,
             acme_renew_before: Duration::from_secs(30 * 86_400),
+            acme_eab_file: None,
+            // A new site gets HTTPS by itself (the owner's intent).
+            auto_https: crate::records::AutoHttpsChoice::On,
         }
     }
 }
@@ -221,6 +230,16 @@ impl Config {
             let v = v.trim();
             self.acme_email = (!v.is_empty()).then(|| v.to_owned());
         }
+        if let Some(v) = get("OXPANEL_ACME_EAB_FILE") {
+            let v = v.trim();
+            self.acme_eab_file = (!v.is_empty()).then(|| PathBuf::from(v));
+        }
+        if let Some(v) = get("OXPANEL_AUTO_HTTPS") {
+            self.auto_https = crate::records::AutoHttpsChoice::from_opt_out(!parse_bool(
+                "OXPANEL_AUTO_HTTPS",
+                &v,
+            )?);
+        }
         if let Some(v) = get("OXPANEL_ACME_RENEW_DAYS") {
             let days = parse_u32("OXPANEL_ACME_RENEW_DAYS", &v)?;
             if !(1..=60).contains(&days) {
@@ -253,6 +272,9 @@ impl Config {
         }
         if let Some(p) = &self.acme_ca_file {
             check_path("OXPANEL_ACME_CA_FILE", p)?;
+        }
+        if let Some(p) = &self.acme_eab_file {
+            check_path("OXPANEL_ACME_EAB_FILE", p)?;
         }
         if let Some(email) = &self.acme_email {
             let ok = email.len() <= 254
@@ -536,6 +558,12 @@ mod tests {
         assert!(from(&[("OXPANEL_ACME_EMAIL", "ops@example.com --evil")]).is_err());
         assert!(from(&[("OXPANEL_ACME_CA_FILE", "/etc/pki/my ca.pem")]).is_err());
         assert!(from(&[("OXPANEL_ACME_RENEW_DAYS", "0")]).is_err());
+        assert!(from(&[]).is_ok_and(|c| c.auto_https.is_on() && c.acme_eab_file.is_none()));
+        assert!(from(&[("OXPANEL_AUTO_HTTPS", "false")]).is_ok_and(|c| !c.auto_https.is_on()));
+        assert!(from(&[("OXPANEL_AUTO_HTTPS", "sometimes")]).is_err());
+        assert!(from(&[("OXPANEL_ACME_EAB_FILE", "/etc/oxpanel/acme-eab")])
+            .is_ok_and(|c| c.acme_eab_file.as_deref() == Some(Path::new("/etc/oxpanel/acme-eab"))));
+        assert!(from(&[("OXPANEL_ACME_EAB_FILE", "/etc/oxpanel/acme eab")]).is_err());
         assert!(from(&[("OXPANEL_TLS_DIR", "/var/lib/oxpanel-acme/keys")]).is_err());
         assert!(from(&[
             ("OXPANEL_NGINX_CONF_DIR", "/etc/nginx/conf.d"),

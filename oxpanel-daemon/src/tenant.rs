@@ -753,6 +753,7 @@ mod tests {
             redirect_https: false,
             hsts: false,
             tls: None,
+            auto_https: crate::records::AutoHttpsChoice::On,
         })?;
         assert!(matches!(
             h.svc.delete("alice", false).await,

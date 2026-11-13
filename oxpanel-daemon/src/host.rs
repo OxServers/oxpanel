@@ -39,6 +39,7 @@ pub enum DriftKind {
     OrphanAppUnit,
     TlsCertificateDrift,
     OrphanTlsFile,
+    OrphanAutoHttpsState,
 }
 
 /// One difference between a record and the operating system.
@@ -417,6 +418,20 @@ fn check_tls(cfg: &Config, vhosts: &[VHostRecord], out: &mut Vec<Drift>) -> Resu
         known.insert(cert);
         known.insert(key);
     }
+    let sites: BTreeSet<PathBuf> = vhosts
+        .iter()
+        .filter_map(|v| Domain::parse(&v.domain).ok())
+        .map(|d| crate::auto_https::state_path(cfg, &d))
+        .collect();
+    for path in crate::auto_https::state_files(cfg)? {
+        if !sites.contains(&path) {
+            out.push(Drift::new(
+                DriftKind::OrphanAutoHttpsState,
+                path.to_string_lossy(),
+                "Automatic HTTPS state of a virtual host that does not exist",
+            ));
+        }
+    }
     for path in fsutil::list_files_with_suffix(&cfg.tls_dir, "")? {
         if !known.contains(&path) {
             out.push(Drift::new(
@@ -621,6 +636,7 @@ mod tests {
             redirect_https: false,
             hsts: false,
             tls: None,
+            auto_https: crate::records::AutoHttpsChoice::On,
         };
         h.ctx.store.save_vhost(&orphan_site)?;
 

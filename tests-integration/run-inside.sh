@@ -555,7 +555,92 @@ JSON
   check "ACME: a failed request installs nothing" bash -c 'test ! -e /etc/pki/oxpanel/unreachable.test.crt && ! ls /etc/pki/oxpanel/*.pending >/dev/null 2>&1 && grep -q "certificate=-" <(oxpanel-ctl cert show unreachable.test)'
   oxpanel-ctl vhost remove unreachable.test >/dev/null
   check "ACME: removing the site removes the certificate" bash -c 'oxpanel-ctl vhost remove acme.test | grep -q "^removed=true" && test ! -e /etc/pki/oxpanel/acme.test.key'
+
+  echo "-- Automatic HTTPS (no request at all)"
+  # cert_names_eventually <domain> <names> [seconds]: an ACME certificate for exactly these names appears.
+  cert_names_eventually() { local i; for i in $(seq 1 $(( ${3:-60} * 2 ))); do oxpanel-ctl cert show "$1" 2>/dev/null | grep -q " source=acme .* names=$2 " && return 0; sleep 0.5; done; oxpanel-ctl cert show "$1"; oxpanel-ctl cert auto status "$1"; return 1; }
+  auto_status_eventually() { local i; for i in $(seq 1 120); do oxpanel-ctl cert auto status "$1" | grep -q "$2" && return 0; sleep 0.5; done; oxpanel-ctl cert auto status "$1"; return 1; }
+  check "Automatic HTTPS is on by default" grep -q ' auto_https=true$' <(oxpanel-ctl host info)
+  echo "127.0.0.1 auto.test www.auto.test new.auto.test optout.test susp.test off.test" >> /etc/hosts
+  oxpanel-ctl vhost set auto.test --tenant alice --alias www.auto.test >/dev/null
+  check "a new site gets a certificate with no request at all" cert_names_eventually auto.test "auto.test,www.auto.test"
+  check "... and is served over HTTPS with it" https_eventually auto.test / "$T/pebble-root.pem" hello-from-alice
+  check "status: covered" auto_status_eventually auto.test '^domain=auto.test auto_https=covered covered=auto.test,www.auto.test pending=- skipped=- '
+  check "no probe file is left in the challenge directory" test -z "$(find /var/lib/oxpanel-acme/challenges -mindepth 1)"
+  oxpanel-ctl vhost set auto.test --tenant alice --alias www.auto.test --alias new.auto.test >/dev/null
+  check "an alias added later gets covered" cert_names_eventually auto.test "auto.test,new.auto.test,www.auto.test"
+  oxpanel-ctl vhost set auto.test --tenant alice --alias www.auto.test --alias new.auto.test --alias nx.auto.test >/dev/null
+  check "a name that does not resolve is skipped, the rest stays covered" auto_status_eventually auto.test '^domain=auto.test auto_https=partial covered=auto.test,new.auto.test,www.auto.test pending=- skipped=nx.auto.test '
+  st="$(oxpanel-ctl cert auto status auto.test)"; echo "$st"
+  check "the reason is given in plain words" grep -q '^  skipped name=nx.auto.test failures=1 next_attempt=[0-9]* reason=the name does not resolve$' <<<"$st"
+  next="$(sed -n 's/^  skipped name=nx.auto.test failures=1 next_attempt=\([0-9]*\) .*/\1/p' <<<"$st")"
+  check "the name backs off for about an hour" test "$(( next - $(date +%s) ))" -gt 3300
+  check "the certificate does not name the unresolvable alias (it is listed as uncovered)" bash -c 'oxpanel-ctl cert show auto.test | grep -q " names=auto.test,new.auto.test,www.auto.test uncovered=nx.auto.test "'
+  systemctl restart oxpanel-daemon
+  check "back-off survives a daemon restart" grep -q "^  skipped name=nx.auto.test failures=1 next_attempt=$next " <(oxpanel-ctl cert auto status auto.test)
+  oxpanel-ctl cert auto run >/dev/null || true
+  check "a run over every site respects the back-off" grep -q "^  skipped name=nx.auto.test failures=1 next_attempt=$next " <(oxpanel-ctl cert auto status auto.test)
+  oxpanel-ctl cert auto run auto.test >/dev/null || true
+  check "a run for the one site retries now, and backs off longer" grep -q '^  skipped name=nx.auto.test failures=2 ' <(oxpanel-ctl cert auto status auto.test)
+
+  oxpanel-ctl vhost set optout.test --tenant alice --no-auto-https >/dev/null
+  sleep 6
+  oxpanel-ctl cert auto run optout.test >/dev/null || true
+  check "a site that opted out gets nothing" bash -c 'grep -q "certificate=- auto_https=off" <(oxpanel-ctl cert show optout.test) && grep -q "^domain=optout.test auto_https=disabled " <(oxpanel-ctl cert auto status optout.test)'
+
+  oxpanel-ctl tenant create carol >/dev/null
+  oxpanel-ctl tenant suspend carol >/dev/null
+  oxpanel-ctl vhost set susp.test --tenant carol >/dev/null
+  sleep 6
+  oxpanel-ctl cert auto run susp.test >/dev/null || true
+  check "nothing is requested for a suspended tenant" bash -c 'grep -q "certificate=-" <(oxpanel-ctl cert show susp.test) && grep -q "^domain=susp.test auto_https=suspended " <(oxpanel-ctl cert auto status susp.test) && ! journalctl --no-pager -q -u oxpanel-acme-susp.test.service | grep -q .'
+  oxpanel-ctl tenant resume carol >/dev/null
+  check "after resume the site catches up by itself" cert_names_eventually susp.test "susp.test"
+
+  check "a valid uploaded certificate is left alone" bash -c 'oxpanel-ctl cert auto run example.test >/dev/null; grep -q " source=uploaded " <(oxpanel-ctl cert show example.test) && grep -q "^domain=example.test auto_https=uploaded " <(oxpanel-ctl cert auto status example.test)'
+
+  echo "OXPANEL_AUTO_HTTPS=false" >> /etc/oxpanel/daemon.env
+  systemctl restart oxpanel-daemon
+  check "the host-wide switch is reported" grep -q ' auto_https=false$' <(oxpanel-ctl host info)
+  oxpanel-ctl vhost set off.test --tenant alice >/dev/null
+  sleep 6
+  oxpanel-ctl cert auto run off.test >/dev/null || true
+  check "with the host-wide switch off nothing is requested" bash -c 'grep -q "certificate=-" <(oxpanel-ctl cert show off.test) && grep -q "^domain=off.test auto_https=disabled " <(oxpanel-ctl cert auto status off.test)'
+  sed -i '/^OXPANEL_AUTO_HTTPS=false$/d' /etc/oxpanel/daemon.env
+  systemctl restart oxpanel-daemon
+  check "switched back on, the waiting site is served" bash -c 'oxpanel-ctl cert auto run off.test >/dev/null; grep -q " source=acme " <(oxpanel-ctl cert show off.test)'
+  check "Automatic HTTPS state is not drift" grep -q '^drifts=0$' <(oxpanel-ctl host reconcile)
+  for d in auto.test optout.test susp.test off.test; do oxpanel-ctl vhost remove "$d" >/dev/null; done
+  check "its state goes with the sites" bash -c 'test -z "$(find /var/lib/oxpanel/auto-https -name "auto.test.json" -o -name "susp.test.json" -o -name "off.test.json")"'
+  oxpanel-ctl tenant delete carol --remove-home >/dev/null
+
+  echo "-- External Account Binding (Pebble requiring it)"
   systemctl stop oxpanel-it-pebble
+  EAB_KEY="$(openssl rand 32 | base64 -w0 | tr '+/' '-_' | tr -d '=')"
+  cat > "$P/pebble-eab.json" <<JSON
+{"pebble": {"listenAddress": "127.0.0.1:14000", "managementListenAddress": "127.0.0.1:15000",
+  "certificate": "$P/pebble.crt", "privateKey": "$P/pebble.key", "httpPort": 80, "tlsPort": 5001,
+  "ocspResponderURL": "", "externalAccountBindingRequired": true,
+  "externalAccountMACKeys": {"oxpanel-it-kid": "$EAB_KEY"}}}
+JSON
+  systemd-run --unit=oxpanel-it-pebble-eab --collect --setenv=PEBBLE_VA_NOSLEEP=1 "$PEBBLE" -config "$P/pebble-eab.json" >/dev/null
+  check "Pebble (EAB required) is up" bash -c 'for i in $(seq 1 100); do curl -sf --cacert "$1" https://localhost:14000/dir >/dev/null && exit 0; sleep 0.1; done; exit 1' _ "$P/ca.crt"
+  echo "127.0.0.1 eab.test" >> /etc/hosts
+  oxpanel-ctl vhost set eab.test --tenant alice --no-auto-https >/dev/null
+  code_eventually eab.test / 200 || true
+  check "EAB: without a binding the CA refuses" bash -c 'oxpanel-ctl cert request eab.test > /root/eab.out 2>&1; grep -q "^succeeded=false" /root/eab.out && grep -qi "externalAccountBinding" /root/eab.out'
+  printf 'kid=oxpanel-it-kid\nhmac_key=%s\n' "$EAB_KEY" > /etc/oxpanel/acme-eab
+  chmod 0644 /etc/oxpanel/acme-eab
+  echo "OXPANEL_ACME_EAB_FILE=/etc/oxpanel/acme-eab" >> /etc/oxpanel/daemon.env
+  systemctl restart oxpanel-daemon
+  check "EAB: a binding file others can read is refused" grep -q 'FailedPrecondition.*readable by root only' <(oxpanel-ctl cert request eab.test 2>&1 || true)
+  chmod 0600 /etc/oxpanel/acme-eab
+  out="$(oxpanel-ctl cert request eab.test || true)"; echo "$out" | tail -4
+  check "EAB: with the binding the certificate is issued" bash -c 'grep -q "^succeeded=true" <<<"$1" && grep -q " source=acme " <<<"$1" && grep -q "binding the account to an external account" <<<"$1"' _ "$out"
+  check "EAB: the HMAC key never reached the journal or a command line" bash -c '! journalctl --no-pager -b | grep -qF "$1"' _ "$EAB_KEY"
+  oxpanel-ctl vhost remove eab.test >/dev/null
+  systemctl stop oxpanel-it-pebble-eab
+  rm -f /etc/oxpanel/acme-eab
   cp -p "$T/hosts.bak" /etc/hosts
   cp -p "$T/daemon.env.bak" /etc/oxpanel/daemon.env
   systemctl restart oxpanel-daemon

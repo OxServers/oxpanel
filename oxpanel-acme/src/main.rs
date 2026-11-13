@@ -17,8 +17,21 @@
 //! against the operating system's trust store, or against `--ca-file` for a
 //! private or test authority.
 //!
-//! Exit status 0 = the chain is in `--out`; anything else = no certificate,
-//! and the reason is on standard error (which systemd puts in the journal).
+//! External Account Binding (RFC 8555 §7.3.4, required by e.g. ZeroSSL and
+//! Google Trust Services): with `--eab`, the key id and HMAC key are read from
+//! the systemd credential `oxpanel-acme-eab` (`LoadCredential=`), so the
+//! secret is never an argument and never readable by anyone but this unit.
+//!
+//! `--mode precheck` asks no certificate authority at all: for every
+//! `--domain` it checks that the name resolves and that every address it
+//! resolves to serves a probe file published under the challenge path, the
+//! way the authority would fetch it. It writes one line per name to `--out`:
+//! `ok <name>` or `skip <name> <reason>`. The daemon orders only names that
+//! passed, so names that cannot validate do not burn the authority's limits.
+//!
+//! Exit status 0 = the chain (or the pre-check report) is in `--out`;
+//! anything else = no result, and the reason is on standard error (which
+//! systemd puts in the journal).
 // Its standard error *is* its interface: the daemon relays it to the caller.
 #![allow(clippy::print_stderr)]
 
@@ -47,11 +60,24 @@ const POLL_ATTEMPTS: u32 = 40;
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// How often a request refused for a stale nonce is repeated.
 const NONCE_RETRIES: u32 = 8;
-const USAGE: &str = "usage: oxpanel-acme --directory URL [--ca-file FILE] [--email ADDRESS] \
---account-dir DIR --challenge-dir DIR --csr FILE --out FILE --domain NAME [--domain NAME]...";
+const USAGE: &str = "usage: oxpanel-acme --directory URL [--ca-file FILE] [--email ADDRESS] [--eab] \
+--account-dir DIR --challenge-dir DIR --csr FILE --out FILE --domain NAME [--domain NAME]...\n\
+       oxpanel-acme --mode precheck --challenge-dir DIR --out FILE --domain NAME [--domain NAME]...";
+/// Name of the systemd credential holding the External Account Binding.
+const EAB_CREDENTIAL: &str = "oxpanel-acme-eab";
+/// The pre-check: connection and read limits, attempts per address.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const PROBE_ATTEMPTS: u32 = 3;
+const PROBE_RETRY: Duration = Duration::from_secs(2);
+const PROBE_MAX_ADDRESSES: usize = 4;
+const PROBE_MAX_RESPONSE: u64 = 16 * 1024;
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Args {
+    /// `--mode precheck`: check reachability only, ask no authority.
+    precheck: bool,
+    /// Bind the account to an external account (`--eab`).
+    eab: bool,
     directory: String,
     ca_file: Option<PathBuf>,
     email: Option<String>,
@@ -65,10 +91,15 @@ struct Args {
 fn parse_args(mut argv: impl Iterator<Item = String>) -> Res<Args> {
     let mut args = Args::default();
     while let Some(flag) = argv.next() {
+        if flag == "--eab" {
+            args.eab = true;
+            continue;
+        }
         let value = argv
             .next()
             .ok_or_else(|| format!("{flag} needs a value\n{USAGE}"))?;
         match flag.as_str() {
+            "--mode" if value == "precheck" => args.precheck = true,
             "--directory" => args.directory = value,
             "--ca-file" => args.ca_file = Some(value.into()),
             "--email" => args.email = Some(value),
@@ -80,18 +111,22 @@ fn parse_args(mut argv: impl Iterator<Item = String>) -> Res<Args> {
             _ => return Err(format!("unknown argument {flag}\n{USAGE}")),
         }
     }
+    let order = !args.precheck;
     let missing = [
-        ("--directory", args.directory.is_empty()),
-        ("--account-dir", args.account_dir.as_os_str().is_empty()),
+        ("--directory", order && args.directory.is_empty()),
+        (
+            "--account-dir",
+            order && args.account_dir.as_os_str().is_empty(),
+        ),
         ("--challenge-dir", args.challenge_dir.as_os_str().is_empty()),
-        ("--csr", args.csr.as_os_str().is_empty()),
+        ("--csr", order && args.csr.as_os_str().is_empty()),
         ("--out", args.out.as_os_str().is_empty()),
         ("--domain", args.domains.is_empty()),
     ];
     if let Some((flag, _)) = missing.iter().find(|(_, absent)| *absent) {
         return Err(format!("{flag} is required\n{USAGE}"));
     }
-    if !args.directory.starts_with("https://") {
+    if order && !args.directory.starts_with("https://") {
         return Err("--directory must be an https:// URL".into());
     }
     Ok(args)
@@ -222,6 +257,70 @@ impl Account {
             "signature": b64url(signature.as_ref()),
         })
         .to_string())
+    }
+}
+
+/// External Account Binding credentials (RFC 8555 §7.3.4).
+struct Eab {
+    kid: String,
+    /// The decoded HMAC key.
+    hmac_key: Vec<u8>,
+}
+
+impl Eab {
+    /// Parse `kid=<id>` and `hmac_key=<base64url>` lines (comments with `#`).
+    fn parse(text: &str) -> Res<Self> {
+        let mut kid = None;
+        let mut key = None;
+        for line in text.lines().map(str::trim) {
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            match line.split_once('=').map(|(k, v)| (k.trim(), v.trim())) {
+                Some(("kid", v)) if !v.is_empty() => kid = Some(v.to_owned()),
+                Some(("hmac_key", v)) if !v.is_empty() => key = Some(v.to_owned()),
+                // Never echo the line: it may be the key.
+                _ => {
+                    return Err(
+                        "the EAB credential has a line that is not kid=… or hmac_key=…".into(),
+                    )
+                }
+            }
+        }
+        let kid = kid.ok_or("the EAB credential has no kid")?;
+        let key = key.ok_or("the EAB credential has no hmac_key")?;
+        // Providers hand out base64url, with or without padding.
+        let hmac_key = URL_SAFE_NO_PAD
+            .decode(key.trim_end_matches('='))
+            .map_err(|_| "the EAB hmac_key is not base64url".to_owned())?;
+        if hmac_key.is_empty() {
+            return Err("the EAB hmac_key is empty".into());
+        }
+        Ok(Self { kid, hmac_key })
+    }
+
+    /// Read the credential systemd placed in `$CREDENTIALS_DIRECTORY`.
+    fn from_credential() -> Res<Self> {
+        let dir = std::env::var_os("CREDENTIALS_DIRECTORY")
+            .ok_or("--eab was given but the unit has no credentials")?;
+        let path = Path::new(&dir).join(EAB_CREDENTIAL);
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| format!("cannot read the EAB credential: {e}"))?;
+        Self::parse(&text)
+    }
+
+    /// The `externalAccountBinding` member of a newAccount request: a JWS
+    /// over the account's public key, signed with HMAC-SHA256.
+    fn binding(&self, jwk: &Value, new_account_url: &str) -> Value {
+        let protected = b64url(
+            json!({"alg": "HS256", "kid": self.kid, "url": new_account_url})
+                .to_string()
+                .as_bytes(),
+        );
+        let payload = b64url(jwk.to_string().as_bytes());
+        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &self.hmac_key);
+        let tag = ring::hmac::sign(&key, format!("{protected}.{payload}").as_bytes());
+        json!({"protected": protected, "payload": payload, "signature": b64url(tag.as_ref())})
     }
 }
 
@@ -428,6 +527,11 @@ struct Challenges {
 impl Challenges {
     /// Publish `<token>.<thumbprint>` as `<dir>/<token>`.
     fn publish(&mut self, token: &str, thumbprint: &str) -> Res<()> {
+        self.publish_body(token, &format!("{token}.{thumbprint}"))
+    }
+
+    /// Publish `body` as `<dir>/<token>`.
+    fn publish_body(&mut self, token: &str, body: &str) -> Res<()> {
         if !valid_token(token) {
             return Err("the authority sent a challenge token that is not base64url".into());
         }
@@ -441,7 +545,7 @@ impl Challenges {
             .mode(0o644)
             .open(&path)
             .map_err(|e| format!("cannot create {}: {e}", path.display()))?;
-        file.write_all(format!("{token}.{thumbprint}").as_bytes())
+        file.write_all(body.as_bytes())
             .map_err(|e| format!("cannot write {}: {e}", path.display()))
     }
 }
@@ -524,6 +628,13 @@ fn run(args: &Args) -> Res<()> {
     if let (Some(email), Some(r)) = (&args.email, registration.as_object_mut()) {
         r.insert("contact".into(), json!([format!("mailto:{email}")]));
     }
+    if args.eab {
+        let binding = Eab::from_credential()?.binding(&client.account.jwk, &new_account);
+        if let Some(r) = registration.as_object_mut() {
+            r.insert("externalAccountBinding".into(), binding);
+        }
+        eprintln!("binding the account to an external account");
+    }
     let registered = client.post(&new_account, Some(&registration))?;
     client.kid = Some(
         registered
@@ -571,6 +682,115 @@ fn run(args: &Args) -> Res<()> {
     Ok(())
 }
 
+/// One HTTP/1.1 GET of `path` from `addr` with `Host: host`, the way an ACME
+/// authority fetches an HTTP-01 challenge. Returns the body of a 200 answer.
+fn fetch(addr: std::net::SocketAddr, host: &str, path: &str) -> Res<String> {
+    use std::io::Read as _;
+    let mut stream = std::net::TcpStream::connect_timeout(&addr, PROBE_TIMEOUT)
+        .map_err(|e| format!("{addr}: cannot connect to port 80 ({e})"))?;
+    stream
+        .set_read_timeout(Some(PROBE_TIMEOUT))
+        .and_then(|()| stream.set_write_timeout(Some(PROBE_TIMEOUT)))
+        .map_err(|e| format!("{addr}: {e}"))?;
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: {host}\r\nUser-Agent: oxpanel-acme/{}\r\nAccept: */*\r\nConnection: close\r\n\r\n",
+        env!("CARGO_PKG_VERSION")
+    );
+    stream
+        .write_all(request.as_bytes())
+        .map_err(|e| format!("{addr}: {e}"))?;
+    let mut raw = Vec::new();
+    stream
+        .take(PROBE_MAX_RESPONSE)
+        .read_to_end(&mut raw)
+        .map_err(|e| format!("{addr}: no complete answer ({e})"))?;
+    let text = String::from_utf8_lossy(&raw);
+    let (head, body) = text
+        .split_once("\r\n\r\n")
+        .ok_or_else(|| format!("{addr}: the answer is not HTTP"))?;
+    let status = head.lines().next().unwrap_or_default();
+    if status.split_whitespace().nth(1) != Some("200") {
+        let shown: String = status
+            .chars()
+            .filter(|c| !c.is_control())
+            .take(80)
+            .collect();
+        return Err(format!(
+            "{addr}: answered \"{shown}\" instead of the probe file"
+        ));
+    }
+    Ok(body.to_owned())
+}
+
+/// Whether `name` would pass HTTP-01: it resolves, and every address it
+/// resolves to serves `body` at `path` (a few attempts each, so a web server
+/// that is still reloading is not taken for a broken one).
+fn probe(name: &str, path: &str, body: &str) -> Res<()> {
+    use std::net::ToSocketAddrs as _;
+    let mut addrs: Vec<std::net::SocketAddr> = (name, 80)
+        .to_socket_addrs()
+        .map_err(|_| "the name does not resolve".to_owned())?
+        .collect();
+    addrs.sort();
+    addrs.dedup();
+    addrs.truncate(PROBE_MAX_ADDRESSES);
+    if addrs.is_empty() {
+        return Err("the name does not resolve".into());
+    }
+    for addr in addrs {
+        let mut last = String::new();
+        for attempt in 0..PROBE_ATTEMPTS {
+            if attempt > 0 {
+                std::thread::sleep(PROBE_RETRY);
+            }
+            match fetch(addr, name, path) {
+                Ok(got) if got.trim_end() == body => {
+                    last.clear();
+                    break;
+                }
+                Ok(_) => {
+                    last = format!("{addr}: serves something else than this server's probe (does the name point at another server?)");
+                }
+                Err(e) => last = e,
+            }
+        }
+        if !last.is_empty() {
+            return Err(last);
+        }
+    }
+    Ok(())
+}
+
+/// `--mode precheck`: one report line per name in `--out`.
+fn precheck(args: &Args) -> Res<()> {
+    let mut random = [0u8; 24];
+    ring::rand::SecureRandom::fill(&SystemRandom::new(), &mut random)
+        .map_err(|_| "no randomness".to_owned())?;
+    let token = format!("oxpanel-probe-{}", b64url(&random));
+    let body = format!("oxpanel-acme probe {}", b64url(&random));
+    let mut challenges = Challenges {
+        dir: args.challenge_dir.clone(),
+        tokens: Vec::new(),
+    };
+    challenges.publish_body(&token, &body)?;
+    let path = format!("/.well-known/acme-challenge/{token}");
+    let mut report = String::new();
+    for name in &args.domains {
+        match probe(name, &path, &body) {
+            Ok(()) => {
+                eprintln!("{name}: reachable");
+                let _ = writeln!(report, "ok {name}");
+            }
+            Err(why) => {
+                eprintln!("{name}: skipped: {why}");
+                let _ = writeln!(report, "skip {name} {why}");
+            }
+        }
+    }
+    drop(challenges);
+    deliver(&args.out, &report)
+}
+
 fn main() -> ExitCode {
     let args = match parse_args(std::env::args().skip(1)) {
         Ok(args) => args,
@@ -579,8 +799,17 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    match run(&args) {
+    let result = if args.precheck {
+        precheck(&args)
+    } else {
+        run(&args)
+    };
+    match result {
         Ok(()) => ExitCode::SUCCESS,
+        Err(e) if args.precheck => {
+            eprintln!("pre-check failed: {e}");
+            ExitCode::FAILURE
+        }
         Err(e) => {
             eprintln!("no certificate: {e}");
             ExitCode::FAILURE
@@ -590,7 +819,7 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::panic)]
+    #![allow(clippy::unwrap_used, clippy::panic, clippy::indexing_slicing)]
     use super::*;
     use ring::signature::{UnparsedPublicKey, ECDSA_P256_SHA256_FIXED};
 
@@ -720,6 +949,132 @@ mod tests {
         assert_eq!(text(&header, "kid"), Some("https://ca.example/acct/7"));
         assert!(header.get("jwk").is_none());
         assert_eq!(text(&jws, "payload"), Some(""));
+    }
+
+    #[test]
+    fn precheck_mode_needs_no_authority() {
+        let a = parse_args(argv(
+            "--mode precheck --challenge-dir /c --out /o --domain example.com --domain www.example.com",
+        ))
+        .unwrap();
+        assert!(a.precheck && !a.eab);
+        assert_eq!(a.domains.len(), 2);
+        assert!(parse_args(argv("--mode precheck --out /o --domain x.test")).is_err());
+        assert!(parse_args(argv(
+            "--mode bogus --challenge-dir /c --out /o --domain x.test"
+        ))
+        .is_err());
+        let a = parse_args(argv(
+            "--directory https://ca.example/dir --eab --account-dir /a --challenge-dir /c --csr /r --out /o --domain x.test",
+        ))
+        .unwrap();
+        assert!(a.eab && !a.precheck);
+    }
+
+    #[test]
+    fn eab_credentials_are_parsed_without_echoing_secrets() {
+        let e = Eab::parse("# from the provider\nkid=kid-1\nhmac_key=AAEC_w==\n").unwrap();
+        assert_eq!(e.kid, "kid-1");
+        assert_eq!(e.hmac_key, vec![0, 1, 2, 0xff]);
+        for bad in [
+            "kid=k",
+            "hmac_key=AAEC",
+            "kid=k\nhmac_key=!!!",
+            "kid=k\nhmac_key=AAEC\nsecret-line",
+        ] {
+            let err = Eab::parse(bad).err().unwrap();
+            assert!(
+                !err.contains("secret-line") && !err.contains("AAEC"),
+                "{err}"
+            );
+        }
+    }
+
+    /// RFC 4231 test case 2: HMAC-SHA256 with key "Jefe" over
+    /// "what do ya want for nothing?". Our binding must be exactly that MAC
+    /// over `protected.payload`.
+    #[test]
+    fn eab_binding_is_an_hs256_jws_over_the_account_key() {
+        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, b"Jefe");
+        assert_eq!(
+            ring::hmac::sign(&key, b"what do ya want for nothing?")
+                .as_ref()
+                .iter()
+                .fold(String::new(), |mut s, b| {
+                    let _ = write!(s, "{b:02x}");
+                    s
+                }),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+        let eab = Eab {
+            kid: "kid-1".into(),
+            hmac_key: b"Jefe".to_vec(),
+        };
+        let jwk = json!({"crv": "P-256", "kty": "EC", "x": "AA", "y": "BB"});
+        let b = eab.binding(&jwk, "https://ca.example/new-acct");
+        let protected = text(&b, "protected").unwrap();
+        let header: Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(protected).unwrap()).unwrap();
+        assert_eq!(
+            header,
+            json!({"alg": "HS256", "kid": "kid-1", "url": "https://ca.example/new-acct"})
+        );
+        let payload = text(&b, "payload").unwrap();
+        let inner: Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).unwrap()).unwrap();
+        assert_eq!(inner, jwk);
+        let signature = URL_SAFE_NO_PAD
+            .decode(text(&b, "signature").unwrap())
+            .unwrap();
+        ring::hmac::verify(
+            &key,
+            format!("{protected}.{payload}").as_bytes(),
+            &signature,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn the_probe_fetches_like_an_authority_and_compares_the_body() {
+        use std::io::{BufRead as _, BufReader};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || {
+            let mut seen = Vec::new();
+            for (i, stream) in listener.incoming().take(2).enumerate() {
+                let mut stream = stream.unwrap();
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut head = String::new();
+                loop {
+                    let mut line = String::new();
+                    reader.read_line(&mut line).unwrap();
+                    if line == "\r\n" || line.is_empty() {
+                        break;
+                    }
+                    head.push_str(&line);
+                }
+                seen.push(head);
+                let answer = if i == 0 {
+                    "HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nprobe"
+                } else {
+                    "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n"
+                };
+                stream.write_all(answer.as_bytes()).unwrap();
+            }
+            seen
+        });
+        assert_eq!(
+            fetch(addr, "example.com", "/.well-known/acme-challenge/t").unwrap(),
+            "probe"
+        );
+        let err = fetch(addr, "example.com", "/x").unwrap_err();
+        assert!(err.contains("404"), "{err}");
+        let seen = server.join().unwrap();
+        assert!(seen[0]
+            .starts_with("GET /.well-known/acme-challenge/t HTTP/1.1\r\nHost: example.com\r\n"));
+        assert!(probe("name.invalid", "/x", "y")
+            .unwrap_err()
+            .contains("does not resolve"));
     }
 
     #[test]

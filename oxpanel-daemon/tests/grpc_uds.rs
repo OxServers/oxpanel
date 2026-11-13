@@ -200,6 +200,7 @@ async fn full_tenant_and_vhost_lifecycle_over_uds() {
         .configure_virtual_host(pb::ConfigureVirtualHostRequest {
             redirect_https: false,
             hsts: false,
+            auto_https_opt_out: false,
             domain: "example.com".into(),
             tenant: "alice".into(),
             document_root: String::new(),
@@ -319,6 +320,7 @@ async fn validation_errors_surface_as_invalid_argument_with_message() {
         .configure_virtual_host(pb::ConfigureVirtualHostRequest {
             redirect_https: false,
             hsts: false,
+            auto_https_opt_out: false,
             domain: "not a domain".into(),
             tenant: "carol".into(),
             document_root: String::new(),
@@ -390,6 +392,7 @@ async fn management_rpcs_over_uds() {
         .configure_virtual_host(pb::ConfigureVirtualHostRequest {
             redirect_https: false,
             hsts: false,
+            auto_https_opt_out: false,
             domain: "example.com".into(),
             tenant: "alice".into(),
             document_root: String::new(),
@@ -607,6 +610,7 @@ async fn a_scoped_peer_can_only_call_its_scopes() {
         .configure_virtual_host(pb::ConfigureVirtualHostRequest {
             redirect_https: false,
             hsts: false,
+            auto_https_opt_out: false,
             domain: "example.com".into(),
             tenant: "alice".into(),
             document_root: String::new(),
@@ -739,9 +743,20 @@ async fn a_read_only_peer_cannot_touch_certificates() {
             .renew_certificates(pb::RenewCertificatesRequest {})
             .await
             .map(|_| ()),
+        client
+            .run_auto_https(pb::RunAutoHttpsRequest::default())
+            .await
+            .map(|_| ()),
     ];
     for r in denied {
         assert_eq!(r.expect_err("denied").code(), Code::PermissionDenied);
     }
+    // Reading the Automatic HTTPS status is a read.
+    let status = client
+        .get_auto_https_status(pb::GetAutoHttpsStatusRequest::default())
+        .await
+        .expect("status")
+        .into_inner();
+    assert!(status.sites.is_empty());
     assert!(srv.sys.calls().is_empty());
 }
