@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 # Phase 10 — install like a user. INSTALL=git follows docs/HANDBOOK.md §3.2 verbatim;
-# INSTALL=rpm installs the package built from the working tree.
+# INSTALL=rpm installs the package built from the working tree;
+# INSTALL=installer runs release/install.sh unattended on a host that has a firewall;
+# INSTALL=upgrade installs the OLD (0.1.0) RPM by hand, as its handbook said (phase 12 then upgrades).
 cd "$(dirname "$0")/.."; source phases/lib.sh
 INSTALL="${INSTALL:-git}"
 echo "== phase 10: install ($INSTALL)"
@@ -20,6 +22,41 @@ case "$INSTALL" in
     check "rpm -V is clean" rpm -V oxpanel-daemon
     check "unit shipped by the package" test -f /usr/lib/systemd/system/oxpanel-daemon.service
     check "enable and start services" systemctl enable --now nginx oxpanel-daemon
+    ;;
+  installer)
+    check "the release directory is intact (SHA256SUMS)" bash -c 'cd release && sha256sum -c --quiet SHA256SUMS'
+    # A host with a firewall: the installer must open 80/443 and must not disable it.
+    check "install firewalld and start it (a host that has a firewall)" bash -c 'dnf -y -q install firewalld && systemctl enable --now firewalld'
+    check "firewalld does not allow http before the installer runs" bash -c '! firewall-cmd --query-service=http'
+    out="$(bash release/install.sh --check 2>&1)"; echo "$out" | tail -5
+    check "--check runs the preflight only" bash -c 'echo "$1" | grep -q "RESULT: preflight ok"' _ "$out"
+    check "nothing was installed by --check" bash -c '! rpm -q oxpanel-daemon'
+    start=$(date +%s)
+    # Unattended, everything optional switched on: that is the widest run the rig can make.
+    bash release/install.sh --yes --quota --no-reboot --fail2ban --enable-epel > install-1.log 2>&1; rc=$?
+    echo "--- install-1.log ---"; cat install-1.log; echo "---------------------"
+    [ "$rc" = 0 ] || fail "install.sh exited $rc (see above)"
+    ok "install.sh --yes ran clean ($(( $(date +%s) - start ))s)"
+    check "the run reports success and that a reboot is needed for quotas" bash -c 'grep -q "^RESULT: ok changes=[1-9][0-9]* .*reboot_required=yes" install-1.log'
+    check "every stage ran" bash -c 'for s in preflight nodejs engine selinux nginx mariadb php panel daemon firewall fail2ban quota verify; do grep -q "^\[$s\]" install-1.log || { echo "stage $s missing"; exit 1; }; done'
+    check "the status file records the result" bash -c 'grep -qx "reboot_required=yes" /var/lib/oxpanel-installer/status && grep -qx "result=ok" /var/lib/oxpanel-installer/status'
+    check "the log file exists, root-only" test "$(stat -c %a /var/log/oxpanel-install.log)" = 600
+    # Idempotence: the second run changes nothing.
+    bash release/install.sh --yes --quota --no-reboot --fail2ban --enable-epel > install-2.log 2>&1; rc=$?
+    tail -25 install-2.log
+    [ "$rc" = 0 ] || fail "second install.sh run exited $rc"
+    check "the second run changes nothing" bash -c 'grep -q "^RESULT: ok changes=0 " install-2.log'
+    check "the second run says so in every stage" bash -c '! grep -q "changed:" install-2.log'
+    ;;
+  upgrade)
+    OLD=$(ls old-rpms/oxpanel-daemon-[0-9]*.el9.x86_64.rpm 2>/dev/null | grep -vE 'debuginfo|debugsource' | head -1)
+    [ -n "$OLD" ] || fail "no old RPM found in $(pwd)/old-rpms"
+    info "installing the OLD package $OLD the way its handbook said"
+    check "enable the Node.js 22 module stream" dnf -y -q module enable nodejs:22
+    check "dnf install of the old RPM" dnf -y -q install "./$OLD"
+    check "enable and start services" systemctl enable --now nginx oxpanel-daemon
+    check "the old engine is what is installed" bash -c "rpm -q --qf '%{VERSION}' oxpanel-daemon | grep -q '^0\.1\.'"
+    info "old version: $(oxpanel-daemon --version)"
     ;;
   git)
     handbook_block "### 3.2 " > install-from-git.sh
@@ -47,12 +84,22 @@ case "$INSTALL" in
   *) fail "unknown INSTALL=$INSTALL";;
 esac
 
-# Tenant databases are optional; set MariaDB up exactly as HANDBOOK §3.5 says.
-handbook_block "### 3.5 " > install-mariadb.sh
-[ -s install-mariadb.sh ] || fail "could not extract the §3.5 MariaDB block from HANDBOOK.md"
-if ! bash -e install-mariadb.sh > install-mariadb.log 2>&1; then tail -30 install-mariadb.log; fail "handbook §3.5 MariaDB block failed"; fi
-ok "handbook §3.5 MariaDB block ran clean"
-check "MariaDB is active" systemctl -q is-active mariadb
+# Tenant databases are optional; set MariaDB up exactly as HANDBOOK §3.5 says
+# (the installer did it itself, and phase 10 then checks the result is the same).
+if [ "$INSTALL" = upgrade ]; then
+  info "MariaDB comes with the upgrade (phase 12)"
+else
+  if [ "$INSTALL" != installer ]; then
+    handbook_block "### 3.5 " > install-mariadb.sh
+    [ -s install-mariadb.sh ] || fail "could not extract the §3.5 MariaDB block from HANDBOOK.md"
+    if ! bash -e install-mariadb.sh > install-mariadb.log 2>&1; then tail -30 install-mariadb.log; fail "handbook §3.5 MariaDB block failed"; fi
+    ok "handbook §3.5 MariaDB block ran clean"
+  fi
+  check "MariaDB is active" systemctl -q is-active mariadb
+  check "MariaDB has no anonymous accounts" bash -c '[ "$(mariadb --no-defaults -u root -N -B -e "SELECT COUNT(*) FROM mysql.global_priv WHERE User=\"\"")" = 0 ]'
+  check "MariaDB has no test database" bash -c '[ "$(mariadb --no-defaults -u root -N -B -e "SHOW DATABASES LIKE \"test\"")" = "" ]'
+  check "MariaDB has no network listener" bash -c '! ss -H -ltn | grep -Eq ":3306[[:space:]]"'
+fi
 
 check "oxpanel group exists" getent group oxpanel
 check "daemon.env is root-owned 0640" test "$(stat -c '%U %a' /etc/oxpanel/daemon.env)" = "root 640"

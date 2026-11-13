@@ -137,6 +137,10 @@ run_phase() { # <NN> → script name
   local n="$1" script rc=0
   case "$n" in
     10) run_remote 10-install "$INSTALL_TIMEOUT" "cd /root/acc && $(phase_env) bash phases/10-install.sh" || rc=$?;;
+    12) run_remote 12-upgrade "$PHASE_TIMEOUT" "cd /root/acc && $(phase_env) bash phases/12-upgrade.sh" || rc=$?;;
+    17) run_remote 17-installer-options "$PHASE_TIMEOUT" "cd /root/acc && $(phase_env) bash phases/17-installer-options.sh" || rc=$?;;
+    16) run_remote 16-fail2ban "$PHASE_TIMEOUT" "cd /root/acc && $(phase_env) bash phases/16-fail2ban.sh" || rc=$?;;
+    95) run_remote 95-uninstall "$PHASE_TIMEOUT" "cd /root/acc && $(phase_env) bash phases/95-uninstall.sh" || rc=$?;;
     15) run_remote 15-quota-pre "$PHASE_TIMEOUT" "cd /root/acc && $(phase_env) bash phases/15-quota-pre.sh" || rc=$?
         if [ "$rc" = 0 ]; then
           log "rebooting VM (disk quotas)"; vm_ssh 'systemctl reboot' >/dev/null 2>&1 || true; sleep 8
@@ -232,6 +236,16 @@ vm_scp "$WORK/tests-integration/run-inside.sh" "$WORK/docs/HANDBOOK.md" /root/ac
 if [ "$INSTALL" = rpm ]; then
   ls "$RPM_DIR"/oxpanel-daemon-*.rpm >/dev/null 2>&1 || die "no RPMs in $RPM_DIR (run make rpm)"
   vm_scp "$RPM_DIR"/oxpanel-daemon-*.rpm /root/acc/rpms/
+fi
+if [ "$INSTALL" = installer ] || [ "$INSTALL" = upgrade ]; then
+  [ -f "$WORK/dist/release/install.sh" ] || die "no dist/release (run make dist)"
+  vm_ssh 'mkdir -p /root/acc/release'
+  vm_scp "$WORK"/dist/release/. /root/acc/release/
+fi
+if [ "$INSTALL" = upgrade ]; then
+  ls "$WORK"/dist/old-rpms/oxpanel-daemon-[0-9]*.rpm >/dev/null 2>&1 || die "no old RPM in dist/old-rpms (make rpm-old)"
+  vm_ssh 'mkdir -p /root/acc/old-rpms'
+  vm_scp "$WORK"/dist/old-rpms/oxpanel-daemon-[0-9]*.rpm /root/acc/old-rpms/
 fi
 
 for p in $PHASES; do
