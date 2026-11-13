@@ -1371,3 +1371,468 @@ mod tests {
         }
     }
 }
+
+// --- File manager -------------------------------------------------------------
+
+/// Longest path inside a home the file manager accepts, in bytes (the
+/// kernel's `PATH_MAX` is 4096 for the whole path, the home included).
+pub const FILE_PATH_MAX: usize = 3072;
+/// Longest name of one entry, in bytes (the kernel's `NAME_MAX`).
+pub const FILE_NAME_MAX: usize = 255;
+/// Most components a path may have.
+pub const FILE_PATH_DEPTH_MAX: usize = 64;
+
+/// A path inside a tenant's home, relative to it: what every file-manager
+/// request names. `""` (or `"."`) is the home itself.
+///
+/// The text is a plain list of names separated by `/`: no leading `/`, no
+/// empty, `.` or `..` component, no NUL, at most [`FILE_PATH_MAX`] bytes and
+/// [`FILE_PATH_DEPTH_MAX`] components, each at most [`FILE_NAME_MAX`] bytes.
+/// Lexical confinement is only the first layer: the worker resolves every
+/// path with `openat2(RESOLVE_BENEATH)` from the home as the tenant, so a
+/// symlink cannot lead out either (see `files_worker.rs`).
+///
+/// A path that names something that already exists may contain any
+/// character the file system allows except NUL — names created over SFTP
+/// with control characters must be removable. A name the engine *creates*
+/// must pass [`check_new_name`].
+#[derive(
+    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
+#[serde(try_from = "String", into = "String")]
+pub struct FilePath(String);
+
+impl FilePath {
+    /// A path to something that may exist.
+    pub fn parse(raw: &str, field: &'static str) -> Result<Self> {
+        if raw.is_empty() || raw == "." {
+            return Ok(Self::home());
+        }
+        if raw.len() > FILE_PATH_MAX {
+            return Err(Error::invalid(
+                field,
+                format!("must be at most {FILE_PATH_MAX} bytes"),
+            ));
+        }
+        if raw.starts_with('/') {
+            return Err(Error::invalid(field, "must be relative to the home"));
+        }
+        let mut depth = 0;
+        for comp in raw.split('/') {
+            depth += 1;
+            if comp.is_empty() {
+                return Err(Error::invalid(
+                    field,
+                    "empty path component (double or trailing '/')",
+                ));
+            }
+            if comp == "." || comp == ".." {
+                return Err(Error::invalid(
+                    field,
+                    "'.' and '..' components are not allowed",
+                ));
+            }
+            if comp.len() > FILE_NAME_MAX {
+                return Err(Error::invalid(
+                    field,
+                    format!("a name may be at most {FILE_NAME_MAX} bytes"),
+                ));
+            }
+            if comp.contains('\0') {
+                return Err(Error::invalid(field, "contains a NUL character"));
+            }
+        }
+        if depth > FILE_PATH_DEPTH_MAX {
+            return Err(Error::invalid(
+                field,
+                format!("may have at most {FILE_PATH_DEPTH_MAX} components"),
+            ));
+        }
+        Ok(Self(raw.to_owned()))
+    }
+
+    /// A path whose last name the engine is going to create: as
+    /// [`Self::parse`], and the last component must pass [`check_new_name`].
+    /// The home itself is never new.
+    pub fn parse_new(raw: &str, field: &'static str) -> Result<Self> {
+        let path = Self::parse(raw, field)?;
+        match path.file_name() {
+            Some(name) => check_new_name(name, field).map(|()| path),
+            None => Err(Error::invalid(field, "must name an entry inside the home")),
+        }
+    }
+
+    /// The home itself.
+    pub fn home() -> Self {
+        Self(String::new())
+    }
+
+    pub fn is_home(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The path as the caller sees it: `.` for the home.
+    pub fn display(&self) -> &str {
+        if self.is_home() {
+            "."
+        } else {
+            &self.0
+        }
+    }
+
+    /// The last name, `None` for the home.
+    pub fn file_name(&self) -> Option<&str> {
+        if self.is_home() {
+            None
+        } else {
+            self.0.rsplit('/').next()
+        }
+    }
+
+    /// The directory holding this entry (the home for a top-level name and
+    /// for the home itself).
+    #[must_use]
+    pub fn parent(&self) -> Self {
+        match self.0.rsplit_once('/') {
+            Some((parent, _)) => Self(parent.to_owned()),
+            None => Self::home(),
+        }
+    }
+
+    /// `self/name`, validated like any other path.
+    pub fn join(&self, name: &str, field: &'static str) -> Result<Self> {
+        if self.is_home() {
+            Self::parse(name, field)
+        } else {
+            Self::parse(&format!("{}/{name}", self.0), field)
+        }
+    }
+
+    /// The names, outermost first (none for the home).
+    pub fn components(&self) -> impl Iterator<Item = &str> {
+        self.0.split('/').filter(|c| !c.is_empty())
+    }
+
+    /// Whether `other` is this path or below it, by name.
+    pub fn contains(&self, other: &Self) -> bool {
+        self.is_home() || other.0 == self.0 || other.0.starts_with(&format!("{}/", self.0))
+    }
+}
+
+impl TryFrom<String> for FilePath {
+    type Error = Error;
+    fn try_from(raw: String) -> Result<Self> {
+        Self::parse(&raw, "path")
+    }
+}
+
+impl From<FilePath> for String {
+    fn from(p: FilePath) -> Self {
+        p.0
+    }
+}
+
+impl fmt::Display for FilePath {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.display())
+    }
+}
+
+/// Characters a name the engine creates may not contain although they are
+/// printable in the narrow sense: invisible format and direction controls
+/// (a name like `invoice\u{202e}fdp.exe` displays as something it is not)
+/// and Unicode's other separators.
+fn is_hidden_char(c: char) -> bool {
+    matches!(c,
+        '\u{00AD}' | '\u{034F}' | '\u{061C}' | '\u{115F}' | '\u{1160}' | '\u{17B4}' | '\u{17B5}'
+        | '\u{180B}'..='\u{180F}' | '\u{200B}'..='\u{200F}' | '\u{2028}'..='\u{202E}'
+        | '\u{2060}'..='\u{206F}' | '\u{3164}' | '\u{FE00}'..='\u{FE0F}' | '\u{FEFF}'
+        | '\u{FFA0}' | '\u{FFF0}'..='\u{FFFF}' | '\u{E0000}'..='\u{E0FFF}')
+}
+
+/// A name the engine is about to create (upload, new folder, rename target,
+/// archive member): 1 to [`FILE_NAME_MAX`] bytes of visible characters —
+/// letters, digits, punctuation and symbols of any script — and the ASCII
+/// space, but not at either end; not `.` or `..`. Refused: `/`, NUL, every
+/// control character (newline, tab, escape, DEL, C1), other whitespace and
+/// invisible formatting characters. A leading `-` is allowed: names never
+/// reach an argument list (the worker gets them inside JSON on standard
+/// input and uses them only with `*at` system calls).
+pub fn check_new_name(name: &str, field: &'static str) -> Result<()> {
+    if name.is_empty() || name.len() > FILE_NAME_MAX {
+        return Err(Error::invalid(
+            field,
+            format!("a name must be 1 to {FILE_NAME_MAX} bytes long"),
+        ));
+    }
+    if name == "." || name == ".." {
+        return Err(Error::invalid(field, "'.' and '..' are not names"));
+    }
+    if name.starts_with(' ') || name.ends_with(' ') {
+        return Err(Error::invalid(
+            field,
+            "a name may not begin or end with a space",
+        ));
+    }
+    let visible = |c: char| {
+        c == ' ' || !(c.is_control() || c.is_whitespace() || is_hidden_char(c) || c == '/')
+    };
+    if !name.chars().all(visible) {
+        return Err(Error::invalid(
+            field,
+            "a new name may contain visible characters and spaces only (no '/', control, invisible or formatting characters)",
+        ));
+    }
+    Ok(())
+}
+
+/// Permission bits the file manager sets: `0` to `0775` — read, write and
+/// execute for the owner and the tenant's private group, read and execute
+/// for others. Never set-uid, set-gid or sticky, never world-writable. On a
+/// file or directory with an access-control list (a document root and what
+/// is created inside it) the group bits are the ACL *mask*, which can only
+/// narrow what the engine's `u:nginx:r-x` entry grants, never widen it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct FileMode(u32);
+
+/// The bits [`FileMode`] may contain.
+pub const FILE_MODE_ALLOWED: u32 = 0o775;
+
+impl FileMode {
+    pub fn parse(raw: u32, field: &'static str) -> Result<Self> {
+        if raw & !0o7777 != 0 {
+            return Err(Error::invalid(
+                field,
+                "must be a permission mode (0 to 0775)",
+            ));
+        }
+        if raw & 0o7000 != 0 {
+            return Err(Error::invalid(
+                field,
+                "set-uid, set-gid and sticky bits are not offered",
+            ));
+        }
+        if raw & 0o002 != 0 {
+            return Err(Error::invalid(
+                field,
+                "world-writable modes are not offered",
+            ));
+        }
+        Ok(Self(raw))
+    }
+
+    pub fn bits(self) -> u32 {
+        self.0
+    }
+}
+
+/// A file-manager job identifier: `^f[0-9]{10,20}$`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct FileJobId(String);
+
+impl FileJobId {
+    pub fn parse(raw: &str) -> Result<Self> {
+        parse_id(raw, 'f', "job_id").map(Self)
+    }
+
+    pub fn from_millis(unix_millis: u128) -> Self {
+        Self(format!("f{unix_millis:013}"))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for FileJobId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// An upload identifier: `^u[0-9]{10,20}$`. It also names the partial file
+/// (`.oxpanel-upload-<id>`) next to the upload's target.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct UploadId(String);
+
+impl UploadId {
+    pub fn parse(raw: &str) -> Result<Self> {
+        parse_id(raw, 'u', "upload_id").map(Self)
+    }
+
+    pub fn from_millis(unix_millis: u128) -> Self {
+        Self(format!("u{unix_millis:013}"))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The partial file's name.
+    pub fn partial_name(&self) -> String {
+        format!(".oxpanel-upload-{}", self.0)
+    }
+}
+
+impl fmt::Display for UploadId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+#[cfg(test)]
+mod file_tests {
+    use super::*;
+
+    #[test]
+    fn file_paths_are_relative_plain_and_bounded() -> Result<()> {
+        assert!(FilePath::parse("", "path")?.is_home());
+        assert!(FilePath::parse(".", "path")?.is_home());
+        for ok in [
+            "public_html",
+            "public_html/index.php",
+            "-rf",
+            "a b/c d.txt",
+            "dir/--help",
+            "Ünïcödé/日本語.txt",
+            "line\nbreak",
+            "tab\there",
+            ".hidden/.x",
+            "...",
+        ] {
+            assert_eq!(FilePath::parse(ok, "path")?.as_str(), ok);
+        }
+        let deep = vec!["d"; FILE_PATH_DEPTH_MAX].join("/");
+        assert!(FilePath::parse(&deep, "path").is_ok());
+        let long_name = "n".repeat(FILE_NAME_MAX);
+        assert!(FilePath::parse(&long_name, "path").is_ok());
+        for bad in [
+            "/etc/passwd".to_owned(),
+            "/".to_owned(),
+            "../alice".to_owned(),
+            "a/../../etc".to_owned(),
+            "a/./b".to_owned(),
+            "./a".to_owned(),
+            "a/".to_owned(),
+            "a//b".to_owned(),
+            "a/..".to_owned(),
+            "..".to_owned(),
+            "nul\0byte".to_owned(),
+            format!("{deep}/d"),
+            "n".repeat(FILE_NAME_MAX + 1),
+            "x/".repeat(FILE_PATH_MAX),
+        ] {
+            assert!(is_invalid(FilePath::parse(&bad, "path")), "{bad:?}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn file_path_helpers() -> Result<()> {
+        let p = FilePath::parse("a/b/c.txt", "path")?;
+        assert_eq!(p.file_name(), Some("c.txt"));
+        assert_eq!(p.parent().as_str(), "a/b");
+        assert_eq!(p.parent().parent().parent(), FilePath::home());
+        assert_eq!(FilePath::home().join("x", "path")?.as_str(), "x");
+        assert_eq!(p.parent().join("d", "path")?.as_str(), "a/b/d");
+        assert!(FilePath::home().join("..", "path").is_err());
+        assert_eq!(p.components().collect::<Vec<_>>(), ["a", "b", "c.txt"]);
+        assert!(FilePath::parse("a", "p")?.contains(&p));
+        assert!(!FilePath::parse("a/b/c", "p")?.contains(&p));
+        assert!(FilePath::home().contains(&p));
+        assert_eq!(FilePath::home().display(), ".");
+        let json = serde_json::to_string(&p).map_err(|e| Error::Internal(e.to_string()))?;
+        assert_eq!(json, "\"a/b/c.txt\"");
+        assert!(serde_json::from_str::<FilePath>("\"../x\"").is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn new_names_are_visible_text() {
+        let too_long = "n".repeat(FILE_NAME_MAX + 1);
+        for ok in [
+            "index.php",
+            "-rf",
+            "--help",
+            "my file (1).txt",
+            "日本語",
+            "émoji 🎉.png",
+            ".htaccess",
+            "...",
+        ] {
+            assert!(check_new_name(ok, "name").is_ok(), "{ok:?}");
+        }
+        for bad in [
+            "",
+            ".",
+            "..",
+            "a/b",
+            "a\nb",
+            "a\rb",
+            "a\tb",
+            "esc\u{1b}[31m",
+            "del\u{7f}",
+            "c1\u{85}",
+            "nul\0",
+            " lead",
+            "trail ",
+            "nb\u{a0}sp",
+            "rtl\u{202e}fdp.exe",
+            "zero\u{200b}width",
+            "bom\u{feff}",
+            too_long.as_str(),
+        ] {
+            assert!(is_invalid(check_new_name(bad, "name")), "{bad:?}");
+        }
+        assert!(FilePath::parse_new("dir/a\nb", "path").is_err());
+        assert!(
+            FilePath::parse_new("di\nr/ab", "path").is_ok(),
+            "only the new name is checked"
+        );
+        assert!(FilePath::parse_new("", "path").is_err());
+    }
+
+    #[test]
+    fn file_modes_are_the_safe_subset() {
+        for ok in [0, 0o600, 0o644, 0o640, 0o700, 0o755, 0o750, 0o664, 0o775] {
+            assert_eq!(
+                FileMode::parse(ok, "mode").map(FileMode::bits).ok(),
+                Some(ok)
+            );
+        }
+        for bad in [
+            0o4755,
+            0o2755,
+            0o1777,
+            0o777,
+            0o666,
+            0o646,
+            0o10_000,
+            u32::MAX,
+        ] {
+            assert!(is_invalid(FileMode::parse(bad, "mode")), "{bad:o}");
+        }
+    }
+
+    #[test]
+    fn file_job_and_upload_ids_are_allow_listed() {
+        assert!(FileJobId::parse(FileJobId::from_millis(1_731_500_000_123).as_str()).is_ok());
+        let u = UploadId::from_millis(1_731_500_000_123);
+        assert!(UploadId::parse(u.as_str()).is_ok());
+        assert_eq!(u.partial_name(), ".oxpanel-upload-u1731500000123");
+        for bad in ["", "j1731500000123", "u1731500000123/..", "u17315000001x3"] {
+            assert!(
+                FileJobId::parse(bad).is_err() && UploadId::parse(bad).is_err(),
+                "{bad:?}"
+            );
+        }
+    }
+
+    fn is_invalid<T: std::fmt::Debug>(r: Result<T>) -> bool {
+        matches!(r, Err(Error::InvalidInput { .. }))
+    }
+}

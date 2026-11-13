@@ -54,6 +54,9 @@ struct Inner {
     ssh: FakeSsh,
     /// Password field per account, as `/etc/shadow` would hold it.
     shadow: BTreeMap<String, String>,
+    /// What each transient unit printed (`journalctl --unit`), for the
+    /// file manager's jobs.
+    journal: BTreeMap<String, String>,
 }
 
 /// Failures the tests switch on (a struct of its own: clippy allows at most
@@ -547,6 +550,7 @@ fn limit_value(command: &str, key: &str) -> Option<u64> {
 fn fake_feature_command(i: &mut Inner, spec: &CommandSpec) -> Option<CommandOutput> {
     fake_ssh_and_accounts(i, spec)
         .or_else(|| fake_tls_quota_and_db(i, spec))
+        .or_else(|| fake_files(i, spec))
         .or_else(|| emulate_job(i, spec))
 }
 
@@ -644,6 +648,52 @@ fn fake_xfs_quota(i: &mut Inner, args: &[OsString]) -> CommandOutput {
         Ok(()) => output(program, 0, "", ""),
         Err(e) => output(program, 1, "", &format!("fake: {e}")),
     }
+}
+
+/// The file manager's worker, run in this process (without changing
+/// identity) on the test's own directories: synchronously for
+/// `systemd-run --scope … files`, and at once for a job unit (`files-job`,
+/// its request read from `StandardInput=file:`), whose output then answers
+/// `journalctl --unit`.
+fn fake_files(i: &mut Inner, spec: &CommandSpec) -> Option<CommandOutput> {
+    let (program, args) = (spec.program, &spec.args);
+    if program == bin::JOURNALCTL {
+        let unit = arg_value(args, "--unit")?;
+        let text = i.journal.get(unit.trim_end_matches(".service"))?;
+        return Some(output(program, 0, text, ""));
+    }
+    if program != bin::SYSTEMD_RUN {
+        return None;
+    }
+    let last = args.last()?.to_str()?;
+    if last == crate::files_worker::SUBCOMMAND && has_flag(args, "--scope") {
+        let input = spec.stdin.clone().unwrap_or_default();
+        let mut out = Vec::new();
+        let code = crate::files_worker::serve(&mut input.as_slice(), &mut out);
+        return Some(CommandOutput {
+            program,
+            code: Some(i32::from(code)),
+            stdout: out,
+            stderr: Vec::new(),
+        });
+    }
+    if last == crate::files_worker::JOB_SUBCOMMAND {
+        let unit = args
+            .iter()
+            .find_map(|a| a.to_str()?.strip_prefix("--unit=").map(str::to_owned))?;
+        let request = args.iter().find_map(|a| {
+            a.to_str()?
+                .strip_prefix("StandardInput=file:")
+                .map(str::to_owned)
+        })?;
+        let input = std::fs::read(request).unwrap_or_default();
+        let mut out = Vec::new();
+        crate::files::serve_job(&mut input.as_slice(), &mut out);
+        i.journal
+            .insert(unit, String::from_utf8_lossy(&out).into_owned());
+        return Some(output(program, 0, "", ""));
+    }
+    None
 }
 
 /// Scripted standard output, and the transient units of backup and restore

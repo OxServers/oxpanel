@@ -24,6 +24,9 @@
 //!   the server).
 //! - [`backup`]   — per-tenant backups and restores, run as jobs; [`worker`]
 //!   is the half of a job that runs outside the daemon.
+//! - [`files`]    — the file manager: a tenant's files managed through the
+//!   API; [`files_worker`], [`files_tree`] and [`files_archive`] are the
+//!   half that runs as the tenant.
 //! - [`host`]     — host information and record ↔ OS reconciliation.
 //! - [`auth`]     — peer-credential gate for the UNIX socket.
 //! - [`server`]   — gRPC ↔ domain mapping.
@@ -48,6 +51,10 @@ pub mod config;
 pub mod ctx;
 pub mod db;
 pub mod error;
+pub mod files;
+pub mod files_archive;
+pub mod files_tree;
+pub mod files_worker;
 pub mod fsutil;
 pub mod host;
 pub mod nginx;
@@ -68,6 +75,11 @@ pub mod worker;
 /// `tests/properties.rs`).
 #[cfg(test)]
 mod proptests;
+
+/// The file manager's worker on real directories (as the test's own user)
+/// and its service against the fake OS.
+#[cfg(test)]
+mod files_tests;
 
 pub use error::{Error, Result};
 /// Generated API types (re-exported from `oxpanel-proto`).

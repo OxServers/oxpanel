@@ -143,6 +143,72 @@ service OxPanelEngine {
   // backup id, the name of the tenant it was taken from and the target.
   // The ordinary RestoreBackup never reaches such a backup.
   rpc RestoreRetainedBackup(RestoreRetainedBackupRequest) returns (StartJobResponse);
+
+  // --- File manager -------------------------------------------------------
+  // A tenant's files, managed on its behalf. Every operation runs AS THE
+  // TENANT (never as root), inside its slice and disk quota, and resolves
+  // paths beneath its home: a symlink that leads out of the home is never
+  // followed (FAILED_PRECONDITION). Paths are relative to the home; "" or
+  // "." is the home itself; no leading "/", no "." or ".." components. A
+  // name the engine creates must be visible text (no control or invisible
+  // characters, no leading or trailing space); existing entries with any
+  // name can be addressed.
+  // Scopes: listing, stat, search and size need `read`; reading content and
+  // every change need `vhost` (file content holds secrets such as database
+  // passwords). A suspended tenant's files can be read but not changed
+  // (FAILED_PRECONDITION). The home, the document and application roots of
+  // its sites, and the directories leading to them cannot be deleted, moved
+  // or have their access changed (FAILED_PRECONDITION).
+  // Errors: NOT_FOUND, ALREADY_EXISTS, PERMISSION_DENIED (the kernel refused
+  // it to the tenant), RESOURCE_EXHAUSTED (disk quota or a file-manager
+  // limit), FAILED_PRECONDITION (wrong type, not empty, outside the home,
+  // protected), INVALID_ARGUMENT.
+  //
+  // One directory, a page at a time: directories first, then by name.
+  rpc ListFiles(ListFilesRequest) returns (ListFilesResponse);
+  rpc StatFile(StatFileRequest) returns (FileEntry);
+  // Up to 1 MiB of a regular file's content (download, editor). FIFOs,
+  // sockets and devices are refused, never opened.
+  rpc ReadFile(ReadFileRequest) returns (ReadFileResponse);
+  // Create or replace a small file (editor save) atomically: written under a
+  // temporary name in the same directory, then renamed. At most 192 KiB of
+  // data (use the upload calls beyond). A replaced file keeps its mode; a
+  // new one is 0644.
+  rpc WriteFile(WriteFileRequest) returns (FileEntry);
+  // Upload a file of any size (up to the host's limit) in chunks of at most
+  // 192 KiB, in order. The content grows in a hidden partial file next to
+  // the target and replaces it only when finished; a refused or abandoned
+  // upload leaves no partial file (quota exceeded: RESOURCE_EXHAUSTED and
+  // the partial file is removed; uploads unfinished after 24 hours are
+  // removed by the engine).
+  rpc StartUpload(StartUploadRequest) returns (StartUploadResponse);
+  rpc UploadChunk(UploadChunkRequest) returns (UploadChunkResponse);
+  rpc FinishUpload(FinishUploadRequest) returns (FileEntry);
+  rpc AbortUpload(AbortUploadRequest) returns (AbortUploadResponse);
+  rpc MakeDirectory(MakeDirectoryRequest) returns (FileEntry);
+  // Rename or move within the home (one file system).
+  rpc MoveFile(MoveFileRequest) returns (FileEntry);
+  // Change who may read a file or directory: private (the tenant only),
+  // readable by the web server, or an explicit mode (0 to 0775: never
+  // set-uid, set-gid, sticky or world-writable). Symlinks are refused.
+  rpc SetFileAccess(SetFileAccessRequest) returns (FileEntry);
+  // Entries whose name contains a text, below a directory. Bounded: it
+  // stops after a number of entries or seconds and says so.
+  rpc SearchFiles(SearchFilesRequest) returns (SearchFilesResponse);
+  rpc GetDirectorySize(GetDirectorySizeRequest) returns (DirectorySize);
+  // The long operations run as jobs (one per tenant at a time) that outlive
+  // the request and a restart of the engine. Each call waits up to two
+  // seconds, so a small job comes back finished.
+  rpc CopyFiles(CopyFilesRequest) returns (FileJob);
+  rpc DeleteFiles(DeleteFilesRequest) returns (FileJob);
+  rpc CompressFiles(CompressFilesRequest) returns (FileJob);
+  // Extract a zip, tar or tar.gz archive (recognised by its content). Names
+  // that are absolute or contain "..", links that lead outside the
+  // destination, devices and FIFOs are skipped; modes are capped at 0755;
+  // the content may not exceed a multiple of the archive's size.
+  rpc ExtractArchive(ExtractArchiveRequest) returns (FileJob);
+  rpc GetFileJob(GetFileJobRequest) returns (FileJob);
+  rpc ListFileJobs(ListFileJobsRequest) returns (ListFileJobsResponse);
 }
 
 // Per-tenant resource limits, applied through systemd (cgroups v2).
@@ -1100,4 +1166,306 @@ message RestoreRetainedBackupRequest {
   string target_tenant = 3;
   // Required: UNSPECIFIED is INVALID_ARGUMENT.
   OnExisting on_existing = 4;
+}
+
+// --- File manager -------------------------------------------------------------
+
+enum FileType {
+  FILE_TYPE_UNSPECIFIED = 0;
+  FILE_TYPE_FILE = 1;
+  FILE_TYPE_DIRECTORY = 2;
+  FILE_TYPE_SYMLINK = 3;
+  FILE_TYPE_FIFO = 4;
+  FILE_TYPE_SOCKET = 5;
+  FILE_TYPE_CHAR_DEVICE = 6;
+  FILE_TYPE_BLOCK_DEVICE = 7;
+}
+
+// Where a symbolic link leads. The engine never follows one out of the home.
+enum SymlinkState {
+  SYMLINK_STATE_UNSPECIFIED = 0;
+  // To an entry inside the home (its type is `symlink_target_type`).
+  SYMLINK_STATE_INSIDE = 1;
+  // Out of the home (or across a mount point): not followed.
+  SYMLINK_STATE_OUTSIDE = 2;
+  // To nothing.
+  SYMLINK_STATE_BROKEN = 3;
+}
+
+message FileEntry {
+  // The name. Names that are not valid UTF-8 are shown with U+FFFD and
+  // `name_utf8` false: such an entry is listed, sized, copied, archived and
+  // deleted with its directory, but cannot be addressed on its own.
+  string name = 1;
+  bool name_utf8 = 2;
+  // Searches: the entry's path relative to the home.
+  string path = 3;
+  FileType type = 4;
+  uint64 size_bytes = 5;
+  // Space it occupies on disk (less than size_bytes for a sparse file).
+  uint64 allocated_bytes = 6;
+  google.protobuf.Timestamp modified = 7;
+  // Permission bits (e.g. 0644 = 420).
+  uint32 mode = 8;
+  // False for something in the home the tenant does not own (left there by
+  // the administrator); the tenant cannot change it.
+  bool owned_by_tenant = 9;
+  // Symlinks: the target as stored (at most 1024 bytes) and where it leads.
+  string symlink_target = 10;
+  SymlinkState symlink_state = 11;
+  FileType symlink_target_type = 12;
+}
+
+message ListFilesRequest {
+  string tenant = 1;
+  string path = 2;
+  // Entries to skip, and to return: 1 to 1000 (0 = 500).
+  uint32 offset = 3;
+  uint32 limit = 4;
+}
+
+message ListFilesResponse {
+  repeated FileEntry entries = 1;
+  // Entries in the directory (as read; see truncated).
+  uint64 total = 2;
+  // The directory has more entries than the engine reads (100 000 by default).
+  bool truncated = 3;
+}
+
+message StatFileRequest {
+  string tenant = 1;
+  string path = 2;
+}
+
+message ReadFileRequest {
+  string tenant = 1;
+  string path = 2;
+  uint64 offset = 3;
+  // 1 to 1048576 bytes (0 = 1048576).
+  uint32 length = 4;
+}
+
+message ReadFileResponse {
+  bytes data = 1;
+  // The whole file's size and modification time (compare them between
+  // chunks to notice a file that changes during a download).
+  uint64 size_bytes = 2;
+  google.protobuf.Timestamp modified = 3;
+  // `offset + len(data)` reached the end of the file.
+  bool eof = 4;
+}
+
+message WriteFileRequest {
+  string tenant = 1;
+  string path = 2;
+  // At most 196608 bytes.
+  bytes data = 3;
+  // Replace an existing file (never a directory). Without it,
+  // ALREADY_EXISTS if something has that name.
+  bool overwrite = 4;
+}
+
+message StartUploadRequest {
+  string tenant = 1;
+  // The file it becomes; its directory must exist.
+  string path = 2;
+  // Replace an existing file when the upload is finished.
+  bool overwrite = 3;
+}
+
+message StartUploadResponse {
+  // "u" followed by digits; names the partial file ".oxpanel-upload-<id>".
+  string upload_id = 1;
+  uint32 max_chunk_bytes = 2;
+  uint64 max_size_bytes = 3;
+}
+
+message UploadChunkRequest {
+  string tenant = 1;
+  string upload_id = 2;
+  // Where `data` goes: at most the bytes received so far (sending a chunk
+  // again after a failure is allowed; what followed it is discarded).
+  uint64 offset = 3;
+  // At most 196608 bytes.
+  bytes data = 4;
+}
+
+message UploadChunkResponse {
+  uint64 received_bytes = 1;
+}
+
+message FinishUploadRequest {
+  string tenant = 1;
+  string upload_id = 2;
+  // The size the caller sent; INVALID_ARGUMENT (and the upload stays open)
+  // if the engine received a different amount.
+  uint64 size_bytes = 3;
+  // Optional lower-case hexadecimal SHA-256 of the content; on a mismatch
+  // the upload is discarded (INVALID_ARGUMENT).
+  string sha256 = 4;
+}
+
+message AbortUploadRequest {
+  string tenant = 1;
+  string upload_id = 2;
+}
+
+message AbortUploadResponse {
+  // false when there was no such upload.
+  bool aborted = 1;
+}
+
+message MakeDirectoryRequest {
+  string tenant = 1;
+  string path = 2;
+  // Create missing parent directories too (no error if it exists).
+  bool parents = 3;
+}
+
+message MoveFileRequest {
+  string tenant = 1;
+  string from = 2;
+  string to = 3;
+  // Replace an existing file or empty directory at `to`.
+  bool overwrite = 4;
+}
+
+enum FileAccess {
+  FILE_ACCESS_UNSPECIFIED = 0;
+  // Only the tenant (and its PHP and applications): files 0600 (0700 if
+  // executable), directories 0700.
+  FILE_ACCESS_PRIVATE = 1;
+  // Also the web server: files 0644 (0755 if executable), directories 0755.
+  FILE_ACCESS_WEB_READABLE = 2;
+  // Exactly `mode`.
+  FILE_ACCESS_MODE = 3;
+}
+
+message SetFileAccessRequest {
+  string tenant = 1;
+  string path = 2;
+  FileAccess access = 3;
+  // FILE_ACCESS_MODE: 0 to 0775 (no set-uid, set-gid, sticky, world write).
+  uint32 mode = 4;
+}
+
+message SearchFilesRequest {
+  string tenant = 1;
+  // Where to search (with everything below it).
+  string path = 2;
+  // Case-insensitive part of a name; 1 to 255 bytes.
+  string name_contains = 3;
+  // 1 to 1000 (0 = 200).
+  uint32 max_results = 4;
+}
+
+message SearchFilesResponse {
+  repeated FileEntry matches = 1;
+  uint64 scanned = 2;
+  // The search stopped early: more results than asked for, or the engine's
+  // bound on entries or time was reached.
+  bool truncated = 3;
+}
+
+message GetDirectorySizeRequest {
+  string tenant = 1;
+  string path = 2;
+}
+
+message DirectorySize {
+  uint64 allocated_bytes = 1;
+  uint64 apparent_bytes = 2;
+  uint64 files = 3;
+  uint64 directories = 4;
+  // The engine's bound on entries or time was reached: the figures are a
+  // lower bound.
+  bool truncated = 5;
+}
+
+enum FileJobKind {
+  FILE_JOB_KIND_UNSPECIFIED = 0;
+  FILE_JOB_KIND_COPY = 1;
+  FILE_JOB_KIND_DELETE = 2;
+  FILE_JOB_KIND_COMPRESS = 3;
+  FILE_JOB_KIND_EXTRACT = 4;
+}
+
+message FileJob {
+  // "f" followed by digits.
+  string id = 1;
+  string tenant = 2;
+  FileJobKind kind = 3;
+  JobState state = 4;
+  // What was asked, in a few words.
+  string request = 5;
+  // One line about the outcome; empty while RUNNING.
+  string message = 6;
+  // The entries the job left out or could not handle (the first 20), with
+  // the reason. May contain names chosen by the tenant.
+  string output = 7;
+  google.protobuf.Timestamp started_at = 8;
+  google.protobuf.Timestamp finished_at = 9;
+  uint64 entries = 10;
+  // Bytes of content copied, archived or extracted.
+  uint64 bytes = 11;
+  uint64 skipped = 12;
+}
+
+message CopyFilesRequest {
+  string tenant = 1;
+  // 1 to 1000 paths; each is copied into `destination` under its own name
+  // (directories with their content, symlinks as symlinks).
+  repeated string sources = 2;
+  string destination = 3;
+  // Replace existing files (directories are merged either way).
+  bool overwrite = 4;
+}
+
+message DeleteFilesRequest {
+  string tenant = 1;
+  // 1 to 1000 paths; directories with everything in them. A symlink is
+  // removed, never what it points to.
+  repeated string paths = 2;
+}
+
+enum ArchiveFormat {
+  ARCHIVE_FORMAT_UNSPECIFIED = 0;
+  ARCHIVE_FORMAT_ZIP = 1;
+  ARCHIVE_FORMAT_TAR_GZ = 2;
+}
+
+message CompressFilesRequest {
+  string tenant = 1;
+  // The directory holding the selection; entries are named relative to it.
+  string directory = 2;
+  // 1 to 1000 names of entries in `directory`.
+  repeated string names = 3;
+  // The archive to create (a path relative to the home).
+  string archive = 4;
+  ArchiveFormat format = 5;
+  bool overwrite = 6;
+}
+
+message ExtractArchiveRequest {
+  string tenant = 1;
+  string archive = 2;
+  // An existing directory.
+  string destination = 3;
+  // Replace existing files (directories are merged either way); without it
+  // they are kept and counted as skipped.
+  bool overwrite = 4;
+}
+
+message GetFileJobRequest {
+  string tenant = 1;
+  string job_id = 2;
+}
+
+message ListFileJobsRequest {
+  string tenant = 1;
+}
+
+message ListFileJobsResponse {
+  // Oldest first; the last 50 per tenant are kept.
+  repeated FileJob jobs = 1;
 }

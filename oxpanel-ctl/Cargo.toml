@@ -20,6 +20,8 @@ tonic = { workspace = true, features = ["channel"] }
 tower = { version = "0.5", features = ["util"] }
 hyper-util = { version = "0.1", features = ["tokio"] }
 clap = { version = "4.5", features = ["derive", "env"] }
+# `files put` sends the SHA-256 of an upload.
+sha2.workspace = true
 
 [lints]
 workspace = true

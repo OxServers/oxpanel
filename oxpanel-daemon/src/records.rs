@@ -16,7 +16,9 @@ use serde::{Deserialize, Serialize};
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::fsutil;
-use crate::validate::{BackupId, DbName, Domain, JobId, Limits, RelPath, Username};
+use crate::validate::{
+    BackupId, DbName, Domain, FileJobId, FilePath, JobId, Limits, RelPath, UploadId, Username,
+};
 
 pub const RECORD_VERSION: u32 = 1;
 const RECORD_MODE: u32 = 0o600;
@@ -401,6 +403,70 @@ pub struct JobRecord {
     pub sites: Vec<SiteResult>,
 }
 
+/// What a file-manager job does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FileJobKind {
+    Copy,
+    Delete,
+    Compress,
+    Extract,
+}
+
+impl FileJobKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Copy => "copy",
+            Self::Delete => "delete",
+            Self::Compress => "compress",
+            Self::Extract => "extract",
+        }
+    }
+}
+
+/// A file-manager job (copy, delete, compress, extract) in flight or
+/// finished. Like a backup job, the work runs in a transient unit and the
+/// record is what a restarted daemon picks it up from. What it was asked to
+/// do is in a root-only request file next to the record.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FileJobRecord {
+    pub version: u32,
+    pub id: String,
+    pub kind: FileJobKind,
+    pub tenant: String,
+    /// The transient unit doing the work (without `.service`).
+    pub unit: String,
+    pub state: JobState,
+    /// What was asked, in a few words (paths relative to the home).
+    pub request: String,
+    /// One line: what happened.
+    pub message: String,
+    /// The end of what the worker printed (entries skipped or failed).
+    pub output: String,
+    pub started_at_unix: u64,
+    /// 0 while running.
+    pub finished_at_unix: u64,
+    /// Entries handled, bytes of content written or archived, entries left out.
+    pub entries: u64,
+    pub bytes: u64,
+    pub skipped: u64,
+}
+
+/// An upload in progress: its content grows in a partial file
+/// (`.oxpanel-upload-<id>`) next to its target until it is finished,
+/// aborted, or swept as stale.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UploadRecord {
+    pub version: u32,
+    pub id: String,
+    pub tenant: String,
+    /// The file it becomes, relative to the home.
+    pub path: String,
+    /// Replace an existing file at `path` when it is finished.
+    pub overwrite: bool,
+    pub created_at_unix: u64,
+}
+
 /// Seconds since the UNIX epoch, saturating at 0 if the clock is before 1970.
 pub fn now_unix() -> u64 {
     SystemTime::now()
@@ -418,6 +484,8 @@ pub struct Store {
     db_users: PathBuf,
     backup_records: PathBuf,
     job_records: PathBuf,
+    file_jobs: PathBuf,
+    uploads: PathBuf,
 }
 
 impl Store {
@@ -429,6 +497,8 @@ impl Store {
             db_users: config.db_users_dir(),
             backup_records: config.backup_records_dir(),
             job_records: config.jobs_dir(),
+            file_jobs: config.file_jobs_dir(),
+            uploads: config.uploads_dir(),
         }
     }
 
@@ -439,6 +509,8 @@ impl Store {
         fsutil::ensure_dir(&self.db_users, DIR_MODE)?;
         fsutil::ensure_dir(&self.vhosts_dir, DIR_MODE)?;
         fsutil::ensure_dir(&self.backup_records, DIR_MODE)?;
+        fsutil::ensure_dir(&self.file_jobs, DIR_MODE)?;
+        fsutil::ensure_dir(&self.uploads, DIR_MODE)?;
         fsutil::ensure_dir(&self.job_records, DIR_MODE)
     }
 
@@ -600,6 +672,61 @@ impl Store {
     /// Every job record, oldest first.
     pub fn list_jobs(&self) -> Result<Vec<JobRecord>> {
         list(&self.job_records)
+    }
+
+    fn file_job_path(&self, id: &FileJobId) -> PathBuf {
+        self.file_jobs.join(format!("{id}.json"))
+    }
+
+    /// Where a file-manager job's request is kept (root-only; the job's unit
+    /// gets it on its standard input).
+    pub fn file_job_request_path(&self, id: &FileJobId) -> PathBuf {
+        self.file_jobs.join(format!("{id}.request"))
+    }
+
+    pub fn load_file_job(&self, id: &FileJobId) -> Result<Option<FileJobRecord>> {
+        load(&self.file_job_path(id))
+    }
+
+    pub fn save_file_job(&self, rec: &FileJobRecord) -> Result<()> {
+        let id = FileJobId::parse(&rec.id)?;
+        Username::parse_field(&rec.tenant, "tenant")?;
+        save(&self.file_job_path(&id), rec)
+    }
+
+    /// The record and its request file.
+    pub fn delete_file_job(&self, id: &FileJobId) -> Result<bool> {
+        fsutil::remove_if_exists(&self.file_job_request_path(id))?;
+        fsutil::remove_if_exists(&self.file_job_path(id))
+    }
+
+    /// Every file-manager job record, oldest first.
+    pub fn list_file_jobs(&self) -> Result<Vec<FileJobRecord>> {
+        list(&self.file_jobs)
+    }
+
+    fn upload_path(&self, id: &UploadId) -> PathBuf {
+        self.uploads.join(format!("{id}.json"))
+    }
+
+    pub fn load_upload(&self, id: &UploadId) -> Result<Option<UploadRecord>> {
+        load(&self.upload_path(id))
+    }
+
+    pub fn save_upload(&self, rec: &UploadRecord) -> Result<()> {
+        let id = UploadId::parse(&rec.id)?;
+        Username::parse_field(&rec.tenant, "tenant")?;
+        FilePath::parse(&rec.path, "path")?;
+        save(&self.upload_path(&id), rec)
+    }
+
+    pub fn delete_upload(&self, id: &UploadId) -> Result<bool> {
+        fsutil::remove_if_exists(&self.upload_path(id))
+    }
+
+    /// Every upload in progress, oldest first.
+    pub fn list_uploads(&self) -> Result<Vec<UploadRecord>> {
+        list(&self.uploads)
     }
 }
 

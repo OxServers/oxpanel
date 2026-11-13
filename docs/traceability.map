@@ -639,3 +639,63 @@
   it properties records_round_trip_and_damaged_ones_block_only_themselves
   it properties a_record_cannot_be_saved_outside_the_state_directory
   sh tests-integration/run-inside.sh record is root-only
+
+[File manager] Runs as the tenant
+  unit files_tests every_operation_runs_as_the_tenant_in_its_slice
+  unit files_tests a_job_runs_sandboxed_as_the_tenant_and_comes_back_finished
+  sh tests-integration/run-inside.sh it belongs to the tenant
+  sh tests-integration/run-inside.sh it runs as the tenant
+  sh tests-integration/run-inside.sh a hard link to another tenant's file cannot be read
+[File manager] Confined to the home
+  unit files_tests a_symlink_out_of_the_home_is_never_followed
+  unit files_tests traversal_never_parses_and_a_request_with_it_is_refused_whole
+  unit files_tests names_with_dashes_newlines_and_unicode_are_just_names
+  unit validate file_paths_are_relative_plain_and_bounded
+  unit validate new_names_are_visible_text
+  it properties an_accepted_file_path_stays_below_the_home
+  it properties an_accepted_new_name_is_visible_text
+  sh tests-integration/run-inside.sh is refused by every command
+  sh tests-integration/run-inside.sh writing into another tenant's home through a link is refused
+  sh tests-integration/run-inside.sh a name beginning with '-' is just a name
+[File manager] Browse, read, edit
+  unit files_tests reads_are_bounded_and_ranged
+  unit files_tests writes_are_atomic_and_never_replace_unless_asked
+  unit files_tests listings_page_directories_first
+  unit files_tests search_and_size_are_bounded_and_do_not_follow_links
+  unit files_tests fifos_and_special_files_are_never_opened
+  sh tests-integration/run-inside.sh an editor save (one request)
+  sh tests-integration/run-inside.sh a FIFO is refused at once, never opened
+[File manager] Uploads of any size
+  unit files_tests uploads_grow_in_a_partial_file_and_replace_the_target_when_finished
+  unit files_tests an_upload_beyond_its_limit_leaves_nothing_behind
+  sh tests-integration/run-inside.sh a 3 MiB upload in chunks, checked by SHA-256
+  sh tests-integration/run-inside.sh and leaves no partial file and no target
+[File manager] Organise
+  unit files_tests directories_renames_and_modes
+  unit validate file_modes_are_the_safe_subset
+  it properties an_accepted_file_mode_is_safe
+  sh tests-integration/run-inside.sh mode and ACL are what SFTP produces
+  sh tests-integration/run-inside.sh private: the web server can no longer read it
+[File manager] Jobs
+  unit files_tests copies_keep_holes_links_and_modes_and_terminate_into_themselves
+  unit files_tests trees_are_deleted_even_where_the_tenant_closed_them
+  unit files_tests a_job_survives_a_restart_of_the_daemon
+  unit files_tests a_job_reports_its_result_last_and_names_cannot_forge_it
+  sh tests-integration/run-inside.sh the restarted daemon concludes the job
+  sh tests-integration/run-inside.sh its copy keeps the hole (seconds, not hours)
+[File manager] Hostile archives
+  unit files_tests a_hostile_tar_lands_inside_its_destination_or_nowhere
+  unit files_tests a_hostile_zip_is_held_to_the_same_rules
+  unit files_tests zip_bombs_and_huge_entry_counts_are_stopped
+  unit files_tests archives_round_trip_and_never_contain_what_a_link_points_to
+  sh tests-integration/run-inside.sh nothing was written outside the destination
+  sh tests-integration/run-inside.sh a zip bomb is stopped by the ratio limit
+[File manager] Protected directories
+  unit files_tests the_engines_directories_cannot_be_removed_moved_or_closed
+  sh tests-integration/run-inside.sh the document root cannot be deleted
+[File manager] Scopes and suspension
+  unit files_tests scopes_of_access_suspension_and_validation
+  unit files_tests one_tenant_cannot_reach_anothers_upload_or_job
+  it grpc_surface every_rpc_is_refused_without_its_scope_and_passes_with_it
+  sh tests-integration/run-inside.sh but not read content (scope vhost)
+  sh tests-integration/run-inside.sh but not changed

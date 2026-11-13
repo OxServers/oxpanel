@@ -113,6 +113,10 @@ pub struct Config {
     pub backup_timeout: Duration,
     /// The program a job's transient unit runs: this daemon, in worker mode.
     pub worker_exe: PathBuf,
+    /// File manager bounds (`OXPANEL_FILES_*`), handed to its worker.
+    pub files: crate::files_worker::Limits,
+    /// Upper bound for one file-manager job (copy, delete, compress, extract).
+    pub files_job_timeout: Duration,
 }
 
 /// Let's Encrypt's production directory.
@@ -164,6 +168,8 @@ impl Default for Config {
             backup_min_free_bytes: 1 << 30,
             backup_timeout: Duration::from_secs(6 * 3600),
             worker_exe: PathBuf::from("/usr/sbin/oxpanel-daemon"),
+            files: crate::files_worker::Limits::default(),
+            files_job_timeout: Duration::from_secs(2 * 3600),
         }
     }
 }
@@ -264,6 +270,7 @@ impl Config {
         c.db_from_lookup(&get)?;
         path("OXPANEL_BACKUP_DIR", &mut c.backup_dir)?;
         c.backup_from_lookup(&get)?;
+        c.files_from_lookup(&get)?;
         c.validate()?;
         Ok(c)
     }
@@ -440,6 +447,16 @@ impl Config {
         self.state_dir.join("backups")
     }
 
+    /// `state_dir/file-jobs`: one record (and one request) per file-manager job.
+    pub fn file_jobs_dir(&self) -> PathBuf {
+        self.state_dir.join("file-jobs")
+    }
+
+    /// `state_dir/uploads`: one record per upload in progress.
+    pub fn uploads_dir(&self) -> PathBuf {
+        self.state_dir.join("uploads")
+    }
+
     /// `state_dir/jobs`: one record per backup or restore job.
     pub fn jobs_dir(&self) -> PathBuf {
         self.state_dir.join("jobs")
@@ -489,6 +506,38 @@ impl Config {
             self.backup_timeout =
                 Duration::from_secs(u64::from(parse_u32("OXPANEL_BACKUP_TIMEOUT_SECS", &v)?));
         }
+        Ok(())
+    }
+
+    /// The `OXPANEL_FILES_*` settings (file manager bounds). Each must be
+    /// at least 1; zero would disable an operation in a confusing way.
+    fn files_from_lookup(&mut self, get: &impl Fn(&str) -> Option<String>) -> Result<()> {
+        let number = |key: &str, cur: &mut u64| -> Result<()> {
+            if let Some(v) = get(key) {
+                *cur = v
+                    .trim()
+                    .parse::<u64>()
+                    .ok()
+                    .filter(|n| *n > 0)
+                    .ok_or_else(|| {
+                        Error::invalid("config", format!("{key}: '{v}' must be a number above 0"))
+                    })?;
+            }
+            Ok(())
+        };
+        let f = &mut self.files;
+        number("OXPANEL_FILES_UPLOAD_MAX_BYTES", &mut f.upload_max_bytes)?;
+        number("OXPANEL_FILES_JOB_MAX_BYTES", &mut f.job_max_bytes)?;
+        number(
+            "OXPANEL_FILES_EXTRACT_MAX_ENTRIES",
+            &mut f.extract_max_entries,
+        )?;
+        number("OXPANEL_FILES_EXTRACT_MAX_RATIO", &mut f.extract_max_ratio)?;
+        number("OXPANEL_FILES_LIST_MAX_ENTRIES", &mut f.list_max_entries)?;
+        number("OXPANEL_FILES_WALK_MAX_ENTRIES", &mut f.walk_max_entries)?;
+        let mut secs = self.files_job_timeout.as_secs();
+        number("OXPANEL_FILES_JOB_TIMEOUT_SECS", &mut secs)?;
+        self.files_job_timeout = Duration::from_secs(secs.max(60));
         Ok(())
     }
 

@@ -23,7 +23,8 @@ prost-types = "0.14"
 tonic-prost-build = "0.14"
 protox = "0.9"
 # OS interop
-nix = { version = "0.31", features = ["user", "fs"] }
+# "dir": the file manager reads directories through descriptors (files_worker.rs).
+nix = { version = "0.31", features = ["user", "fs", "dir"] }
 # Errors / logging
 thiserror = "2"
 tracing = "0.1"
@@ -39,6 +40,12 @@ sha2 = "0.10"
 # The hash MariaDB stores for a password (mysql_native_password), so the
 # plaintext never has to be sent to the server.
 sha1 = "0.10"
+# The file manager's archives (files_archive.rs): zip, tar and gzip, read and
+# written as the tenant by our own code (pure Rust: no C, no other formats).
+# zip >= 9: earlier versions carry RUSTSEC advisories (cargo deny).
+zip = { version = "9", default-features = false, features = ["deflate-flate2"] }
+tar = { version = "0.4", default-features = false }
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 # Tests
 tempfile = "3"
 

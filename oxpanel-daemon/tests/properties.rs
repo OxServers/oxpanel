@@ -38,7 +38,8 @@ use oxpanel_daemon::records::{
 };
 use oxpanel_daemon::system::{bin, CommandSpec};
 use oxpanel_daemon::validate::{
-    Domain, Limits, OwnerLabel, RelPath, Username, MAX_WEIGHT, MIN_MEMORY_MAX_BYTES,
+    check_new_name, Domain, FileMode, FilePath, Limits, OwnerLabel, RelPath, Username,
+    FILE_NAME_MAX, FILE_PATH_DEPTH_MAX, FILE_PATH_MAX, MAX_WEIGHT, MIN_MEMORY_MAX_BYTES,
 };
 use oxpanel_daemon::{app, nginx, php, systemd, Error};
 
@@ -815,4 +816,80 @@ proptest! {
             prop_assert_eq!(policy.permits(&peer, scope), expected);
         }
     }
+
+    /// The file manager's paths: whatever is accepted is relative, has no
+    /// `.` or `..` component, is bounded, and joined to a home stays
+    /// below it with one component per name (nothing collapses away).
+    #[test]
+    fn an_accepted_file_path_stays_below_the_home(s in near_file_path()) {
+        match FilePath::parse(&s, "path") {
+            Ok(p) if p.is_home() => prop_assert!(s.is_empty() || s == "."),
+            Ok(p) => {
+                prop_assert_eq!(p.as_str(), s.as_str());
+                prop_assert!(s.len() <= FILE_PATH_MAX);
+                prop_assert!(!s.starts_with('/') && !s.ends_with('/') && !s.contains("//"));
+                prop_assert!(!s.contains(' '));
+                let comps: Vec<&str> = s.split('/').collect();
+                prop_assert!(comps.len() <= FILE_PATH_DEPTH_MAX);
+                for comp in &comps {
+                    prop_assert!(*comp != "." && *comp != ".." && comp.len() <= FILE_NAME_MAX);
+                }
+                let home = Path::new("/home/alice");
+                let abs = home.join(p.as_str());
+                prop_assert!(abs.starts_with(home));
+                prop_assert!(abs.components().all(|c| matches!(c, Component::RootDir | Component::Normal(_))));
+                prop_assert_eq!(abs.components().count(), 3 + comps.len());
+                // Its parent and name put it back together.
+                match p.file_name() {
+                    Some(name) => prop_assert_eq!(p.parent().join(name, "path").ok(), Some(p.clone())),
+                    None => prop_assert!(false, "a non-home path has a name"),
+                }
+                // And it survives JSON (the worker's protocol) unchanged.
+                let json = serde_json::to_string(&p).map_err(|e| TestCaseError::fail(e.to_string()))?;
+                let back: FilePath = serde_json::from_str(&json).map_err(|e| TestCaseError::fail(e.to_string()))?;
+                prop_assert_eq!(back, p);
+            }
+            Err(e) => {
+                let invalid = matches!(e, Error::InvalidInput { .. });
+                prop_assert!(invalid);
+            }
+        }
+    }
+
+    /// A name the engine creates is visible text: no control character,
+    /// no separator, not `.`/`..`, no space at either end.
+    #[test]
+    fn an_accepted_new_name_is_visible_text(s in near_file_path()) {
+        if check_new_name(&s, "name").is_ok() {
+            prop_assert!(!s.is_empty() && s.len() <= FILE_NAME_MAX);
+            prop_assert!(!s.contains('/') && s != "." && s != "..");
+            prop_assert!(!s.chars().any(char::is_control));
+            prop_assert!(!s.starts_with(' ') && !s.ends_with(' '));
+            prop_assert!(s.chars().all(|c| c == ' ' || !c.is_whitespace()));
+            let as_path = FilePath::parse_new(&s, "path");
+            prop_assert!(as_path.is_ok());
+        }
+    }
+
+    /// Modes never carry set-uid, set-gid, sticky or world-write.
+    #[test]
+    fn an_accepted_file_mode_is_safe(m in any::<u32>()) {
+        if let Ok(mode) = FileMode::parse(m, "mode") {
+            prop_assert_eq!(mode.bits(), m);
+            prop_assert_eq!(m & !0o775, 0);
+        }
+    }
+}
+
+/// Paths a hostile panel would send to the file manager.
+fn near_file_path() -> impl Strategy<Value = String> {
+    prop_oneof![
+        "[A-Za-z0-9 ._-]{1,12}(/[A-Za-z0-9 ._-]{1,12}){0,5}",
+        r"(\.\./|\./|/)?[a-z.]{1,8}(/(\.\.|\.|[a-z]{1,6}|)){0,4}/?",
+        "[a-z]{1,4}[\n\t\r\0\u{1b}\u{202e}\u{200b} /][a-z]{1,4}",
+        "-[a-z-]{1,10}",
+        "(a/){60,70}a",
+        "[a-z]{250,260}",
+        any_text(),
+    ]
 }

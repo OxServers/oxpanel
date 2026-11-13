@@ -505,6 +505,32 @@ sudo oxpanel-ctl backup restore-retained b1794571300456 --from acme --to acme2 -
 # ...or drop it early
 sudo oxpanel-ctl backup delete acme b1794571300456 --tenant-deleted
 
+# The file manager: everything runs AS THE TENANT, beneath its home (a symlink
+# out of the home is never followed). Paths are relative to the home.
+sudo oxpanel-ctl files ls acme public_html
+# dir 0755 4096 1794571500 css
+# file 0644 5120 1794571400 index.php
+# link 0777 11 1794571400 pw -> /etc/passwd (outside-home)
+# total=3 truncated=false
+sudo oxpanel-ctl files cat acme public_html/index.php        # 1 MiB per request, any size
+echo '<?php phpinfo();' | sudo oxpanel-ctl files write acme public_html/info.php   # editor save, ≤ 192 KiB
+sudo oxpanel-ctl files put acme ./site.zip site.zip          # chunked upload, SHA-256 checked
+sudo oxpanel-ctl files get acme public_html/index.php ./index.php
+sudo oxpanel-ctl files mkdir acme public_html/img --parents
+sudo oxpanel-ctl files mv acme public_html/info.php public_html/old/info.php
+sudo oxpanel-ctl files chmod acme public_html/.env --private  # 0600: the web server cannot read it
+sudo oxpanel-ctl files chmod acme public_html/old --web       # 0755
+sudo oxpanel-ctl files find acme "" config                     # names containing "config"
+sudo oxpanel-ctl files du acme public_html
+# Long operations are jobs (one per tenant); --wait follows them (exit 5 if FAILED)
+sudo oxpanel-ctl files extract acme site.zip public_html --wait
+# ...skipped '../../etc/cron.d/x': its name contains '..'
+# job=f1794571600123 kind=FILE_JOB_KIND_EXTRACT tenant=acme state=JOB_STATE_SUCCEEDED entries=212 bytes=4022113 skipped=1 ...
+sudo oxpanel-ctl files compress acme "" backup-site.tar.gz public_html --format tar-gz --wait
+sudo oxpanel-ctl files cp acme public_html/old public_html/img --wait
+sudo oxpanel-ctl files rm acme public_html/old backup-site.tar.gz --wait
+sudo oxpanel-ctl files jobs acme
+
 # Tear down (order matters: vhosts and databases first; backups that are not
 # retained block deleting the tenant)
 sudo oxpanel-ctl db user-delete acme_shopapp
@@ -522,6 +548,15 @@ Limits: `--memory` is `0` (unlimited) or ≥ 16 MiB; `--cpu-weight` and
 names refused); domains lower-case ASCII labels (punycode `xn--` allowed, no
 wildcards, no IP literals); `--root` is relative, with components made of
 `A-Z a-z 0-9 . _ -` only; `--owner` is `^[a-z0-9][a-z0-9_.-]{0,63}$`.
+File-manager paths are relative to the home (no leading `/`, no `.` or `..`,
+at most 3072 bytes and 64 components); names it creates must be visible text
+(no newline, control or invisible characters, no leading or trailing space).
+Its bounds are set with `OXPANEL_FILES_UPLOAD_MAX_BYTES` (4 GiB),
+`OXPANEL_FILES_JOB_MAX_BYTES` (8 GiB), `OXPANEL_FILES_EXTRACT_MAX_RATIO`
+(200), `OXPANEL_FILES_EXTRACT_MAX_ENTRIES` (100000),
+`OXPANEL_FILES_LIST_MAX_ENTRIES` (100000), `OXPANEL_FILES_WALK_MAX_ENTRIES`
+(200000) and `OXPANEL_FILES_JOB_TIMEOUT_SECS` (7200); see
+`docs/superpowers/specs/2026-11-14-files-design.md`.
 Database and database-user names are `<tenant>_<suffix>` with a suffix of 1–24
 characters `a-z 0-9` (so `acme_shop_wp` belongs to tenant `acme_shop`, never to
 `acme`); passwords are 8–128 characters without control characters.
