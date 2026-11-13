@@ -974,7 +974,12 @@ SQL
   check "password change takes effect" test "$(usersql carol_app "$DBPW-changed" 'SELECT 1')" = 1
   check_not "the old password no longer works" usersql carol_app "$DBPW" 'SELECT 1'
   printf '%s\n' "$DBPW" | oxpanel-ctl db user-passwd carol_app >/dev/null
+  # The requests above can finish within a few watcher rounds; let it complete
+  # some more (at most 10 s) so the sanity check below measures the watcher,
+  # not how fast the daemon was.
+  for _ in $(seq 1 100); do [ "$(grep -c '^COMMAND$' /root/db-ps.log)" -ge 6 ] && break; sleep 0.1; done
   kill "$watcher"; wait "$watcher" 2>/dev/null || true
+  echo "info - the watcher captured $(wc -l < /root/db-ps.log) lines, $(grep -c '^COMMAND$' /root/db-ps.log) process listings"
   check "watcher saw processes and MariaDB statements" test "$(wc -l < /root/db-ps.log)" -gt 100
   check "no password in any process argv or the MariaDB process list" bash -c '! grep -qF -e "$1" -e "Carol-DB-pass" -e "quoted" /root/db-ps.log' _ "$DAVEPW"
   check "no password and no password hash in the daemon journal" bash -c '! journalctl -u oxpanel-daemon --no-pager | grep -qE "Carol-DB-pass|quoted|\*[0-9A-F]{40}"'
