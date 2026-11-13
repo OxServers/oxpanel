@@ -647,6 +647,9 @@
 [Tenant accounts] Delete tenant with everything (cascade)
   unit lifecycle a_cascade_needs_the_name_twice_and_a_valid_retention
   unit lifecycle a_cascade_removes_everything_in_order
+  unit lifecycle a_cascade_waits_for_file_jobs_and_takes_the_file_managers_state_along
+  sh tests-integration/run-inside.sh deleting the tenant with everything waits for the running file job
+  sh tests-integration/run-inside.sh the file manager's job history and upload records are gone
   unit lifecycle nothing_is_deleted_when_the_final_backup_fails
   unit lifecycle a_complete_final_backup_is_kept_and_then_everything_goes
   unit lifecycle one_job_at_a_time_and_the_refusing_delete_waits

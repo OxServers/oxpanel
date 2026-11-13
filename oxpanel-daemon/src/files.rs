@@ -368,6 +368,16 @@ impl FileService {
         if write && rec.suspended {
             return Err(Error::TenantSuspended(name.to_string()));
         }
+        // While a deletion of the tenant runs (its final backup is being
+        // taken), its files are not changed any more.
+        if write {
+            if let Some(job) = crate::lifecycle::running_deletion(&self.ctx, &name)? {
+                return Err(Error::JobRunning {
+                    tenant: name.to_string(),
+                    job: job.id,
+                });
+            }
+        }
         Ok(rec)
     }
 
@@ -1269,11 +1279,31 @@ fn conclude_job(
     Ok(job)
 }
 
-/// Suspension: a running file job of the tenant is stopped (its unit and
-/// processes end; a file being written is left under its temporary name,
-/// never as a partial target) and recorded as failed. The caller holds the
-/// mutation lock.
-pub async fn stop_tenant_jobs(ctx: &Ctx, tenant: &TenantRecord) -> Result<()> {
+/// Why a running file job is stopped by the engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopReason {
+    /// The tenant was suspended.
+    Suspended,
+    /// The tenant is being deleted with everything it has (the cascade
+    /// refuses to start while a file job runs; this is the backstop for a
+    /// deletion resumed after a crash).
+    Deleted,
+}
+
+impl StopReason {
+    fn message(self) -> &'static str {
+        match self {
+            Self::Suspended => "stopped because the tenant was suspended",
+            Self::Deleted => "stopped because the tenant is being deleted",
+        }
+    }
+}
+
+/// Suspension or deletion: a running file job of the tenant is stopped (its
+/// unit and processes end; a file being written is left under its temporary
+/// name, never as a partial target) and recorded as failed. The caller holds
+/// the mutation lock.
+pub async fn stop_tenant_jobs(ctx: &Ctx, tenant: &TenantRecord, why: StopReason) -> Result<()> {
     for job in ctx.store.list_file_jobs()? {
         if job.tenant != tenant.username || job.state != JobState::Running {
             continue;
@@ -1282,13 +1312,8 @@ pub async fn stop_tenant_jobs(ctx: &Ctx, tenant: &TenantRecord) -> Result<()> {
             .args(["stop", "--"])
             .arg(format!("{}.service", job.unit));
         ctx.sys.run(stop).await?;
-        info!(job = %job.id, tenant = %tenant.username, "file job stopped: the tenant was suspended");
-        conclude_job(
-            ctx,
-            job,
-            Err("stopped because the tenant was suspended".to_owned()),
-            "",
-        )?;
+        info!(job = %job.id, tenant = %tenant.username, reason = why.message(), "file job stopped");
+        conclude_job(ctx, job, Err(why.message().to_owned()), "")?;
     }
     Ok(())
 }

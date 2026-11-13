@@ -325,9 +325,11 @@ impl TenantService {
     /// (503 while suspended), validated and activated; only then is the
     /// record updated, so an interrupted attempt is simply repeated.
     ///
-    /// The order across features (docs/superpowers/specs/2026-11-13-integration-design.md):
-    /// suspend: the sites answer 503 first, then the tenant's processes stop
-    /// (PHP, applications), then its access is cut (SFTP keys, password and
+    /// The order across features (docs/superpowers/specs/2026-11-13-integration-design.md,
+    /// extended by 2026-11-14-m3-integration-design.md):
+    /// suspend: the sites answer 503 first, then a running file-manager job
+    /// is stopped (the files are read-only from now on), then the tenant's
+    /// processes stop (PHP, applications), then its access is cut (SFTP keys, password and
     /// sessions; database accounts locked and their sessions killed, last,
     /// when nothing is left that could reconnect). Resume is the reverse:
     /// access, then processes, then the sites — so no request sees a 502 and
@@ -351,7 +353,12 @@ impl TenantService {
         if changed {
             if suspended {
                 // A file job changing the home stops with everything else.
-                crate::files::stop_tenant_jobs(&self.ctx, &rec).await?;
+                crate::files::stop_tenant_jobs(
+                    &self.ctx,
+                    &rec,
+                    crate::files::StopReason::Suspended,
+                )
+                .await?;
                 crate::php::set_running(&self.ctx, &rec, false).await?;
                 crate::app::set_running_all(&self.ctx, &rec, false).await?;
                 // The keys file goes away, the password hash is locked and
@@ -539,8 +546,8 @@ impl TenantService {
         Ok(())
     }
 
-    /// Delete a tenant with everything it has, in this order: PHP and
-    /// applications stopped, every site removed (with its certificate,
+    /// Delete a tenant with everything it has, in this order: a file-manager
+    /// job left running stopped, PHP and applications stopped, every site removed (with its certificate,
     /// Automatic HTTPS state, logs, PHP pool and application unit), SFTP
     /// access, every database user, database and the database trash
     /// (dropped at once), the backups that are not retained, then the
@@ -562,6 +569,9 @@ impl TenantService {
             info!(tenant = %name, "deleting the tenant with everything it has");
         }
         crate::backup::detach_retained(&self.ctx, name)?;
+        // A file job still working in the home is stopped first (the cascade
+        // does not start while one runs; this covers a resumed deletion).
+        crate::files::stop_tenant_jobs(&self.ctx, &rec, crate::files::StopReason::Deleted).await?;
         crate::php::set_running(&self.ctx, &rec, false).await?;
         crate::app::set_running_all(&self.ctx, &rec, false).await?;
         let vhosts = vhost::VHostService::new(self.ctx.clone());
@@ -1250,6 +1260,46 @@ pub(crate) mod tests {
         })
     }
 
+    /// A file job of `tenant` recorded as running (its unit is the fake
+    /// system's; only the record matters to the engine's rules).
+    pub(crate) fn running_file_job(
+        ctx: &Ctx,
+        tenant: &str,
+        millis: u128,
+    ) -> Result<crate::records::FileJobRecord> {
+        let id = crate::validate::FileJobId::from_millis(millis);
+        let job = crate::records::FileJobRecord {
+            version: crate::records::RECORD_VERSION,
+            id: id.to_string(),
+            kind: crate::records::FileJobKind::Extract,
+            tenant: tenant.to_owned(),
+            unit: crate::files::unit_name(&id),
+            state: crate::records::JobState::Running,
+            request: "extract site.zip into public_html".into(),
+            message: String::new(),
+            output: String::new(),
+            started_at_unix: now_unix(),
+            finished_at_unix: 0,
+            entries: 0,
+            bytes: 0,
+            skipped: 0,
+        };
+        ctx.store.save_file_job(&job)?;
+        Ok(job)
+    }
+
+    /// An upload of `tenant` in progress (its partial file is in the home).
+    pub(crate) fn upload_in_progress(ctx: &Ctx, tenant: &str, millis: u128) -> Result<()> {
+        ctx.store.save_upload(&crate::records::UploadRecord {
+            version: crate::records::RECORD_VERSION,
+            id: crate::validate::UploadId::from_millis(millis).to_string(),
+            tenant: tenant.to_owned(),
+            path: "public_html/big.bin".into(),
+            overwrite: false,
+            created_at_unix: now_unix(),
+        })
+    }
+
     impl Everything {
         fn keys_file(&self) -> Result<PathBuf> {
             let rec = self
@@ -1263,11 +1313,18 @@ pub(crate) mod tests {
         /// Suspend: sites answer 503, then PHP and the application stop,
         /// then SFTP (password locked, sessions ended), databases last.
         async fn suspend(&self) -> Result<()> {
+            let file_job = running_file_job(&self.ctx, "alice", 1_794_000_000_001)?;
+            let file_unit = format!("{}.service", file_job.unit);
             self.sys.clear_calls();
             self.tenants.set_suspended("alice", true).await?;
             let calls = argvs(&self.sys);
             let order = [
                 first(&calls, |c| mentions(c, "reload-or-restart"), "nginx reload"),
+                first(
+                    &calls,
+                    |c| systemctl(c, "stop", &file_unit),
+                    "file job stop",
+                ),
                 first(
                     &calls,
                     |c| systemctl(c, "disable", "oxpanel-php-alice.service"),
@@ -1301,6 +1358,25 @@ pub(crate) mod tests {
             assert!(
                 !self.keys_file()?.exists(),
                 "no SFTP key works while suspended"
+            );
+            let stopped = self
+                .ctx
+                .store
+                .load_file_job(&crate::validate::FileJobId::parse(&file_job.id)?)?
+                .unwrap_or_else(|| panic!("file job record"));
+            assert_eq!(stopped.state, crate::records::JobState::Failed);
+            assert!(stopped.message.contains("suspended"), "{}", stopped.message);
+            // Read-only while suspended: a change is refused before anything runs.
+            self.sys.clear_calls();
+            assert!(matches!(
+                crate::files::FileService::new(self.ctx.clone())
+                    .write("alice", "public_html/x.html", b"x", true)
+                    .await,
+                Err(Error::TenantSuspended(_))
+            ));
+            assert!(
+                self.sys.calls().is_empty(),
+                "nothing ran for the refused change"
             );
             assert!(
                 self.host.reconcile().await?.is_empty(),
@@ -1375,7 +1451,17 @@ pub(crate) mod tests {
             // The deleted database waits in the trash: still refused.
             self.refused(|e| matches!(e, Error::TenantHasDatabases(_)))
                 .await?;
-            assert_eq!(self.db.purge_trash("alice", "").await?, 1);
+            // This one and the database put in the trash before the suspension.
+            assert_eq!(self.db.purge_trash("alice", "").await?, 2);
+            // A file job still works in the home: refused until it ends.
+            let file_job = running_file_job(&self.ctx, "alice", 1_794_000_000_002)?;
+            self.refused(|e| matches!(e, Error::FileJobRunning { .. }))
+                .await?;
+            let mut done = file_job;
+            done.state = crate::records::JobState::Succeeded;
+            done.finished_at_unix = now_unix();
+            self.ctx.store.save_file_job(&done)?;
+            upload_in_progress(&self.ctx, "alice", 1_794_000_000_003)?;
             self.refused(|e| matches!(e, Error::TenantHasBackups(_)))
                 .await?;
             self.backups.retain("alice", &self.backup_id, 1, 0).await?;
@@ -1403,6 +1489,11 @@ pub(crate) mod tests {
                 "the retained backup outlives the tenant, detached"
             );
             assert!(
+                self.ctx.store.list_file_jobs()?.is_empty()
+                    && self.ctx.store.list_uploads()?.is_empty(),
+                "the file manager's job history and upload records go with the tenant"
+            );
+            assert!(
                 self.host.reconcile().await?.is_empty(),
                 "nothing left behind"
             );
@@ -1412,14 +1503,25 @@ pub(crate) mod tests {
 
     /// One tenant using every feature at once — a PHP site with an uploaded
     /// certificate, a Node.js application, an SFTP key and password, a
-    /// database and a database user, and a backup — through suspension,
+    /// database and a database user, a database in the trash, a backup, a
+    /// running file job and an upload in progress — through suspension,
     /// resumption and deletion, with the order across the feature modules
     /// asserted (see `TenantService::set_suspended`).
     #[tokio::test]
     async fn one_tenant_with_every_feature_through_suspend_resume_and_delete() -> Result<()> {
         let all = everything().await?;
+        // A deleted database waits in the trash through all of it.
+        all.db
+            .create_database("alice", "alice_old", crate::records::DbEngine::Mariadb)
+            .await?;
+        all.db.delete_database("alice_old").await?;
         all.suspend().await?;
         all.resume().await?;
+        assert_eq!(
+            all.ctx.store.list_trash()?.len(),
+            1,
+            "the trash is untouched"
+        );
         all.delete().await
     }
 

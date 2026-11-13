@@ -41,6 +41,16 @@ const POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// Consecutive faults after which a driver stops looking at its job.
 const MAX_DRIVER_FAULTS: u32 = 30;
 
+/// The running deletion (cascade) job of `tenant`, if there is one. Other
+/// features refuse to start work for a tenant that is being deleted.
+pub fn running_deletion(ctx: &Ctx, tenant: &Username) -> Result<Option<JobRecord>> {
+    Ok(ctx.store.list_jobs()?.into_iter().find(|j| {
+        j.tenant == tenant.as_str()
+            && j.state == JobState::Running
+            && j.kind == JobKind::DeleteTenant
+    }))
+}
+
 #[derive(Debug, Clone)]
 pub struct LifecycleService {
     ctx: Ctx,
@@ -123,6 +133,10 @@ impl LifecycleService {
                 })
             };
         }
+        // A file job working in the home: wait for it (or suspend the tenant,
+        // which stops it), like for a backup or restore. Refused before
+        // anything is written.
+        crate::files::refuse_tenant_deletion(&self.ctx, &name)?;
         if running.len() >= MAX_RUNNING_JOBS {
             return Err(Error::TooManyJobs);
         }
@@ -311,7 +325,7 @@ mod tests {
     use super::*;
     use crate::records::DbEngine;
     use crate::system::{bin, CommandSpec};
-    use crate::tenant::tests::{everything, Everything};
+    use crate::tenant::tests::{everything, running_file_job, upload_in_progress, Everything};
 
     /// alice with every feature (see `tenant::tests::everything`) plus a
     /// database in her trash, and the deletion service.
@@ -489,6 +503,103 @@ mod tests {
         assert!(all.ctx.store.list_backups()?.is_empty(), "no final backup");
         // Repeating it finds no tenant.
         assert_eq!(life.delete_cascade("alice", "alice", 0).await?, None);
+        Ok(())
+    }
+
+    /// The file manager and a cascade: the deletion waits for a running file
+    /// job (refused before anything is written, like for a backup); while the
+    /// final backup is taken, the tenant's files are not changed any more;
+    /// a file job found running when the removal starts (a deletion resumed
+    /// after a crash) is stopped before anything else; the file manager's job
+    /// history and upload records go with the tenant.
+    #[tokio::test]
+    async fn a_cascade_waits_for_file_jobs_and_takes_the_file_managers_state_along() -> Result<()> {
+        let (all, life) = setup().await?;
+        let files = crate::files::FileService::new(all.ctx.clone());
+        let running = running_file_job(&all.ctx, "alice", 1_794_000_000_001)?;
+        assert!(matches!(
+            life.delete_cascade("alice", "alice", 3).await,
+            Err(Error::FileJobRunning { .. })
+        ));
+        assert!(all.sys.calls().is_empty(), "nothing ran");
+        assert!(all
+            .ctx
+            .store
+            .list_jobs()?
+            .iter()
+            .all(|j| j.kind != JobKind::DeleteTenant));
+        intact(&all)?;
+        let mut finished = running;
+        finished.state = JobState::Succeeded;
+        finished.finished_at_unix = now_unix();
+        all.ctx.store.save_file_job(&finished)?;
+        upload_in_progress(&all.ctx, "alice", 1_794_000_000_002)?;
+
+        let (_, id) = start(&life, 3).await?;
+        assert!(!life.step(&id).await?, "the final backup starts");
+        all.sys.clear_calls();
+        assert!(matches!(
+            files.write("alice", "public_html/x.html", b"x", true).await,
+            Err(Error::JobRunning { .. })
+        ));
+        assert!(matches!(
+            files
+                .start_upload("alice", "public_html/y.bin", false)
+                .await,
+            Err(Error::JobRunning { .. })
+        ));
+        assert!(
+            all.sys.calls().is_empty(),
+            "no worker ran for a refused change"
+        );
+        let child = all
+            .ctx
+            .store
+            .list_jobs()?
+            .into_iter()
+            .find(|j| j.parent_job == id.as_str())
+            .unwrap_or_else(|| panic!("no final backup job"));
+        assert!(all.backups.step(&JobId::parse(&child.id)?).await?);
+        assert!(!life.step(&id).await?, "on to the removal");
+        // As if the daemon had stopped here and a file job had been left running.
+        let stray = running_file_job(&all.ctx, "alice", 1_794_000_000_003)?;
+        all.sys.clear_calls();
+        assert!(life.step(&id).await?);
+        let done = load(&all, &id)?;
+        assert_eq!(done.state, JobState::Succeeded, "{}", done.message);
+        let calls = all.sys.calls();
+        let unit = format!("{}.service", stray.unit);
+        let order = [
+            position(
+                &calls,
+                |c| c.program == bin::SYSTEMCTL && has(c, "stop") && has(c, &unit),
+                "file job stop",
+            ),
+            position(
+                &calls,
+                |c| {
+                    c.program == bin::SYSTEMCTL
+                        && has(c, "disable")
+                        && has(c, "oxpanel-php-alice.service")
+                },
+                "PHP stop",
+            ),
+            position(
+                &calls,
+                |c| c.program == bin::USERDEL && has(c, "--remove"),
+                "userdel",
+            ),
+        ];
+        assert!(order.is_sorted(), "removal order {order:?}");
+        gone(&all).await?;
+        assert!(
+            all.ctx.store.list_file_jobs()?.is_empty(),
+            "file job history gone"
+        );
+        assert!(
+            all.ctx.store.list_uploads()?.is_empty(),
+            "upload records gone"
+        );
         Ok(())
     }
 

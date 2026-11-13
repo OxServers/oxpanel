@@ -69,6 +69,13 @@ open-core:
   tenant). Keys live in root-owned files outside the home; the tenant is
   chrooted into a root-owned directory holding only its home, bind-mounted by
   a systemd mount unit. See `src/sftp.rs` and the M2c design record.
+- **File manager:** the API's file operations (list, read, write, upload,
+  move, copy, delete, compress, extract) never run as root: a worker mode of
+  the daemon binary runs as the tenant (`setpriv`, or a transient service with
+  `User=` the tenant for jobs) and resolves every path beneath the home with
+  `openat2(RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV)`; archives
+  are parsed by pure-Rust crates with bomb and path-trick limits. See
+  `src/files.rs` and the files design record.
 - **Disk:** XFS user quotas per tenant uid (`src/quota.rs`), when the host
   mounts the homes' file system with `uquota`; refused, never ignored, when not.
 - **SELinux:** document roots get a persistent `httpd_sys_content_t` file-context
@@ -90,7 +97,10 @@ changing the workflows.
 `/var/lib/oxpanel/{tenants,vhosts}/<name>.json` (root-only). A record claiming
 the name and uid is written *before* the irreversible step (`useradd`) with
 `state = provisioning`, synced to the account afterwards, then set to `ready`;
-deletion marks `deleting` first. Records carry an opaque `owner` label for the
+deletion marks `deleting` first. Databases, the database trash
+(`db-trash/`), backups and their jobs (`jobs/`), file-manager jobs
+(`file-jobs/`) and uploads in progress (`uploads/`) have their own record
+directories beside them. Records carry an opaque `owner` label for the
 panel's reseller model.
 Repeating a request replays it safely: identical spec → `created=false`,
 different spec → `ALREADY_EXISTS`, interrupted → resumed.
@@ -129,6 +139,6 @@ not per object; per-owner confinement is a possible later refinement.
 2. Confined SELinux domain (`oxpanel_t`) and a capability *allow*-list for the unit; a confining policy for `oxpanel_app_t` (today it only labels applications so the web server can be allowed to reach exactly them).
 3. ~~Per-tenant PHP-FPM in the tenant slice; per-vhost logs~~ — done (hosting milestone 2a). Node.js and Python applications likewise (one sandboxed service per site, UNIX socket, own SELinux domain). Next: runtime version choice, per-tenant PHP settings, application environment variables.
 4. ~~TLS for virtual hosts (ACME)~~ — done (M2b): uploaded and ACME (HTTP-01) certificates; the ACME client `oxpanel-acme` runs unprivileged outside the daemon. Next: DNS-01 / wildcard certificates. SFTP access and disk quotas: done (M2c).
-5. ~~Tenant databases (MariaDB), per-tenant backups and restores~~ — done (M2d, M2e; merged with M2b/M2c in the M2 integration). Next: database dumps in backups, a database trash, cascade deletion of a customer with an optional final backup.
+5. ~~Tenant databases (MariaDB), per-tenant backups and restores~~ — done (M2d, M2e; merged with M2b/M2c in the M2 integration). Database dumps in backups, a database trash and the one-step (cascade) deletion of a customer with an optional final backup: done (M3 lifecycle). A file manager running as the tenant: done (M3 files). Both merged in the M3 integration.
 6. Repair mode for `Reconcile` (today it reports only).
 7. Split privileged helper behind the `System` trait.

@@ -1580,6 +1580,9 @@ PY
   oxpanel-ctl db grant lcz_app lcz_one >/dev/null
   lcsql lcz_app lcz_one "CREATE TABLE t (a INT); INSERT INTO t VALUES (7)"
   LZT="$(trash_of "$(oxpanel-ctl db delete lcz_old)")"
+  printf 'from-the-file-manager' | oxpanel-ctl files write lcz fm.txt >/dev/null
+  oxpanel-ctl files cp lcz fm.txt fm-copy.txt --wait >/dev/null
+  check "the customer has a file-manager job in its history" grep -q '"tenant": "lcz"' <(cat /var/lib/oxpanel/file-jobs/*.json 2>/dev/null)
   out="$(timeout 300 oxpanel-ctl backup create lcz --wait)" || true
   LZB="$(backup_of "$out")"
   check "a tenant with every feature is set up" bash -c 'test -f /etc/nginx/oxpanel.d/lcz.test.conf && test -f /etc/pki/oxpanel/lcz.test.key && test -f /etc/systemd/system/oxpanel-php-lcz.service && test -f /etc/systemd/system/oxpanel-app-lczapp.test.service && test -d "$1/lcz/$2" && test "$(schemas_like "oxpanel_trash_$3")" = 1' _ "$BK" "$LZB" "$LZT"
@@ -1600,6 +1603,7 @@ PY
   check "no database records are left" bash -c '! grep -l "\"tenant\": \"lcz\"" /var/lib/oxpanel/databases/* /var/lib/oxpanel/db-users/* /var/lib/oxpanel/db-trash/* 2>/dev/null | grep -q .'
   check "the ordinary backup is deleted" test ! -e "$BK/lcz/$LZB"
   check "the account and its home are gone" bash -c '! id lcz 2>/dev/null && test ! -e /home/lcz && test ! -e /var/lib/oxpanel/tenants/lcz.json'
+  check "the file manager's job history and upload records are gone" bash -c '! grep -l "\"tenant\": \"lcz\"" /var/lib/oxpanel/file-jobs/* /var/lib/oxpanel/uploads/* 2>/dev/null | grep -q .'
   retained="$(oxpanel-ctl backup list-retained)"; echo "$retained"
   check "the final backup is kept, detached, with both databases" bash -c 'grep -A3 "^backup=$1 tenant=lcz tenant_deleted=true " <<<"$2" | grep -q "^  database lcz_one " && grep -A3 "^backup=$1 " <<<"$2" | grep -q "^  database lcz_two "' _ "$LZF" "$retained"
   check "it is kept for 3 days" bash -c 'u="$(sed -n "s/^backup=$1 .* retain_until=\([0-9]*\) .*/\1/p" <<<"$2")"; n="$(date +%s)"; test "$u" -ge $((n + 259200 - 700)) && test "$u" -le $((n + 259200))' _ "$LZF" "$retained"
@@ -1627,6 +1631,7 @@ PY
   out="$(oxpanel-ctl tenant delete lck --cascade --confirm lck --final-backup-days 1)"; echo "$out"
   LKJ="$(job_of "$out")"
   check "the cascade starts with the final backup" grep -qx 'phase=final-backup' <<<"$out"
+  check "while it runs, the file manager changes nothing" bash -c 'printf x | oxpanel-ctl files write lck late.txt 2>&1 | grep -q "FailedPrecondition.*still running for tenant .lck." && test ! -e /home/lck/late.txt'
   systemctl kill -s SIGKILL oxpanel-daemon
   for i in $(seq 1 60); do systemctl -q is-active oxpanel-daemon && break; sleep 0.5; done
   rc=0; out="$(timeout 600 oxpanel-ctl tenant delete lck --cascade --confirm lck --final-backup-days 1 --wait)" || rc=$?; echo "$out" | tail -3
@@ -1863,6 +1868,7 @@ out="$(F compress filea "" bulk.tar.gz bulk --format tar-gz)"; JOB="$(sed -n 's/
 check "a long job is still running after the request" test "$(job_state "$out")" = JOB_STATE_RUNNING
 check "it runs as the tenant" test "$(systemctl show -p User --value "oxpanel-files-$JOB.service")" = "$(id -u filea)"
 check "in its slice" test "$(systemctl show -p Slice --value "oxpanel-files-$JOB.service")" = oxpanel-tenant-filea.slice
+check "deleting the tenant with everything waits for the running file job" bash -c 'oxpanel-ctl tenant delete filea --cascade --confirm filea 2>&1 | grep -q "FailedPrecondition.*file job" && oxpanel-ctl tenant get filea | grep -q " state=TENANT_STATE_READY "'
 systemctl kill -s KILL oxpanel-daemon
 check "the daemon comes back after being killed mid-job" bash -c 'for i in $(seq 1 60); do systemctl -q is-active oxpanel-daemon && exit 0; sleep 1; done; exit 1'
 out="$(timeout 600 oxpanel-ctl files job filea "$JOB" --wait)" || true; echo "$out" | tail -1

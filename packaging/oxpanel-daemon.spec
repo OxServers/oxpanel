@@ -8,7 +8,9 @@ Source0:        %{name}-%{version}.tar.gz
 
 BuildRequires:  gcc
 BuildRequires:  systemd-rpm-macros
-# Rust toolchain: use `rustup` (see rust-toolchain.toml) or the rust-toolset module.
+# Rust toolchain: 1.88 or newer (Cargo.toml rust-version; tested with the
+# version pinned in rust-toolchain.toml). Use `rustup`, or the rust-toolset
+# module only if it is at least 1.88.
 
 Requires:       nginx
 # Certificates are checked, and ACME keys and signing requests made, with OpenSSL;

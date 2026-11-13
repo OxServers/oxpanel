@@ -67,6 +67,7 @@ creating files and links in its own home, and making network connections.
 | Connect to another tenant's PHP or application socket | socket directory `0750` with an ACL for the web server only; socket ACL names `nginx` | phase 80, section 1; run-inside |
 | Plant a symlink or hard link so that Nginx serves a file the tenant does not own | `disable_symlinks if_not_owner`; `protected_hardlinks` | phase 80, section 2 |
 | Plant a symlink so that the root daemon acts outside the tenant (`setfacl`, `restorecon`/`semanage`, document-root creation, `du`, `userdel -r`) | document root created as the tenant and verified to be a real directory owned by the tenant; `setfacl --physical`; `du` without following links; `userdel` removes links, not targets | phase 80, section 4 (including a race between a path flipping from directory to link and repeated configuration) |
+| Make the file manager act outside the home (a link to `/etc/passwd` or another home, a directory swapped for a link during a walk, archive entries named `../x` or `/etc/x`, links and hard links in archives, zip and tar bombs, names with control or bidirectional characters) | every file operation runs as the tenant (never root) with no capabilities; request paths resolved with `openat2(RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_XDEV)`, walks descriptor to descriptor with `O_NOFOLLOW`; archive entries rebuilt component by component and refused, never "fixed"; ratio, byte and entry caps while extracting | `files_tests` (symlinks out of the home, traversal, hostile archives, bombs); run-inside "file manager" section (as root against a real home) |
 | Escalate privilege | `NoNewPrivileges`, empty capability bounding set, `RestrictSUIDSGID`, no setuid helpers reachable | phase 80 probes `sudo`, `su`, `systemd-run`, `mount`, `nsenter`, `setfacl /etc`, `useradd` from inside each runtime; `/proc/self/status` checks |
 | Exhaust memory | `MemoryMax` on the tenant slice, `MemorySwapMax=0`: the kernel kills inside the slice | phase 80, section 5 (PHP, Node.js, Python); the victim and the host are unaffected |
 | Fork bomb | `TasksMax` on the slice | phase 80, section 5b |
@@ -117,6 +118,11 @@ operator granted that uid; arbitrary field values.
   (`malformed_requests_are_refused_without_side_effects`,
   `oversized_requests_are_refused_before_decoding`,
   `random_requests_never_panic_or_corrupt_state`).
+* **File content.** A `vhost`-scoped peer can read and change any tenant's
+  files through the file manager, as that tenant and only beneath its home
+  (`ReadFile` and every change need `vhost`; listing needs `read`, so a
+  monitoring peer never sees content such as a database password). Nothing
+  it sends reaches a file outside a home, and nothing runs as root.
 * **Ownership.** The daemon only modifies what a record says it created, so even
   a full-scope peer cannot make it delete `root` or adopt `nginx`
   (`never_adopts_a_foreign_account_or_group`).

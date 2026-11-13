@@ -607,7 +607,7 @@ impl SchemaObjects {
 
 fn unhex(field: &str) -> Result<String> {
     let bytes = field.as_bytes();
-    if bytes.len() % 2 != 0 {
+    if !bytes.len().is_multiple_of(2) {
         return Err(Error::Internal(format!("not hexadecimal: '{field}'")));
     }
     let mut out = Vec::with_capacity(bytes.len() / 2);

@@ -173,7 +173,7 @@ fn walk(
         let (names, cut) = read_names(&dir.fd, remaining)?;
         for (name, _) in names {
             seen += 1;
-            if seen % 1024 == 0 && started.elapsed().as_secs() >= limits.walk_max_secs {
+            if seen.is_multiple_of(1024) && started.elapsed().as_secs() >= limits.walk_max_secs {
                 return Ok((seen, true));
             }
             let name = OsStr::from_bytes(&name);
