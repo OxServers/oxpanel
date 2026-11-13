@@ -3,6 +3,8 @@
 //! Exit status: 0 on success, 1 on an API error (message on stderr),
 //! 2 on usage errors, 3 when `host reconcile` found drift, 4 when
 //! `vhost install-deps` ran and the installer failed.
+//!
+//! Database passwords are read from standard input, never from arguments.
 // A CLI's whole job is to print.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
@@ -60,6 +62,79 @@ enum Cmd {
     /// The engine and the host it runs on.
     #[command(subcommand)]
     Host(HostCmd),
+    /// Databases and database users of tenants (MariaDB).
+    #[command(subcommand)]
+    Db(DbCmd),
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug)]
+enum DbEngineArg {
+    Mariadb,
+}
+
+impl From<DbEngineArg> for i32 {
+    fn from(e: DbEngineArg) -> Self {
+        match e {
+            DbEngineArg::Mariadb => pb::DatabaseEngine::Mariadb.into(),
+        }
+    }
+}
+
+fn engine_name(raw: i32) -> &'static str {
+    match pb::DatabaseEngine::try_from(raw) {
+        Ok(pb::DatabaseEngine::Mariadb) => "mariadb",
+        Ok(pb::DatabaseEngine::Unspecified) | Err(_) => "unknown",
+    }
+}
+
+#[derive(Subcommand, Debug)]
+enum DbCmd {
+    /// Create a database (idempotent). The name is <tenant>_<suffix>.
+    Create {
+        name: String,
+        #[arg(long)]
+        tenant: String,
+        #[arg(long, value_enum, default_value_t = DbEngineArg::Mariadb)]
+        engine: DbEngineArg,
+    },
+    /// List databases with their size.
+    List {
+        #[arg(long, default_value = "")]
+        tenant: String,
+    },
+    /// Drop a database OxPanel created, with everything in it.
+    Delete {
+        name: String,
+    },
+    /// Create a database user. The password is read from standard input
+    /// (one line), never from the command line.
+    UserCreate {
+        name: String,
+        #[arg(long)]
+        tenant: String,
+        #[arg(long, value_enum, default_value_t = DbEngineArg::Mariadb)]
+        engine: DbEngineArg,
+    },
+    UserList {
+        #[arg(long, default_value = "")]
+        tenant: String,
+    },
+    /// Replace a user's password, read from standard input (one line).
+    UserPasswd {
+        name: String,
+    },
+    UserDelete {
+        name: String,
+    },
+    /// Let a user work in a database of the same tenant.
+    Grant {
+        user: String,
+        database: String,
+    },
+    Revoke {
+        user: String,
+        database: String,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -303,7 +378,168 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
         Cmd::Tenant(cmd) => run_tenant(&mut c, cmd).await?,
         Cmd::Vhost(cmd) => run_vhost(&mut c, cmd).await?,
         Cmd::Host(cmd) => run_host(&mut c, cmd).await?,
+        Cmd::Db(cmd) => run_db(&mut c, cmd).await?,
     })
+}
+
+/// One line from standard input, without its line ending. A password given
+/// as an argument would be visible to every user of the host in `ps`.
+fn read_password() -> Result<String, tonic::Status> {
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .map_err(|e| tonic::Status::invalid_argument(format!("reading the password: {e}")))?;
+    let password = line.trim_end_matches(['\n', '\r']);
+    if password.is_empty() {
+        return Err(tonic::Status::invalid_argument(
+            "no password on standard input (e.g. `oxpanel-ctl db user-create … < password-file`)",
+        ));
+    }
+    Ok(password.to_owned())
+}
+
+fn print_db_user(u: &pb::DatabaseUser) {
+    say!(
+        "user={} tenant={} engine={} databases={} max_connections={} created_at={}",
+        u.name,
+        u.tenant,
+        engine_name(u.engine),
+        if u.databases.is_empty() {
+            "-".to_owned()
+        } else {
+            u.databases.join(",")
+        },
+        u.max_connections,
+        u.created_at.as_ref().map_or(0, |ts| ts.seconds),
+    );
+}
+
+fn print_database(d: &pb::Database) {
+    say!(
+        "database={} tenant={} engine={} size={} created_at={}",
+        d.name,
+        d.tenant,
+        engine_name(d.engine),
+        d.size_bytes,
+        d.created_at.as_ref().map_or(0, |ts| ts.seconds),
+    );
+}
+
+async fn run_db(
+    c: &mut OxPanelEngineClient<Channel>,
+    cmd: DbCmd,
+) -> Result<ExitCode, tonic::Status> {
+    match cmd {
+        DbCmd::Create {
+            name,
+            tenant,
+            engine,
+        } => {
+            let r = c
+                .create_database(pb::CreateDatabaseRequest {
+                    tenant,
+                    name,
+                    engine: engine.into(),
+                })
+                .await?
+                .into_inner();
+            say!("created={}", r.created);
+            if let Some(d) = &r.database {
+                print_database(d);
+            }
+        }
+        DbCmd::List { tenant } => {
+            for d in &c
+                .list_databases(pb::ListDatabasesRequest { tenant })
+                .await?
+                .into_inner()
+                .databases
+            {
+                print_database(d);
+            }
+        }
+        DbCmd::Delete { name } => {
+            let r = c
+                .delete_database(pb::DeleteDatabaseRequest { name })
+                .await?
+                .into_inner();
+            say!("deleted={}", r.deleted);
+        }
+        DbCmd::UserCreate {
+            name,
+            tenant,
+            engine,
+        } => {
+            let password = read_password()?;
+            let r = c
+                .create_database_user(pb::CreateDatabaseUserRequest {
+                    tenant,
+                    name,
+                    password,
+                    engine: engine.into(),
+                })
+                .await?
+                .into_inner();
+            say!("created={}", r.created);
+            if let Some(u) = &r.user {
+                print_db_user(u);
+            }
+        }
+        DbCmd::UserList { tenant } => {
+            for u in &c
+                .list_database_users(pb::ListDatabaseUsersRequest { tenant })
+                .await?
+                .into_inner()
+                .users
+            {
+                print_db_user(u);
+            }
+        }
+        DbCmd::UserPasswd { name } => {
+            let password = read_password()?;
+            c.set_database_user_password(pb::SetDatabaseUserPasswordRequest { name, password })
+                .await?;
+            say!("changed=true");
+        }
+        DbCmd::UserDelete { name } => {
+            let r = c
+                .delete_database_user(pb::DeleteDatabaseUserRequest { name })
+                .await?
+                .into_inner();
+            say!("deleted={}", r.deleted);
+        }
+        DbCmd::Grant { .. } | DbCmd::Revoke { .. } => run_db_access(c, cmd).await?,
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `db grant` and `db revoke`.
+async fn run_db_access(
+    c: &mut OxPanelEngineClient<Channel>,
+    cmd: DbCmd,
+) -> Result<(), tonic::Status> {
+    let (changed, user) = match cmd {
+        DbCmd::Grant { user, database } => {
+            let r = c
+                .grant_database_access(pb::GrantDatabaseAccessRequest { user, database })
+                .await?
+                .into_inner();
+            (r.changed, r.user)
+        }
+        DbCmd::Revoke { user, database } => {
+            let r = c
+                .revoke_database_access(pb::RevokeDatabaseAccessRequest { user, database })
+                .await?
+                .into_inner();
+            (r.changed, r.user)
+        }
+        _ => return Ok(()),
+    };
+    say!("changed={changed}");
+    if let Some(u) = &user {
+        print_db_user(u);
+    }
+    Ok(())
 }
 
 async fn run_tenant(
@@ -559,6 +795,21 @@ async fn run_host(
                 i.home_disk_free_bytes,
                 i.uptime_seconds,
             );
+            // One line per database engine.
+            for e in &i.database_engines {
+                say!(
+                    "database_engine={} available={} version={} databases={} database_users={}",
+                    engine_name(e.engine),
+                    e.available,
+                    if e.version.is_empty() {
+                        "-"
+                    } else {
+                        e.version.as_str()
+                    },
+                    e.database_count,
+                    e.database_user_count,
+                );
+            }
         }
         HostCmd::Reconcile => {
             let r = c.reconcile(pb::ReconcileRequest {}).await?.into_inner();

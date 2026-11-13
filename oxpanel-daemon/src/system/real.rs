@@ -10,6 +10,7 @@ use nix::sys::stat::{fchmod, fstat, Mode, SFlag};
 use std::ffi::CString;
 
 use nix::unistd::{fchown, getgrouplist, Gid, Group, Uid, User};
+use tokio::io::AsyncWriteExt;
 use tracing::{debug, warn};
 
 use super::{CommandOutput, CommandSpec, HostStats, OsUser, System};
@@ -48,14 +49,29 @@ impl System for RealSystem {
             .env_clear()
             .env("PATH", CHILD_PATH)
             .env("LC_ALL", "C")
-            .stdin(Stdio::null())
+            .stdin(if spec.stdin.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             // If we stop waiting (timeout below), the child is killed rather than orphaned.
             .kill_on_drop(true);
-        let child = cmd.spawn().map_err(|e| Error::io("spawn", program, e))?;
+        let mut child = cmd.spawn().map_err(|e| Error::io("spawn", program, e))?;
         let secs = spec.timeout.as_secs();
-        match tokio::time::timeout(spec.timeout, child.wait_with_output()).await {
+        let pipe = child.stdin.take();
+        let input = spec.stdin.clone();
+        let finished = async move {
+            if let (Some(mut pipe), Some(input)) = (pipe, input) {
+                // A child that exits early closes the pipe; its exit status
+                // and stderr say why, so a failed write is not reported.
+                let _ = pipe.write_all(&input).await;
+                let _ = pipe.shutdown().await;
+            }
+            child.wait_with_output().await
+        };
+        match tokio::time::timeout(spec.timeout, finished).await {
             Ok(Ok(out)) => {
                 let result = CommandOutput {
                     program: spec.program,
@@ -63,7 +79,10 @@ impl System for RealSystem {
                     stdout: out.stdout,
                     stderr: out.stderr,
                 };
-                if !result.success() {
+                if !result.success() && spec.secret_input {
+                    // The tool may have echoed its input, which carries a secret.
+                    warn!(command = %spec.display(), code = ?result.code, "command failed (stderr withheld: its input carried a secret)");
+                } else if !result.success() {
                     warn!(command = %spec.display(), code = ?result.code, stderr = %result.stderr_lossy(), "command failed");
                 }
                 Ok(result)

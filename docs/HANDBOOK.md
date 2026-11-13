@@ -56,6 +56,7 @@ not touch an account, unit or Nginx file it has no record for.
 | SELinux | Enforcing is supported and is the target; the daemon detects it at start-up and labels tenant content accordingly. The booleans `httpd_enable_homedirs` and `httpd_read_user_content` must be on (the RPM sets them; the source install block sets them), because document roots live under tenant homes. |
 | Network | None. The API is a local UNIX socket; the daemon has no network access at all under its unit. |
 | Ports | Nginx on 80 (v0.1.0 does not manage TLS). |
+| Databases (optional) | `mariadb-server` 10.4 or newer (AlmaLinux 9 ships 10.5) and, for PHP sites, `php-mysqlnd`. Not installed by the RPM: see §3.5. Without them the database RPCs refuse cleanly. |
 
 ## 3. Installation
 
@@ -157,6 +158,40 @@ ls -l /run/oxpanel/oxpanel.sock             # srw-rw---- root oxpanel
 sudo oxpanel-ctl tenant list                # empty on a fresh host, exit 0
 journalctl -u oxpanel-daemon -n 20          # "preflight selinux=true|false", "listening"
 ```
+
+### 3.5 Tenant databases (optional): MariaDB
+
+Tenants can have MariaDB databases once a MariaDB server runs on the host.
+The daemon talks to it as `root` over the local UNIX socket (root
+authenticates through `unix_socket`, the AlmaLinux default, so there is no
+administrative password to store). A fresh MariaDB gives every local user an
+anonymous account and a shared `test` database; remove them, and keep the
+server off the network — tenant database users can only connect locally
+anyway (`'user'@'localhost'`), and with `skip-networking` there is no TCP
+listener at all (applications connect to `localhost`, i.e. the socket, not
+to `127.0.0.1`):
+
+```sh
+sudo dnf install -y mariadb-server php-mysqlnd
+sudo systemctl enable --now mariadb
+# What mysql_secure_installation does, without the prompts: no anonymous
+# accounts, no `test` database open to everyone.
+sudo mariadb --no-defaults --user=root <<'SQL'
+DELETE FROM mysql.global_priv WHERE User='';
+DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%';
+DROP DATABASE IF EXISTS test;
+FLUSH PRIVILEGES;
+SQL
+printf '[mysqld]\nskip-networking\n' | sudo tee /etc/my.cnf.d/oxpanel-local.cnf >/dev/null
+sudo systemctl restart mariadb
+sudo oxpanel-ctl host info | grep '^database_engine='   # database_engine=mariadb available=true version=10.5…
+```
+
+PHP-FPM instances that were already running load `php-mysqlnd` the next time
+they start (`systemctl restart 'oxpanel-php-*'`). Nothing in OxPanel has to be
+restarted: availability is checked on every request. If the server stops,
+database requests fail with `FAILED_PRECONDITION` and `host reconcile` reports
+it; sites keep running.
 
 ## 4. Configuration
 
@@ -290,6 +325,16 @@ vhost restart-app  <domain>
 vhost install-deps <domain>
 vhost remove  <domain>
 vhost list    [--tenant <username>]
+
+db create     <tenant>_<suffix> --tenant <username> [--engine mariadb]
+db list       [--tenant <username>]
+db delete     <name>
+db user-create <tenant>_<suffix> --tenant <username> [--engine mariadb]   # password: one line on stdin
+db user-list  [--tenant <username>]
+db user-passwd <name>                                                     # password: one line on stdin
+db user-delete <name>
+db grant      <user> <database>
+db revoke     <user> <database>
 ```
 
 Sizes accept `k`, `m`, `g`, `t` suffixes (binary units) or plain bytes.
@@ -363,7 +408,17 @@ sudo oxpanel-ctl vhost install-deps api.acme.example      # pip install -r requi
 sudo oxpanel-ctl vhost log acme.example
 sudo oxpanel-ctl vhost log acme.example --error --bytes 64K
 
-# Tear down (order matters: vhosts first)
+# A database for the shop and a user for it (§3.5 first). Names start with
+# "<tenant>_"; the password is read from standard input, never an argument.
+sudo oxpanel-ctl db create acme_shop --tenant acme
+printf '%s\n' "$SHOP_DB_PASSWORD" | sudo oxpanel-ctl db user-create acme_shopapp --tenant acme
+sudo oxpanel-ctl db grant acme_shopapp acme_shop
+sudo oxpanel-ctl db list --tenant acme        # database=acme_shop tenant=acme engine=mariadb size=…
+#   in the application: host "localhost", user "acme_shopapp", database "acme_shop"
+
+# Tear down (order matters: vhosts and databases first)
+sudo oxpanel-ctl db user-delete acme_shopapp
+sudo oxpanel-ctl db delete acme_shop          # drops the database and everything in it
 sudo oxpanel-ctl vhost remove shop.acme.example
 sudo oxpanel-ctl vhost remove acme.example
 sudo oxpanel-ctl tenant delete acme --remove-home
@@ -375,6 +430,9 @@ Limits: `--memory` is `0` (unlimited) or ≥ 16 MiB; `--cpu-weight` and
 names refused); domains lower-case ASCII labels (punycode `xn--` allowed, no
 wildcards, no IP literals); `--root` is relative, with components made of
 `A-Z a-z 0-9 . _ -` only; `--owner` is `^[a-z0-9][a-z0-9_.-]{0,63}$`.
+Database and database-user names are `<tenant>_<suffix>` with a suffix of 1–24
+characters `a-z 0-9` (so `acme_shop_wp` belongs to tenant `acme_shop`, never to
+`acme`); passwords are 8–128 characters without control characters.
 
 **Uploading content:** tenants have no login in v0.1.0. Put files in place as
 the tenant so ownership stays correct, e.g.
@@ -420,6 +478,11 @@ resp, err := client.CreateTenant(ctx, &oxpanelv1.CreateTenantRequest{
 | `InstallAppDependencies` | re-runs the installer; **not** under the mutation lock (it can take minutes), other RPCs proceed meanwhile | returns `succeeded=false` plus the installer output when npm/pip fails — show it to the site owner. `FAILED_PRECONDITION` as for `RestartApp`. Allow up to 5 minutes |
 | `ReadVirtualHostLog` | read-only; at most 128 KiB of whole lines from the end of the current file | `NOT_FOUND` (no such site). Log lines contain visitor IP addresses: show a site's log only to its owner |
 | `Reconcile` | read-only; waits for the mutation lock | — (an empty `drifts` list means records and OS agree) |
+| `CreateDatabase` / `CreateDatabaseUser` | existing → `created=false` (a user's password is **not** changed by a repeat; use `SetDatabaseUserPassword`); interrupted → completed | `INVALID_ARGUMENT` (name not `<tenant>_<suffix>`, password length), `FAILED_PRECONDITION` (MariaDB not installed/running; the name exists on the server but OxPanel did not create it; a hand-written grant pattern would expose the new database), `RESOURCE_EXHAUSTED` (per-tenant cap), `NOT_FOUND` (tenant) |
+| `SetDatabaseUserPassword` | sets it every time; re-creates an account that disappeared, with its grants | `NOT_FOUND` (no such user), `FAILED_PRECONDITION` |
+| `DeleteDatabase` / `DeleteDatabaseUser` | `deleted=false` if OxPanel has no such object (it never drops one it did not create) | `FAILED_PRECONDITION` (MariaDB unavailable) |
+| `GrantDatabaseAccess` / `RevokeDatabaseAccess` | already so → `changed=false`; a grant is re-applied every time (heals a hand-made revoke) | `INVALID_ARGUMENT` (user and database of different tenants), `NOT_FOUND` |
+| `ListDatabases` / `ListDatabaseUsers` | read-only; sizes are `0` while MariaDB is down | — |
 | any | | `PERMISSION_DENIED` (peer not allowed, or its scopes do not cover the RPC — §5), `DEADLINE_EXCEEDED` (a system command hit `OXPANEL_COMMAND_TIMEOUT_SECS`), `INTERNAL` (redacted; see the journal) |
 
 Guidance for the three panels (root / reseller / customer): the engine is
@@ -454,6 +517,9 @@ needs to confirm a site is live, poll it.
 | `/run/oxpanel-app/<domain>/app.sock` | directory `<t>:<t> 0750` + ACL `user:nginx:--x` | socket Nginx proxies to; created by the application |
 | `/usr/share/oxpanel/selinux/oxpanel.cil` | `root 0644` | SELinux module: the `oxpanel_app_t` domain and the socket-directory label |
 | `/run/oxpanel/oxpanel.sock` | `root:oxpanel 0660` | API socket |
+| `/var/lib/oxpanel/databases/<name>.json` | `root 0600` | database record: tenant, engine, `state`, created time |
+| `/var/lib/oxpanel/db-users/<name>.json` | `root 0600` | database-user record: tenant, engine, connection limit, granted databases, `state`. **No password and no hash** |
+| MariaDB | | databases `<tenant>_<suffix>` (utf8mb4) and accounts `'<tenant>_<suffix>'@'localhost'`; data lives in `/var/lib/mysql`, which OxPanel's backups of `/var/lib/oxpanel` do not include |
 | SELinux hosts | | `semanage fcontext` equivalence `<docroot> = /usr/share/nginx/html` (labels the tree `httpd_sys_content_t`; a plain rule would be overridden by `file_contexts.homedirs`) |
 
 Records are the source of truth for *what OxPanel owns*. Back up
@@ -556,6 +622,10 @@ What to do with each finding:
 | `ORPHAN_APP_UNIT` | An application unit no site accounts for. | Inspect and remove by hand. |
 | `ORPHAN_PHP_POOL` | A PHP-FPM file no PHP-enabled site accounts for. | Inspect and remove by hand. |
 | `ORPHAN_NGINX_CONFIG` / `ORPHAN_SLICE_UNIT` | A file in OxPanel's directories that no record accounts for. | Inspect and remove by hand; OxPanel will not touch what it did not record. |
+| `DATABASE_MISSING` | A recorded database is gone from the server, its record is half-created/half-deleted, or MariaDB cannot be asked at all (subject `mariadb`). | Repeat `db create` (re-creates it **empty**) or `db delete`; start MariaDB. |
+| `DATABASE_USER_MISSING` | A recorded database user is gone from the server, or its record is interrupted. | `db user-passwd` re-creates the account with its recorded grants; or repeat `db user-create` / `db user-delete`. |
+| `DATABASE_PRIVILEGE_DRIFT` | A database user holds more or less than its record says (a global privilege, a grant on another database, `GRANT OPTION`, an edited connection limit, a lock that does not match the tenant's suspension), or an account OxPanel does not manage can reach a managed database. | Remove what was added by hand (`REVOKE …`); `db revoke` + `db grant` restores OxPanel's own grant. |
+| `ORPHAN_DATABASE_OBJECT` | A database or account on the server carries a tenant's prefix (`<tenant>_`) but has no record. | Inspect and remove by hand; OxPanel will not adopt or drop it. |
 
 **Recovering a stuck tenant** — a record in `provisioning` or `deleting`
 resumes on the next identical `CreateTenant`/`DeleteTenant`. A record whose
@@ -714,4 +784,12 @@ uninstall and remove `/var/lib/oxpanel`, `/etc/nginx/oxpanel.d`,
 - The SELinux path (`semanage fcontext`, `restorecon`) is likewise only
   exercised on a real enforcing host; test one tenant and one site there
   before rolling out.
+- Databases: the daemon only ever sends SQL on the `mariadb` client's
+  standard input, never as an argument, and only a password *hash* (what
+  MariaDB stores for `mysql_native_password`), never the password. The hash
+  is still a secret (it can be attacked offline): it appears in MariaDB's
+  general and binary logs if you enable them, like any `ALTER USER`. Keep
+  those logs root-only. Do not give tenants `root` or any account with
+  `CREATE USER`/`GRANT OPTION` — OxPanel's isolation between tenants rests on
+  the grants it writes.
 - Report security issues privately to the maintainers, not in public issues.

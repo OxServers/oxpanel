@@ -79,6 +79,36 @@ pub enum Error {
     #[error("virtual host '{0}' does not run an application")]
     NoApp(String),
 
+    /// MariaDB is not installed, not running, not reachable or not usable.
+    #[error("databases are not available on this host: {0}")]
+    DbUnavailable(String),
+
+    /// No record of this database or database user.
+    #[error("{kind} '{name}' not found")]
+    DbObjectNotFound { kind: &'static str, name: String },
+
+    /// It exists on the MariaDB server but OxPanel did not create it.
+    #[error("{kind} '{name}' exists on the MariaDB server but is not managed by OxPanel")]
+    DbNotManaged { kind: &'static str, name: String },
+
+    /// The record exists but the object cannot be used as it is.
+    #[error("{kind} '{name}' {reason}")]
+    DbObjectUnusable {
+        kind: &'static str,
+        name: String,
+        reason: &'static str,
+    },
+
+    #[error("tenant '{tenant}' already has the maximum of {max} {kind}s")]
+    DbLimitReached {
+        tenant: String,
+        kind: &'static str,
+        max: u32,
+    },
+
+    #[error("tenant '{0}' still owns databases or database users; delete them first")]
+    TenantHasDatabases(String),
+
     #[error("{program} exited with {status}")]
     CommandFailed {
         program: String,
@@ -153,6 +183,12 @@ impl Error {
                 | Self::RuntimeTooOld { .. }
                 | Self::AppPolicyMissing
                 | Self::Unauthorised
+                | Self::DbUnavailable(_)
+                | Self::DbObjectNotFound { .. }
+                | Self::DbNotManaged { .. }
+                | Self::DbObjectUnusable { .. }
+                | Self::DbLimitReached { .. }
+                | Self::TenantHasDatabases(_)
         )
     }
 }
@@ -168,7 +204,9 @@ impl From<Error> for Status {
         match err {
             Error::InvalidInput { .. } => Status::invalid_argument(message),
             Error::TenantExists(_) | Error::SpecMismatch(_) => Status::already_exists(message),
-            Error::TenantNotFound(_) | Error::VHostNotFound(_) => Status::not_found(message),
+            Error::TenantNotFound(_) | Error::VHostNotFound(_) | Error::DbObjectNotFound { .. } => {
+                Status::not_found(message)
+            }
             Error::NotManaged(_)
             | Error::TenantNotReady(_)
             | Error::TenantHasVHosts(_)
@@ -178,8 +216,14 @@ impl From<Error> for Status {
             | Error::NoApp(_)
             | Error::RuntimeTooOld { .. }
             | Error::AppPolicyMissing
+            | Error::DbUnavailable(_)
+            | Error::DbNotManaged { .. }
+            | Error::DbObjectUnusable { .. }
+            | Error::TenantHasDatabases(_)
             | Error::NginxInvalid(_) => Status::failed_precondition(message),
-            Error::UidExhausted { .. } => Status::resource_exhausted(message),
+            Error::UidExhausted { .. } | Error::DbLimitReached { .. } => {
+                Status::resource_exhausted(message)
+            }
             Error::Unauthorised => Status::permission_denied(message),
             Error::CommandTimeout { .. } => Status::deadline_exceeded(message),
             Error::CommandFailed { .. }
@@ -240,6 +284,33 @@ mod tests {
                 Code::DeadlineExceeded,
             ),
             (Error::Internal("x".into()), Code::Internal),
+            (Error::DbUnavailable("x".into()), Code::FailedPrecondition),
+            (
+                Error::DbObjectNotFound {
+                    kind: "database",
+                    name: "a_b".into(),
+                },
+                Code::NotFound,
+            ),
+            (
+                Error::DbNotManaged {
+                    kind: "database",
+                    name: "a_b".into(),
+                },
+                Code::FailedPrecondition,
+            ),
+            (
+                Error::DbLimitReached {
+                    tenant: "a".into(),
+                    kind: "database",
+                    max: 1,
+                },
+                Code::ResourceExhausted,
+            ),
+            (
+                Error::TenantHasDatabases("a".into()),
+                Code::FailedPrecondition,
+            ),
         ];
         for (err, code) in cases {
             let s: Status = err.into();

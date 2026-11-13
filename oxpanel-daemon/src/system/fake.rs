@@ -10,6 +10,7 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use super::fake_mariadb::FakeMariaDb;
 use super::{bin, CommandOutput, CommandSpec, HostStats, OsUser, System};
 use crate::error::{Error, Result};
 
@@ -18,8 +19,9 @@ struct Inner {
     users: BTreeMap<String, OsUser>,
     groups: BTreeMap<String, u32>,
     calls: Vec<CommandSpec>,
-    /// Scripted outcomes consumed in order per program.
-    scripted: BTreeMap<&'static str, VecDeque<(i32, String)>>,
+    /// Scripted outcomes consumed in order per program; `None` lets that
+    /// invocation run normally.
+    scripted: BTreeMap<&'static str, VecDeque<Option<(i32, String)>>>,
     selinux_enabled: bool,
     /// Supplementary group memberships: account name -> gids.
     memberships: BTreeMap<String, Vec<u32>>,
@@ -29,6 +31,8 @@ struct Inner {
     missing: Vec<&'static str>,
     /// What `node --version` prints; `None` = a supported version.
     node_version: Option<String>,
+    /// The emulated MariaDB server; `None` = MariaDB is not installed.
+    mariadb: Option<FakeMariaDb>,
 }
 
 #[derive(Debug, Default)]
@@ -80,7 +84,15 @@ impl FakeSystem {
             i.scripted
                 .entry(program)
                 .or_default()
-                .push_back((code, stderr.to_owned()));
+                .push_back(Some((code, stderr.to_owned())));
+        }
+    }
+
+    /// Let the next invocation of `program` run normally, so that a
+    /// following [`Self::script_failure`] hits the one after it.
+    pub fn script_pass_through(&self, program: &'static str) {
+        if let Ok(mut i) = self.inner.lock() {
+            i.scripted.entry(program).or_default().push_back(None);
         }
     }
 
@@ -96,6 +108,46 @@ impl FakeSystem {
         if let Ok(mut i) = self.inner.lock() {
             i.node_version = Some(version.to_owned());
         }
+    }
+
+    /// Install an (empty, running) emulated MariaDB server. Without this
+    /// call the fake host has no MariaDB, like a host without the package.
+    pub fn install_mariadb(&self) {
+        if let Ok(mut i) = self.inner.lock() {
+            i.mariadb.get_or_insert_with(FakeMariaDb::default);
+        }
+    }
+
+    /// Start or stop the emulated server (stopped: connections are refused).
+    pub fn set_mariadb_running(&self, running: bool) {
+        if let Ok(mut i) = self.inner.lock() {
+            if let Some(db) = i.mariadb.as_mut() {
+                db.stopped = !running;
+            }
+        }
+    }
+
+    /// Run statements on the emulated server as its administrator would by
+    /// hand, behind the daemon's back. Not recorded in [`Self::calls`].
+    pub fn mariadb_admin(&self, script: &str) -> Result<String> {
+        let mut i = self.lock()?;
+        let db = i
+            .mariadb
+            .as_mut()
+            .ok_or_else(|| Error::Internal("fake MariaDB is not installed".into()))?;
+        match db.execute(script) {
+            (0, stdout, _) => Ok(stdout),
+            (_, _, stderr) => Err(Error::Internal(stderr)),
+        }
+    }
+
+    /// Every script the daemon sent to the MariaDB client, in order.
+    pub fn mariadb_scripts(&self) -> Vec<String> {
+        self.calls_to(bin::MARIADB)
+            .into_iter()
+            .filter_map(|c| c.stdin)
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .collect()
     }
 
     /// Forget recorded commands (tests call this after harness setup).
@@ -169,6 +221,7 @@ impl System for FakeSystem {
             .scripted
             .get_mut(spec.program)
             .and_then(VecDeque::pop_front)
+            .flatten()
         {
             return Ok(output(spec.program, code, "", &stderr));
         }
@@ -243,6 +296,14 @@ impl System for FakeSystem {
                 let version = i.node_version.clone().unwrap_or_else(|| "v22.11.0".to_owned());
                 output(program, 0, &format!("{version}\n"), "")
             }
+            bin::MARIADB => {
+                let script = String::from_utf8_lossy(spec.stdin.as_deref().unwrap_or_default()).into_owned();
+                let Some(db) = i.mariadb.as_mut() else {
+                    return Ok(output(program, 127, "", "mariadb: not installed"));
+                };
+                let (code, stdout, stderr) = db.execute(&script);
+                output(program, code, &stdout, &stderr)
+            }
             bin::DU => {
                 let target = args.last().map(|a| a.to_string_lossy().into_owned()).unwrap_or_default();
                 output(program, 0, &format!("8192\t{target}\n"), "")
@@ -310,9 +371,9 @@ impl System for FakeSystem {
     }
 
     async fn is_installed(&self, program: &'static str) -> bool {
-        self.inner
-            .lock()
-            .is_ok_and(|i| !i.missing.contains(&program))
+        self.inner.lock().is_ok_and(|i| {
+            !i.missing.contains(&program) && (program != bin::MARIADB || i.mariadb.is_some())
+        })
     }
 
     async fn host_stats(&self, _path: &Path) -> Result<HostStats> {

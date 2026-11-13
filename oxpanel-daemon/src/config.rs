@@ -59,6 +59,15 @@ pub struct Config {
     pub dry_run: bool,
     /// `tracing` filter directive, e.g. `info` or `oxpanel_daemon=debug`.
     pub log_filter: String,
+    /// UNIX socket of the local MariaDB server.
+    pub mariadb_socket: PathBuf,
+    /// Most databases one tenant may have.
+    pub db_max_databases: u32,
+    /// Most database users one tenant may have.
+    pub db_max_users: u32,
+    /// MariaDB `MAX_USER_CONNECTIONS` given to database users created from
+    /// now on (1..=10000).
+    pub db_max_user_connections: u32,
 }
 
 impl Default for Config {
@@ -84,6 +93,10 @@ impl Default for Config {
             command_timeout: Duration::from_secs(60),
             dry_run: false,
             log_filter: "info".to_owned(),
+            mariadb_socket: PathBuf::from("/var/lib/mysql/mysql.sock"),
+            db_max_databases: 20,
+            db_max_users: 20,
+            db_max_user_connections: 25,
         }
     }
 }
@@ -118,6 +131,7 @@ impl Config {
         path("OXPANEL_SYSTEMD_UNIT_DIR", &mut c.systemd_unit_dir)?;
         path("OXPANEL_NGINX_LOG_DIR", &mut c.nginx_log_dir)?;
         path("OXPANEL_PHP_CONF_DIR", &mut c.php_conf_dir)?;
+        path("OXPANEL_MARIADB_SOCKET", &mut c.mariadb_socket)?;
 
         if let Some(g) = get("OXPANEL_SOCKET_GROUP") {
             let g = g.trim();
@@ -178,6 +192,15 @@ impl Config {
         if let Some(v) = get("OXPANEL_LOG") {
             c.log_filter = v;
         }
+        if let Some(v) = get("OXPANEL_DB_MAX_DATABASES") {
+            c.db_max_databases = parse_u32("OXPANEL_DB_MAX_DATABASES", &v)?;
+        }
+        if let Some(v) = get("OXPANEL_DB_MAX_USERS") {
+            c.db_max_users = parse_u32("OXPANEL_DB_MAX_USERS", &v)?;
+        }
+        if let Some(v) = get("OXPANEL_DB_MAX_USER_CONNECTIONS") {
+            c.db_max_user_connections = parse_u32("OXPANEL_DB_MAX_USER_CONNECTIONS", &v)?;
+        }
         c.validate()?;
         Ok(c)
     }
@@ -193,6 +216,7 @@ impl Config {
             ("OXPANEL_SYSTEMD_UNIT_DIR", &self.systemd_unit_dir),
             ("OXPANEL_NGINX_LOG_DIR", &self.nginx_log_dir),
             ("OXPANEL_PHP_CONF_DIR", &self.php_conf_dir),
+            ("OXPANEL_MARIADB_SOCKET", &self.mariadb_socket),
         ] {
             check_path(key, p)?;
         }
@@ -225,7 +249,23 @@ impl Config {
                 "OXPANEL_NGINX_INCLUDE_FILE must not live inside OXPANEL_NGINX_CONF_DIR",
             ));
         }
+        if !(1..=10_000).contains(&self.db_max_user_connections) {
+            return Err(Error::invalid(
+                "config",
+                "OXPANEL_DB_MAX_USER_CONNECTIONS must be 1..=10000",
+            ));
+        }
         Ok(())
+    }
+
+    /// `state_dir/databases`.
+    pub fn databases_dir(&self) -> PathBuf {
+        self.state_dir.join("databases")
+    }
+
+    /// `state_dir/db-users`.
+    pub fn db_users_dir(&self) -> PathBuf {
+        self.state_dir.join("db-users")
     }
 
     /// `state_dir/tenants`.
@@ -413,6 +453,21 @@ mod tests {
         assert!(from(&[("OXPANEL_NGINX_CONF_DIR", "/etc/nginx/ox;panel.d")]).is_err());
         assert!(from(&[("OXPANEL_HOME_BASE", "/srv/web-homes_v2")]).is_ok());
         assert!(from(&[("OXPANEL_WEB_USER", "nginx;rm")]).is_err());
+        assert!(from(&[("OXPANEL_MARIADB_SOCKET", "mysql.sock")]).is_err());
+        assert!(from(&[("OXPANEL_MARIADB_SOCKET", "/run/my sql.sock")]).is_err());
+        assert!(from(&[("OXPANEL_DB_MAX_USER_CONNECTIONS", "0")]).is_err());
+        assert!(from(&[("OXPANEL_DB_MAX_DATABASES", "many")]).is_err());
+        assert!(from(&[
+            ("OXPANEL_MARIADB_SOCKET", "/run/mysqld/mysqld.sock"),
+            ("OXPANEL_DB_MAX_DATABASES", "0"),
+            ("OXPANEL_DB_MAX_USERS", "3"),
+            ("OXPANEL_DB_MAX_USER_CONNECTIONS", "10"),
+        ])
+        .is_ok_and(|c| (
+            c.db_max_databases,
+            c.db_max_users,
+            c.db_max_user_connections
+        ) == (0, 3, 10)));
         assert!(from(&[
             ("OXPANEL_NGINX_CONF_DIR", "/etc/nginx/conf.d"),
             ("OXPANEL_NGINX_INCLUDE_FILE", "/etc/nginx/conf.d/x.conf")

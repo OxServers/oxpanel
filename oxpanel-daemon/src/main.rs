@@ -255,6 +255,8 @@ fn make_system(config: &mut Config) -> Result<Arc<dyn System>, Fatal> {
         if let Some(g) = &config.socket_group {
             fake.add_group(g, 990);
         }
+        // An emulated MariaDB, so the database RPCs can be developed against.
+        fake.install_mariadb();
         // Let the developer running the daemon talk to it.
         config.allowed_uids.insert(nix::unistd::geteuid().as_raw());
         warn!("DRY RUN: no accounts, files under /etc or services will be touched");

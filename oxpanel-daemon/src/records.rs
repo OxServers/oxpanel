@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::fsutil;
-use crate::validate::{Domain, Limits, RelPath, Username};
+use crate::validate::{DbName, Domain, Limits, RelPath, Username};
 
 pub const RECORD_VERSION: u32 = 1;
 const RECORD_MODE: u32 = 0o600;
@@ -103,6 +103,64 @@ pub struct AppRecord {
     pub entry: String,
 }
 
+/// Life cycle of a database or database-user record.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DbState {
+    /// The name is claimed; the object may not exist on the server yet.
+    Provisioning,
+    Ready,
+    Deleting,
+}
+
+/// The database server an object lives on. Names are unique across
+/// engines (one namespace per tenant), so records are keyed by name alone and
+/// a later engine adds a variant here, not a second set of records.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DbEngine {
+    /// The default: records written before the field existed are MariaDB's.
+    #[default]
+    Mariadb,
+}
+
+impl DbEngine {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Mariadb => "mariadb",
+        }
+    }
+}
+
+/// A database OxPanel created for a tenant.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DatabaseRecord {
+    pub version: u32,
+    pub name: String,
+    pub tenant: String,
+    #[serde(default)]
+    pub engine: DbEngine,
+    pub created_at_unix: u64,
+    pub state: DbState,
+}
+
+/// A database account OxPanel created for a tenant (on MariaDB
+/// `'<name>'@'localhost'`). Neither the password nor its hash is ever recorded.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DbUserRecord {
+    pub version: u32,
+    pub name: String,
+    pub tenant: String,
+    #[serde(default)]
+    pub engine: DbEngine,
+    pub created_at_unix: u64,
+    pub state: DbState,
+    /// `MAX_USER_CONNECTIONS` the account was created with.
+    pub max_user_connections: u32,
+    /// Databases of the same tenant this user may work in (sorted).
+    pub grants: Vec<String>,
+}
+
 impl VHostRecord {
     /// All server names this vhost claims.
     pub fn all_names(&self) -> impl Iterator<Item = &str> {
@@ -122,6 +180,9 @@ pub fn now_unix() -> u64 {
 pub struct Store {
     tenants_dir: PathBuf,
     vhosts_dir: PathBuf,
+    /// `state_dir/databases` and `state_dir/db-users`.
+    databases: PathBuf,
+    db_users: PathBuf,
 }
 
 impl Store {
@@ -129,12 +190,16 @@ impl Store {
         Self {
             tenants_dir: config.tenants_dir(),
             vhosts_dir: config.vhosts_dir(),
+            databases: config.databases_dir(),
+            db_users: config.db_users_dir(),
         }
     }
 
     /// Create the state directories with root-only permissions.
     pub fn init(&self) -> Result<()> {
         fsutil::ensure_dir(&self.tenants_dir, DIR_MODE)?;
+        fsutil::ensure_dir(&self.databases, DIR_MODE)?;
+        fsutil::ensure_dir(&self.db_users, DIR_MODE)?;
         fsutil::ensure_dir(&self.vhosts_dir, DIR_MODE)
     }
 
@@ -183,6 +248,56 @@ impl Store {
 
     pub fn list_vhosts(&self) -> Result<Vec<VHostRecord>> {
         list(&self.vhosts_dir)
+    }
+
+    fn database_path(&self, name: &DbName) -> PathBuf {
+        self.databases.join(format!("{name}.json"))
+    }
+
+    fn db_user_path(&self, name: &DbName) -> PathBuf {
+        self.db_users.join(format!("{name}.json"))
+    }
+
+    pub fn load_database(&self, name: &DbName) -> Result<Option<DatabaseRecord>> {
+        load(&self.database_path(name))
+    }
+
+    /// The name is re-validated and must belong to the recorded tenant.
+    pub fn save_database(&self, rec: &DatabaseRecord) -> Result<()> {
+        let tenant = Username::parse(&rec.tenant)?;
+        let name = DbName::parse_for(&rec.name, &tenant, "name")?;
+        save(&self.database_path(&name), rec)
+    }
+
+    pub fn delete_database(&self, name: &DbName) -> Result<bool> {
+        fsutil::remove_if_exists(&self.database_path(name))
+    }
+
+    pub fn list_databases(&self) -> Result<Vec<DatabaseRecord>> {
+        list(&self.databases)
+    }
+
+    pub fn load_db_user(&self, name: &DbName) -> Result<Option<DbUserRecord>> {
+        load(&self.db_user_path(name))
+    }
+
+    /// The name and every granted database are re-validated and must belong
+    /// to the recorded tenant: a record can never describe a cross-tenant grant.
+    pub fn save_db_user(&self, rec: &DbUserRecord) -> Result<()> {
+        let tenant = Username::parse(&rec.tenant)?;
+        let name = DbName::parse_for(&rec.name, &tenant, "name")?;
+        for g in &rec.grants {
+            DbName::parse_for(g, &tenant, "database")?;
+        }
+        save(&self.db_user_path(&name), rec)
+    }
+
+    pub fn delete_db_user(&self, name: &DbName) -> Result<bool> {
+        fsutil::remove_if_exists(&self.db_user_path(name))
+    }
+
+    pub fn list_db_users(&self) -> Result<Vec<DbUserRecord>> {
+        list(&self.db_users)
     }
 }
 
@@ -333,5 +448,68 @@ mod tests {
             app: None,
         };
         assert!(s.save_vhost(&v).is_err());
+    }
+
+    #[test]
+    fn database_records_round_trip_and_cannot_cross_tenants() -> Result<()> {
+        let (_d, s) = store();
+        let db = DatabaseRecord {
+            version: RECORD_VERSION,
+            name: "alice_wp".into(),
+            tenant: "alice".into(),
+            engine: DbEngine::Mariadb,
+            created_at_unix: 1,
+            state: DbState::Ready,
+        };
+        let user = DbUserRecord {
+            version: RECORD_VERSION,
+            name: "alice_app".into(),
+            tenant: "alice".into(),
+            engine: DbEngine::Mariadb,
+            created_at_unix: 1,
+            state: DbState::Ready,
+            max_user_connections: 25,
+            grants: vec!["alice_wp".into()],
+        };
+        s.save_database(&db)?;
+        s.save_db_user(&user)?;
+        let name = DbName::parse("alice_wp", "name")?;
+        assert_eq!(s.load_database(&name)?, Some(db.clone()));
+        assert_eq!(s.list_db_users()?, vec![user.clone()]);
+        // A record whose name or grant belongs to another tenant is refused.
+        assert!(s
+            .save_database(&DatabaseRecord {
+                tenant: "bob".into(),
+                ..db.clone()
+            })
+            .is_err());
+        assert!(s
+            .save_db_user(&DbUserRecord {
+                grants: vec!["bob_wp".into()],
+                ..user.clone()
+            })
+            .is_err());
+        assert!(s
+            .save_database(&DatabaseRecord {
+                name: "../../etc/passwd".into(),
+                ..db
+            })
+            .is_err());
+        let json = std::fs::read_to_string(s.db_user_path(&DbName::parse("alice_app", "name")?))
+            .map_err(|e| Error::io("read", "record", e))?;
+        assert!(
+            !json.contains("password") && !json.contains("hash"),
+            "no secret in a record"
+        );
+        assert!(json.contains(r#""engine": "mariadb""#), "{json}");
+        // A record from before the engine field reads as MariaDB; an engine
+        // this build does not know is an error, not a guess.
+        let old: DbUserRecord = serde_json::from_str(&json.replace(r#""engine": "mariadb","#, ""))
+            .map_err(|e| Error::Internal(e.to_string()))?;
+        assert_eq!(old.engine, DbEngine::Mariadb);
+        assert!(serde_json::from_str::<DbUserRecord>(&json.replace("mariadb", "oracle")).is_err());
+        assert!(s.delete_database(&name)?);
+        assert!(s.list_databases()?.is_empty());
+        Ok(())
     }
 }

@@ -19,6 +19,7 @@ use crate::error::Result;
 
 pub mod command;
 pub mod fake;
+mod fake_mariadb;
 pub mod real;
 
 pub use command::{CommandOutput, CommandSpec, RunAs};
@@ -50,6 +51,8 @@ pub mod bin {
     /// Runs dependency installation outside the daemon's network-less sandbox.
     pub const SYSTEMD_RUN: &str = "/usr/bin/systemd-run";
     pub const JOURNALCTL: &str = "/usr/bin/journalctl";
+    /// Optional: the MariaDB client, only needed once tenants have databases.
+    pub const MARIADB: &str = "/usr/bin/mariadb";
     /// Login shell given to every tenant account.
     pub const NOLOGIN: &str = "/sbin/nologin";
 }

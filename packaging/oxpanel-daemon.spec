@@ -23,6 +23,11 @@ Recommends:     php-fpm
 # only after `dnf module enable nodejs:22`. (Python 3 is part of the base system.)
 Recommends:     nodejs >= 1:22
 Recommends:     npm
+# Tenant databases are optional too, and a database server is a decision for
+# the operator (HANDBOOK §3.5 installs, hardens and starts it), so these are
+# only suggested: dnf does not install them by itself.
+Suggests:       mariadb-server
+Suggests:       php-mysqlnd
 Requires:       policycoreutils
 Requires:       policycoreutils-python-utils
 Requires:       libselinux-utils

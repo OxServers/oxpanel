@@ -12,9 +12,12 @@ use std::sync::Arc;
 
 use crate::auth::{PeerInfo, Scope, ScopePolicy};
 use crate::ctx::Ctx;
+use crate::db::DbService;
 use crate::error::Error;
 use crate::host::{Drift, DriftKind, HostService};
-use crate::records::{AppRuntime, TenantRecord, TenantState, VHostRecord};
+use crate::records::{
+    AppRuntime, DatabaseRecord, DbEngine, DbUserRecord, TenantRecord, TenantState, VHostRecord,
+};
 use crate::tenant::TenantService;
 use crate::validate::Limits;
 use crate::vhost::{AppRequest, LogKind, VHostRequest, VHostService};
@@ -27,6 +30,7 @@ pub struct Engine {
     tenants: TenantService,
     vhosts: VHostService,
     host: HostService,
+    databases: DbService,
     scopes: Arc<ScopePolicy>,
 }
 
@@ -39,6 +43,7 @@ impl Engine {
             scopes: Arc::new(ScopePolicy::new(ctx.config.peer_scopes.clone())),
             tenants: TenantService::new(ctx.clone()),
             vhosts: VHostService::new(ctx.clone()),
+            databases: DbService::new(ctx.clone()),
             host: HostService::new(ctx),
         }
     }
@@ -109,6 +114,10 @@ fn drift_to(d: &Drift) -> pb::Drift {
         DriftKind::OrphanPhpPool => pb::DriftKind::OrphanPhpPool,
         DriftKind::AppUnitDrift => pb::DriftKind::AppUnitDrift,
         DriftKind::OrphanAppUnit => pb::DriftKind::OrphanAppUnit,
+        DriftKind::DatabaseMissing => pb::DriftKind::DatabaseMissing,
+        DriftKind::DatabaseUserMissing => pb::DriftKind::DatabaseUserMissing,
+        DriftKind::DatabasePrivilegeDrift => pb::DriftKind::DatabasePrivilegeDrift,
+        DriftKind::OrphanDatabaseObject => pb::DriftKind::OrphanDatabaseObject,
     };
     pb::Drift {
         kind: kind.into(),
@@ -142,6 +151,12 @@ fn fail(rpc: &'static str, peer: &str, err: Error) -> Status {
         | Error::NoApp(_)
         | Error::RuntimeTooOld { .. }
         | Error::AppPolicyMissing
+        | Error::DbUnavailable(_)
+        | Error::DbObjectNotFound { .. }
+        | Error::DbNotManaged { .. }
+        | Error::DbObjectUnusable { .. }
+        | Error::DbLimitReached { .. }
+        | Error::TenantHasDatabases(_)
         | Error::NginxInvalid(_) => {
             warn!(rpc, peer, error = %err, "request refused");
             err.into()
@@ -205,6 +220,43 @@ fn vhost_to(rec: &VHostRecord) -> pb::VirtualHost {
             root: a.root.clone(),
             entry: a.entry.clone(),
         }),
+    }
+}
+
+fn engine_to(engine: DbEngine) -> i32 {
+    match engine {
+        DbEngine::Mariadb => pb::DatabaseEngine::Mariadb.into(),
+    }
+}
+
+/// `UNSPECIFIED` is the default engine, MariaDB.
+fn engine_from(raw: i32) -> Result<DbEngine, Error> {
+    match pb::DatabaseEngine::try_from(raw) {
+        Ok(pb::DatabaseEngine::Unspecified | pb::DatabaseEngine::Mariadb) => Ok(DbEngine::Mariadb),
+        Err(_) => Err(Error::invalid("engine", "unknown database engine")),
+    }
+}
+
+fn database_to(rec: &DatabaseRecord, size_bytes: u64) -> pb::Database {
+    pb::Database {
+        name: rec.name.clone(),
+        tenant: rec.tenant.clone(),
+        size_bytes,
+        created_at: Some(timestamp(rec.created_at_unix)),
+        engine: engine_to(rec.engine),
+    }
+}
+
+/// A database user as the API shows it: there is no secret to leave out,
+/// because none is recorded.
+fn db_user_to(rec: &DbUserRecord) -> pb::DatabaseUser {
+    pb::DatabaseUser {
+        name: rec.name.clone(),
+        tenant: rec.tenant.clone(),
+        databases: rec.grants.clone(),
+        max_connections: rec.max_user_connections,
+        created_at: Some(timestamp(rec.created_at_unix)),
+        engine: engine_to(rec.engine),
     }
 }
 
@@ -520,6 +572,17 @@ impl OxPanelEngine for Engine {
             node_available: i.runtimes.node,
             python_available: i.runtimes.python,
             node_version: i.node_version,
+            database_engines: i
+                .databases
+                .into_iter()
+                .map(|f| pb::DatabaseEngineInfo {
+                    engine: engine_to(f.engine),
+                    available: f.available,
+                    version: f.version,
+                    database_count: f.database_count,
+                    database_user_count: f.user_count,
+                })
+                .collect(),
         }))
     }
 
@@ -537,6 +600,179 @@ impl OxPanelEngine for Engine {
         info!(rpc = RPC, peer, findings = drifts.len(), "reconciled");
         Ok(Response::new(pb::ReconcileResponse {
             drifts: drifts.iter().map(drift_to).collect(),
+        }))
+    }
+
+    // --- MariaDB databases. Managing a tenant's databases is site
+    // management (scope `vhost`); listing is `read`. A request's password is
+    // never logged: the log lines below name fields explicitly.
+
+    async fn create_database(
+        &self,
+        req: Request<pb::CreateDatabaseRequest>,
+    ) -> Result<Response<pb::CreateDatabaseResponse>, Status> {
+        const RPC: &str = "CreateDatabase";
+        let peer = self.authorise(&req, RPC, Scope::VHost)?;
+        let r = req.into_inner();
+        info!(rpc = RPC, peer, tenant = %r.tenant, database = %r.name, "request");
+        let (rec, created) = self
+            .databases
+            .create_database(
+                &r.tenant,
+                &r.name,
+                engine_from(r.engine).map_err(|e| fail(RPC, &peer, e))?,
+            )
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(pb::CreateDatabaseResponse {
+            database: Some(database_to(&rec, 0)),
+            created,
+        }))
+    }
+
+    async fn list_databases(
+        &self,
+        req: Request<pb::ListDatabasesRequest>,
+    ) -> Result<Response<pb::ListDatabasesResponse>, Status> {
+        const RPC: &str = "ListDatabases";
+        let peer = self.authorise(&req, RPC, Scope::Read)?;
+        let r = req.into_inner();
+        let recs = self
+            .databases
+            .list_databases(&r.tenant)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(pb::ListDatabasesResponse {
+            databases: recs
+                .iter()
+                .map(|(rec, size)| database_to(rec, *size))
+                .collect(),
+        }))
+    }
+
+    async fn delete_database(
+        &self,
+        req: Request<pb::DeleteDatabaseRequest>,
+    ) -> Result<Response<pb::DeleteDatabaseResponse>, Status> {
+        const RPC: &str = "DeleteDatabase";
+        let peer = self.authorise(&req, RPC, Scope::VHost)?;
+        let r = req.into_inner();
+        info!(rpc = RPC, peer, database = %r.name, "request");
+        let deleted = self
+            .databases
+            .delete_database(&r.name)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(pb::DeleteDatabaseResponse { deleted }))
+    }
+
+    async fn create_database_user(
+        &self,
+        req: Request<pb::CreateDatabaseUserRequest>,
+    ) -> Result<Response<pb::CreateDatabaseUserResponse>, Status> {
+        const RPC: &str = "CreateDatabaseUser";
+        let peer = self.authorise(&req, RPC, Scope::VHost)?;
+        let r = req.into_inner();
+        info!(rpc = RPC, peer, tenant = %r.tenant, user = %r.name, "request");
+        let (rec, created) = self
+            .databases
+            .create_user(
+                &r.tenant,
+                &r.name,
+                &r.password,
+                engine_from(r.engine).map_err(|e| fail(RPC, &peer, e))?,
+            )
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(pb::CreateDatabaseUserResponse {
+            user: Some(db_user_to(&rec)),
+            created,
+        }))
+    }
+
+    async fn list_database_users(
+        &self,
+        req: Request<pb::ListDatabaseUsersRequest>,
+    ) -> Result<Response<pb::ListDatabaseUsersResponse>, Status> {
+        const RPC: &str = "ListDatabaseUsers";
+        let peer = self.authorise(&req, RPC, Scope::Read)?;
+        let r = req.into_inner();
+        let recs = self
+            .databases
+            .list_users(&r.tenant)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(pb::ListDatabaseUsersResponse {
+            users: recs.iter().map(db_user_to).collect(),
+        }))
+    }
+
+    async fn set_database_user_password(
+        &self,
+        req: Request<pb::SetDatabaseUserPasswordRequest>,
+    ) -> Result<Response<pb::SetDatabaseUserPasswordResponse>, Status> {
+        const RPC: &str = "SetDatabaseUserPassword";
+        let peer = self.authorise(&req, RPC, Scope::VHost)?;
+        let r = req.into_inner();
+        info!(rpc = RPC, peer, user = %r.name, "request");
+        self.databases
+            .set_password(&r.name, &r.password)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(pb::SetDatabaseUserPasswordResponse {}))
+    }
+
+    async fn delete_database_user(
+        &self,
+        req: Request<pb::DeleteDatabaseUserRequest>,
+    ) -> Result<Response<pb::DeleteDatabaseUserResponse>, Status> {
+        const RPC: &str = "DeleteDatabaseUser";
+        let peer = self.authorise(&req, RPC, Scope::VHost)?;
+        let r = req.into_inner();
+        info!(rpc = RPC, peer, user = %r.name, "request");
+        let deleted = self
+            .databases
+            .delete_user(&r.name)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(pb::DeleteDatabaseUserResponse { deleted }))
+    }
+
+    async fn grant_database_access(
+        &self,
+        req: Request<pb::GrantDatabaseAccessRequest>,
+    ) -> Result<Response<pb::GrantDatabaseAccessResponse>, Status> {
+        const RPC: &str = "GrantDatabaseAccess";
+        let peer = self.authorise(&req, RPC, Scope::VHost)?;
+        let r = req.into_inner();
+        info!(rpc = RPC, peer, user = %r.user, database = %r.database, "request");
+        let (rec, changed) = self
+            .databases
+            .grant(&r.user, &r.database)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(pb::GrantDatabaseAccessResponse {
+            user: Some(db_user_to(&rec)),
+            changed,
+        }))
+    }
+
+    async fn revoke_database_access(
+        &self,
+        req: Request<pb::RevokeDatabaseAccessRequest>,
+    ) -> Result<Response<pb::RevokeDatabaseAccessResponse>, Status> {
+        const RPC: &str = "RevokeDatabaseAccess";
+        let peer = self.authorise(&req, RPC, Scope::VHost)?;
+        let r = req.into_inner();
+        info!(rpc = RPC, peer, user = %r.user, database = %r.database, "request");
+        let (rec, changed) = self
+            .databases
+            .revoke(&r.user, &r.database)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(pb::RevokeDatabaseAccessResponse {
+            user: Some(db_user_to(&rec)),
+            changed,
         }))
     }
 }

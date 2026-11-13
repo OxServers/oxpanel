@@ -53,3 +53,7 @@ RUN dnf -y install --setopt=install_weak_deps=False php-fpm logrotate \
 RUN dnf -y module enable nodejs:22 \
     && dnf -y install --setopt=install_weak_deps=False nodejs npm \
     && dnf clean all && rm -rf /var/cache/dnf
+
+# MariaDB (tenant databases) and the PHP driver for it, for the integration test.
+RUN dnf -y install --setopt=install_weak_deps=False mariadb-server php-mysqlnd \
+    && dnf clean all && rm -rf /var/cache/dnf

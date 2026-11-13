@@ -37,6 +37,10 @@ pub enum DriftKind {
     OrphanPhpPool,
     AppUnitDrift,
     OrphanAppUnit,
+    DatabaseMissing,
+    DatabaseUserMissing,
+    DatabasePrivilegeDrift,
+    OrphanDatabaseObject,
 }
 
 /// One difference between a record and the operating system.
@@ -49,7 +53,11 @@ pub struct Drift {
 }
 
 impl Drift {
-    fn new(kind: DriftKind, subject: impl Into<String>, detail: impl Into<String>) -> Self {
+    pub(crate) fn new(
+        kind: DriftKind,
+        subject: impl Into<String>,
+        detail: impl Into<String>,
+    ) -> Self {
         Self {
             kind,
             subject: subject.into(),
@@ -79,6 +87,8 @@ pub struct HostInfo {
     /// Installed Node.js version; empty if none.
     pub node_version: String,
     pub stats: HostStats,
+    /// Per database engine: availability, version, databases and users.
+    pub databases: Vec<crate::db::EngineFacts>,
 }
 
 #[derive(Debug, Clone)]
@@ -111,6 +121,7 @@ impl HostService {
             },
             node_version,
             stats: self.ctx.sys.host_stats(&cfg.home_base).await?,
+            databases: crate::db::facts(&self.ctx).await?,
         })
     }
 
@@ -161,6 +172,7 @@ impl HostService {
         }
         check_php_pools(cfg, &tenants, &vhosts, &mut out)?;
         check_apps(cfg, self.ctx.selinux, &by_name, &vhosts, &mut out)?;
+        out.extend(crate::db::drifts(&self.ctx, &tenants).await?);
         Ok(out)
     }
 

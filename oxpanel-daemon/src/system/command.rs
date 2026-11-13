@@ -15,12 +15,36 @@ pub struct RunAs {
 }
 
 /// An external program invocation: absolute program path plus discrete arguments.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct CommandSpec {
     pub program: &'static str,
     pub args: Vec<OsString>,
     pub run_as: Option<RunAs>,
     pub timeout: Duration,
+    /// Bytes written to the program's standard input, which is then closed.
+    /// `None` = `/dev/null`.
+    pub stdin: Option<Vec<u8>>,
+    /// The input carries a secret: it is never printed, and what the program
+    /// writes to stderr is not logged (a tool may echo its input there).
+    pub secret_input: bool,
+}
+
+/// A secret input is not part of the debug representation.
+impl std::fmt::Debug for CommandSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let stdin = match &self.stdin {
+            None => None,
+            Some(_) if self.secret_input => Some("<redacted>".to_owned()),
+            Some(bytes) => Some(String::from_utf8_lossy(bytes).into_owned()),
+        };
+        f.debug_struct("CommandSpec")
+            .field("program", &self.program)
+            .field("args", &self.args)
+            .field("run_as", &self.run_as)
+            .field("timeout", &self.timeout)
+            .field("stdin", &stdin)
+            .finish()
+    }
 }
 
 impl CommandSpec {
@@ -30,7 +54,25 @@ impl CommandSpec {
             args: Vec::new(),
             run_as: None,
             timeout,
+            stdin: None,
+            secret_input: false,
         }
+    }
+
+    /// Feed `input` to the program's standard input.
+    #[must_use]
+    pub fn stdin(mut self, input: impl Into<Vec<u8>>) -> Self {
+        self.stdin = Some(input.into());
+        self
+    }
+
+    /// Like [`Self::stdin`] for input that carries a secret. Secrets go
+    /// here and nowhere else: never into an argument (see [`Self::display`]).
+    #[must_use]
+    pub fn secret_stdin(mut self, input: impl Into<Vec<u8>>) -> Self {
+        self.stdin = Some(input.into());
+        self.secret_input = true;
+        self
     }
 
     #[must_use]
@@ -223,6 +265,21 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    #[test]
+    fn secret_input_is_never_printed() {
+        let spec = CommandSpec::new(bin::MARIADB, Duration::from_secs(1))
+            .arg("--batch")
+            .secret_stdin("ALTER USER x IDENTIFIED VIA y USING '*HASH';");
+        assert!(spec.secret_input);
+        assert!(!format!("{spec:?}").contains("HASH"));
+        assert!(format!("{spec:?}").contains("<redacted>"));
+        assert_eq!(spec.display(), "/usr/bin/mariadb --batch");
+        let plain = CommandSpec::new(bin::MARIADB, Duration::from_secs(1)).stdin("SELECT 1;");
+        assert!(!plain.secret_input);
+        assert!(format!("{plain:?}").contains("SELECT 1;"));
+        assert!(!plain.display().contains("SELECT"));
     }
 
     #[test]

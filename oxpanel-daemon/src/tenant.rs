@@ -326,6 +326,8 @@ impl TenantService {
         // Resume: PHP is back before the sites are. Suspend: the sites
         // answer 503 before PHP stops. Either way no request sees a 502.
         if changed && !suspended {
+            // Database accounts first: PHP and applications connect at start.
+            crate::db::set_locked_all(&self.ctx, &rec, false).await?;
             crate::php::set_running(&self.ctx, &rec, true).await?;
             crate::app::set_running_all(&self.ctx, &rec, true).await?;
         }
@@ -334,6 +336,10 @@ impl TenantService {
             if suspended {
                 crate::php::set_running(&self.ctx, &rec, false).await?;
                 crate::app::set_running_all(&self.ctx, &rec, false).await?;
+                // Last: by now nothing of the tenant's is running that could
+                // reconnect; its database accounts are locked and their
+                // sessions ended.
+                crate::db::set_locked_all(&self.ctx, &rec, true).await?;
             }
             self.ctx.store.save_tenant(&rec)?;
             info!(tenant = %name, suspended, "suspension changed");
@@ -409,6 +415,10 @@ impl TenantService {
             .any(|v| v.tenant == rec.username)
         {
             return Err(Error::TenantHasVHosts(name.to_string()));
+        }
+        // Databases are data: dropping them is always an explicit request.
+        if crate::db::tenant_has_objects(&self.ctx, &name)? {
+            return Err(Error::TenantHasDatabases(name.to_string()));
         }
         if rec.state != TenantState::Deleting {
             rec.state = TenantState::Deleting;
