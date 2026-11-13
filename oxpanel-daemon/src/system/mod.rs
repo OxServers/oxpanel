@@ -60,6 +60,11 @@ pub mod bin {
     pub const OXPANEL_ACME: &str = "/usr/libexec/oxpanel/oxpanel-acme";
     /// Optional: the MariaDB client, only needed once tenants have databases.
     pub const MARIADB: &str = "/usr/bin/mariadb";
+    /// Backups: the archiver and its compressor, both run as the tenant.
+    pub const TAR: &str = "/usr/bin/tar";
+    /// Backups: finds what the archive leaves out (run as the tenant).
+    pub const FIND: &str = "/usr/bin/find";
+    pub const GZIP: &str = "/usr/bin/gzip";
     /// Login shell given to every tenant account.
     pub const NOLOGIN: &str = "/sbin/nologin";
     /// Membership of the group that confines tenants in sshd.

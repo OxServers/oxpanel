@@ -107,7 +107,7 @@ The package installs:
 
 ```sh
 sudo dnf module enable -y nodejs:22        # Node.js applications need version 22 or newer
-sudo dnf install -y gcc git nginx shadow-utils util-linux acl policycoreutils policycoreutils-python-utils libselinux-utils logrotate openssl ca-certificates php-fpm nodejs npm
+sudo dnf install -y gcc git nginx shadow-utils util-linux acl policycoreutils policycoreutils-python-utils libselinux-utils logrotate tar gzip openssl ca-certificates php-fpm nodejs npm
 # SELinux: sites live under tenant homes, so the web server must be allowed to traverse and read them.
 if sudo selinuxenabled; then sudo setsebool -P httpd_enable_homedirs=on httpd_read_user_content=on httpd_unified=on; fi
 curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal && source ~/.cargo/env
@@ -226,6 +226,10 @@ valid. After editing: `sudo systemctl restart oxpanel-daemon`.
 | `OXPANEL_SFTP_PASSWORDS` | `true` | Whether tenants may be given SFTP passwords (opt-in per tenant). `false` = keys only (§9). |
 | `OXPANEL_SSHD_DROPIN_FILE` | `/etc/ssh/sshd_config.d/60-oxpanel.conf` | The sshd drop-in OxPanel owns; its directory must be included by `sshd_config`. |
 | `OXPANEL_SFTP_KEYS_DIR` | `/etc/oxpanel-sftp` | Per-tenant SFTP keys files (root-owned). |
+| `OXPANEL_BACKUP_DIR` | `/var/lib/oxpanel-backups` | Backup store: `<dir>/<tenant>/<backup id>/`, root-only. Must not be inside `OXPANEL_HOME_BASE` and must be writable under the unit's `ReadWritePaths` (anything below `/var/lib` is). |
+| `OXPANEL_BACKUP_KEEP` | `7` | Complete backups kept per tenant (1–365); older ones are removed when a new one completes. |
+| `OXPANEL_BACKUP_MIN_FREE_BYTES` | `1073741824` | Space that must stay free on the backup file system: a backup that could eat into it is refused, and no archive may grow into it. |
+| `OXPANEL_BACKUP_TIMEOUT_SECS` | `21600` | Upper bound for one backup or restore job (≥ 60). |
 | `OXPANEL_COMMAND_TIMEOUT_SECS` | `60` | Upper bound for any single external command (`useradd`, `nginx -t`, …). |
 | `OXPANEL_TLS_DIR` | `/etc/pki/oxpanel` | Certificates and private keys of sites (root `0700`). |
 | `OXPANEL_ACME_DIR` | `/var/lib/oxpanel-acme` | Working directories shared with the ACME client. Created by `tmpfiles.d/oxpanel.conf` and labelled by the SELinux module: change those too if you move it. Must not overlap `OXPANEL_TLS_DIR`. |
@@ -244,7 +248,8 @@ Rules enforced at start-up (`--check-config` reports them):
   only `A-Z a-z 0-9 / . _ -` (paths are interpolated into Nginx directives and
   SELinux regular expressions);
 - `OXPANEL_NGINX_INCLUDE_FILE` may not live inside `OXPANEL_NGINX_CONF_DIR`;
-- `OXPANEL_UID_MIN` ≥ 1000 and ≤ `OXPANEL_UID_MAX`.
+- `OXPANEL_UID_MIN` ≥ 1000 and ≤ `OXPANEL_UID_MAX`;
+- `OXPANEL_BACKUP_DIR` may not live inside `OXPANEL_HOME_BASE`.
 
 Example `/etc/oxpanel/daemon.env` for a node whose panel API runs as user
 `panelapi` and whose homes live on a dedicated volume:
@@ -473,11 +478,40 @@ sudo oxpanel-ctl db grant acme_shopapp acme_shop
 sudo oxpanel-ctl db list --tenant acme        # database=acme_shop tenant=acme engine=mariadb size=…
 #   in the application: host "localhost", user "acme_shopapp", database "acme_shop"
 
-# Tear down (order matters: vhosts and databases first)
+# Back up the tenant (home + the engine's records), waiting for the job;
+# without --wait it prints the job id at once (`backup job <id>` to look again)
+sudo oxpanel-ctl backup create acme --wait
+# job=j1794571200123 kind=JOB_KIND_BACKUP tenant=acme backup=b1794571200123 state=JOB_STATE_SUCCEEDED ...
+sudo oxpanel-ctl backup list acme
+# backup=b1794571200123 tenant=acme state=BACKUP_STATE_READY created_at=1794571200 size=48213 domains=acme.example,shop.acme.example members=home:home.tar.gz:47101,records:records.json:1112
+# Put the files back. You must choose what happens to files that exist now:
+# --overwrite replaces them, --keep-existing leaves them and restores only
+# what is missing. PHP/apps stop meanwhile; apps get their virtualenv and
+# dependencies reinstalled (backups leave node_modules and virtualenvs out).
+# --wait exits 5 if the job failed.
+sudo oxpanel-ctl backup restore acme b1794571200123 --keep-existing --wait
+# restored_entries=12 skipped_entries=40
+# site=app.acme.example dependencies_ok=true detail=dependencies reinstalled from package.json
+sudo oxpanel-ctl backup delete acme b1794571200123
+
+# Closing a customer's account: a final backup kept for 6 months after the
+# deletion (then removed automatically); other backups must go first
+sudo oxpanel-ctl backup create acme --retain-months 6 --wait
+sudo oxpanel-ctl backup list-retained
+# backup=b1794571300456 tenant=acme state=BACKUP_STATE_READY created_at=... retain_until=1810349000 ...
+# After the deletion it is listed with tenant_deleted=true; a new tenant named
+# acme never sees it. The customer came back as acme2: restore it there
+sudo oxpanel-ctl backup restore-retained b1794571300456 --from acme --to acme2 --overwrite --wait
+# ...or drop it early
+sudo oxpanel-ctl backup delete acme b1794571300456 --tenant-deleted
+
+# Tear down (order matters: vhosts and databases first; backups that are not
+# retained block deleting the tenant)
 sudo oxpanel-ctl db user-delete acme_shopapp
 sudo oxpanel-ctl db delete acme_shop          # drops the database and everything in it
 sudo oxpanel-ctl vhost remove shop.acme.example
 sudo oxpanel-ctl vhost remove acme.example
+for id in $(sudo oxpanel-ctl backup list acme | sed -n 's/^backup=\([^ ]*\).*/\1/p'); do sudo oxpanel-ctl backup delete acme "$id"; done
 sudo oxpanel-ctl tenant delete acme --remove-home
 ```
 
@@ -591,10 +625,15 @@ needs to confirm a site is live, poll it.
 | `/var/lib/oxpanel/databases/<name>.json` | `root 0600` | database record: tenant, engine, `state`, created time |
 | `/var/lib/oxpanel/db-users/<name>.json` | `root 0600` | database-user record: tenant, engine, connection limit, granted databases, `state`. **No password and no hash** |
 | MariaDB | | databases `<tenant>_<suffix>` (utf8mb4) and accounts `'<tenant>_<suffix>'@'localhost'`; data lives in `/var/lib/mysql`, which OxPanel's backups of `/var/lib/oxpanel` do not include |
+| `/var/lib/oxpanel/backups/<id>.json`, `/var/lib/oxpanel/jobs/<id>.json` | `root 0600` | backup records (members, sizes, SHA-256) and backup/restore job records |
+| `/var/lib/oxpanel-backups/<tenant>/<id>/` | `root 0700`, files `0600` | one backup: `home.tar.gz`, `records.json`, `manifest.json` (written last; a directory without it is not a backup) |
+| `oxpanel-job-<id>.service` | transient | a running backup or restore (in the tenant's slice); gone once the daemon has recorded its result |
 | SELinux hosts | | `semanage fcontext` equivalence `<docroot> = /usr/share/nginx/html` (labels the tree `httpd_sys_content_t`; a plain rule would be overridden by `file_contexts.homedirs`) |
 
 Records are the source of truth for *what OxPanel owns*. Back up
-`/var/lib/oxpanel` together with `/home` and `/etc/nginx/oxpanel.d`.
+`/var/lib/oxpanel` together with `/home` and `/etc/nginx/oxpanel.d`. The
+engine's own per-tenant backups (§9) live on the same host: copy
+`/var/lib/oxpanel-backups` off the host if they are to survive losing it.
 
 ## 9. Day-2 operations
 
@@ -700,6 +739,42 @@ What to do with each finding:
 | `DATABASE_USER_MISSING` | A recorded database user is gone from the server, or its record is interrupted. | `db user-passwd` re-creates the account with its recorded grants; or repeat `db user-create` / `db user-delete`. |
 | `DATABASE_PRIVILEGE_DRIFT` | A database user holds more or less than its record says (a global privilege, a grant on another database, `GRANT OPTION`, an edited connection limit, a lock that does not match the tenant's suspension), or an account OxPanel does not manage can reach a managed database. | Remove what was added by hand (`REVOKE …`); `db revoke` + `db grant` restores OxPanel's own grant. |
 | `ORPHAN_DATABASE_OBJECT` | A database or account on the server carries a tenant's prefix (`<tenant>_`) but has no record. | Inspect and remove by hand; OxPanel will not adopt or drop it. |
+| `BACKUP_ARCHIVE_MISSING` / `_MODIFIED` | A backup's directory, manifest or member is gone, or a member's size (or the manifest) no longer matches the record. Such a backup cannot be trusted; a restore from it is refused by the checksum. | `backup delete` it. |
+| `BACKUP_INCOMPLETE` | A backup record that was never completed and has no running job (or a job without a backup record). | `backup delete` the backup id. |
+| `ORPHAN_BACKUP_ARCHIVE` | A directory under the backup store that no record accounts for. | Inspect and remove by hand. |
+
+**Backups** — `backup create` starts a job in a transient unit
+(`oxpanel-job-<id>.service`, in the tenant's slice, lowest CPU/IO priority)
+and returns; the daemon may be restarted meanwhile and picks the job up
+again. `tar` runs as the tenant, so files the tenant cannot read (planted by
+root, belonging to someone else) are skipped and named in the job's output.
+A backup is refused (`RESOURCE_EXHAUSTED`) when the home would not fit with
+`OXPANEL_BACKUP_MIN_FREE_BYTES` to spare; at most 4 jobs run on the host and
+one per tenant. Only the newest `OXPANEL_BACKUP_KEEP` backups of a tenant are
+kept. Scheduling is the panel's job (or cron:
+`oxpanel-ctl backup create <tenant>`). A tenant with backups cannot be
+deleted until they are deleted or *retained* (`backup retain <tenant> <id>
+--months 1..12`, or `backup create --retain-months N`): retained backups
+outlive the tenant, are hidden from any later tenant of the same name, and
+are removed by the daemon when their date passes (at start-up and hourly).
+`backup list-retained`, `backup delete … --tenant-deleted` and `backup
+restore-retained <id> --from <deleted tenant> --to <tenant>` (needs the
+`delete` scope) are the operator's tools for them.
+Backups leave out `node_modules`, Python virtualenvs (any directory holding
+a `pyvenv.cfg`, and each Python application's `.venv`) and the `.cache` /
+`.npm` caches; `backup list` shows how many directories were left out
+(`excluded=`), and the manifest names them. A restore needs an explicit
+`--overwrite` or `--keep-existing`; newer files always stay. It stops the
+tenant's PHP and applications while it runs, then restores the home's
+privacy, SELinux labels and the web server's ACLs, recreates each Python
+application's virtualenv and reinstalls every application's dependencies
+(like `vhost install-deps`, so the package registry must be reachable unless
+dependencies are local), and starts them again. A failed reinstallation is
+reported per site (`dependencies_ok=false`) without failing the restore;
+fix the cause and run `vhost install-deps`. A
+`FAILED` restore of an engine-made backup usually means a member could not be
+written as the tenant (e.g. a device node root once put in the home); the
+other files were restored — see `backup job <id>`.
 
 **Recovering a stuck tenant** — a record in `provisioning` or `deleting`
 resumes on the next identical `CreateTenant`/`DeleteTenant`. A record whose
@@ -917,6 +992,7 @@ T=$HOME/ox; mkdir -p $T/nginx/conf.d $T/home $T/systemd
 export OXPANEL_DRY_RUN=1 OXPANEL_STATE_DIR=$T/state OXPANEL_HOME_BASE=$T/home \
        OXPANEL_SYSTEMD_UNIT_DIR=$T/systemd OXPANEL_NGINX_CONF_DIR=$T/nginx/oxpanel.d \
        OXPANEL_NGINX_INCLUDE_FILE=$T/nginx/conf.d/00-oxpanel.conf \
+       OXPANEL_BACKUP_DIR=$T/backups \
        OXPANEL_SOCKET_PATH=$T/oxpanel.sock OXPANEL_SOCKET_GROUP=
 oxpanel-daemon --dry-run &
 oxpanel-ctl --socket $T/oxpanel.sock tenant create alice --memory 512M
@@ -933,7 +1009,8 @@ architecture in `oxpanel-daemon/PROJECT_DETAILS.md`.
 
 **Upgrade:** install the new RPM (`dnf upgrade ./oxpanel-daemon-*.rpm`); the
 unit restarts automatically, records are versioned (`version` field) and older
-records load with defaults for new fields.
+records load with defaults for new fields. Backup and restore jobs that are
+running keep running in their own units and are picked up by the new daemon.
 
 **Uninstall the engine, keep the tenants:**
 
@@ -941,13 +1018,14 @@ records load with defaults for new fields.
 sudo systemctl disable --now oxpanel-daemon
 sudo dnf remove oxpanel-daemon
 # left in place on purpose: /var/lib/oxpanel, /home/<tenants>, /etc/systemd/system/oxpanel-tenant-*.slice,
-# /etc/nginx/oxpanel.d, /etc/nginx/conf.d/00-oxpanel.conf, the accounts themselves, /etc/oxpanel/daemon.env
+# /etc/nginx/oxpanel.d, /etc/nginx/conf.d/00-oxpanel.conf, the accounts themselves, /etc/oxpanel/daemon.env,
+# the backups in /var/lib/oxpanel-backups
 ```
 
 **Remove everything:** delete every virtual host and tenant through the API
-first (`vhost remove`, `tenant delete --remove-home`) — that is the only path
+first (`backup delete`, `vhost remove`, `tenant delete --remove-home`) — that is the only path
 that cleans up accounts, ACLs, SELinux rules and units consistently — then
-uninstall and remove `/var/lib/oxpanel`, `/etc/nginx/oxpanel.d`,
+uninstall and remove `/var/lib/oxpanel`, `/var/lib/oxpanel-backups`, `/etc/nginx/oxpanel.d`,
 `/etc/nginx/conf.d/00-oxpanel.conf`, `/etc/oxpanel`, and the `oxpanel` group.
 
 ## 13. Security notes for operators

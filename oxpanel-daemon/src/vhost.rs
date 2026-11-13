@@ -420,7 +420,7 @@ impl VHostService {
     pub async fn install_app_dependencies(&self, domain: &str) -> Result<(bool, String)> {
         let domain = Domain::parse(domain)?;
         let (tenant, rec) = self.load_app_vhost(&domain)?;
-        let (succeeded, output) = app::install_dependencies(&self.ctx, &tenant, &rec).await?;
+        let (succeeded, output) = app::run_installer(&self.ctx, &tenant, &rec).await?;
         if succeeded {
             // Minutes may have passed without the lock. Restart only what the
             // records call for *now*: a tenant suspended or a site removed
@@ -504,6 +504,31 @@ impl VHostService {
             all.retain(|v| v.tenant == t.as_str());
         }
         Ok(all)
+    }
+
+    /// After a restore replaced files in the tenant's home: give every
+    /// document root of the tenant what `configure` gives it — it exists and
+    /// is the tenant's own directory, the web server may traverse to it and
+    /// read it, and on SELinux hosts it carries the web-content label.
+    /// The caller holds the mutation lock.
+    pub(crate) async fn restore_web_access(&self, tenant: &TenantRecord) -> Result<()> {
+        for v in self
+            .ctx
+            .store
+            .list_vhosts()?
+            .iter()
+            .filter(|v| v.tenant == tenant.username)
+        {
+            let docroot = RelPath::parse(&v.document_root)?;
+            let abs_root = tenant.home.join(docroot.as_str());
+            self.create_document_root(tenant, &abs_root).await?;
+            self.grant_web_access(&tenant.home, &docroot, &abs_root)
+                .await?;
+            if self.ctx.selinux {
+                self.label_docroot(&abs_root).await?;
+            }
+        }
+        Ok(())
     }
 
     /// Persistent SELinux label for the document root, then apply it.
@@ -802,6 +827,7 @@ mod tests {
     async fn harness(selinux: bool) -> Harness {
         let dir = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
         let mut cfg = Config::default();
+        crate::config::sandbox_feature_paths(&mut cfg, dir.path());
         cfg.state_dir = dir.path().join("state");
         cfg.home_base = dir.path().join("home");
         cfg.systemd_unit_dir = dir.path().join("systemd");

@@ -460,10 +460,15 @@ impl TenantService {
         if crate::db::tenant_has_objects(&self.ctx, &name)? {
             return Err(Error::TenantHasDatabases(name.to_string()));
         }
+        // Backups are the tenant's data too: they are deleted explicitly,
+        // never as a side effect, and no job may be in flight.
+        crate::backup::refuse_tenant_deletion(&self.ctx, &name)?;
         if rec.state != TenantState::Deleting {
             rec.state = TenantState::Deleting;
             self.ctx.store.save_tenant(&rec)?;
         }
+        // Retained backups outlive the tenant, detached from its name.
+        crate::backup::detach_retained(&self.ctx, &name)?;
 
         let timeout = self.ctx.config.command_timeout;
         // SFTP first: the home must not be removed while it is still mounted
@@ -491,6 +496,7 @@ impl TenantService {
             timeout,
         )
         .await?;
+        crate::backup::forget_tenant_jobs(&self.ctx, &name)?;
         self.ctx.store.delete_tenant(&name)?;
         Ok(true)
     }

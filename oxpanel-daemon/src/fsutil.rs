@@ -160,6 +160,45 @@ pub fn list_entry_names(dir: &Path) -> Result<Vec<String>> {
     Ok(out)
 }
 
+/// Remove a directory OxPanel created, with everything in it. Refuses a
+/// symlink (the target is not ours). Returns whether anything was removed.
+pub fn remove_dir_tree(dir: &Path) -> Result<bool> {
+    match fs::symlink_metadata(dir) {
+        Ok(md) if md.file_type().is_symlink() || !md.is_dir() => Err(Error::Internal(format!(
+            "{} is not a directory; refusing to remove it",
+            dir.display()
+        ))),
+        Ok(_) => {
+            fs::remove_dir_all(dir).map_err(|e| Error::io("rm", dir, e))?;
+            if let Some(parent) = dir.parent() {
+                fsync_dir(parent)?;
+            }
+            Ok(true)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(Error::io("lstat", dir, e)),
+    }
+}
+
+/// Names of the directories directly inside `dir`, sorted. Symlinks are not
+/// directories here. A missing `dir` is empty.
+pub fn list_dirs(dir: &Path) -> Result<Vec<String>> {
+    let rd = match fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(Error::io("readdir", dir, e)),
+    };
+    let mut out = Vec::new();
+    for entry in rd {
+        let entry = entry.map_err(|e| Error::io("readdir", dir, e))?;
+        if entry.file_type().is_ok_and(|t| t.is_dir()) {
+            out.push(entry.file_name().to_string_lossy().into_owned());
+        }
+    }
+    out.sort();
+    Ok(out)
+}
+
 /// Regular files directly inside `dir` whose name ends with `suffix`, sorted.
 pub fn list_files_with_suffix(dir: &Path, suffix: &str) -> Result<Vec<PathBuf>> {
     let rd = match fs::read_dir(dir) {

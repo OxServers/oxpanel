@@ -35,14 +35,18 @@ struct Inner {
     missing: Vec<&'static str>,
     /// What `node --version` prints; `None` = a supported version.
     node_version: Option<String>,
+    /// Scripted standard output, consumed in order per program.
+    scripted_stdout: BTreeMap<&'static str, VecDeque<String>>,
+    /// Free space reported by `host_stats`; `None` = 80 GiB.
+    disk_free_bytes: Option<u64>,
     /// The emulated MariaDB server; `None` = MariaDB is not installed.
     mariadb: Option<FakeMariaDb>,
     /// Keys the fake `openssl genpkey` has handed out.
     generated_keys: u32,
     /// Lifetime of certificates the fake ACME client delivers; `None` = 90 days.
     acme_lifetime: Option<u64>,
-    /// The fake certificate authority refuses every order.
-    acme_refuses: bool,
+    /// Failures the tests switch on.
+    faults: FakeFaults,
     /// User quotas are enforced on the (one) fake file system.
     quota_enforced: bool,
     /// Per-uid quota state of the fake file system.
@@ -50,6 +54,16 @@ struct Inner {
     ssh: FakeSsh,
     /// Password field per account, as `/etc/shadow` would hold it.
     shadow: BTreeMap<String, String>,
+}
+
+/// Failures the tests switch on (a struct of its own: clippy allows at most
+/// three bools in one).
+#[derive(Debug, Default)]
+struct FakeFaults {
+    /// The fake certificate authority refuses every order.
+    acme_refuses: bool,
+    /// Backup workers leave no archive behind (as if they had failed).
+    worker_writes_nothing: bool,
 }
 
 /// sshd and login sessions on the fake host.
@@ -276,7 +290,7 @@ impl FakeSystem {
     /// The reachability pre-check is not affected.
     pub fn set_acme_refuses(&self, refuses: bool) {
         if let Ok(mut i) = self.inner.lock() {
-            i.acme_refuses = refuses;
+            i.faults.acme_refuses = refuses;
         }
     }
 
@@ -318,6 +332,31 @@ impl FakeSystem {
             .filter_map(|c| c.stdin)
             .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
             .collect()
+    }
+
+    /// Make the next invocation of `program` succeed and print `stdout`.
+    pub fn script_stdout(&self, program: &'static str, stdout: &str) {
+        if let Ok(mut i) = self.inner.lock() {
+            i.scripted_stdout
+                .entry(program)
+                .or_default()
+                .push_back(stdout.to_owned());
+        }
+    }
+
+    /// Free space `host_stats` reports for every file system.
+    pub fn set_disk_free(&self, bytes: u64) {
+        if let Ok(mut i) = self.inner.lock() {
+            i.disk_free_bytes = Some(bytes);
+        }
+    }
+
+    /// Whether the fake backup worker writes its archive (default) or leaves
+    /// nothing behind, as a worker that failed or was killed would.
+    pub fn set_worker_writes_nothing(&self, on: bool) {
+        if let Ok(mut i) = self.inner.lock() {
+            i.faults.worker_writes_nothing = on;
+        }
     }
 
     /// Forget recorded commands (tests call this after harness setup).
@@ -502,6 +541,15 @@ fn limit_value(command: &str, key: &str) -> Option<u64> {
 /// `systemd-run … -- xfs_quota -x -c <command>… <device>`: apply `limit`
 /// commands to the fake quota table and write what `report` commands print to
 /// the file the transient unit's standard output is directed to.
+/// The commands of the feature modules (SFTP, HTTPS, quotas, databases,
+/// backup jobs). Order matters: the SFTP session check is a `systemctl show
+/// --property=ActiveState` too, and must not be answered as a job unit.
+fn fake_feature_command(i: &mut Inner, spec: &CommandSpec) -> Option<CommandOutput> {
+    fake_ssh_and_accounts(i, spec)
+        .or_else(|| fake_tls_quota_and_db(i, spec))
+        .or_else(|| emulate_job(i, spec))
+}
+
 /// Commands of the HTTPS, disk-quota and database workflows: OpenSSL, the
 /// ACME client and `xfs_quota` in their transient units, and the MariaDB
 /// client. `None` for anything else.
@@ -515,7 +563,7 @@ fn fake_tls_quota_and_db(i: &mut Inner, spec: &CommandSpec) -> Option<CommandOut
         }
         // The ACME client in its transient unit (other uses of systemd-run just succeed).
         bin::SYSTEMD_RUN if args.iter().any(|a| a == bin::OXPANEL_ACME) => {
-            let (code, stderr) = if i.acme_refuses && !args.iter().any(|a| a == "precheck") {
+            let (code, stderr) = if i.faults.acme_refuses && !args.iter().any(|a| a == "precheck") {
                 (1, "no certificate: the authority refused (429): too many certificates (urn:ietf:params:acme:error:rateLimited)".to_owned())
             } else {
                 super::fake_tls::acme_client(args, i.acme_lifetime.unwrap_or(90 * 86_400))
@@ -598,6 +646,39 @@ fn fake_xfs_quota(i: &mut Inner, args: &[OsString]) -> CommandOutput {
     }
 }
 
+/// Scripted standard output, and the transient units of backup and restore
+/// jobs: the worker "runs" at once, a backup leaves a small archive with its
+/// result file like the real one, and the unit reports success afterwards.
+fn emulate_job(i: &mut Inner, spec: &CommandSpec) -> Option<CommandOutput> {
+    let (program, args) = (spec.program, &spec.args);
+    if let Some(stdout) = i
+        .scripted_stdout
+        .get_mut(program)
+        .and_then(VecDeque::pop_front)
+    {
+        return Some(output(program, 0, &stdout, ""));
+    }
+    match program {
+        bin::SYSTEMD_RUN if has_flag(args, "worker") => {
+            if has_flag(args, "backup") && !i.faults.worker_writes_nothing {
+                if let Some(path) = arg_value(args, "--output") {
+                    if let Err(e) = crate::worker::write_fake_archive(Path::new(&path)) {
+                        return Some(output(program, 1, "", &e.to_string()));
+                    }
+                }
+            }
+            Some(output(program, 0, "", ""))
+        }
+        bin::SYSTEMCTL if has_flag(args, "--property=ActiveState") => Some(output(
+            program,
+            0,
+            "LoadState=loaded\nActiveState=active\nSubState=exited\nResult=success\nExecMainStatus=0\n",
+            "",
+        )),
+        _ => None,
+    }
+}
+
 fn create_private_dir(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(path)?;
@@ -617,10 +698,7 @@ impl System for FakeSystem {
         {
             return Ok(output(spec.program, code, "", &stderr));
         }
-        if let Some(out) = fake_ssh_and_accounts(&mut i, &spec) {
-            return Ok(out);
-        }
-        if let Some(out) = fake_tls_quota_and_db(&mut i, &spec) {
+        if let Some(out) = fake_feature_command(&mut i, &spec) {
             return Ok(out);
         }
         let args = &spec.args;
@@ -770,13 +848,14 @@ impl System for FakeSystem {
     }
 
     async fn host_stats(&self, _path: &Path) -> Result<HostStats> {
+        let free = self.lock()?.disk_free_bytes.unwrap_or(80 << 30);
         Ok(HostStats {
             load: (0.25, 0.5, 0.75),
             memory_total_bytes: 8 << 30,
             memory_free_bytes: 6 << 30,
             uptime_secs: 3600,
             disk_total_bytes: 100 << 30,
-            disk_free_bytes: 80 << 30,
+            disk_free_bytes: free,
         })
     }
 

@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::fsutil;
-use crate::validate::{DbName, Domain, Limits, RelPath, Username};
+use crate::validate::{BackupId, DbName, Domain, JobId, Limits, RelPath, Username};
 
 pub const RECORD_VERSION: u32 = 1;
 const RECORD_MODE: u32 = 0o600;
@@ -256,6 +256,151 @@ impl VHostRecord {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackupState {
+    /// The job that writes it is still running (or was interrupted).
+    Creating,
+    /// Sealed: every member is on disk and listed with its checksum.
+    Ready,
+}
+
+/// One file of a backup, with what is needed to verify it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupMember {
+    /// File name inside the backup directory.
+    pub name: String,
+    /// What it holds: `home`, `records`, … (see `backup.rs`).
+    pub kind: String,
+    pub size_bytes: u64,
+    /// Lower-case hexadecimal SHA-256 of the file.
+    pub sha256: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackupRecord {
+    pub version: u32,
+    pub id: String,
+    pub tenant: String,
+    /// The tenant's uid when the backup was made. A backup is only ever
+    /// restored into the account it was taken from.
+    pub uid: u32,
+    pub created_at_unix: u64,
+    pub state: BackupState,
+    /// Total size of the members; 0 until sealed.
+    pub size_bytes: u64,
+    pub members: Vec<BackupMember>,
+    /// Virtual hosts the tenant had when the backup was made.
+    pub domains: Vec<String>,
+    /// Kept until this time (UNIX seconds) whatever the per-tenant count
+    /// says, and across `DeleteTenant`; 0 = no such mark.
+    #[serde(default)]
+    pub retain_until_unix: u64,
+    /// The tenant was deleted while this retained backup was kept. Invisible
+    /// to every per-tenant RPC (a later tenant of the same name never sees
+    /// it); only the operator RPCs for retained backups reach it.
+    #[serde(default)]
+    pub tenant_deleted: bool,
+    /// Directories left out of the home archive by the exclusion rules
+    /// (`backup::EXCLUDE_RULES`), relative to the home ("." is the home
+    /// itself), as found when the backup was started; at most
+    /// `backup::EXCLUDED_LISTED` of them.
+    #[serde(default)]
+    pub excluded: Vec<String>,
+    /// How many there were in all.
+    #[serde(default)]
+    pub excluded_count: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobKind {
+    Backup,
+    Restore,
+}
+
+impl JobKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Backup => "backup",
+            Self::Restore => "restore",
+        }
+    }
+}
+
+/// What a restore does with a file that already exists in the home. There is
+/// no default: the caller must choose.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OnExisting {
+    /// Files in the backup replace the current ones.
+    Overwrite,
+    /// Existing files (and directories, symlinks) are left untouched; only
+    /// what is missing is restored.
+    Keep,
+}
+
+impl OnExisting {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Overwrite => "overwrite",
+            Self::Keep => "keep",
+        }
+    }
+}
+
+/// What happened to one application site after a restore.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SiteResult {
+    pub domain: String,
+    pub succeeded: bool,
+    /// One line: what was done, or why it failed.
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum JobState {
+    Running,
+    Succeeded,
+    Failed,
+}
+
+/// A backup or restore in flight or finished. The work itself runs in a
+/// transient systemd unit, so the record is what lets a restarted daemon
+/// find it again.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JobRecord {
+    pub version: u32,
+    pub id: String,
+    pub kind: JobKind,
+    pub tenant: String,
+    pub backup_id: String,
+    /// The transient unit doing the work (without `.service`).
+    pub unit: String,
+    pub state: JobState,
+    /// One line from the engine: what happened.
+    pub message: String,
+    /// The end of what the worker printed (warnings, the reason of a failure).
+    pub output: String,
+    pub started_at_unix: u64,
+    /// 0 while running.
+    pub finished_at_unix: u64,
+    /// Restores: the caller's choice for files that already exist.
+    #[serde(default)]
+    pub on_existing: Option<OnExisting>,
+    /// Restores: archive entries written, and entries skipped because they
+    /// already existed (`Keep`). Directories count as entries.
+    #[serde(default)]
+    pub restored_entries: u64,
+    #[serde(default)]
+    pub skipped_entries: u64,
+    /// Restores: per application site, the virtualenv and dependency
+    /// reinstallation (dependencies are not in backups).
+    #[serde(default)]
+    pub sites: Vec<SiteResult>,
+}
+
 /// Seconds since the UNIX epoch, saturating at 0 if the clock is before 1970.
 pub fn now_unix() -> u64 {
     SystemTime::now()
@@ -271,6 +416,8 @@ pub struct Store {
     /// `state_dir/databases` and `state_dir/db-users`.
     databases: PathBuf,
     db_users: PathBuf,
+    backup_records: PathBuf,
+    job_records: PathBuf,
 }
 
 impl Store {
@@ -280,6 +427,8 @@ impl Store {
             vhosts_dir: config.vhosts_dir(),
             databases: config.databases_dir(),
             db_users: config.db_users_dir(),
+            backup_records: config.backup_records_dir(),
+            job_records: config.jobs_dir(),
         }
     }
 
@@ -288,7 +437,9 @@ impl Store {
         fsutil::ensure_dir(&self.tenants_dir, DIR_MODE)?;
         fsutil::ensure_dir(&self.databases, DIR_MODE)?;
         fsutil::ensure_dir(&self.db_users, DIR_MODE)?;
-        fsutil::ensure_dir(&self.vhosts_dir, DIR_MODE)
+        fsutil::ensure_dir(&self.vhosts_dir, DIR_MODE)?;
+        fsutil::ensure_dir(&self.backup_records, DIR_MODE)?;
+        fsutil::ensure_dir(&self.job_records, DIR_MODE)
     }
 
     fn tenant_path(&self, name: &Username) -> PathBuf {
@@ -402,6 +553,53 @@ impl Store {
 
     pub fn list_db_users(&self) -> Result<Vec<DbUserRecord>> {
         list(&self.db_users)
+    }
+
+    fn backup_path(&self, id: &BackupId) -> PathBuf {
+        self.backup_records.join(format!("{id}.json"))
+    }
+
+    fn job_path(&self, id: &JobId) -> PathBuf {
+        self.job_records.join(format!("{id}.json"))
+    }
+
+    pub fn load_backup(&self, id: &BackupId) -> Result<Option<BackupRecord>> {
+        load(&self.backup_path(id))
+    }
+
+    pub fn save_backup(&self, rec: &BackupRecord) -> Result<()> {
+        let id = BackupId::parse(&rec.id)?;
+        Username::parse_field(&rec.tenant, "tenant")?;
+        save(&self.backup_path(&id), rec)
+    }
+
+    pub fn delete_backup(&self, id: &BackupId) -> Result<bool> {
+        fsutil::remove_if_exists(&self.backup_path(id))
+    }
+
+    /// Every backup record, oldest first (identifiers sort by creation time).
+    pub fn list_backups(&self) -> Result<Vec<BackupRecord>> {
+        list(&self.backup_records)
+    }
+
+    pub fn load_job(&self, id: &JobId) -> Result<Option<JobRecord>> {
+        load(&self.job_path(id))
+    }
+
+    pub fn save_job(&self, rec: &JobRecord) -> Result<()> {
+        let id = JobId::parse(&rec.id)?;
+        Username::parse_field(&rec.tenant, "tenant")?;
+        BackupId::parse(&rec.backup_id)?;
+        save(&self.job_path(&id), rec)
+    }
+
+    pub fn delete_job(&self, id: &JobId) -> Result<bool> {
+        fsutil::remove_if_exists(&self.job_path(id))
+    }
+
+    /// Every job record, oldest first.
+    pub fn list_jobs(&self) -> Result<Vec<JobRecord>> {
+        list(&self.job_records)
     }
 }
 

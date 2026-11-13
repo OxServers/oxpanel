@@ -22,6 +22,8 @@
 //! - [`db`]       — tenant databases and database users; one submodule per
 //!   engine ([`db::mariadb`] is the only place that builds SQL or talks to
 //!   the server).
+//! - [`backup`]   — per-tenant backups and restores, run as jobs; [`worker`]
+//!   is the half of a job that runs outside the daemon.
 //! - [`host`]     — host information and record ↔ OS reconciliation.
 //! - [`auth`]     — peer-credential gate for the UNIX socket.
 //! - [`server`]   — gRPC ↔ domain mapping.
@@ -41,6 +43,7 @@ pub mod acme;
 pub mod app;
 pub mod auth;
 pub mod auto_https;
+pub mod backup;
 pub mod config;
 pub mod ctx;
 pub mod db;
@@ -59,6 +62,7 @@ pub mod tenant;
 pub mod tls;
 pub mod validate;
 pub mod vhost;
+pub mod worker;
 
 /// Property tests of crate-private parsers (the public ones are covered by
 /// `tests/properties.rs`).

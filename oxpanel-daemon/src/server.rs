@@ -12,13 +12,15 @@ use std::sync::Arc;
 
 use crate::auth::{PeerInfo, Scope, ScopePolicy};
 use crate::auto_https;
+use crate::backup::BackupService;
 use crate::ctx::Ctx;
 use crate::db::DbService;
 use crate::error::Error;
 use crate::host::{Drift, DriftKind, HostService};
 use crate::records::{
-    AppRuntime, CertSource, DatabaseRecord, DbEngine, DbUserRecord, SftpKeyRecord, TenantRecord,
-    TenantState, VHostRecord,
+    AppRuntime, BackupRecord, BackupState, CertSource, DatabaseRecord, DbEngine, DbUserRecord,
+    JobKind, JobRecord, JobState, OnExisting, SftpKeyRecord, TenantRecord, TenantState,
+    VHostRecord,
 };
 use crate::sftp::SftpService;
 use crate::tenant::TenantService;
@@ -38,6 +40,7 @@ pub struct Engine {
     databases: DbService,
     scopes: Arc<ScopePolicy>,
     tls: TlsService,
+    backups: BackupService,
 }
 
 /// Interceptor type used by [`Engine::into_service`].
@@ -52,6 +55,7 @@ impl Engine {
             tls: TlsService::new(ctx.clone()),
             sftp: SftpService::new(ctx.clone()),
             databases: DbService::new(ctx.clone()),
+            backups: BackupService::new(ctx.clone()),
             host: HostService::new(ctx),
         }
     }
@@ -60,6 +64,12 @@ impl Engine {
     /// the "request in flight" bookkeeping with the RPCs.
     pub fn tls(&self) -> TlsService {
         self.tls.clone()
+    }
+
+    /// The backup service behind this engine (the daemon resumes jobs
+    /// through it at start-up).
+    pub fn backups(&self) -> &BackupService {
+        &self.backups
     }
 
     /// The tonic service, wrapped so every request must carry a verified peer.
@@ -149,6 +159,10 @@ fn drift_to(d: &Drift) -> pb::Drift {
         DriftKind::DatabaseUserMissing => pb::DriftKind::DatabaseUserMissing,
         DriftKind::DatabasePrivilegeDrift => pb::DriftKind::DatabasePrivilegeDrift,
         DriftKind::OrphanDatabaseObject => pb::DriftKind::OrphanDatabaseObject,
+        DriftKind::BackupArchiveMissing => pb::DriftKind::BackupArchiveMissing,
+        DriftKind::BackupArchiveModified => pb::DriftKind::BackupArchiveModified,
+        DriftKind::OrphanBackupArchive => pb::DriftKind::OrphanBackupArchive,
+        DriftKind::BackupIncomplete => pb::DriftKind::BackupIncomplete,
     };
     pb::Drift {
         kind: kind.into(),
@@ -195,6 +209,13 @@ fn fail(rpc: &'static str, peer: &str, err: Error) -> Status {
         | Error::DbObjectUnusable { .. }
         | Error::DbLimitReached { .. }
         | Error::TenantHasDatabases(_)
+        | Error::BackupNotFound { .. }
+        | Error::BackupNotReady(_)
+        | Error::JobNotFound(_)
+        | Error::JobRunning { .. }
+        | Error::TooManyJobs
+        | Error::BackupNoSpace { .. }
+        | Error::TenantHasBackups(_)
         | Error::NginxInvalid(_) => {
             warn!(rpc, peer, error = %err, "request refused");
             err.into()
@@ -707,6 +728,9 @@ impl OxPanelEngine for Engine {
                     database_user_count: f.user_count,
                 })
                 .collect(),
+            backup_disk_total_bytes: i.backup_disk_total_bytes,
+            backup_disk_free_bytes: i.backup_disk_free_bytes,
+            backup_keep: i.backup_keep,
         }))
     }
 
@@ -1109,6 +1133,229 @@ impl OxPanelEngine for Engine {
             changed,
         }))
     }
+
+    async fn create_backup(
+        &self,
+        req: Request<pb::CreateBackupRequest>,
+    ) -> Result<Response<pb::StartJobResponse>, Status> {
+        const RPC: &str = "CreateBackup";
+        let peer = self.authorise(&req, RPC, Scope::Tenant)?;
+        let r = req.into_inner();
+        info!(rpc = RPC, peer, tenant = %r.tenant, "request");
+        let (job, started) = self
+            .backups
+            .create(&r.tenant, r.retain_months)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(pb::StartJobResponse {
+            job: Some(job_to(&job)),
+            started,
+        }))
+    }
+
+    async fn list_backups(
+        &self,
+        req: Request<pb::ListBackupsRequest>,
+    ) -> Result<Response<pb::ListBackupsResponse>, Status> {
+        const RPC: &str = "ListBackups";
+        let peer = self.authorise(&req, RPC, Scope::Read)?;
+        let r = req.into_inner();
+        let recs = self
+            .backups
+            .list(&r.tenant)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(pb::ListBackupsResponse {
+            backups: recs.iter().map(backup_to).collect(),
+        }))
+    }
+
+    async fn delete_backup(
+        &self,
+        req: Request<pb::DeleteBackupRequest>,
+    ) -> Result<Response<pb::DeleteBackupResponse>, Status> {
+        const RPC: &str = "DeleteBackup";
+        let peer = self.authorise(&req, RPC, Scope::Delete)?;
+        let r = req.into_inner();
+        info!(rpc = RPC, peer, tenant = %r.tenant, backup = %r.backup_id, "request");
+        let deleted = if r.tenant_deleted {
+            self.backups.delete_retained(&r.tenant, &r.backup_id).await
+        } else {
+            self.backups.delete(&r.tenant, &r.backup_id).await
+        }
+        .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(pb::DeleteBackupResponse { deleted }))
+    }
+
+    async fn restore_backup(
+        &self,
+        req: Request<pb::RestoreBackupRequest>,
+    ) -> Result<Response<pb::StartJobResponse>, Status> {
+        const RPC: &str = "RestoreBackup";
+        let peer = self.authorise(&req, RPC, Scope::Tenant)?;
+        let r = req.into_inner();
+        info!(rpc = RPC, peer, tenant = %r.tenant, backup = %r.backup_id, on_existing = r.on_existing, "request");
+        let mode = on_existing(r.on_existing).map_err(|e| fail(RPC, &peer, e))?;
+        let (job, started) = self
+            .backups
+            .restore(&r.tenant, &r.backup_id, mode)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(pb::StartJobResponse {
+            job: Some(job_to(&job)),
+            started,
+        }))
+    }
+
+    async fn get_job(&self, req: Request<pb::GetJobRequest>) -> Result<Response<pb::Job>, Status> {
+        const RPC: &str = "GetJob";
+        let peer = self.authorise(&req, RPC, Scope::Read)?;
+        let r = req.into_inner();
+        let job = self
+            .backups
+            .job(&r.job_id)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(job_to(&job)))
+    }
+
+    async fn retain_backup(
+        &self,
+        req: Request<pb::RetainBackupRequest>,
+    ) -> Result<Response<pb::Backup>, Status> {
+        const RPC: &str = "RetainBackup";
+        let peer = self.authorise(&req, RPC, Scope::Tenant)?;
+        let r = req.into_inner();
+        info!(rpc = RPC, peer, tenant = %r.tenant, backup = %r.backup_id, months = r.retain_months, "request");
+        let rec = self
+            .backups
+            .retain(&r.tenant, &r.backup_id, r.retain_months)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(backup_to(&rec)))
+    }
+
+    async fn list_retained_backups(
+        &self,
+        req: Request<pb::ListRetainedBackupsRequest>,
+    ) -> Result<Response<pb::ListBackupsResponse>, Status> {
+        const RPC: &str = "ListRetainedBackups";
+        let peer = self.authorise(&req, RPC, Scope::Read)?;
+        let recs = self
+            .backups
+            .list_retained()
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(pb::ListBackupsResponse {
+            backups: recs.iter().map(backup_to).collect(),
+        }))
+    }
+
+    async fn restore_retained_backup(
+        &self,
+        req: Request<pb::RestoreRetainedBackupRequest>,
+    ) -> Result<Response<pb::StartJobResponse>, Status> {
+        const RPC: &str = "RestoreRetainedBackup";
+        // Data of one (deleted) account into another: the strongest scope.
+        let peer = self.authorise(&req, RPC, Scope::Delete)?;
+        let r = req.into_inner();
+        info!(rpc = RPC, peer, backup = %r.backup_id, from = %r.source_tenant, to = %r.target_tenant, on_existing = r.on_existing, "request");
+        let mode = on_existing(r.on_existing).map_err(|e| fail(RPC, &peer, e))?;
+        let (job, started) = self
+            .backups
+            .restore_retained(&r.backup_id, &r.source_tenant, &r.target_tenant, mode)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(pb::StartJobResponse {
+            job: Some(job_to(&job)),
+            started,
+        }))
+    }
+}
+
+/// The caller's choice for existing files; there is no default.
+fn on_existing(raw: i32) -> Result<OnExisting, Error> {
+    match pb::OnExisting::try_from(raw) {
+        Ok(pb::OnExisting::Overwrite) => Ok(OnExisting::Overwrite),
+        Ok(pb::OnExisting::Keep) => Ok(OnExisting::Keep),
+        _ => Err(Error::invalid(
+            "on_existing",
+            "choose ON_EXISTING_OVERWRITE or ON_EXISTING_KEEP",
+        )),
+    }
+}
+
+fn backup_to(rec: &BackupRecord) -> pb::Backup {
+    pb::Backup {
+        id: rec.id.clone(),
+        tenant: rec.tenant.clone(),
+        created_at: Some(timestamp(rec.created_at_unix)),
+        state: match rec.state {
+            BackupState::Creating => pb::BackupState::Creating,
+            BackupState::Ready => pb::BackupState::Ready,
+        }
+        .into(),
+        size_bytes: rec.size_bytes,
+        members: rec
+            .members
+            .iter()
+            .map(|m| pb::BackupMember {
+                name: m.name.clone(),
+                kind: m.kind.clone(),
+                size_bytes: m.size_bytes,
+                sha256: m.sha256.clone(),
+            })
+            .collect(),
+        domains: rec.domains.clone(),
+        retain_until: (rec.retain_until_unix != 0).then(|| timestamp(rec.retain_until_unix)),
+        tenant_deleted: rec.tenant_deleted,
+        exclude_rules: crate::backup::EXCLUDE_RULES
+            .iter()
+            .map(|r| (*r).to_owned())
+            .collect(),
+        excluded: rec.excluded.clone(),
+        excluded_count: rec.excluded_count,
+    }
+}
+
+fn job_to(rec: &JobRecord) -> pb::Job {
+    pb::Job {
+        id: rec.id.clone(),
+        kind: match rec.kind {
+            JobKind::Backup => pb::JobKind::Backup,
+            JobKind::Restore => pb::JobKind::Restore,
+        }
+        .into(),
+        tenant: rec.tenant.clone(),
+        backup_id: rec.backup_id.clone(),
+        state: match rec.state {
+            JobState::Running => pb::JobState::Running,
+            JobState::Succeeded => pb::JobState::Succeeded,
+            JobState::Failed => pb::JobState::Failed,
+        }
+        .into(),
+        message: rec.message.clone(),
+        output: rec.output.clone(),
+        started_at: Some(timestamp(rec.started_at_unix)),
+        finished_at: (rec.finished_at_unix != 0).then(|| timestamp(rec.finished_at_unix)),
+        on_existing: match rec.on_existing {
+            None => pb::OnExisting::Unspecified,
+            Some(OnExisting::Overwrite) => pb::OnExisting::Overwrite,
+            Some(OnExisting::Keep) => pb::OnExisting::Keep,
+        }
+        .into(),
+        restored_entries: rec.restored_entries,
+        skipped_entries: rec.skipped_entries,
+        sites: rec
+            .sites
+            .iter()
+            .map(|s| pb::JobSiteResult {
+                domain: s.domain.clone(),
+                succeeded: s.succeeded,
+                detail: s.detail.clone(),
+            })
+            .collect(),
+    }
 }
 
 #[cfg(test)]
@@ -1145,6 +1392,10 @@ mod tests {
             DriftKind::DatabaseUserMissing,
             DriftKind::DatabasePrivilegeDrift,
             DriftKind::OrphanDatabaseObject,
+            DriftKind::BackupArchiveMissing,
+            DriftKind::BackupArchiveModified,
+            DriftKind::OrphanBackupArchive,
+            DriftKind::BackupIncomplete,
         ] {
             let dbg = format!("{kind:?}");
             let mut snake = String::new();

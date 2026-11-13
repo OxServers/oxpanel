@@ -135,6 +135,34 @@ pub enum Error {
     #[error("tenant '{0}' still owns databases or database users; delete them first")]
     TenantHasDatabases(String),
 
+    #[error("backup '{id}' of tenant '{tenant}' not found")]
+    BackupNotFound { tenant: String, id: String },
+
+    /// The backup exists but is still being written.
+    #[error("backup '{0}' is not complete yet")]
+    BackupNotReady(String),
+
+    #[error("job '{0}' not found")]
+    JobNotFound(String),
+
+    /// A backup or restore of this tenant is in flight; one at a time.
+    #[error("job '{job}' is still running for tenant '{tenant}'; wait for it to finish")]
+    JobRunning { tenant: String, job: String },
+
+    #[error("too many backup or restore jobs are running on this host; try again later")]
+    TooManyJobs,
+
+    /// Not enough room on the backup file system for a backup of this home.
+    #[error("not enough free space for this backup: it may need {needed} bytes and {reserve} bytes must stay free, but only {free} are available")]
+    BackupNoSpace {
+        needed: u64,
+        reserve: u64,
+        free: u64,
+    },
+
+    #[error("tenant '{0}' still has backups; delete them or mark them retained first")]
+    TenantHasBackups(String),
+
     #[error("{program} exited with {status}")]
     CommandFailed {
         program: String,
@@ -222,6 +250,13 @@ impl Error {
                 | Self::DbObjectUnusable { .. }
                 | Self::DbLimitReached { .. }
                 | Self::TenantHasDatabases(_)
+                | Self::BackupNotFound { .. }
+                | Self::BackupNotReady(_)
+                | Self::JobNotFound(_)
+                | Self::JobRunning { .. }
+                | Self::TooManyJobs
+                | Self::BackupNoSpace { .. }
+                | Self::TenantHasBackups(_)
         )
     }
 }
@@ -245,7 +280,9 @@ impl From<Error> for Status {
             Error::TenantNotFound(_)
             | Error::VHostNotFound(_)
             | Error::SftpKeyNotFound { .. }
-            | Error::DbObjectNotFound { .. } => Status::not_found(message),
+            | Error::DbObjectNotFound { .. }
+            | Error::BackupNotFound { .. }
+            | Error::JobNotFound(_) => Status::not_found(message),
             Error::NotManaged(_)
             | Error::TenantNotReady(_)
             | Error::TenantHasVHosts(_)
@@ -261,10 +298,15 @@ impl From<Error> for Status {
             | Error::DbNotManaged { .. }
             | Error::DbObjectUnusable { .. }
             | Error::TenantHasDatabases(_)
+            | Error::BackupNotReady(_)
+            | Error::JobRunning { .. }
+            | Error::TenantHasBackups(_)
             | Error::NginxInvalid(_) => Status::failed_precondition(message),
             Error::UidExhausted { .. }
             | Error::TooManySftpKeys(_)
-            | Error::DbLimitReached { .. } => Status::resource_exhausted(message),
+            | Error::DbLimitReached { .. }
+            | Error::TooManyJobs
+            | Error::BackupNoSpace { .. } => Status::resource_exhausted(message),
             Error::Unauthorised => Status::permission_denied(message),
             Error::CommandTimeout { .. } => Status::deadline_exceeded(message),
             Error::CommandFailed { .. }

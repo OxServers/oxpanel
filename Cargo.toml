@@ -34,7 +34,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # PEM bodies (tls.rs) and SSH public keys (sftp.rs); already in the tree through tonic
 base64 = "0.22"
-# SSH key fingerprints (sftp.rs)
+# SSH key fingerprints (sftp.rs) and checksums of backup archives (backup.rs, worker.rs)
 sha2 = "0.10"
 # The hash MariaDB stores for a password (mysql_native_password), so the
 # plaintext never has to be sent to the server.

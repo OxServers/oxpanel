@@ -827,6 +827,123 @@ impl fmt::Debug for DbPassword {
     }
 }
 
+/// Identifier of a backup (`b` + creation time in milliseconds) or of a job
+/// (`j` + start time). Allow-listed because both become file and unit names.
+fn parse_id(raw: &str, prefix: char, field: &'static str) -> Result<String> {
+    let mut chars = raw.chars();
+    let digits = raw.len().saturating_sub(1);
+    if chars.next() != Some(prefix)
+        || !(10..=20).contains(&digits)
+        || !chars.all(|c| c.is_ascii_digit())
+    {
+        return Err(Error::invalid(
+            field,
+            format!("must be '{prefix}' followed by 10 to 20 digits"),
+        ));
+    }
+    Ok(raw.to_owned())
+}
+
+/// A validated backup identifier: `^b[0-9]{10,20}$`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct BackupId(String);
+
+impl BackupId {
+    pub fn parse(raw: &str) -> Result<Self> {
+        parse_id(raw, 'b', "backup_id").map(Self)
+    }
+
+    /// The identifier for a backup created at `unix_millis`.
+    pub fn from_millis(unix_millis: u128) -> Self {
+        Self(format!("b{unix_millis:013}"))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for BackupId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// A validated job identifier: `^j[0-9]{10,20}$`.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct JobId(String);
+
+impl JobId {
+    pub fn parse(raw: &str) -> Result<Self> {
+        parse_id(raw, 'j', "job_id").map(Self)
+    }
+
+    /// The identifier for a job started at `unix_millis`.
+    pub fn from_millis(unix_millis: u128) -> Self {
+        Self(format!("j{unix_millis:013}"))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for JobId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Length of a month for retention periods: a twelfth of the Gregorian
+/// year, so that 12 months is one year to the second.
+pub const RETENTION_MONTH_SECS: u64 = 2_629_746;
+
+/// A retention period in whole months, 1 to 12 (`field` names the API field).
+pub fn retain_months(months: u32, field: &'static str) -> Result<u64> {
+    if (1..=12).contains(&months) {
+        Ok(u64::from(months) * RETENTION_MONTH_SECS)
+    } else {
+        Err(Error::invalid(field, "must be between 1 and 12 months"))
+    }
+}
+
+#[cfg(test)]
+mod id_tests {
+    use super::*;
+
+    #[test]
+    fn backup_and_job_ids_are_allow_listed() {
+        assert!(BackupId::parse("b1731500000123").is_ok());
+        assert_eq!(BackupId::from_millis(5).as_str(), "b0000000000005");
+        assert!(JobId::parse(JobId::from_millis(1_731_500_000_123).as_str()).is_ok());
+        for bad in [
+            "",
+            "b",
+            "b123",
+            "j1731500000123",
+            "b1731500000123/..",
+            "../b1731500000123",
+            "b17315000001x3",
+            "b1731500000123\n",
+            "b173150000012300000000000000",
+            "B1731500000123",
+            "b१७३१५००००००१२३",
+        ] {
+            assert!(BackupId::parse(bad).is_err(), "{bad:?}");
+        }
+        assert!(JobId::parse("b1731500000123").is_err());
+    }
+
+    #[test]
+    fn retention_is_one_to_twelve_months() {
+        assert_eq!(retain_months(12, "retain_months").ok(), Some(31_556_952));
+        assert_eq!(retain_months(1, "retain_months").ok(), Some(2_629_746));
+        for bad in [0, 13, u32::MAX] {
+            assert!(retain_months(bad, "retain_months").is_err());
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -101,6 +101,18 @@ pub struct Config {
     /// MariaDB `MAX_USER_CONNECTIONS` given to database users created from
     /// now on (1..=10000).
     pub db_max_user_connections: u32,
+    /// Where backups are stored: `<backup_dir>/<tenant>/<backup id>/`. Root
+    /// only; never inside a tenant home.
+    pub backup_dir: PathBuf,
+    /// Backups kept per tenant; older ones are removed when a new one completes.
+    pub backup_keep: u32,
+    /// Space that must stay free on the backup file system. A backup that
+    /// could eat into it is refused, and no archive may grow into it.
+    pub backup_min_free_bytes: u64,
+    /// Upper bound for one backup or restore job.
+    pub backup_timeout: Duration,
+    /// The program a job's transient unit runs: this daemon, in worker mode.
+    pub worker_exe: PathBuf,
 }
 
 /// Let's Encrypt's production directory.
@@ -147,6 +159,11 @@ impl Default for Config {
             db_max_databases: 20,
             db_max_users: 20,
             db_max_user_connections: 25,
+            backup_dir: PathBuf::from("/var/lib/oxpanel-backups"),
+            backup_keep: 7,
+            backup_min_free_bytes: 1 << 30,
+            backup_timeout: Duration::from_secs(6 * 3600),
+            worker_exe: PathBuf::from("/usr/sbin/oxpanel-daemon"),
         }
     }
 }
@@ -245,6 +262,8 @@ impl Config {
         path("OXPANEL_ACME_DIR", &mut c.acme_dir)?;
         c.acme_from_lookup(&get)?;
         c.db_from_lookup(&get)?;
+        path("OXPANEL_BACKUP_DIR", &mut c.backup_dir)?;
+        c.backup_from_lookup(&get)?;
         c.validate()?;
         Ok(c)
     }
@@ -352,10 +371,12 @@ impl Config {
             ("OXPANEL_SSHD_DROPIN_FILE", &self.sshd_dropin_file),
             ("OXPANEL_SFTP_KEYS_DIR", &self.sftp_keys_dir),
             ("OXPANEL_MARIADB_SOCKET", &self.mariadb_socket),
+            ("OXPANEL_BACKUP_DIR", &self.backup_dir),
         ] {
             check_path(key, p)?;
         }
         self.validate_acme()?;
+        self.validate_backup()?;
         if self.uid_min < 1000 {
             return Err(Error::invalid(
                 "config",
@@ -414,6 +435,15 @@ impl Config {
         self.state_dir.join("vhosts")
     }
 
+    /// `state_dir/backups`: one record per backup.
+    pub fn backup_records_dir(&self) -> PathBuf {
+        self.state_dir.join("backups")
+    }
+
+    /// `state_dir/jobs`: one record per backup or restore job.
+    pub fn jobs_dir(&self) -> PathBuf {
+        self.state_dir.join("jobs")
+    }
     /// `state_dir/sftp`: one root-owned chroot directory per tenant with SFTP
     /// access; the tenant's home is bind-mounted inside it.
     pub fn sftp_chroot_dir(&self) -> PathBuf {
@@ -441,6 +471,52 @@ pub enum SftpPasswords {
 }
 
 impl Config {
+    /// The backup part of [`Config::from_lookup`] (except the directory,
+    /// which is read with the other paths).
+    fn backup_from_lookup(&mut self, get: &impl Fn(&str) -> Option<String>) -> Result<()> {
+        if let Some(v) = get("OXPANEL_BACKUP_KEEP") {
+            self.backup_keep = parse_u32("OXPANEL_BACKUP_KEEP", &v)?;
+        }
+        if let Some(v) = get("OXPANEL_BACKUP_MIN_FREE_BYTES") {
+            self.backup_min_free_bytes = v.trim().parse::<u64>().map_err(|_| {
+                Error::invalid(
+                    "config",
+                    format!("OXPANEL_BACKUP_MIN_FREE_BYTES: '{v}' is not a number of bytes"),
+                )
+            })?;
+        }
+        if let Some(v) = get("OXPANEL_BACKUP_TIMEOUT_SECS") {
+            self.backup_timeout =
+                Duration::from_secs(u64::from(parse_u32("OXPANEL_BACKUP_TIMEOUT_SECS", &v)?));
+        }
+        Ok(())
+    }
+
+    /// Backup settings that cannot be checked one value at a time.
+    fn validate_backup(&self) -> Result<()> {
+        // A backup directory a tenant could reach would hand every archive
+        // to that tenant, and let it plant files for the root-side worker.
+        if self.backup_dir.starts_with(&self.home_base) {
+            return Err(Error::invalid(
+                "config",
+                "OXPANEL_BACKUP_DIR must not be inside OXPANEL_HOME_BASE",
+            ));
+        }
+        if !(1..=365).contains(&self.backup_keep) {
+            return Err(Error::invalid(
+                "config",
+                "OXPANEL_BACKUP_KEEP must be between 1 and 365",
+            ));
+        }
+        if self.backup_timeout < Duration::from_secs(60) {
+            return Err(Error::invalid(
+                "config",
+                "OXPANEL_BACKUP_TIMEOUT_SECS must be at least 60",
+            ));
+        }
+        Ok(())
+    }
+
     /// The database part of [`Config::from_lookup`].
     fn db_from_lookup(&mut self, get: &impl Fn(&str) -> Option<String>) -> Result<()> {
         if let Some(v) = get("OXPANEL_DB_MAX_DATABASES") {
@@ -600,7 +676,7 @@ fn parse_bool(key: &str, raw: &str) -> Result<bool> {
 
 /// For unit-test harnesses: move the locations the feature modules write to
 /// (certificates, ACME, SFTP, the sshd drop-in, the scratch directory next
-/// to the socket) into `dir`, so no test touches the host's `/etc`, `/run`
+/// to the socket, backups) into `dir`, so no test touches the host's `/etc`, `/run`
 /// or `/var/lib`.
 #[cfg(test)]
 pub(crate) fn sandbox_feature_paths(cfg: &mut Config, dir: &Path) {
@@ -609,6 +685,7 @@ pub(crate) fn sandbox_feature_paths(cfg: &mut Config, dir: &Path) {
     cfg.sftp_keys_dir = dir.join("sftp-keys");
     cfg.sshd_dropin_file = dir.join("sshd_config.d").join("60-oxpanel.conf");
     cfg.socket_path = dir.join("run").join("oxpanel.sock");
+    cfg.backup_dir = dir.join("backups");
     for d in [dir.join("sshd_config.d"), dir.join("run")] {
         std::fs::create_dir_all(&d).unwrap_or_else(|e| panic!("{}: {e}", d.display()));
     }
@@ -754,6 +831,21 @@ mod tests {
             c.db_max_users,
             c.db_max_user_connections
         ) == (0, 3, 10)));
+        assert!(from(&[("OXPANEL_BACKUP_DIR", "/home/backups")]).is_err());
+        assert!(from(&[("OXPANEL_BACKUP_DIR", "backups")]).is_err());
+        assert!(from(&[("OXPANEL_BACKUP_KEEP", "0")]).is_err());
+        assert!(from(&[("OXPANEL_BACKUP_TIMEOUT_SECS", "5")]).is_err());
+        assert!(from(&[("OXPANEL_BACKUP_MIN_FREE_BYTES", "1G")]).is_err());
+        let c = from(&[
+            ("OXPANEL_BACKUP_DIR", "/srv/backups"),
+            ("OXPANEL_BACKUP_KEEP", "3"),
+            ("OXPANEL_BACKUP_MIN_FREE_BYTES", "0"),
+            ("OXPANEL_BACKUP_TIMEOUT_SECS", "600"),
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(c.backup_dir, PathBuf::from("/srv/backups"));
+        assert_eq!((c.backup_keep, c.backup_min_free_bytes), (3, 0));
+        assert_eq!(c.backup_timeout, Duration::from_secs(600));
         assert!(from(&[
             ("OXPANEL_NGINX_CONF_DIR", "/etc/nginx/conf.d"),
             ("OXPANEL_NGINX_INCLUDE_FILE", "/etc/nginx/conf.d/x.conf")

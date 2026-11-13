@@ -300,6 +300,34 @@ async fn full_tenant_and_vhost_lifecycle_over_uds() {
 async fn validation_errors_surface_as_invalid_argument_with_message() {
     let srv = start(allow_me()).await;
     let mut client = connect(&srv.socket).await.expect("connect");
+    // A restore must say what happens to existing files: no default.
+    for unchosen in [0, 7] {
+        let e = client
+            .restore_backup(pb::RestoreBackupRequest {
+                tenant: "alice".into(),
+                backup_id: "b1731500000123".into(),
+                on_existing: unchosen,
+            })
+            .await
+            .expect_err("must fail");
+        assert_eq!(e.code(), Code::InvalidArgument);
+        assert!(
+            e.message().starts_with("invalid on_existing"),
+            "{}",
+            e.message()
+        );
+        let e = client
+            .restore_retained_backup(pb::RestoreRetainedBackupRequest {
+                backup_id: "b1731500000123".into(),
+                source_tenant: "alice".into(),
+                target_tenant: "bob".into(),
+                on_existing: unchosen,
+            })
+            .await
+            .expect_err("must fail");
+        assert_eq!(e.code(), Code::InvalidArgument);
+    }
+    assert!(srv.sys.calls().is_empty(), "refused before anything ran");
     for bad in ["root", "Alice", "a;b", "../etc", ""] {
         let e = client
             .create_tenant(pb::CreateTenantRequest {
@@ -681,6 +709,26 @@ async fn a_scoped_peer_can_only_call_its_scopes() {
         .reconcile(pb::ReconcileRequest {})
         .await
         .expect("reconcile");
+    // Listing backups and reading a job are reads: past the gate, then
+    // NOT_FOUND for what does not exist.
+    let e = client
+        .list_backups(pb::ListBackupsRequest {
+            tenant: "alice".into(),
+        })
+        .await
+        .expect_err("no such tenant");
+    assert_eq!(e.code(), Code::NotFound);
+    let e = client
+        .get_job(pb::GetJobRequest {
+            job_id: "j1731500000123".into(),
+        })
+        .await
+        .expect_err("no such job");
+    assert_eq!(e.code(), Code::NotFound);
+    client
+        .list_retained_backups(pb::ListRetainedBackupsRequest {})
+        .await
+        .expect("listing retained backups is a read");
 
     // (Host information asks the installed Node.js for its version.)
     srv.sys.clear_calls();
@@ -725,6 +773,47 @@ async fn a_scoped_peer_can_only_call_its_scopes() {
             .delete_tenant(pb::DeleteTenantRequest {
                 username: "alice".into(),
                 remove_home: true,
+            })
+            .await
+            .map(|_| ()),
+        // Backups: taking and restoring need `tenant`, deleting `delete`.
+        client
+            .create_backup(pb::CreateBackupRequest {
+                tenant: "alice".into(),
+                retain_months: 0,
+            })
+            .await
+            .map(|_| ()),
+        client
+            .retain_backup(pb::RetainBackupRequest {
+                tenant: "alice".into(),
+                backup_id: "b1731500000123".into(),
+                retain_months: 12,
+            })
+            .await
+            .map(|_| ()),
+        client
+            .restore_retained_backup(pb::RestoreRetainedBackupRequest {
+                backup_id: "b1731500000123".into(),
+                source_tenant: "alice".into(),
+                target_tenant: "bob".into(),
+                on_existing: pb::OnExisting::Keep.into(),
+            })
+            .await
+            .map(|_| ()),
+        client
+            .restore_backup(pb::RestoreBackupRequest {
+                tenant: "alice".into(),
+                backup_id: "b1731500000123".into(),
+                on_existing: pb::OnExisting::Overwrite.into(),
+            })
+            .await
+            .map(|_| ()),
+        client
+            .delete_backup(pb::DeleteBackupRequest {
+                tenant: "alice".into(),
+                backup_id: "b1731500000123".into(),
+                tenant_deleted: true,
             })
             .await
             .map(|_| ()),
