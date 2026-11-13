@@ -379,7 +379,18 @@ sudo oxpanel-ctl backup list acme
 sudo oxpanel-ctl backup restore acme b1794571200123 --wait
 sudo oxpanel-ctl backup delete acme b1794571200123
 
-# Tear down (order matters: vhosts first; backups block deleting the tenant)
+# Closing a customer's account: a final backup kept for 6 months after the
+# deletion (then removed automatically); other backups must go first
+sudo oxpanel-ctl backup create acme --retain-months 6 --wait
+sudo oxpanel-ctl backup list-retained
+# backup=b1794571300456 tenant=acme state=BACKUP_STATE_READY created_at=... retain_until=1810349000 ...
+# After the deletion it is listed with tenant_deleted=true; a new tenant named
+# acme never sees it. The customer came back as acme2: restore it there
+sudo oxpanel-ctl backup restore-retained b1794571300456 --from acme --to acme2 --wait
+# ...or drop it early
+sudo oxpanel-ctl backup delete acme b1794571300456 --tenant-deleted
+
+# Tear down (order matters: vhosts first; backups that are not retained block deleting the tenant)
 sudo oxpanel-ctl vhost remove shop.acme.example
 sudo oxpanel-ctl vhost remove acme.example
 for id in $(sudo oxpanel-ctl backup list acme | sed -n 's/^backup=\([^ ]*\).*/\1/p'); do sudo oxpanel-ctl backup delete acme "$id"; done
@@ -592,7 +603,13 @@ A backup is refused (`RESOURCE_EXHAUSTED`) when the home would not fit with
 one per tenant. Only the newest `OXPANEL_BACKUP_KEEP` backups of a tenant are
 kept. Scheduling is the panel's job (or cron:
 `oxpanel-ctl backup create <tenant>`). A tenant with backups cannot be
-deleted: delete its backups first (deliberately — see the design record).
+deleted until they are deleted or *retained* (`backup retain <tenant> <id>
+--months 1..12`, or `backup create --retain-months N`): retained backups
+outlive the tenant, are hidden from any later tenant of the same name, and
+are removed by the daemon when their date passes (at start-up and hourly).
+`backup list-retained`, `backup delete … --tenant-deleted` and `backup
+restore-retained <id> --from <deleted tenant> --to <tenant>` (needs the
+`delete` scope) are the operator's tools for them.
 Restore merges the backup over the home (newer files stay), stops the
 tenant's PHP and applications while it runs, then restores the home's
 privacy, SELinux labels and the web server's ACLs and starts them again. A
@@ -706,6 +723,7 @@ T=$HOME/ox; mkdir -p $T/nginx/conf.d $T/home $T/systemd
 export OXPANEL_DRY_RUN=1 OXPANEL_STATE_DIR=$T/state OXPANEL_HOME_BASE=$T/home \
        OXPANEL_SYSTEMD_UNIT_DIR=$T/systemd OXPANEL_NGINX_CONF_DIR=$T/nginx/oxpanel.d \
        OXPANEL_NGINX_INCLUDE_FILE=$T/nginx/conf.d/00-oxpanel.conf \
+       OXPANEL_BACKUP_DIR=$T/backups \
        OXPANEL_SOCKET_PATH=$T/oxpanel.sock OXPANEL_SOCKET_GROUP=
 oxpanel-daemon --dry-run &
 oxpanel-ctl --socket $T/oxpanel.sock tenant create alice --memory 512M

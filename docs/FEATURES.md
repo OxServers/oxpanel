@@ -86,7 +86,8 @@ see "Not yet included" at the end so nobody assumes otherwise.
 | Integrity | Size and SHA-256 are verified in full before a restore starts; a damaged or truncated archive is refused and nothing is restored. |
 | Restore as the tenant | Merges over the home (files in the backup replace current ones, newer files stay), extracted by `tar` running as the tenant in a sandbox where only the home is writable: absolute paths, `..`, writes through symlinks, hard links out of the home, set-uid/set-gid files and device nodes are all refused, and every file belongs to the tenant. PHP and applications are stopped during the restore; afterwards the home is made private again, relabelled, and every document root gets its web-server ACLs and SELinux label back, so the site is served without manual steps. |
 | Tenant isolation | A backup is only found for the tenant it belongs to (and the uid it was taken from): restoring or deleting another tenant's backup is `NOT_FOUND`. |
-| Lifecycle | Suspended tenants can be backed up and restored (their services stay stopped). `DeleteTenant` is refused while the tenant has backups or a running job. |
+| Lifecycle | Suspended tenants can be backed up and restored (their services stay stopped). `DeleteTenant` is refused while the tenant has a running job or backups that are not retained. |
+| Retained backups | A backup can be kept for 1–12 months (`CreateBackup.retain_months` or `RetainBackup`): exempt from the per-tenant count, kept after `DeleteTenant`, then removed automatically (checked at start-up and hourly). Backups of a deleted tenant are invisible to a later tenant of the same name; the operator lists them (`ListRetainedBackups`), deletes them early, or restores one into an existing tenant with `RestoreRetainedBackup` (backup id + former tenant + target, `delete` scope). |
 | Reconciliation | `BACKUP_ARCHIVE_MISSING`, `BACKUP_ARCHIVE_MODIFIED` (size or manifest differs from the record), `ORPHAN_BACKUP_ARCHIVE`, `BACKUP_INCOMPLETE`. |
 | Scheduling | Left to the panel (call `CreateBackup` on its own timetable); retention is enforced by the engine. |
 
@@ -107,7 +108,7 @@ see "Not yet included" at the end so nobody assumes otherwise.
 
 | Feature | Detail |
 |---|---|
-| `oxpanel-ctl` | Command-line client: `tenant create|get|list|set-limits|set-owner|suspend|resume|usage|delete`, `vhost set|log|restart-app|install-deps|remove|list`, `host info|reconcile`, `backup create|list|delete|restore|job` (with `--wait`), human-readable sizes (`512M`, `2G`). |
+| `oxpanel-ctl` | Command-line client: `tenant create|get|list|set-limits|set-owner|suspend|resume|usage|delete`, `vhost set|log|restart-app|install-deps|remove|list`, `host info|reconcile`, `backup create|list|delete|restore|job|retain|list-retained|restore-retained` (with `--wait`), human-readable sizes (`512M`, `2G`). |
 | Host information | `GetHostInfo`: engine version, SELinux and dry-run state, tenant and virtual-host counts, the tenant uid range (capacity), load averages, memory, uptime, and size/free space of the file system holding tenant homes. |
 | Reconciliation | `Reconcile` compares every record with the operating system and reports differences: interrupted tenants, missing or mismatched accounts, invalid homes, edited or missing unit files, missing or edited Nginx files, virtual hosts without a tenant, and orphan files in OxPanel's own directories. Strictly read-only — most findings are healed by repeating the original request. `oxpanel-ctl host reconcile` exits `3` when drift is found. |
 | Configuration | Environment variables `OXPANEL_*` (from `/etc/oxpanel/daemon.env`); every value has a production default. `--check-config` validates configuration and host prerequisites without starting. |
@@ -122,7 +123,7 @@ see "Not yet included" at the end so nobody assumes otherwise.
 
 - Rust, `#![forbid(unsafe_code)]`, clippy pedantic with warnings as errors, no `unwrap`/`expect`/`panic` in production paths.
 - No shell anywhere: every external program is an absolute path with an argv array; the only module that spawns processes is `system/real.rs`.
-- Tests: 106 unit tests (exact argv assertions against a fake OS), 6 end-to-end gRPC tests over a real UNIX socket, a 224-check root integration suite in an AlmaLinux 9 systemd container, and `make acceptance`: ≈370 checks on a real AlmaLinux 9 VM with SELinux enforcing (install from git or RPM, SELinux labels and zero AVC denials, sandbox namespaces, restart/kill/resume, reboot, soak). `cargo-deny` for advisories/licences/bans.
+- Tests: 132 unit tests (exact argv assertions against a fake OS), 6 end-to-end gRPC tests over a real UNIX socket, a 328-check root integration suite in an AlmaLinux 9 systemd container, and `make acceptance`: ≈370 checks on a real AlmaLinux 9 VM with SELinux enforcing (install from git or RPM, SELinux labels and zero AVC denials, sandbox namespaces, restart/kill/resume, reboot, soak). `cargo-deny` for advisories/licences/bans.
 - Builds without a system `protoc` (pure-Rust `protox`) and without a host toolchain (everything runs in the AlmaLinux 9 container).
 
 ## Not yet included

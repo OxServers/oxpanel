@@ -576,7 +576,7 @@ impl OxPanelEngine for Engine {
         info!(rpc = RPC, peer, tenant = %r.tenant, "request");
         let (job, started) = self
             .backups
-            .create(&r.tenant)
+            .create(&r.tenant, r.retain_months)
             .await
             .map_err(|e| fail(RPC, &peer, e))?;
         Ok(Response::new(pb::StartJobResponse {
@@ -610,11 +610,12 @@ impl OxPanelEngine for Engine {
         let peer = self.authorise(&req, RPC, Scope::Delete)?;
         let r = req.into_inner();
         info!(rpc = RPC, peer, tenant = %r.tenant, backup = %r.backup_id, "request");
-        let deleted = self
-            .backups
-            .delete(&r.tenant, &r.backup_id)
-            .await
-            .map_err(|e| fail(RPC, &peer, e))?;
+        let deleted = if r.tenant_deleted {
+            self.backups.delete_retained(&r.tenant, &r.backup_id).await
+        } else {
+            self.backups.delete(&r.tenant, &r.backup_id).await
+        }
+        .map_err(|e| fail(RPC, &peer, e))?;
         Ok(Response::new(pb::DeleteBackupResponse { deleted }))
     }
 
@@ -648,6 +649,58 @@ impl OxPanelEngine for Engine {
             .map_err(|e| fail(RPC, &peer, e))?;
         Ok(Response::new(job_to(&job)))
     }
+
+    async fn retain_backup(
+        &self,
+        req: Request<pb::RetainBackupRequest>,
+    ) -> Result<Response<pb::Backup>, Status> {
+        const RPC: &str = "RetainBackup";
+        let peer = self.authorise(&req, RPC, Scope::Tenant)?;
+        let r = req.into_inner();
+        info!(rpc = RPC, peer, tenant = %r.tenant, backup = %r.backup_id, months = r.retain_months, "request");
+        let rec = self
+            .backups
+            .retain(&r.tenant, &r.backup_id, r.retain_months)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(backup_to(&rec)))
+    }
+
+    async fn list_retained_backups(
+        &self,
+        req: Request<pb::ListRetainedBackupsRequest>,
+    ) -> Result<Response<pb::ListBackupsResponse>, Status> {
+        const RPC: &str = "ListRetainedBackups";
+        let peer = self.authorise(&req, RPC, Scope::Read)?;
+        let recs = self
+            .backups
+            .list_retained()
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(pb::ListBackupsResponse {
+            backups: recs.iter().map(backup_to).collect(),
+        }))
+    }
+
+    async fn restore_retained_backup(
+        &self,
+        req: Request<pb::RestoreRetainedBackupRequest>,
+    ) -> Result<Response<pb::StartJobResponse>, Status> {
+        const RPC: &str = "RestoreRetainedBackup";
+        // Data of one (deleted) account into another: the strongest scope.
+        let peer = self.authorise(&req, RPC, Scope::Delete)?;
+        let r = req.into_inner();
+        info!(rpc = RPC, peer, backup = %r.backup_id, from = %r.source_tenant, to = %r.target_tenant, "request");
+        let (job, started) = self
+            .backups
+            .restore_retained(&r.backup_id, &r.source_tenant, &r.target_tenant)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(pb::StartJobResponse {
+            job: Some(job_to(&job)),
+            started,
+        }))
+    }
 }
 
 fn backup_to(rec: &BackupRecord) -> pb::Backup {
@@ -672,6 +725,8 @@ fn backup_to(rec: &BackupRecord) -> pb::Backup {
             })
             .collect(),
         domains: rec.domains.clone(),
+        retain_until: (rec.retain_until_unix != 0).then(|| timestamp(rec.retain_until_unix)),
+        tenant_deleted: rec.tenant_deleted,
     }
 }
 

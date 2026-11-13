@@ -146,6 +146,15 @@ pub struct BackupRecord {
     pub members: Vec<BackupMember>,
     /// Virtual hosts the tenant had when the backup was made.
     pub domains: Vec<String>,
+    /// Kept until this time (UNIX seconds) whatever the per-tenant count
+    /// says, and across `DeleteTenant`; 0 = no such mark.
+    #[serde(default)]
+    pub retain_until_unix: u64,
+    /// The tenant was deleted while this retained backup was kept. Invisible
+    /// to every per-tenant RPC (a later tenant of the same name never sees
+    /// it); only the operator RPCs for retained backups reach it.
+    #[serde(default)]
+    pub tenant_deleted: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

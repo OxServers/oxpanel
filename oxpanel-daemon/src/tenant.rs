@@ -417,6 +417,8 @@ impl TenantService {
             rec.state = TenantState::Deleting;
             self.ctx.store.save_tenant(&rec)?;
         }
+        // Retained backups outlive the tenant, detached from its name.
+        crate::backup::detach_retained(&self.ctx, &name)?;
 
         let timeout = self.ctx.config.command_timeout;
         if self.ctx.sys.user_by_name(name.as_str()).await?.is_some() {

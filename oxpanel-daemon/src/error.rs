@@ -104,7 +104,7 @@ pub enum Error {
         free: u64,
     },
 
-    #[error("tenant '{0}' still has backups; delete them first")]
+    #[error("tenant '{0}' still has backups; delete them or mark them retained first")]
     TenantHasBackups(String),
 
     #[error("{program} exited with {status}")]

@@ -551,6 +551,10 @@ async fn a_scoped_peer_can_only_call_its_scopes() {
         .await
         .expect_err("no such job");
     assert_eq!(e.code(), Code::NotFound);
+    client
+        .list_retained_backups(pb::ListRetainedBackupsRequest {})
+        .await
+        .expect("listing retained backups is a read");
 
     // (Host information asks the installed Node.js for its version.)
     srv.sys.clear_calls();
@@ -602,6 +606,23 @@ async fn a_scoped_peer_can_only_call_its_scopes() {
         client
             .create_backup(pb::CreateBackupRequest {
                 tenant: "alice".into(),
+                retain_months: 0,
+            })
+            .await
+            .map(|_| ()),
+        client
+            .retain_backup(pb::RetainBackupRequest {
+                tenant: "alice".into(),
+                backup_id: "b1731500000123".into(),
+                retain_months: 12,
+            })
+            .await
+            .map(|_| ()),
+        client
+            .restore_retained_backup(pb::RestoreRetainedBackupRequest {
+                backup_id: "b1731500000123".into(),
+                source_tenant: "alice".into(),
+                target_tenant: "bob".into(),
             })
             .await
             .map(|_| ()),
@@ -616,6 +637,7 @@ async fn a_scoped_peer_can_only_call_its_scopes() {
             .delete_backup(pb::DeleteBackupRequest {
                 tenant: "alice".into(),
                 backup_id: "b1731500000123".into(),
+                tenant_deleted: true,
             })
             .await
             .map(|_| ()),

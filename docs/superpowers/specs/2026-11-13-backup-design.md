@@ -27,8 +27,14 @@ domains at the time; `DeleteBackup(tenant, backup_id)`.
 - Ids are `b<unix millis>` and `j<unix millis>` (allow-listed newtypes
   `BackupId`/`JobId`; they become file and unit names). Backups sort by time.
 - `HostInfo` 32–34: backup file-system size and free space, `backup_keep`.
-- `oxpanel-ctl backup create|list|delete|restore|job`, with `--wait` (exit 5
-  if the job failed).
+- Retained backups (owner decision, see "Tenant lifecycle"):
+  `CreateBackup.retain_months`, `RetainBackup` (scope `tenant`),
+  `ListRetainedBackups` (`read`), `RestoreRetainedBackup` (`delete`),
+  `DeleteBackup.tenant_deleted` (`delete`); `Backup.retain_until`,
+  `Backup.tenant_deleted`.
+- `oxpanel-ctl backup create [--retain-months N]|list|delete
+  [--tenant-deleted]|restore|job|retain|list-retained|restore-retained`, with
+  `--wait` (exit 5 if the job failed).
 
 ## Jobs
 
@@ -176,7 +182,8 @@ too). `tar` then exits non-zero and the job is `FAILED` ("refused or failed
 to restore some members; the others were restored").
 
 **Cross-tenant**: a backup is looked up *for the requesting tenant*;
-someone else's id is `NOT_FOUND` (restore and delete). The record also keeps
+someone else's id — or a retained backup of a deleted tenant of the same
+name — is `NOT_FOUND` (restore and delete). The record also keeps
 the uid it was taken from; a restore into an account with a different uid
 (tenant deleted and recreated) is refused.
 
@@ -203,16 +210,52 @@ the uid it was taken from; a restore into an account with a different uid
   information for the operator/panel. Restoring configuration is a panel
   decision (domains may have moved to another tenant since).
 
-## Tenant lifecycle
+## Tenant lifecycle and retained backups
 
-`DeleteTenant` is **refused** while the tenant has backups or a job in
-flight (`FAILED_PRECONDITION`, "still has backups; delete them first").
-Backups are found by tenant name, so a later tenant of the same name would
-inherit them; deleting them silently would destroy the only copy of a
-customer's data as a side effect. The panel deletes backups explicitly (or
-keeps the tenant until its retention period ends). The job history of a
-deleted tenant is dropped. Suspended tenants can be backed up and restored by
-the operator.
+Owner decision: when a customer is deleted, the operator must be able to
+keep a final backup for a period chosen then (1–12 months), after which it
+expires on its own.
+
+- **Retention mark.** A backup can carry `retain_until` (set at creation with
+  `retain_months`, or later with `RetainBackup`, 1–12 months from *now*; a
+  month is 1/12 of the Gregorian year, 2 629 746 s, so 12 months is a year).
+  A retained backup is exempt from the per-tenant count and is never removed
+  by it. Repeating `RetainBackup` sets a new date (shorter or longer).
+- **`DeleteTenant`** is refused while the tenant has a job in flight or any
+  backup that is *not* retained (`FAILED_PRECONDITION`, "still has backups;
+  delete them or mark them retained first"): deleting a customer's only copy
+  as a side effect of another request is the failure we refuse. Retained
+  backups survive the deletion: when the tenant record goes to `deleting`,
+  each is marked `tenant_deleted` (`backup::detach_retained`, idempotent,
+  before `userdel`, so a crash cannot leave them attached to a name that is
+  about to be reused).
+- **Detached means invisible to the name.** Every per-tenant operation
+  (`ListBackups`, `RestoreBackup`, `RetainBackup`, `DeleteBackup` without the
+  flag, the retention count) filters out `tenant_deleted` backups, so a new
+  tenant that reuses the name (and possibly the uid — uids are reused, which
+  is why a name/uid match is not enough) can neither see, restore, re-date nor
+  delete them. The files stay in the root-only store under the old name.
+- **Operator access.** `ListRetainedBackups` lists every retained backup,
+  live or of deleted tenants. `DeleteBackup{tenant, backup_id,
+  tenant_deleted: true}` deletes one early. `RestoreRetainedBackup{backup_id,
+  source_tenant, target_tenant}` restores one into an existing tenant: the
+  operator proves intent by naming the backup **and** the deleted tenant it
+  was taken from **and** the target (any mismatch is `NOT_FOUND`), and the
+  call needs the `delete` scope — the strongest one, which a customer-facing
+  peer (`read+vhost`) never has. The restore is the same job as an ordinary
+  restore (as the target tenant, target's uid/gid, its home only, services
+  stopped and restored). The ordinary `RestoreBackup` still only reaches the
+  requesting tenant's own, attached backups, so "A's backup into B" through
+  it remains impossible.
+- **Expiry.** At start-up and every hour the daemon removes retained backups
+  of deleted tenants whose date has passed (skipping one a job is using);
+  on an existing tenant's backup only the mark lapses and it counts towards
+  the tenant's retention again (it is not deleted out from under a live
+  customer). Detached backups have records, so `Reconcile` does not report
+  them as orphans.
+
+The job history of a deleted tenant is dropped. Suspended tenants can be
+backed up and restored by the operator.
 
 `Reconcile` reports `BACKUP_ARCHIVE_MISSING` (directory, manifest or member
 gone), `BACKUP_ARCHIVE_MODIFIED` (member size or manifest differs from the

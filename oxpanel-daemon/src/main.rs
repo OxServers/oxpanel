@@ -190,9 +190,10 @@ fn locate_worker(config: &mut Config) {
     }
 }
 
-/// Make sure the backup store exists (root-only from the first moment), then
-/// pick up the backups and restores that were running when the daemon last
-/// stopped: they went on without it; find out how they ended.
+/// Make sure the backup store exists (root-only from the first moment), pick
+/// up the backups and restores that were running when the daemon last
+/// stopped (they went on without it; find out how they ended), and start
+/// expiring retained backups.
 async fn resume_jobs(ctx: &Ctx, engine: &Engine) {
     if !ctx.config.dry_run {
         if let Err(e) = fsutil::ensure_dir(&ctx.config.backup_dir, 0o700) {
@@ -206,6 +207,8 @@ async fn resume_jobs(ctx: &Ctx, engine: &Engine) {
             warn!(error = %e, "could not resume running jobs; see `oxpanel-ctl host reconcile`");
         }
     }
+    // Retained backups past their date go now, and hourly from here on.
+    engine.backups().spawn_expiry();
 }
 
 async fn run(cli: Cli) -> Result<(), Fatal> {

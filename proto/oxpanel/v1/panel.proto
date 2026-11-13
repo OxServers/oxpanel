@@ -69,6 +69,17 @@ service OxPanelEngine {
   rpc RestoreBackup(RestoreBackupRequest) returns (StartJobResponse);
   // State of a backup or restore job.
   rpc GetJob(GetJobRequest) returns (Job);
+  // Keep one of a tenant's complete backups for 1 to 12 months from now,
+  // whatever the per-tenant retention count says and also after the tenant
+  // is deleted; then the engine removes it. Repeating it sets a new date.
+  rpc RetainBackup(RetainBackupRequest) returns (Backup);
+  // Every backup with a retention date, including those of deleted tenants.
+  rpc ListRetainedBackups(ListRetainedBackupsRequest) returns (ListBackupsResponse);
+  // Operator action: restore a retained backup of a DELETED tenant into an
+  // existing tenant (e.g. the customer's re-created account). Needs the
+  // backup id, the name of the tenant it was taken from and the target.
+  // The ordinary RestoreBackup never reaches such a backup.
+  rpc RestoreRetainedBackup(RestoreRetainedBackupRequest) returns (StartJobResponse);
 }
 
 // Per-tenant resource limits, applied through systemd (cgroups v2).
@@ -437,6 +448,12 @@ message Backup {
   repeated BackupMember members = 6;
   // The tenant's virtual hosts when the backup was made.
   repeated string domains = 7;
+  // Set when the backup is retained: kept until then whatever the
+  // per-tenant count says (also after the tenant is deleted), then removed.
+  google.protobuf.Timestamp retain_until = 8;
+  // The tenant this backup was taken from has been deleted; the backup is
+  // only reachable through the retained-backup operations.
+  bool tenant_deleted = 9;
 }
 
 enum JobKind {
@@ -474,6 +491,9 @@ message Job {
 
 message CreateBackupRequest {
   string tenant = 1;
+  // 0: an ordinary backup. 1-12: retained for that many months (see
+  // RetainBackup) — e.g. the final backup before deleting the tenant.
+  uint32 retain_months = 2;
 }
 
 message StartJobResponse {
@@ -494,6 +514,9 @@ message ListBackupsResponse {
 message DeleteBackupRequest {
   string tenant = 1;
   string backup_id = 2;
+  // Delete a retained backup of the DELETED tenant named `tenant` before its
+  // date. Without it, only backups of the existing tenant are found.
+  bool tenant_deleted = 3;
 }
 
 message DeleteBackupResponse {
@@ -510,4 +533,21 @@ message RestoreBackupRequest {
 
 message GetJobRequest {
   string job_id = 1;
+}
+
+message RetainBackupRequest {
+  string tenant = 1;
+  string backup_id = 2;
+  // 1 to 12.
+  uint32 retain_months = 3;
+}
+
+message ListRetainedBackupsRequest {}
+
+message RestoreRetainedBackupRequest {
+  string backup_id = 1;
+  // The (deleted) tenant the backup was taken from, as listed.
+  string source_tenant = 2;
+  // The existing tenant whose home receives the files, as that tenant.
+  string target_tenant = 3;
 }

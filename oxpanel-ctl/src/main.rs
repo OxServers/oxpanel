@@ -588,6 +588,33 @@ enum BackupCmd {
     /// Start a backup of a tenant; prints the job.
     Create {
         tenant: String,
+        /// Keep this backup for 1-12 months whatever the retention count
+        /// says, also after the tenant is deleted (e.g. a final backup).
+        #[arg(long, default_value_t = 0)]
+        retain_months: u32,
+        /// Wait for the job to finish; exits with status 5 if it failed.
+        #[arg(long)]
+        wait: bool,
+    },
+    /// Keep a complete backup for 1-12 months from now (also after the
+    /// tenant is deleted); then the engine removes it.
+    Retain {
+        tenant: String,
+        backup_id: String,
+        #[arg(long)]
+        months: u32,
+    },
+    /// Every retained backup, including those of deleted tenants.
+    ListRetained,
+    /// Restore a retained backup of a DELETED tenant into an existing tenant.
+    RestoreRetained {
+        backup_id: String,
+        /// The deleted tenant the backup was taken from.
+        #[arg(long)]
+        from: String,
+        /// The existing tenant that receives the files.
+        #[arg(long)]
+        to: String,
         /// Wait for the job to finish; exits with status 5 if it failed.
         #[arg(long)]
         wait: bool,
@@ -595,7 +622,13 @@ enum BackupCmd {
     /// The tenant's backups, oldest first.
     List { tenant: String },
     /// Delete one of the tenant's backups.
-    Delete { tenant: String, backup_id: String },
+    Delete {
+        tenant: String,
+        backup_id: String,
+        /// The backup is a retained backup of the deleted tenant `tenant`.
+        #[arg(long)]
+        tenant_deleted: bool,
+    },
     /// Restore the tenant's home from one of its own backups (merges over
     /// the current files); prints the job.
     Restore {
@@ -645,11 +678,13 @@ fn print_backup(b: &pb::Backup) {
         .map(|m| format!("{}:{}:{}", m.kind, m.name, m.size_bytes))
         .collect();
     say!(
-        "backup={} tenant={} state={} created_at={} size={} domains={} members={}",
+        "backup={} tenant={}{} state={} created_at={} retain_until={} size={} domains={} members={}",
         b.id,
         b.tenant,
+        if b.tenant_deleted { " tenant_deleted=true" } else { "" },
         state,
         b.created_at.as_ref().map_or(0, |ts| ts.seconds),
+        b.retain_until.as_ref().map_or(0, |ts| ts.seconds),
         b.size_bytes,
         if b.domains.is_empty() {
             "-".to_owned()
@@ -693,21 +728,37 @@ async fn follow_job(
     Ok(ExitCode::SUCCESS)
 }
 
+/// Print whether a job was started, then follow it like `follow_job`.
+async fn follow_start(
+    c: &mut OxPanelEngineClient<Channel>,
+    r: pb::StartJobResponse,
+    wait: bool,
+) -> Result<ExitCode, tonic::Status> {
+    say!("started={}", r.started);
+    match r.job {
+        Some(job) => follow_job(c, job, wait).await,
+        None => Err(tonic::Status::internal("no job in the response")),
+    }
+}
+
 async fn run_backup(
     c: &mut OxPanelEngineClient<Channel>,
     cmd: BackupCmd,
 ) -> Result<ExitCode, tonic::Status> {
     match cmd {
-        BackupCmd::Create { tenant, wait } => {
+        BackupCmd::Create {
+            tenant,
+            retain_months,
+            wait,
+        } => {
             let r = c
-                .create_backup(pb::CreateBackupRequest { tenant })
+                .create_backup(pb::CreateBackupRequest {
+                    tenant,
+                    retain_months,
+                })
                 .await?
                 .into_inner();
-            say!("started={}", r.started);
-            match r.job {
-                Some(job) => return follow_job(c, job, wait).await,
-                None => return Err(tonic::Status::internal("no job in the response")),
-            }
+            return follow_start(c, r, wait).await;
         }
         BackupCmd::Restore {
             tenant,
@@ -718,11 +769,7 @@ async fn run_backup(
                 .restore_backup(pb::RestoreBackupRequest { tenant, backup_id })
                 .await?
                 .into_inner();
-            say!("started={}", r.started);
-            match r.job {
-                Some(job) => return follow_job(c, job, wait).await,
-                None => return Err(tonic::Status::internal("no job in the response")),
-            }
+            return follow_start(c, r, wait).await;
         }
         BackupCmd::Job { job_id, wait } => {
             let job = c.get_job(pb::GetJobRequest { job_id }).await?.into_inner();
@@ -738,9 +785,58 @@ async fn run_backup(
                 print_backup(b);
             }
         }
-        BackupCmd::Delete { tenant, backup_id } => {
+        BackupCmd::Retain {
+            tenant,
+            backup_id,
+            months,
+        } => {
+            let b = c
+                .retain_backup(pb::RetainBackupRequest {
+                    tenant,
+                    backup_id,
+                    retain_months: months,
+                })
+                .await?
+                .into_inner();
+            print_backup(&b);
+        }
+        BackupCmd::ListRetained => {
+            for b in &c
+                .list_retained_backups(pb::ListRetainedBackupsRequest {})
+                .await?
+                .into_inner()
+                .backups
+            {
+                print_backup(b);
+            }
+        }
+        BackupCmd::RestoreRetained {
+            backup_id,
+            from,
+            to,
+            wait,
+        } => {
             let r = c
-                .delete_backup(pb::DeleteBackupRequest { tenant, backup_id })
+                .restore_retained_backup(pb::RestoreRetainedBackupRequest {
+                    backup_id,
+                    source_tenant: from,
+                    target_tenant: to,
+                })
+                .await?
+                .into_inner();
+            return follow_start(c, r, wait).await;
+        }
+        BackupCmd::Delete {
+            tenant,
+            backup_id,
+            tenant_deleted,
+        } => {
+            let r = c
+                .delete_backup(pb::DeleteBackupRequest {
+                    tenant,
+                    backup_id,
+                    tenant_deleted,
+                })
                 .await?
                 .into_inner();
             say!("deleted={}", r.deleted);

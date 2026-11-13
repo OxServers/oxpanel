@@ -834,7 +834,7 @@ mod tests {
         let cfg = &h.ctx.config;
         let backups = BackupService::new(h.ctx.clone())
             .with_poll_interval(std::time::Duration::from_secs(3600));
-        let (job, _) = backups.create("alice").await?;
+        let (job, _) = backups.create("alice", 0).await?;
         assert_eq!(
             h.host.reconcile().await?,
             vec![],
@@ -859,7 +859,7 @@ mod tests {
         let records = dir.join("records.json");
         std::fs::remove_file(&records).map_err(|e| Error::io("rm", &records, e))?;
         // A backup whose job record vanished while it was being written.
-        let (lost, _) = backups.create("foo-bar").await?;
+        let (lost, _) = backups.create("foo-bar", 0).await?;
         h.ctx.store.delete_job(&JobId::parse(&lost.id)?)?;
         // Directories nobody recorded.
         let stray_a = cfg.backup_dir.join("alice").join("b0000000000001");

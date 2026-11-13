@@ -426,6 +426,19 @@ impl fmt::Display for JobId {
     }
 }
 
+/// Length of a month for retention periods: a twelfth of the Gregorian
+/// year, so that 12 months is one year to the second.
+pub const RETENTION_MONTH_SECS: u64 = 2_629_746;
+
+/// A retention period in whole months, 1 to 12 (`field` names the API field).
+pub fn retain_months(months: u32, field: &'static str) -> Result<u64> {
+    if (1..=12).contains(&months) {
+        Ok(u64::from(months) * RETENTION_MONTH_SECS)
+    } else {
+        Err(Error::invalid(field, "must be between 1 and 12 months"))
+    }
+}
+
 #[cfg(test)]
 mod id_tests {
     use super::*;
@@ -451,6 +464,15 @@ mod id_tests {
             assert!(BackupId::parse(bad).is_err(), "{bad:?}");
         }
         assert!(JobId::parse("b1731500000123").is_err());
+    }
+
+    #[test]
+    fn retention_is_one_to_twelve_months() {
+        assert_eq!(retain_months(12, "retain_months").ok(), Some(31_556_952));
+        assert_eq!(retain_months(1, "retain_months").ok(), Some(2_629_746));
+        for bad in [0, 13, u32::MAX] {
+            assert!(retain_months(bad, "retain_months").is_err());
+        }
     }
 }
 

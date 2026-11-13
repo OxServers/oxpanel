@@ -583,6 +583,38 @@ check "the refusal says why" grep -q 'still has backups' <(oxpanel-ctl tenant de
 mkdir -p "$BK/ghost/b0000000000001"
 check "a directory without a record is drift" grep -q "ORPHAN_BACKUP_ARCHIVE subject=$BK/ghost/b0000000000001" <(oxpanel-ctl host reconcile || true)
 rm -r "$BK/ghost"
+echo "-- a final backup retained after the tenant is deleted"
+as_user foo-bar sh -c 'echo final-marker > /home/foo-bar/final.txt'
+check_not "a retention period over 12 months is refused" oxpanel-ctl backup create foo-bar --retain-months 13
+out="$(timeout 300 oxpanel-ctl backup create foo-bar --retain-months 12 --wait)" || true
+check "a final backup retained for 12 months" grep -q 'state=JOB_STATE_SUCCEEDED' <<<"$out"
+FINAL="$(backup_of "$out")"
+EARLY="$(backup_ids foo-bar | head -1)"
+check "an existing backup can be retained too" grep -q "^backup=$EARLY .* retain_until=[1-9]" <(oxpanel-ctl backup retain foo-bar "$EARLY" --months 1)
+check "the final backup is dated about a year ahead" bash -c 'u="$(oxpanel-ctl backup list foo-bar | sed -n "s/^backup=$1 .* retain_until=\([0-9]*\) .*/\1/p")"; n="$(date +%s)"; test "$u" -ge $((n + 31556952 - 120)) && test "$u" -le $((n + 31556952))' _ "$FINAL"
+for id in $(backup_ids foo-bar); do [ "$id" = "$FINAL" ] || [ "$id" = "$EARLY" ] || oxpanel-ctl backup delete foo-bar "$id" >/dev/null; done
+check "a tenant with only retained backups can be deleted" grep -q '^deleted=true' <(oxpanel-ctl tenant delete foo-bar --remove-home)
+check "its retained backups are kept, marked as of a deleted tenant" test "$(oxpanel-ctl backup list-retained | grep -c '^backup=.* tenant=foo-bar tenant_deleted=true ')" -eq 2
+check "their files are kept" test -f "$BK/foo-bar/$FINAL/home.tar.gz"
+check "retained backups are not drift" grep -q '^drifts=0$' <(oxpanel-ctl host reconcile)
+check "a new tenant of the same name" grep -q '^created=true' <(oxpanel-ctl tenant create foo-bar --owner reseller1 --memory 128M)
+check "does not see them" test -z "$(oxpanel-ctl backup list foo-bar)"
+check "cannot restore them" grep -q 'NotFound' <(oxpanel-ctl backup restore foo-bar "$FINAL" 2>&1 || true)
+check "cannot delete them" grep -q '^deleted=false' <(oxpanel-ctl backup delete foo-bar "$FINAL")
+check_not "cannot read them" as_user foo-bar cat "$BK/foo-bar/$FINAL/home.tar.gz"
+check_not "the operator's restore needs the right source tenant" oxpanel-ctl backup restore-retained "$FINAL" --from bob --to foo-bar
+out="$(timeout 300 oxpanel-ctl backup restore-retained "$FINAL" --from foo-bar --to foo-bar --wait)" || true
+check "the operator restores the final backup into the re-created account" grep -q 'kind=JOB_KIND_RESTORE tenant=foo-bar .* state=JOB_STATE_SUCCEEDED' <<<"$out"
+check "the files are back, owned by the new account" test "$(stat -c '%U' /home/foo-bar/final.txt)/$(cat /home/foo-bar/final.txt)" = "foo-bar/final-marker"
+check "an early deletion needs the deleted-tenant flag" grep -q '^deleted=true' <(oxpanel-ctl backup delete foo-bar "$EARLY" --tenant-deleted)
+python3 - "/var/lib/oxpanel/backups/$FINAL.json" <<'PY'
+import json, sys
+r = json.load(open(sys.argv[1])); r["retain_until_unix"] = 1
+json.dump(r, open(sys.argv[1], "w"), indent=2)
+PY
+systemctl restart oxpanel-daemon
+check "a backup past its date is removed when the daemon starts" bash -c 'for i in $(seq 1 50); do [ ! -e "$1" ] && [ ! -e "$2" ] && exit 0; sleep 0.2; done; exit 1' _ "/var/lib/oxpanel/backups/$FINAL.json" "$BK/foo-bar/$FINAL"
+check "no retained backups left" test -z "$(oxpanel-ctl backup list-retained)"
 for t in alice bob foo-bar; do for id in $(backup_ids "$t"); do oxpanel-ctl backup delete "$t" "$id" >/dev/null; done; done
 check "every backup deleted" test -z "$(ls "$BK")"
 check "remove the PHP backup site" grep -q '^removed=true' <(oxpanel-ctl vhost remove bkphp.test)

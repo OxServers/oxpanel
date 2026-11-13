@@ -46,7 +46,7 @@ use crate::records::{
     TenantState, VHostRecord, RECORD_VERSION,
 };
 use crate::system::{bin, CommandSpec};
-use crate::validate::{BackupId, JobId, Username};
+use crate::validate::{retain_months, BackupId, JobId, Username};
 use crate::vhost::VHostService;
 use crate::worker::{self, Task};
 
@@ -71,6 +71,8 @@ const MEASURE_TIMEOUT: Duration = Duration::from_secs(240);
 /// How much of the worker's output a job record keeps.
 const OUTPUT_LINES: &str = "40";
 const OUTPUT_MAX_BYTES: usize = 4096;
+/// How often retention dates are checked.
+const EXPIRY_INTERVAL: Duration = Duration::from_secs(3600);
 /// Consecutive faults after which a driver stops looking at its job.
 const MAX_DRIVER_FAULTS: u32 = 30;
 
@@ -378,10 +380,16 @@ impl BackupService {
         Ok(cmd.arg("--").arg(exe).args(task.to_args()))
     }
 
-    /// Start a backup of `tenant`. Returns the job and whether it was started
-    /// now (`false`: a backup of this tenant was already running).
-    pub async fn create(&self, tenant: &str) -> Result<(JobRecord, bool)> {
+    /// Start a backup of `tenant`; with `retain_months` (1–12, 0 = none) it
+    /// is kept that long whatever the per-tenant count says, also after the
+    /// tenant is deleted. Returns the job and whether it was started now
+    /// (`false`: a backup of this tenant was already running).
+    pub async fn create(&self, tenant: &str, retain_months: u32) -> Result<(JobRecord, bool)> {
         let name = Username::parse_field(tenant, "tenant")?;
+        let retain_until_unix = match retain_months {
+            0 => 0,
+            m => now_unix().saturating_add(self::retain_months(m, "retain_months")?),
+        };
         self.archiver_available().await?;
         // Measured before the lock is taken: it can take a while.
         let needed = self.home_usage(&self.ready_tenant(&name)?).await?;
@@ -435,6 +443,8 @@ impl BackupService {
             size_bytes: 0,
             members: Vec::new(),
             domains: vhosts.iter().map(|v| v.domain.clone()).collect(),
+            retain_until_unix,
+            tenant_deleted: false,
         };
         let job = JobRecord {
             version: RECORD_VERSION,
@@ -503,19 +513,56 @@ impl BackupService {
         let id = BackupId::parse(backup_id)?;
         self.archiver_available().await?;
         let guard = self.ctx.lock.lock().await;
-        let cfg = &self.ctx.config;
         let tenant_rec = self.ready_tenant(&name)?;
         // The backup is looked up *for this tenant*: someone else's backup
-        // does not exist here, whatever its identifier.
+        // (and a retained backup of a deleted namesake) does not exist here,
+        // whatever its identifier.
         let backup = self.backup_of(&name, &id)?;
-        if backup.state != BackupState::Ready {
-            return Err(Error::BackupNotReady(id.to_string()));
-        }
         if backup.uid != tenant_rec.uid {
             return Err(Error::Internal(format!(
                 "backup {id} was taken from uid {}, but tenant '{name}' is uid {}",
                 backup.uid, tenant_rec.uid
             )));
+        }
+        let started = self.start_restore(&tenant_rec, &backup).await?;
+        drop(guard);
+        Ok(started)
+    }
+
+    /// The operator's restore of a retained backup of a *deleted* tenant
+    /// into an existing tenant (typically the customer's re-created
+    /// account). The caller proves intent by naming the backup, the tenant
+    /// it was taken from, and the target; anything else is `NOT_FOUND`.
+    pub async fn restore_retained(
+        &self,
+        backup_id: &str,
+        source_tenant: &str,
+        target_tenant: &str,
+    ) -> Result<(JobRecord, bool)> {
+        let id = BackupId::parse(backup_id)?;
+        let source = Username::parse_field(source_tenant, "source_tenant")?;
+        let target = Username::parse_field(target_tenant, "target_tenant")?;
+        self.archiver_available().await?;
+        let guard = self.ctx.lock.lock().await;
+        let backup = self.retained_of_deleted(&source, &id)?;
+        let tenant_rec = self.ready_tenant(&target)?;
+        let started = self.start_restore(&tenant_rec, &backup).await?;
+        drop(guard);
+        Ok(started)
+    }
+
+    /// The common half of both restores: `backup` into `tenant_rec`'s home,
+    /// as that tenant. The caller holds the mutation lock and has checked
+    /// that this backup may go into this tenant.
+    async fn start_restore(
+        &self,
+        tenant_rec: &TenantRecord,
+        backup: &BackupRecord,
+    ) -> Result<(JobRecord, bool)> {
+        let name = Username::parse_field(&tenant_rec.username, "tenant")?;
+        let id = BackupId::parse(&backup.id)?;
+        if backup.state != BackupState::Ready {
+            return Err(Error::BackupNotReady(id.to_string()));
         }
         if let Some(job) = self.job_in_flight(&name)? {
             return if job.kind == JobKind::Restore && job.backup_id == backup.id {
@@ -532,6 +579,8 @@ impl BackupService {
             .iter()
             .find(|m| m.kind == worker::KIND_HOME)
             .ok_or_else(|| Error::Internal(format!("backup {id} has no home member")))?;
+        // Stored under the name of the tenant it was taken from.
+        let source = Username::parse_field(&backup.tenant, "tenant")?;
         let (_, job_id) = self.new_ids()?;
         let job = JobRecord {
             version: RECORD_VERSION,
@@ -550,15 +599,15 @@ impl BackupService {
             uid: tenant_rec.uid,
             gid: tenant_rec.gid,
             home: tenant_rec.home.clone(),
-            input: backup_path(&cfg.backup_dir, &name, &id).join(&home.name),
+            input: backup_path(&self.ctx.config.backup_dir, &source, &id).join(&home.name),
             sha256: home.sha256.clone(),
             size: home.size_bytes,
         };
-        let cmd = self.job_command(&job, &tenant_rec, &tenant_rec.home, &task)?;
+        let cmd = self.job_command(&job, tenant_rec, &tenant_rec.home, &task)?;
         self.ctx.store.save_job(&job)?;
         // Nothing of the tenant's runs on half-restored files. A suspended
         // tenant's services are stopped already.
-        let started = match self.set_services(&tenant_rec, false).await {
+        let started = match self.set_services(tenant_rec, false).await {
             Ok(()) => self.ctx.sys.run_ok(cmd).await.map(|_| ()),
             Err(e) => Err(e),
         };
@@ -568,8 +617,7 @@ impl BackupService {
                 .await?;
             return Err(e);
         }
-        drop(guard);
-        info!(job = %job.id, backup = %id, tenant = %name, "restore started");
+        info!(job = %job.id, backup = %id, from = %source, tenant = %name, "restore started");
         self.spawn_driver(job_id);
         Ok((job, true))
     }
@@ -584,14 +632,27 @@ impl BackupService {
         crate::app::set_running_all(&self.ctx, tenant, running).await
     }
 
-    /// The record of `tenant`'s backup `id`.
+    /// The record of the (existing) `tenant`'s backup `id`. Retained
+    /// backups of a deleted tenant of the same name are not among them.
     fn backup_of(&self, tenant: &Username, id: &BackupId) -> Result<BackupRecord> {
         self.ctx
             .store
             .load_backup(id)?
-            .filter(|b| b.tenant == tenant.as_str())
+            .filter(|b| b.tenant == tenant.as_str() && !b.tenant_deleted)
             .ok_or_else(|| Error::BackupNotFound {
                 tenant: tenant.to_string(),
+                id: id.to_string(),
+            })
+    }
+
+    /// The retained backup `id` of the deleted tenant `former`.
+    fn retained_of_deleted(&self, former: &Username, id: &BackupId) -> Result<BackupRecord> {
+        self.ctx
+            .store
+            .load_backup(id)?
+            .filter(|b| b.tenant == former.as_str() && b.tenant_deleted)
+            .ok_or_else(|| Error::BackupNotFound {
+                tenant: former.to_string(),
                 id: id.to_string(),
             })
     }
@@ -603,8 +664,84 @@ impl BackupService {
             return Err(Error::TenantNotFound(name.to_string()));
         }
         let mut all = self.ctx.store.list_backups()?;
-        all.retain(|b| b.tenant == name.as_str());
+        all.retain(|b| b.tenant == name.as_str() && !b.tenant_deleted);
         Ok(all)
+    }
+
+    /// Every backup with a retention date — of existing tenants and of
+    /// deleted ones (`tenant_deleted`) — oldest first. For the operator.
+    pub async fn list_retained(&self) -> Result<Vec<BackupRecord>> {
+        let mut all = self.ctx.store.list_backups()?;
+        all.retain(|b| b.retain_until_unix != 0);
+        Ok(all)
+    }
+
+    /// Mark one of an existing tenant's complete backups as kept for
+    /// `months` (1–12) from now — replacing an earlier date, shorter or
+    /// longer. Returns the updated record.
+    pub async fn retain(&self, tenant: &str, backup_id: &str, months: u32) -> Result<BackupRecord> {
+        let name = Username::parse_field(tenant, "tenant")?;
+        let id = BackupId::parse(backup_id)?;
+        let period = retain_months(months, "retain_months")?;
+        let _guard = self.ctx.lock.lock().await;
+        let mut backup = self.backup_of(&name, &id)?;
+        if backup.state != BackupState::Ready {
+            return Err(Error::BackupNotReady(id.to_string()));
+        }
+        backup.retain_until_unix = now_unix().saturating_add(period);
+        self.ctx.store.save_backup(&backup)?;
+        info!(backup = %id, tenant = %name, until = backup.retain_until_unix, "backup retained");
+        Ok(backup)
+    }
+
+    /// Delete a retained backup of the deleted tenant `former` before its
+    /// date. Returns `false` if there is no such backup.
+    pub async fn delete_retained(&self, former: &str, backup_id: &str) -> Result<bool> {
+        let name = Username::parse_field(former, "tenant")?;
+        let id = BackupId::parse(backup_id)?;
+        let _guard = self.ctx.lock.lock().await;
+        if self.retained_of_deleted(&name, &id).is_err() {
+            return Ok(false);
+        }
+        self.refuse_while_in_use(&name, &id)?;
+        self.remove_backup(&name, &id)?;
+        info!(backup = %id, former_tenant = %name, "retained backup deleted");
+        Ok(true)
+    }
+
+    /// Remove what has passed its retention date: a retained backup of a
+    /// deleted tenant goes; on an existing tenant's backup only the mark
+    /// lapses (it counts towards the tenant's retention again). Backups in
+    /// use by a job are left for the next round. Returns how many were
+    /// removed.
+    pub async fn expire_retained(&self) -> Result<usize> {
+        let _guard = self.ctx.lock.lock().await;
+        let now = now_unix();
+        let busy: Vec<String> = self
+            .running_jobs()?
+            .into_iter()
+            .map(|j| j.backup_id)
+            .collect();
+        let mut removed = 0;
+        for mut b in self.ctx.store.list_backups()? {
+            if b.retain_until_unix == 0 || b.retain_until_unix > now || busy.contains(&b.id) {
+                continue;
+            }
+            let (name, id) = (
+                Username::parse_field(&b.tenant, "tenant")?,
+                BackupId::parse(&b.id)?,
+            );
+            if b.tenant_deleted {
+                self.remove_backup(&name, &id)?;
+                info!(backup = %id, former_tenant = %name, "retained backup expired and removed");
+                removed += 1;
+            } else {
+                b.retain_until_unix = 0;
+                self.ctx.store.save_backup(&b)?;
+                info!(backup = %id, tenant = %name, "retention period ended; ordinary backup again");
+            }
+        }
+        Ok(removed)
     }
 
     pub async fn job(&self, job_id: &str) -> Result<JobRecord> {
@@ -621,22 +758,28 @@ impl BackupService {
         let name = Username::parse_field(tenant, "tenant")?;
         let id = BackupId::parse(backup_id)?;
         let _guard = self.ctx.lock.lock().await;
-        let Ok(backup) = self.backup_of(&name, &id) else {
+        if self.backup_of(&name, &id).is_err() {
             return Ok(false);
-        };
-        if let Some(job) = self
-            .running_jobs()?
-            .into_iter()
-            .find(|j| j.backup_id == backup.id)
-        {
-            return Err(Error::JobRunning {
-                tenant: name.to_string(),
-                job: job.id,
-            });
         }
+        self.refuse_while_in_use(&name, &id)?;
         self.remove_backup(&name, &id)?;
         info!(backup = %id, tenant = %name, "backup deleted");
         Ok(true)
+    }
+
+    /// A backup a job is writing or restoring from is not removed.
+    fn refuse_while_in_use(&self, tenant: &Username, id: &BackupId) -> Result<()> {
+        match self
+            .running_jobs()?
+            .into_iter()
+            .find(|j| j.backup_id == id.as_str())
+        {
+            Some(job) => Err(Error::JobRunning {
+                tenant: tenant.to_string(),
+                job: job.id,
+            }),
+            None => Ok(()),
+        }
     }
 
     /// Remove a backup's files, then its record. Repeating it after a crash
@@ -659,6 +802,22 @@ impl BackupService {
             self.spawn_driver(JobId::parse(&job.id)?);
         }
         Ok(jobs.len())
+    }
+
+    /// Expire retained backups now and then every hour, for as long as the
+    /// daemon runs.
+    pub fn spawn_expiry(&self) {
+        let svc = self.clone();
+        tokio::spawn(async move {
+            loop {
+                match svc.expire_retained().await {
+                    Ok(0) => {}
+                    Ok(n) => info!(removed = n, "expired retained backups removed"),
+                    Err(e) => warn!(error = %e, "could not expire retained backups; will retry"),
+                }
+                tokio::time::sleep(EXPIRY_INTERVAL).await;
+            }
+        });
     }
 
     fn spawn_driver(&self, id: JobId) {
@@ -976,7 +1135,13 @@ impl BackupService {
     /// Keep the newest `backup_keep` complete backups of the tenant.
     fn enforce_retention(&self, tenant: &Username) -> Result<()> {
         let mut ready = self.ctx.store.list_backups()?;
-        ready.retain(|b| b.tenant == tenant.as_str() && b.state == BackupState::Ready);
+        // Retained backups do not count, and are never removed here.
+        ready.retain(|b| {
+            b.tenant == tenant.as_str()
+                && !b.tenant_deleted
+                && b.retain_until_unix == 0
+                && b.state == BackupState::Ready
+        });
         let keep = usize::try_from(self.ctx.config.backup_keep).unwrap_or(usize::MAX);
         let surplus = ready.len().saturating_sub(keep);
         for old in ready.iter().take(surplus) {
@@ -988,10 +1153,11 @@ impl BackupService {
     }
 }
 
-/// `DeleteTenant` is refused while the tenant has backups or a job in
-/// flight: backups are found by the tenant's name, so a later tenant of the
-/// same name would inherit them, and deleting them silently would destroy
-/// the only copy of a customer's data on the say-so of a different request.
+/// `DeleteTenant` is refused while the tenant has a job in flight or
+/// backups that are not retained: deleting them silently would destroy the
+/// only copy of a customer's data on the say-so of a different request, so
+/// the operator either deletes them or marks them retained. Retained
+/// backups survive the deletion ([`detach_retained`]).
 pub fn refuse_tenant_deletion(ctx: &Ctx, tenant: &Username) -> Result<()> {
     if let Some(job) = ctx
         .store
@@ -1008,9 +1174,24 @@ pub fn refuse_tenant_deletion(ctx: &Ctx, tenant: &Username) -> Result<()> {
         .store
         .list_backups()?
         .iter()
-        .any(|b| b.tenant == tenant.as_str())
+        .any(|b| b.tenant == tenant.as_str() && !b.tenant_deleted && b.retain_until_unix == 0)
     {
         return Err(Error::TenantHasBackups(tenant.to_string()));
+    }
+    Ok(())
+}
+
+/// The tenant is being deleted: its retained backups stay, detached from
+/// the name, so that a later tenant of the same name can neither see nor
+/// restore them. Only the operator RPCs for retained backups reach them
+/// until their date passes. Idempotent.
+pub fn detach_retained(ctx: &Ctx, tenant: &Username) -> Result<()> {
+    for mut b in ctx.store.list_backups()? {
+        if b.tenant == tenant.as_str() && !b.tenant_deleted && b.retain_until_unix != 0 {
+            b.tenant_deleted = true;
+            ctx.store.save_backup(&b)?;
+            info!(backup = %b.id, %tenant, until = b.retain_until_unix, "retained backup kept after the tenant's deletion");
+        }
     }
     Ok(())
 }
@@ -1120,7 +1301,7 @@ mod tests {
     impl Harness {
         /// Start a backup and conclude it (the fake worker has finished).
         async fn backup(&self, tenant: &str) -> Result<JobRecord> {
-            let (job, started) = self.backups.create(tenant).await?;
+            let (job, started) = self.backups.create(tenant, 0).await?;
             assert!(started);
             self.finish(&job).await
         }
@@ -1173,7 +1354,7 @@ mod tests {
     #[tokio::test]
     async fn create_starts_a_sandboxed_worker_in_the_tenants_slice() -> Result<()> {
         let h = harness(false).await;
-        let (job, started) = h.backups.create("alice").await?;
+        let (job, started) = h.backups.create("alice", 0).await?;
         assert!(started);
         assert_eq!((job.kind, job.state), (JobKind::Backup, JobState::Running));
         let home = h.ctx.config.home_base.join("alice");
@@ -1267,7 +1448,7 @@ mod tests {
             Err(Error::JobRunning { .. })
         ));
         // A repeated request returns the job that is running.
-        let (again, started) = h.backups.create("alice").await?;
+        let (again, started) = h.backups.create("alice", 0).await?;
         assert!(!started);
         assert_eq!(again.id, job.id);
         assert_eq!(h.sys.calls_to(bin::SYSTEMD_RUN).len(), 1);
@@ -1278,7 +1459,7 @@ mod tests {
     async fn a_finished_backup_is_sealed_with_checksums_and_a_manifest() -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
         let h = harness(false).await;
-        let (job, _) = h.backups.create("alice").await?;
+        let (job, _) = h.backups.create("alice", 0).await?;
         let id = JobId::parse(&job.id)?;
         // Still running: nothing changes.
         h.sys.script_stdout(bin::SYSTEMCTL, RUNNING);
@@ -1368,7 +1549,7 @@ mod tests {
     async fn a_failed_or_interrupted_backup_leaves_nothing_behind() -> Result<()> {
         let h = harness(false).await;
         // The worker failed: tar could not read the home.
-        let (job, _) = h.backups.create("alice").await?;
+        let (job, _) = h.backups.create("alice", 0).await?;
         std::fs::write(h.dir(&job).join("home.tar.gz"), b"partial")
             .map_err(|e| Error::io("write", h.dir(&job), e))?;
         std::fs::remove_file(h.dir(&job).join("home.tar.gz.result.json"))
@@ -1400,7 +1581,7 @@ mod tests {
             (failed("exit-code", worker::EXIT_TOO_LARGE), "would not fit"),
             (failed("signal", 0), "the worker failed (signal"),
         ] {
-            let (job, _) = h.backups.create("alice").await?;
+            let (job, _) = h.backups.create("alice", 0).await?;
             h.sys.script_stdout(bin::SYSTEMCTL, &show);
             let done = h.finish(&job).await?;
             assert_eq!(done.state, JobState::Failed);
@@ -1411,7 +1592,7 @@ mod tests {
         // The unit vanished (host restarted) before the worker finished: the
         // archive is there but has no result file, so it is not a backup.
         h.sys.set_worker_writes_nothing(true);
-        let (job, _) = h.backups.create("alice").await?;
+        let (job, _) = h.backups.create("alice", 0).await?;
         std::fs::write(h.dir(&job).join("home.tar.gz"), b"looks like an archive")
             .map_err(|e| Error::io("write", h.dir(&job), e))?;
         h.sys.script_stdout(bin::SYSTEMCTL, GONE);
@@ -1420,14 +1601,14 @@ mod tests {
         assert!(done.message.contains("no complete archive"));
         assert!(!h.dir(&job).exists());
         // … and the same when the unit says it succeeded but left nothing.
-        let (job, _) = h.backups.create("alice").await?;
+        let (job, _) = h.backups.create("alice", 0).await?;
         let done = h.finish(&job).await?;
         assert_eq!(done.state, JobState::Failed);
         assert!(h.backups.list("alice").await?.is_empty());
         h.sys.set_worker_writes_nothing(false);
 
         // A unit that vanished *after* the worker finished: complete, kept.
-        let (job, _) = h.backups.create("alice").await?;
+        let (job, _) = h.backups.create("alice", 0).await?;
         h.sys.script_stdout(bin::SYSTEMCTL, GONE);
         assert_eq!(h.finish(&job).await?.state, JobState::Succeeded);
         assert_eq!(h.backups.list("alice").await?.len(), 1);
@@ -1443,7 +1624,7 @@ mod tests {
             "Failed to start transient service unit",
         );
         assert!(matches!(
-            h.backups.create("alice").await,
+            h.backups.create("alice", 0).await,
             Err(Error::CommandFailed { .. })
         ));
         assert!(h.backups.list("alice").await?.is_empty());
@@ -1454,7 +1635,7 @@ mod tests {
             |j| j.state == JobState::Failed && j.message.contains("could not be started")
         ));
         // Nothing is left "running": the next request starts a new job.
-        assert!(h.backups.create("alice").await?.1);
+        assert!(h.backups.create("alice", 0).await?.1);
         Ok(())
     }
 
@@ -1463,12 +1644,15 @@ mod tests {
         let h = harness(false).await;
         for bad in ["", "root", "../alice", "alice;id", "Alice"] {
             assert!(
-                matches!(h.backups.create(bad).await, Err(Error::InvalidInput { .. })),
+                matches!(
+                    h.backups.create(bad, 0).await,
+                    Err(Error::InvalidInput { .. })
+                ),
                 "{bad:?}"
             );
         }
         assert!(matches!(
-            h.backups.create("carol").await,
+            h.backups.create("carol", 0).await,
             Err(Error::TenantNotFound(_))
         ));
         assert!(matches!(
@@ -1478,7 +1662,7 @@ mod tests {
         // No archiver on the host: refused, nothing measured or started.
         h.sys.set_missing(bin::TAR);
         assert!(matches!(
-            h.backups.create("alice").await,
+            h.backups.create("alice", 0).await,
             Err(Error::RuntimeUnavailable(_))
         ));
         assert!(h.sys.calls().is_empty());
@@ -1493,7 +1677,7 @@ mod tests {
         let h = harness(false).await;
         // Not enough room: the fake home is 8192 bytes, the reserve 1 GiB.
         h.sys.set_disk_free((1 << 30) + 8191);
-        match h.backups.create("alice").await {
+        match h.backups.create("alice", 0).await {
             Err(Error::BackupNoSpace {
                 needed,
                 reserve,
@@ -1508,7 +1692,7 @@ mod tests {
         assert!(h.ctx.store.list_backups()?.is_empty());
         // Exactly enough: the archive may use what is left above the reserve.
         h.sys.set_disk_free((1 << 30) + 8192);
-        let (job, _) = h.backups.create("alice").await?;
+        let (job, _) = h.backups.create("alice", 0).await?;
         let run = h.sys.calls_to(bin::SYSTEMD_RUN);
         let argv = run.first().map(args).unwrap_or_default();
         assert_eq!(argv.last().map(String::as_str), Some("8192"));
@@ -1673,7 +1857,7 @@ mod tests {
         );
         // One job per tenant; the same request returns the same job.
         assert!(matches!(
-            h.backups.create("alice").await,
+            h.backups.create("alice", 0).await,
             Err(Error::JobRunning { .. })
         ));
         assert!(!h.backups.restore("alice", &made.backup_id).await?.1);
@@ -1849,10 +2033,10 @@ mod tests {
         }
         let mut jobs = Vec::new();
         for tenant in ["alice", "bob", "carol", "dave"] {
-            jobs.push(h.backups.create(tenant).await?.0);
+            jobs.push(h.backups.create(tenant, 0).await?.0);
         }
         assert!(matches!(
-            h.backups.create("erin").await,
+            h.backups.create("erin", 0).await,
             Err(Error::TooManyJobs)
         ));
         // A new daemon (same state on disk) finds the four and finishes them.
@@ -1874,7 +2058,7 @@ mod tests {
             assert_eq!(h.backups.job(&job.id).await?.state, JobState::Succeeded);
         }
         assert_eq!(restarted.resume_all().await?, 0);
-        assert!(h.backups.create("erin").await?.1);
+        assert!(h.backups.create("erin", 0).await?.1);
 
         // History is bounded per tenant.
         for _ in 0..JOBS_KEPT_PER_TENANT + 3 {
@@ -1894,7 +2078,7 @@ mod tests {
     #[tokio::test]
     async fn a_tenant_with_backups_or_a_running_job_cannot_be_deleted() -> Result<()> {
         let h = harness(false).await;
-        let (job, _) = h.backups.create("bob").await?;
+        let (job, _) = h.backups.create("bob", 0).await?;
         assert!(matches!(
             h.tenants.delete("bob", true).await,
             Err(Error::JobRunning { .. })
@@ -1911,6 +2095,177 @@ mod tests {
             h.ctx.store.list_jobs()?.iter().all(|j| j.tenant != "bob"),
             "the job history goes with the tenant"
         );
+        Ok(())
+    }
+
+    /// bob with a final backup kept for 3 months, then deleted, then a new
+    /// tenant named bob. Returns the harness and the final backup's job.
+    async fn retained_backup_of_deleted_bob() -> Result<(Harness, JobRecord)> {
+        let h = harness(false).await;
+        let month = crate::validate::RETENTION_MONTH_SECS;
+        // Validated before anything is created.
+        assert!(matches!(
+            h.backups.create("bob", 13).await,
+            Err(Error::InvalidInput { .. })
+        ));
+        assert!(h.sys.calls().is_empty() && h.ctx.store.list_backups()?.is_empty());
+
+        // A final backup of bob, kept for 3 months; plus ordinary ones.
+        let before = now_unix();
+        let fin = h.backups.create("bob", 3).await?.0;
+        h.finish(&fin).await?;
+        let rec = h.ctx.store.load_backup(&BackupId::parse(&fin.backup_id)?)?;
+        let until = rec.as_ref().map_or(0, |r| r.retain_until_unix);
+        assert!(until >= before + 3 * month && until <= now_unix() + 3 * month);
+        for _ in 0..3 {
+            h.backup("bob").await?;
+        }
+        // keep = 2 ordinary backups, and the retained one on top.
+        let listed = h.backups.list("bob").await?;
+        assert_eq!(listed.len(), 3);
+        assert!(listed.iter().any(|b| b.id == fin.backup_id));
+
+        // Marking an existing backup: validated, own tenant, complete only.
+        let other = listed
+            .iter()
+            .find(|b| b.id != fin.backup_id)
+            .map(|b| b.id.clone())
+            .unwrap_or_default();
+        assert!(matches!(
+            h.backups.retain("bob", &other, 0).await,
+            Err(Error::InvalidInput { .. })
+        ));
+        assert!(matches!(
+            h.backups.retain("alice", &other, 1).await,
+            Err(Error::BackupNotFound { .. })
+        ));
+        assert!(h.backups.retain("bob", &other, 1).await?.retain_until_unix > 0);
+
+        // Deleting bob: refused while an ordinary backup is left.
+        assert!(matches!(
+            h.tenants.delete("bob", true).await,
+            Err(Error::TenantHasBackups(_))
+        ));
+        for b in h.backups.list("bob").await? {
+            if b.retain_until_unix == 0 {
+                h.backups.delete("bob", &b.id).await?;
+            }
+        }
+        assert!(h.tenants.delete("bob", true).await?);
+        let retained = h.backups.list_retained().await?;
+        assert_eq!(retained.len(), 2);
+        assert!(retained
+            .iter()
+            .all(|b| b.tenant == "bob" && b.tenant_deleted));
+        assert!(h.dir(&fin).join(MANIFEST).is_file(), "the files stay");
+        assert_eq!(
+            crate::host::HostService::new(h.ctx.clone())
+                .reconcile()
+                .await?,
+            vec![]
+        );
+
+        // A new tenant named bob sees nothing of them.
+        h.tenants.create("bob", Limits::default(), "").await?;
+        assert!(h.backups.list("bob").await?.is_empty());
+        assert!(matches!(
+            h.backups.restore("bob", &fin.backup_id).await,
+            Err(Error::BackupNotFound { .. })
+        ));
+        assert!(matches!(
+            h.backups.retain("bob", &fin.backup_id, 12).await,
+            Err(Error::BackupNotFound { .. })
+        ));
+        assert!(!h.backups.delete("bob", &fin.backup_id).await?);
+        h.backup("bob").await?;
+        h.backup("bob").await?;
+        h.backup("bob").await?;
+        assert_eq!(
+            h.backups.list_retained().await?.len(),
+            2,
+            "untouched by the new bob's retention"
+        );
+
+        Ok((h, fin))
+    }
+
+    #[tokio::test]
+    async fn retained_backups_skip_the_count_and_outlive_their_tenant() -> Result<()> {
+        retained_backup_of_deleted_bob().await.map(|_| ())
+    }
+
+    #[tokio::test]
+    async fn retained_backups_are_restored_deleted_and_expired_by_the_operator() -> Result<()> {
+        let (h, fin) = retained_backup_of_deleted_bob().await?;
+        // The operator's restore: backup id, source and target must agree.
+        h.sys.clear_calls();
+        assert!(matches!(
+            h.backups
+                .restore_retained(&fin.backup_id, "alice", "bob")
+                .await,
+            Err(Error::BackupNotFound { .. })
+        ));
+        assert!(matches!(
+            h.backups
+                .restore_retained(&fin.backup_id, "bob", "carol")
+                .await,
+            Err(Error::TenantNotFound(_))
+        ));
+        assert!(h.sys.calls_to(bin::SYSTEMD_RUN).is_empty());
+        let (job, started) = h
+            .backups
+            .restore_retained(&fin.backup_id, "bob", "alice")
+            .await?;
+        assert!(started && job.tenant == "alice");
+        let argv = h
+            .sys
+            .calls_to(bin::SYSTEMD_RUN)
+            .first()
+            .map(args)
+            .unwrap_or_default();
+        let input = h.dir(&fin).join(HOME_MEMBER);
+        assert!(
+            argv.contains(&input.to_string_lossy().into_owned()),
+            "read from where it was stored"
+        );
+        assert!(
+            argv.windows(2).any(|w| w == ["restore", "20000"]),
+            "written as alice: {argv:?}"
+        );
+        assert_eq!(h.finish(&job).await?.state, JobState::Succeeded);
+
+        // Deleting one early, by the name it was kept under.
+        let early = h
+            .backups
+            .list_retained()
+            .await?
+            .into_iter()
+            .find(|b| b.id != fin.backup_id)
+            .map(|b| b.id)
+            .unwrap_or_default();
+        assert!(!h.backups.delete_retained("alice", &early).await?);
+        assert!(h.backups.delete_retained("bob", &early).await?);
+
+        // Expiry: the deleted tenant's backup goes; an existing tenant's mark lapses.
+        let alices = h.backups.create("alice", 1).await?.0;
+        h.finish(&alices).await?;
+        assert_eq!(h.backups.expire_retained().await?, 0, "nothing is due yet");
+        for id in [&fin.backup_id, &alices.backup_id] {
+            let id = BackupId::parse(id)?;
+            let mut rec = h
+                .ctx
+                .store
+                .load_backup(&id)?
+                .unwrap_or_else(|| panic!("record"));
+            rec.retain_until_unix = now_unix() - 1;
+            h.ctx.store.save_backup(&rec)?;
+        }
+        assert_eq!(h.backups.expire_retained().await?, 1);
+        assert!(!h.dir(&fin).exists() && h.backups.list_retained().await?.is_empty());
+        let lapsed = h.backups.list("alice").await?;
+        assert!(lapsed
+            .iter()
+            .any(|b| b.id == alices.backup_id && b.retain_until_unix == 0));
         Ok(())
     }
 
