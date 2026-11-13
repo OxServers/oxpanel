@@ -635,8 +635,22 @@ JSON
   systemctl restart oxpanel-daemon
   check "EAB: a binding file others can read is refused" grep -q 'FailedPrecondition.*readable by root only' <(oxpanel-ctl cert request eab.test 2>&1 || true)
   chmod 0600 /etc/oxpanel/acme-eab
-  out="$(oxpanel-ctl cert request eab.test || true)"; echo "$out" | tail -4
-  check "EAB: with the binding the certificate is issued" bash -c 'grep -q "^succeeded=true" <<<"$1" && grep -q " source=acme " <<<"$1" && grep -q "binding the account to an external account" <<<"$1"' _ "$out"
+  out="$(oxpanel-ctl cert request eab.test || true)"; echo "$out" | tail -40
+  # The binding reaches the client as a systemd credential. systemd hands
+  # credentials to an unprivileged unit on every real host; in a rootless
+  # container started with CAP_SYS_ADMIN (which the SFTP bind mounts need)
+  # it mounts them on ramfs inside the user namespace, where the unit's user
+  # cannot read them. Probe that exact situation; the acceptance VM (phase
+  # 20) always runs the check.
+  printf probe > /root/cred-probe; chmod 0600 /root/cred-probe
+  if systemd-run --wait --collect --quiet --unit=oxpanel-it-credprobe -p User=oxpanel-acme \
+       -p LoadCredential=p:/root/cred-probe /usr/bin/test -r /run/credentials/oxpanel-it-credprobe.service/p 2>/dev/null; then
+    check "EAB: with the binding the certificate is issued" bash -c 'grep -q "^succeeded=true" <<<"$1" && grep -q " source=acme " <<<"$1" && grep -q "binding the account to an external account" <<<"$1"' _ "$out"
+  else
+    echo "info - SKIPPED here (runs on the acceptance VM): this container's systemd cannot pass a credential to an unprivileged unit"
+    check "EAB: the client was given the binding and could not read it in this container" bash -c 'journalctl --no-pager -b -u oxpanel-acme-eab.test | grep -q "cannot read the EAB credential"'
+  fi
+  rm -f /root/cred-probe
   check "EAB: the HMAC key never reached the journal or a command line" bash -c '! journalctl --no-pager -b | grep -qF "$1"' _ "$EAB_KEY"
   oxpanel-ctl vhost remove eab.test >/dev/null
   systemctl stop oxpanel-it-pebble-eab
