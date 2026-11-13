@@ -71,6 +71,12 @@ fn scope_table() -> BTreeMap<&'static str, Scope> {
         ("RenewCertificates", Scope::VHost),
         ("RunAutoHttps", Scope::VHost),
         ("GetAutoHttpsStatus", Scope::Read),
+        // SFTP (sftp stream; customers manage their own access)
+        ("AddSftpKey", Scope::VHost),
+        ("RemoveSftpKey", Scope::VHost),
+        ("ListSftpKeys", Scope::Read),
+        ("SetSftpPassword", Scope::VHost),
+        ("ClearSftpPassword", Scope::VHost),
     ]
     .into_iter()
     .collect()
@@ -443,6 +449,8 @@ async fn random_requests_never_panic_or_corrupt_state() {
                     cpu_weight: u32::MAX,
                     io_weight: i as u32,
                     tasks_max: u32::MAX,
+                    disk_max_bytes: u64::MAX - (i as u64),
+                    inodes_max: i as u64,
                 }),
             }
             .encode_to_vec(),
@@ -545,6 +553,8 @@ fn limits(memory_mib: u64) -> Option<pb::ResourceLimits> {
         cpu_weight: 0,
         io_weight: 0,
         tasks_max: 0,
+        disk_max_bytes: 0,
+        inodes_max: 0,
     })
 }
 

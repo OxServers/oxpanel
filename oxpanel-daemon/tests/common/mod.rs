@@ -33,7 +33,8 @@ use oxpanel_daemon::host::HostService;
 use oxpanel_daemon::records::TenantState;
 use oxpanel_daemon::server::Engine;
 use oxpanel_daemon::system::{
-    bin, CommandOutput, CommandSpec, FakeSystem, HostStats, OsUser, System,
+    bin, CommandOutput, CommandSpec, FakeSystem, HostStats, OsUser, PasswordState, QuotaState,
+    System,
 };
 use oxpanel_daemon::tenant::TenantService;
 use oxpanel_daemon::vhost::VHostService;
@@ -166,6 +167,12 @@ impl System for Chaos {
     async fn host_stats(&self, path: &Path) -> Result<HostStats> {
         self.fake.host_stats(path).await
     }
+    async fn quota_state(&self, path: &Path) -> Result<QuotaState> {
+        self.fake.quota_state(path).await
+    }
+    async fn password_state(&self, user: &str) -> Result<PasswordState> {
+        self.fake.password_state(user).await
+    }
 }
 
 /// A configuration whose every path lives in a fresh temporary directory.
@@ -179,10 +186,16 @@ pub fn sandbox_config(dir: &Path) -> Config {
     cfg.nginx_conf_dir = dir.join("nginx").join("oxpanel.d");
     cfg.nginx_include_file = dir.join("nginx").join("conf.d").join("00-oxpanel.conf");
     cfg.socket_path = dir.join("oxpanel.sock");
+    // The feature streams' own locations (defaults under /etc and /var/lib).
+    cfg.tls_dir = dir.join("pki");
+    cfg.acme_dir = dir.join("acme");
+    cfg.sftp_keys_dir = dir.join("sftp-keys");
+    cfg.sshd_dropin_file = dir.join("sshd_config.d").join("60-oxpanel.conf");
     for d in [
         &cfg.home_base,
         &cfg.systemd_unit_dir,
         &dir.join("nginx").join("conf.d"),
+        &dir.join("sshd_config.d"),
     ] {
         std::fs::create_dir_all(d).expect("mkdir");
     }
@@ -236,6 +249,7 @@ impl World {
         .expect("nginx include");
         // main() only logs a failure here; so do we.
         let _ = vhost::converge_all(&ctx).await;
+        let _ = oxpanel_daemon::sftp::converge_all(&ctx).await;
         Services {
             tenants: TenantService::new(ctx.clone()),
             vhosts: VHostService::new(ctx.clone()),

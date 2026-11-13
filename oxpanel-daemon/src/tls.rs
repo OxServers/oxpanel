@@ -991,11 +991,15 @@ pub(crate) mod tests {
         cfg.nginx_include_file = p.join("nginx").join("conf.d").join("00-oxpanel.conf");
         cfg.tls_dir = p.join("pki");
         cfg.acme_dir = p.join("acme");
+        cfg.sftp_keys_dir = p.join("sftp-keys");
+        cfg.sshd_dropin_file = p.join("sshd_config.d").join("60-oxpanel.conf");
+        cfg.socket_path = p.join("run").join("oxpanel.sock");
         adjust(&mut cfg);
         for d in [
             cfg.home_base.clone(),
             cfg.systemd_unit_dir.clone(),
             p.join("nginx").join("conf.d"),
+            p.join("sshd_config.d"),
             cfg.acme_dir.join("account"),
             cfg.acme_dir.join("challenges"),
             cfg.acme_dir.join("csr"),
@@ -1028,6 +1032,8 @@ pub(crate) mod tests {
             })
             .await
             .unwrap();
+        // As the daemon does at start: the sshd drop-in is in place.
+        crate::sftp::converge_all(&ctx).await.unwrap();
         sys.clear_calls();
         Harness {
             _dir: dir,

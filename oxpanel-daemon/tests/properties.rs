@@ -92,13 +92,20 @@ fn limits() -> impl Strategy<Value = Limits> {
         proptest::option::of(1..=MAX_WEIGHT),
         proptest::option::of(1..=MAX_WEIGHT),
         proptest::option::of(1..=u32::MAX),
+        // Disk quotas: at least 1 MiB, whole KiB; at least 100 inodes.
+        proptest::option::of((1u64 << 10..=u64::MAX >> 10).prop_map(|kib| kib << 10)),
+        proptest::option::of(100..=u64::MAX),
     )
         .prop_map(
-            |(memory_max_bytes, cpu_weight, io_weight, tasks_max)| Limits {
-                memory_max_bytes,
-                cpu_weight,
-                io_weight,
-                tasks_max,
+            |(memory_max_bytes, cpu_weight, io_weight, tasks_max, disk_max_bytes, inodes_max)| {
+                Limits {
+                    memory_max_bytes,
+                    cpu_weight,
+                    io_weight,
+                    tasks_max,
+                    disk_max_bytes,
+                    inodes_max,
+                }
             },
         )
 }
@@ -137,6 +144,8 @@ fn tenant_record(name: &Username, home: &Path) -> TenantRecord {
         state: TenantState::Ready,
         owner: String::new(),
         suspended: false,
+        sftp_keys: Vec::new(),
+        sftp_password: false,
     }
 }
 

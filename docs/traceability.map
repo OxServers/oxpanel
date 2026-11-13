@@ -79,6 +79,18 @@
   unit tenant cgroup_usage_parsing_tolerates_unset_and_garbage
   it properties no_text_makes_a_parser_panic
   sh tests-integration/run-inside.sh disk usage is measured
+  unit quota usage_comes_from_the_quota_system_when_it_is_enforced
+[Tenant accounts] Disk quotas
+  unit validate disk_limits_parse_and_bounds
+  unit quota limits_are_set_with_exact_commands_and_verified
+  unit quota a_limit_the_kernel_does_not_show_is_an_error
+  unit quota report_parsing_handles_real_output
+  sh tests-integration/run-inside.sh a disk limit is refused, saying what to do
+  sh tests-integration/run-inside.sh writing beyond the limit fails with EDQUOT
+  sh tests-integration/run-inside.sh too many files fail too
+  sh tests-integration/run-inside.sh an SFTP upload beyond the limit fails with a quota error
+  sh tests-acceptance/phases/15-quota-post.sh the file system holding /home enforces user quotas
+  sh tests-acceptance/phases/60-reboot-post.sh bootb's disk limit is enforced after reboot
 [Tenant accounts] Reserved names
   unit tenant reserved_and_malformed_names_never_reach_the_os
   unit validate username_rejects_dangerous_names
@@ -305,6 +317,75 @@
   sh tests-integration/run-inside.sh reconcile reports the edited certificate and the opened key
   sh tests-integration/run-inside.sh reconcile reports the stray file
   sh tests-integration/run-inside.sh no drift after healing
+
+[SFTP access] SFTP only
+  unit sftp dropin_confines_the_tenant_group_and_nobody_else
+  unit sftp first_key_creates_the_access_with_exact_commands
+  sh tests-integration/run-inside.sh no shell: a command is never run
+  sh tests-integration/run-inside.sh no terminal, no forwarding of any kind (sshd's effective settings)
+  sh tests-integration/run-inside.sh no TCP forwarding (ssh -W to the web server)
+  sh tests-integration/run-inside.sh no remote forwarding
+[SFTP access] Confined to its own home
+  unit sftp removal_never_deletes_anything_inside_the_chroot_directory
+  sh tests-integration/run-inside.sh the tenant sees only its own home
+  sh tests-integration/run-inside.sh another tenant's home is not reachable
+  sh tests-integration/run-inside.sh not even by its absolute path one level up
+  sh tests-integration/run-inside.sh mount unit is active and enabled
+  sh tests-acceptance/phases/60-reboot-post.sh SFTP chroot mount came back by itself
+[SFTP access] Files just work
+  sh tests-integration/run-inside.sh uploaded file belongs to the tenant
+  sh tests-integration/run-inside.sh uploaded file inherits the web server's ACL
+  sh tests-integration/run-inside.sh nginx serves the uploaded file
+  sh tests-integration/run-inside.sh PHP reads the uploaded file and writes its own
+  sh tests-integration/run-inside.sh the file PHP wrote can be downloaded and removed over SFTP
+[SFTP access] Keys only OxPanel can change
+  unit validate ssh_key_accepts_plain_keys_and_computes_the_openssh_fingerprint
+  unit validate ssh_key_rejects_options_other_types_and_malformed_blobs
+  unit validate rsa_size_is_read_from_the_key_itself
+  unit sftp keys_are_idempotent_labelled_and_limited
+  unit sftp rendering_refuses_stored_values_that_could_inject_lines
+  sh tests-integration/run-inside.sh keys file is root-owned, not writable by the tenant
+  sh tests-integration/run-inside.sh only this tenant may read its keys file
+  sh tests-integration/run-inside.sh the tenant cannot add a key itself
+[SFTP access] Passwords, opt-in per tenant
+  unit validate sftp_passwords_have_a_minimum_length_and_no_control_characters
+  unit sftp a_password_is_set_through_stdin_only_with_exact_commands
+  unit sftp a_host_that_forbids_passwords_refuses_them_before_anything
+  sh tests-integration/run-inside.sh a tenant without a password is not offered password login
+  sh tests-integration/run-inside.sh the shadow file holds a hash, not the password
+  sh tests-integration/run-inside.sh the password is in no record and not in the journal
+  sh tests-integration/run-inside.sh password tenants are confined exactly like key tenants
+  sh tests-integration/run-inside.sh sshd offers no tenant password login
+  sh tests-acceptance/phases/60-reboot-post.sh SFTP password login works after reboot
+[SFTP access] Customers manage their own access
+  it grpc_surface every_rpc_has_a_scope_decision
+  it grpc_surface every_rpc_is_refused_without_its_scope_and_passes_with_it
+[SFTP access] Every tenant confined
+  unit sftp every_tenant_is_put_in_the_tenant_group
+  unit sftp a_host_that_cannot_confine_tenants_gets_no_keys
+  sh tests-integration/run-inside.sh every tenant is in the tenant group
+  sh tests-integration/run-inside.sh a tenant without keys is confined all the same
+  sh tests-integration/run-inside.sh root's own SSH is unaffected (no forced command, no chroot)
+[SFTP access] Lifecycle
+  unit sftp suspension_withdraws_the_keys_file_and_ends_sessions
+  unit sftp suspension_locks_the_hash_and_resume_unlocks_it_without_the_plaintext
+  unit sftp removing_a_key_ends_sessions_and_the_last_key_removes_everything
+  unit sftp clearing_the_password_ends_sessions_only_when_asked
+  unit sftp without_end_sessions_the_mount_waits_for_open_sessions
+  unit sftp deleting_a_tenant_removes_its_access_first
+  sh tests-integration/run-inside.sh suspension ends the open session
+  sh tests-integration/run-inside.sh no login while suspended
+  sh tests-integration/run-inside.sh login works again after resume
+  sh tests-integration/run-inside.sh deletion removed keys file, mount, unit and chroot
+[SFTP access] Reconciliation
+  unit host reports_sftp_drift_and_orphans
+  unit host reports_password_drift_both_ways
+  unit host reports_disk_quota_drift
+  sh tests-integration/run-inside.sh a password set behind OxPanel's back is drift
+  sh tests-integration/run-inside.sh a recorded password that vanished is drift
+[SFTP access] SELinux
+  sh tests-integration/run-inside.sh SELinux: uploaded file is httpd_sys_content_t
+  sh tests-acceptance/phases/60-reboot-post.sh SFTP login works after reboot
 
 [API, transport and authentication] gRPC over a UNIX socket only
   it grpc_uds full_tenant_and_vhost_lifecycle_over_uds

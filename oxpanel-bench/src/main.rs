@@ -101,6 +101,10 @@ async fn start(uid_max: u32) -> Result<Daemon, BoxError> {
     cfg.nginx_conf_dir = p.join("nginx").join("oxpanel.d");
     cfg.nginx_include_file = p.join("nginx").join("conf.d").join("00-oxpanel.conf");
     cfg.socket_path = p.join("oxpanel.sock");
+    cfg.tls_dir = p.join("pki");
+    cfg.acme_dir = p.join("acme");
+    cfg.sftp_keys_dir = p.join("sftp-keys");
+    cfg.sshd_dropin_file = p.join("sshd_config.d").join("60-oxpanel.conf");
     cfg.uid_max = uid_max;
     for d in [
         &cfg.home_base,
@@ -171,6 +175,8 @@ async fn create_tenants(c: &mut Client, from: usize, to: usize) -> Result<f64, B
                 cpu_weight: 100,
                 io_weight: 0,
                 tasks_max: 128,
+                disk_max_bytes: 0,
+                inodes_max: 0,
             }),
         })
         .await?;
@@ -463,6 +469,8 @@ async fn scale_run(tenants: usize, vhosts: usize, secs: u64) -> Result<(), BoxEr
                     cpu_weight: 100,
                     io_weight: 0,
                     tasks_max: 128,
+                    disk_max_bytes: 0,
+                    inodes_max: 0,
                 }),
             })
             .await
@@ -564,6 +572,8 @@ async fn scale_run(tenants: usize, vhosts: usize, secs: u64) -> Result<(), BoxEr
                         cpu_weight: 100,
                         io_weight: 0,
                         tasks_max: 128,
+                        disk_max_bytes: 0,
+                        inodes_max: 0,
                     }),
                 })
                 .await

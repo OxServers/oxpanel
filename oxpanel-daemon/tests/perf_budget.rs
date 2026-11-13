@@ -45,6 +45,8 @@ async fn provisioning_and_reads_stay_within_budget_at_300_tenants_and_300_sites(
                 cpu_weight: 100,
                 io_weight: 0,
                 tasks_max: 100,
+                disk_max_bytes: 0,
+                inodes_max: 0,
             }),
         })
         .await
@@ -124,6 +126,8 @@ async fn provisioning_and_reads_stay_within_budget_at_300_tenants_and_300_sites(
                     cpu_weight: 100,
                     io_weight: 0,
                     tasks_max: 100,
+                    disk_max_bytes: 0,
+                    inodes_max: 0,
                 }),
             })
             .await

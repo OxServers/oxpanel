@@ -68,6 +68,9 @@ fn limits(memory_mib: u64) -> Limits {
         cpu_weight: Some(50),
         io_weight: None,
         tasks_max: Some(64),
+        // The fake host enforces no quotas: a disk limit would be refused.
+        disk_max_bytes: None,
+        inodes_max: None,
     }
 }
 
