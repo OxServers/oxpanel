@@ -17,12 +17,16 @@ use crate::ctx::Ctx;
 use crate::db::trash::Deleted;
 use crate::db::DbService;
 use crate::error::Error;
+use crate::files::{FileService, JobRequest};
+use crate::files_worker::{
+    ArchiveFormat, Entry as FileEntry, Kind as FileKind, LinkState, ModeChange, Reply as FileReply,
+};
 use crate::host::{Drift, DriftKind, HostService};
 use crate::lifecycle::LifecycleService;
 use crate::records::{
     AppRuntime, BackupRecord, BackupState, CertSource, DatabaseRecord, DbEngine, DbTrashRecord,
-    DbUserRecord, JobKind, JobRecord, JobState, ObjectIssue, OnExisting, SftpKeyRecord,
-    TenantRecord, TenantState, VHostRecord,
+    DbUserRecord, FileJobKind, FileJobRecord, JobKind, JobRecord, JobState, ObjectIssue,
+    OnExisting, SftpKeyRecord, TenantRecord, TenantState, VHostRecord,
 };
 use crate::sftp::SftpService;
 use crate::tenant::TenantService;
@@ -44,6 +48,9 @@ pub struct Engine {
     tls: TlsService,
     backups: BackupService,
     lifecycle: LifecycleService,
+    files: FileService,
+    /// Largest upload, as `StartUpload` reports it.
+    files_upload_max: u64,
 }
 
 /// Interceptor type used by [`Engine::into_service`].
@@ -60,6 +67,8 @@ impl Engine {
             databases: DbService::new(ctx.clone()),
             backups: BackupService::new(ctx.clone()),
             lifecycle: LifecycleService::new(ctx.clone(), BackupService::new(ctx.clone())),
+            files: FileService::new(ctx.clone()),
+            files_upload_max: ctx.config.files.upload_max_bytes,
             host: HostService::new(ctx),
         }
     }
@@ -79,6 +88,12 @@ impl Engine {
     /// The tenant deletions behind this engine (resumed at start-up).
     pub fn lifecycle(&self) -> &LifecycleService {
         &self.lifecycle
+    }
+
+    /// The file manager behind this engine (the daemon resumes its jobs and
+    /// sweeps stale uploads through it).
+    pub fn files(&self) -> &FileService {
+        &self.files
     }
 
     /// The tonic service, wrapped so every request must carry a verified peer.
@@ -229,6 +244,12 @@ fn fail(rpc: &'static str, peer: &str, err: Error) -> Status {
         | Error::TooManyJobs
         | Error::BackupNoSpace { .. }
         | Error::TenantHasBackups(_)
+        | Error::FileRefused { .. }
+        | Error::TenantSuspended(_)
+        | Error::FileJobRunning { .. }
+        | Error::TooManyFileJobs
+        | Error::UploadNotFound(_)
+        | Error::TooManyUploads(_)
         | Error::NginxInvalid(_) => {
             warn!(rpc, peer, error = %err, "request refused");
             err.into()
@@ -1425,6 +1446,353 @@ impl OxPanelEngine for Engine {
             started,
         }))
     }
+
+    // --- File manager ---------------------------------------------------------
+    // Listing needs `read`; content and every change need `vhost` (a file's
+    // content holds secrets, e.g. a database password in wp-config.php, and a
+    // read-only peer such as monitoring has no business reading them).
+
+    async fn list_files(
+        &self,
+        req: Request<pb::ListFilesRequest>,
+    ) -> Result<Response<pb::ListFilesResponse>, Status> {
+        const RPC: &str = "ListFiles";
+        let peer = self.authorise(&req, RPC, Scope::Read)?;
+        let r = req.into_inner();
+        let (entries, total, truncated) = self
+            .files
+            .list(&r.tenant, &r.path, r.offset, r.limit)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(pb::ListFilesResponse {
+            entries: entries.iter().map(file_entry_to).collect(),
+            total,
+            truncated,
+        }))
+    }
+
+    async fn stat_file(
+        &self,
+        req: Request<pb::StatFileRequest>,
+    ) -> Result<Response<pb::FileEntry>, Status> {
+        const RPC: &str = "StatFile";
+        let peer = self.authorise(&req, RPC, Scope::Read)?;
+        let r = req.into_inner();
+        let entry = self
+            .files
+            .stat(&r.tenant, &r.path)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(file_entry_to(&entry)))
+    }
+
+    async fn read_file(
+        &self,
+        req: Request<pb::ReadFileRequest>,
+    ) -> Result<Response<pb::ReadFileResponse>, Status> {
+        const RPC: &str = "ReadFile";
+        let peer = self.authorise(&req, RPC, Scope::VHost)?;
+        let r = req.into_inner();
+        let read = self
+            .files
+            .read(&r.tenant, &r.path, r.offset, r.length)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(pb::ReadFileResponse {
+            modified: Some(precise_timestamp(read.modified_unix, read.modified_nanos)),
+            data: read.data,
+            size_bytes: read.size,
+            eof: read.eof,
+        }))
+    }
+
+    async fn write_file(
+        &self,
+        req: Request<pb::WriteFileRequest>,
+    ) -> Result<Response<pb::FileEntry>, Status> {
+        const RPC: &str = "WriteFile";
+        let peer = self.authorise(&req, RPC, Scope::VHost)?;
+        let r = req.into_inner();
+        // The path is logged, never the content.
+        info!(rpc = RPC, peer, tenant = %r.tenant, path = %r.path.escape_debug(), bytes = r.data.len(), "request");
+        let entry = self
+            .files
+            .write(&r.tenant, &r.path, &r.data, r.overwrite)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(file_entry_to(&entry)))
+    }
+
+    async fn start_upload(
+        &self,
+        req: Request<pb::StartUploadRequest>,
+    ) -> Result<Response<pb::StartUploadResponse>, Status> {
+        const RPC: &str = "StartUpload";
+        let peer = self.authorise(&req, RPC, Scope::VHost)?;
+        let r = req.into_inner();
+        info!(rpc = RPC, peer, tenant = %r.tenant, path = %r.path.escape_debug(), "request");
+        let rec = self
+            .files
+            .start_upload(&r.tenant, &r.path, r.overwrite)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(pb::StartUploadResponse {
+            upload_id: rec.id,
+            max_chunk_bytes: u32::try_from(crate::files::WRITE_MAX).unwrap_or(u32::MAX),
+            max_size_bytes: self.files_upload_max,
+        }))
+    }
+
+    async fn upload_chunk(
+        &self,
+        req: Request<pb::UploadChunkRequest>,
+    ) -> Result<Response<pb::UploadChunkResponse>, Status> {
+        const RPC: &str = "UploadChunk";
+        let peer = self.authorise(&req, RPC, Scope::VHost)?;
+        let r = req.into_inner();
+        let received_bytes = self
+            .files
+            .upload_chunk(&r.tenant, &r.upload_id, r.offset, &r.data)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(pb::UploadChunkResponse { received_bytes }))
+    }
+
+    async fn finish_upload(
+        &self,
+        req: Request<pb::FinishUploadRequest>,
+    ) -> Result<Response<pb::FileEntry>, Status> {
+        const RPC: &str = "FinishUpload";
+        let peer = self.authorise(&req, RPC, Scope::VHost)?;
+        let r = req.into_inner();
+        info!(rpc = RPC, peer, tenant = %r.tenant, upload = %r.upload_id, bytes = r.size_bytes, "request");
+        let entry = self
+            .files
+            .finish_upload(&r.tenant, &r.upload_id, r.size_bytes, &r.sha256)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(file_entry_to(&entry)))
+    }
+
+    async fn abort_upload(
+        &self,
+        req: Request<pb::AbortUploadRequest>,
+    ) -> Result<Response<pb::AbortUploadResponse>, Status> {
+        const RPC: &str = "AbortUpload";
+        let peer = self.authorise(&req, RPC, Scope::VHost)?;
+        let r = req.into_inner();
+        let aborted = self
+            .files
+            .abort_upload(&r.tenant, &r.upload_id)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(pb::AbortUploadResponse { aborted }))
+    }
+
+    async fn make_directory(
+        &self,
+        req: Request<pb::MakeDirectoryRequest>,
+    ) -> Result<Response<pb::FileEntry>, Status> {
+        const RPC: &str = "MakeDirectory";
+        let peer = self.authorise(&req, RPC, Scope::VHost)?;
+        let r = req.into_inner();
+        info!(rpc = RPC, peer, tenant = %r.tenant, path = %r.path.escape_debug(), "request");
+        let entry = self
+            .files
+            .make_dir(&r.tenant, &r.path, r.parents)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(file_entry_to(&entry)))
+    }
+
+    async fn move_file(
+        &self,
+        req: Request<pb::MoveFileRequest>,
+    ) -> Result<Response<pb::FileEntry>, Status> {
+        const RPC: &str = "MoveFile";
+        let peer = self.authorise(&req, RPC, Scope::VHost)?;
+        let r = req.into_inner();
+        info!(rpc = RPC, peer, tenant = %r.tenant, from = %r.from.escape_debug(), to = %r.to.escape_debug(), "request");
+        let entry = self
+            .files
+            .rename(&r.tenant, &r.from, &r.to, r.overwrite)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(file_entry_to(&entry)))
+    }
+
+    async fn set_file_access(
+        &self,
+        req: Request<pb::SetFileAccessRequest>,
+    ) -> Result<Response<pb::FileEntry>, Status> {
+        const RPC: &str = "SetFileAccess";
+        let peer = self.authorise(&req, RPC, Scope::VHost)?;
+        let r = req.into_inner();
+        info!(rpc = RPC, peer, tenant = %r.tenant, path = %r.path.escape_debug(), access = r.access, "request");
+        let change = match pb::FileAccess::try_from(r.access) {
+            Ok(pb::FileAccess::Private) => ModeChange::Private,
+            Ok(pb::FileAccess::WebReadable) => ModeChange::WebReadable,
+            Ok(pb::FileAccess::Mode) => ModeChange::Bits(r.mode),
+            _ => {
+                return Err(fail(
+                    RPC,
+                    &peer,
+                    Error::invalid("access", "choose PRIVATE, WEB_READABLE or MODE"),
+                ))
+            }
+        };
+        let entry = self
+            .files
+            .chmod(&r.tenant, &r.path, change)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(file_entry_to(&entry)))
+    }
+
+    async fn search_files(
+        &self,
+        req: Request<pb::SearchFilesRequest>,
+    ) -> Result<Response<pb::SearchFilesResponse>, Status> {
+        const RPC: &str = "SearchFiles";
+        let peer = self.authorise(&req, RPC, Scope::Read)?;
+        let r = req.into_inner();
+        let (matches, scanned, truncated) = self
+            .files
+            .search(&r.tenant, &r.path, &r.name_contains, r.max_results)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(pb::SearchFilesResponse {
+            matches: matches.iter().map(file_entry_to).collect(),
+            scanned,
+            truncated,
+        }))
+    }
+
+    async fn get_directory_size(
+        &self,
+        req: Request<pb::GetDirectorySizeRequest>,
+    ) -> Result<Response<pb::DirectorySize>, Status> {
+        const RPC: &str = "GetDirectorySize";
+        let peer = self.authorise(&req, RPC, Scope::Read)?;
+        let r = req.into_inner();
+        match self
+            .files
+            .size(&r.tenant, &r.path)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?
+        {
+            FileReply::Size {
+                allocated,
+                apparent,
+                files,
+                directories,
+                truncated,
+            } => Ok(Response::new(pb::DirectorySize {
+                allocated_bytes: allocated,
+                apparent_bytes: apparent,
+                files,
+                directories,
+                truncated,
+            })),
+            _ => Err(Status::internal(
+                "internal error; see the oxpanel-daemon journal",
+            )),
+        }
+    }
+
+    async fn copy_files(
+        &self,
+        req: Request<pb::CopyFilesRequest>,
+    ) -> Result<Response<pb::FileJob>, Status> {
+        const RPC: &str = "CopyFiles";
+        let peer = self.authorise(&req, RPC, Scope::VHost)?;
+        let r = req.into_inner();
+        info!(rpc = RPC, peer, tenant = %r.tenant, sources = r.sources.len(), destination = %r.destination.escape_debug(), "request");
+        let job = JobRequest::copy(&r.sources, &r.destination, r.overwrite)
+            .map_err(|e| fail(RPC, &peer, e))?;
+        self.file_job(RPC, &peer, &r.tenant, job).await
+    }
+
+    async fn delete_files(
+        &self,
+        req: Request<pb::DeleteFilesRequest>,
+    ) -> Result<Response<pb::FileJob>, Status> {
+        const RPC: &str = "DeleteFiles";
+        let peer = self.authorise(&req, RPC, Scope::VHost)?;
+        let r = req.into_inner();
+        info!(rpc = RPC, peer, tenant = %r.tenant, paths = r.paths.len(), "request");
+        let job = JobRequest::delete(&r.paths).map_err(|e| fail(RPC, &peer, e))?;
+        self.file_job(RPC, &peer, &r.tenant, job).await
+    }
+
+    async fn compress_files(
+        &self,
+        req: Request<pb::CompressFilesRequest>,
+    ) -> Result<Response<pb::FileJob>, Status> {
+        const RPC: &str = "CompressFiles";
+        let peer = self.authorise(&req, RPC, Scope::VHost)?;
+        let r = req.into_inner();
+        info!(rpc = RPC, peer, tenant = %r.tenant, names = r.names.len(), archive = %r.archive.escape_debug(), "request");
+        let format = match pb::ArchiveFormat::try_from(r.format) {
+            Ok(pb::ArchiveFormat::Zip) => ArchiveFormat::Zip,
+            Ok(pb::ArchiveFormat::TarGz) => ArchiveFormat::TarGz,
+            _ => {
+                return Err(fail(
+                    RPC,
+                    &peer,
+                    Error::invalid("format", "choose ZIP or TAR_GZ"),
+                ))
+            }
+        };
+        let job = JobRequest::compress(&r.directory, &r.names, &r.archive, format, r.overwrite)
+            .map_err(|e| fail(RPC, &peer, e))?;
+        self.file_job(RPC, &peer, &r.tenant, job).await
+    }
+
+    async fn extract_archive(
+        &self,
+        req: Request<pb::ExtractArchiveRequest>,
+    ) -> Result<Response<pb::FileJob>, Status> {
+        const RPC: &str = "ExtractArchive";
+        let peer = self.authorise(&req, RPC, Scope::VHost)?;
+        let r = req.into_inner();
+        info!(rpc = RPC, peer, tenant = %r.tenant, archive = %r.archive.escape_debug(), destination = %r.destination.escape_debug(), "request");
+        let job = JobRequest::extract(&r.archive, &r.destination, r.overwrite)
+            .map_err(|e| fail(RPC, &peer, e))?;
+        self.file_job(RPC, &peer, &r.tenant, job).await
+    }
+
+    async fn get_file_job(
+        &self,
+        req: Request<pb::GetFileJobRequest>,
+    ) -> Result<Response<pb::FileJob>, Status> {
+        const RPC: &str = "GetFileJob";
+        let peer = self.authorise(&req, RPC, Scope::Read)?;
+        let r = req.into_inner();
+        let job = self
+            .files
+            .job(&r.tenant, &r.job_id)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(file_job_to(&job)))
+    }
+
+    async fn list_file_jobs(
+        &self,
+        req: Request<pb::ListFileJobsRequest>,
+    ) -> Result<Response<pb::ListFileJobsResponse>, Status> {
+        const RPC: &str = "ListFileJobs";
+        let peer = self.authorise(&req, RPC, Scope::Read)?;
+        let r = req.into_inner();
+        let jobs = self
+            .files
+            .jobs(&r.tenant)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(pb::ListFileJobsResponse {
+            jobs: jobs.iter().map(file_job_to).collect(),
+        }))
+    }
 }
 
 fn trashed_to(t: &DbTrashRecord) -> pb::TrashedDatabase {
@@ -1446,6 +1814,105 @@ fn issue_to(i: &ObjectIssue) -> pb::DatabaseObjectIssue {
         name: i.name.clone(),
         reason: i.reason.clone(),
         definition: i.definition.clone(),
+    }
+}
+
+// --- File manager ---------------------------------------------------------------
+
+impl Engine {
+    /// Start a file job and return it (finished if it took under two seconds).
+    async fn file_job(
+        &self,
+        rpc: &'static str,
+        peer: &str,
+        tenant: &str,
+        job: JobRequest,
+    ) -> Result<Response<pb::FileJob>, Status> {
+        let job = self
+            .files
+            .start_job(tenant, job)
+            .await
+            .map_err(|e| fail(rpc, peer, e))?;
+        Ok(Response::new(file_job_to(&job)))
+    }
+}
+
+fn precise_timestamp(unix: i64, nanos: u32) -> prost_types::Timestamp {
+    prost_types::Timestamp {
+        seconds: unix,
+        nanos: i32::try_from(nanos).unwrap_or(0),
+    }
+}
+
+fn file_type_to(kind: FileKind) -> pb::FileType {
+    match kind {
+        FileKind::File => pb::FileType::File,
+        FileKind::Directory => pb::FileType::Directory,
+        FileKind::Symlink => pb::FileType::Symlink,
+        FileKind::Fifo => pb::FileType::Fifo,
+        FileKind::Socket => pb::FileType::Socket,
+        FileKind::CharDevice => pb::FileType::CharDevice,
+        FileKind::BlockDevice => pb::FileType::BlockDevice,
+    }
+}
+
+fn file_entry_to(e: &FileEntry) -> pb::FileEntry {
+    let (target, state, target_type) = match &e.link {
+        None => (
+            String::new(),
+            pb::SymlinkState::Unspecified,
+            pb::FileType::Unspecified,
+        ),
+        Some(link) => {
+            let (state, kind) = match link.state {
+                LinkState::Inside(k) => (pb::SymlinkState::Inside, file_type_to(k)),
+                LinkState::Outside => (pb::SymlinkState::Outside, pb::FileType::Unspecified),
+                LinkState::Broken => (pb::SymlinkState::Broken, pb::FileType::Unspecified),
+            };
+            (link.target.clone(), state, kind)
+        }
+    };
+    pb::FileEntry {
+        name: e.name.clone(),
+        name_utf8: e.name_utf8,
+        path: e.path.clone().unwrap_or_default(),
+        r#type: file_type_to(e.kind).into(),
+        size_bytes: e.size,
+        allocated_bytes: e.allocated,
+        modified: Some(precise_timestamp(e.modified_unix, e.modified_nanos)),
+        mode: e.mode,
+        owned_by_tenant: e.owned,
+        symlink_target: target,
+        symlink_state: state.into(),
+        symlink_target_type: target_type.into(),
+    }
+}
+
+fn file_job_to(rec: &FileJobRecord) -> pb::FileJob {
+    pb::FileJob {
+        id: rec.id.clone(),
+        tenant: rec.tenant.clone(),
+        kind: match rec.kind {
+            FileJobKind::Copy => pb::FileJobKind::Copy,
+            FileJobKind::Delete => pb::FileJobKind::Delete,
+            FileJobKind::Compress => pb::FileJobKind::Compress,
+            FileJobKind::Extract => pb::FileJobKind::Extract,
+        }
+        .into(),
+        state: match rec.state {
+            JobState::Running => pb::JobState::Running,
+            JobState::Succeeded => pb::JobState::Succeeded,
+            JobState::Failed => pb::JobState::Failed,
+        }
+        .into(),
+        request: rec.request.clone(),
+        message: rec.message.clone(),
+        output: rec.output.clone(),
+        started_at: Some(timestamp(rec.started_at_unix)),
+        finished_at: (rec.finished_at_unix != 0).then(|| timestamp(rec.finished_at_unix)),
+        entries: rec.entries,
+        bytes: rec.bytes,
+        skipped: rec.skipped,
     }
 }
 

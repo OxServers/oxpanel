@@ -105,6 +105,28 @@ fn scope_table() -> BTreeMap<&'static str, Scope> {
         ("PurgeDatabaseTrash", Scope::VHost),
         ("RestoreBackupDatabase", Scope::Tenant),
         ("RestoreRetainedBackupDatabase", Scope::Delete),
+        // File manager (files stream): listing is `read`; content holds
+        // secrets, so reading it needs the customer's write scope, like
+        // every change.
+        ("ListFiles", Scope::Read),
+        ("StatFile", Scope::Read),
+        ("ReadFile", Scope::VHost),
+        ("WriteFile", Scope::VHost),
+        ("StartUpload", Scope::VHost),
+        ("UploadChunk", Scope::VHost),
+        ("FinishUpload", Scope::VHost),
+        ("AbortUpload", Scope::VHost),
+        ("MakeDirectory", Scope::VHost),
+        ("MoveFile", Scope::VHost),
+        ("SetFileAccess", Scope::VHost),
+        ("SearchFiles", Scope::Read),
+        ("GetDirectorySize", Scope::Read),
+        ("CopyFiles", Scope::VHost),
+        ("DeleteFiles", Scope::VHost),
+        ("CompressFiles", Scope::VHost),
+        ("ExtractArchive", Scope::VHost),
+        ("GetFileJob", Scope::Read),
+        ("ListFileJobs", Scope::Read),
     ]
     .into_iter()
     .collect()

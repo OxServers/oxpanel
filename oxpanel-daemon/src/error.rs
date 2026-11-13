@@ -176,6 +176,31 @@ pub enum Error {
     #[error("tenant '{0}' still has backups; delete them or mark them retained first")]
     TenantHasBackups(String),
 
+    /// The file manager's worker refused or failed an operation. The
+    /// message names only paths relative to the tenant's home, as the
+    /// caller gave them.
+    #[error("{message}")]
+    FileRefused {
+        fault: crate::files_worker::Fault,
+        message: String,
+    },
+
+    /// A suspended tenant's files can be read, not changed.
+    #[error("tenant '{0}' is suspended; its files can be read but not changed")]
+    TenantSuspended(String),
+
+    #[error("a file job ('{job}') is still running for tenant '{tenant}'; wait for it to finish")]
+    FileJobRunning { tenant: String, job: String },
+
+    #[error("too many file jobs are running on this host; try again later")]
+    TooManyFileJobs,
+
+    #[error("no upload '{0}' in progress")]
+    UploadNotFound(String),
+
+    #[error("tenant '{0}' already has the maximum number of uploads in progress")]
+    TooManyUploads(String),
+
     #[error("{program} exited with {status}")]
     CommandFailed {
         program: String,
@@ -272,6 +297,12 @@ impl Error {
                 | Self::TooManyJobs
                 | Self::BackupNoSpace { .. }
                 | Self::TenantHasBackups(_)
+                | Self::FileRefused { .. }
+                | Self::TenantSuspended(_)
+                | Self::FileJobRunning { .. }
+                | Self::TooManyFileJobs
+                | Self::UploadNotFound(_)
+                | Self::TooManyUploads(_)
         )
     }
 }
@@ -298,6 +329,7 @@ impl From<Error> for Status {
             | Error::DbObjectNotFound { .. }
             | Error::BackupNotFound { .. }
             | Error::TrashNotFound { .. }
+            | Error::UploadNotFound(_)
             | Error::JobNotFound(_) => Status::not_found(message),
             Error::NotManaged(_)
             | Error::TenantNotReady(_)
@@ -318,13 +350,18 @@ impl From<Error> for Status {
             | Error::BackupNotReady(_)
             | Error::JobRunning { .. }
             | Error::TenantHasBackups(_)
+            | Error::TenantSuspended(_)
+            | Error::FileJobRunning { .. }
             | Error::NginxInvalid(_) => Status::failed_precondition(message),
             Error::UidExhausted { .. }
             | Error::TooManySftpKeys(_)
             | Error::DbLimitReached { .. }
             | Error::TooManyJobs
+            | Error::TooManyFileJobs
+            | Error::TooManyUploads(_)
             | Error::BackupNoSpace { .. } => Status::resource_exhausted(message),
             Error::Unauthorised => Status::permission_denied(message),
+            Error::FileRefused { fault, .. } => file_status(fault, message),
             Error::CommandTimeout { .. } => Status::deadline_exceeded(message),
             Error::CommandFailed { .. }
             | Error::Io { .. }
@@ -332,6 +369,25 @@ impl From<Error> for Status {
             | Error::CorruptRecord { .. }
             | Error::Internal(_) => Status::internal(message),
         }
+    }
+}
+
+/// The status of a file-manager refusal.
+fn file_status(fault: crate::files_worker::Fault, message: String) -> Status {
+    use crate::files_worker::Fault;
+    match fault {
+        Fault::NotFound => Status::not_found(message),
+        Fault::Exists => Status::already_exists(message),
+        Fault::PermissionDenied => Status::permission_denied(message),
+        Fault::QuotaExceeded | Fault::TooLarge => Status::resource_exhausted(message),
+        Fault::Invalid => Status::invalid_argument(message),
+        Fault::NotADirectory
+        | Fault::IsADirectory
+        | Fault::NotEmpty
+        | Fault::OutsideHome
+        | Fault::NotRegular
+        | Fault::Protected => Status::failed_precondition(message),
+        Fault::Failed => Status::internal(message),
     }
 }
 

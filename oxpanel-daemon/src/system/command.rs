@@ -141,16 +141,8 @@ impl CommandSpec {
         match self.run_as {
             None => (self.program, self.args.clone()),
             Some(RunAs { uid, gid }) => {
-                let mut argv: Vec<OsString> = vec![
-                    format!("--reuid={uid}").into(),
-                    format!("--regid={gid}").into(),
-                    "--clear-groups".into(),
-                    "--bounding-set=-all".into(),
-                    "--inh-caps=-all".into(),
-                    "--no-new-privs".into(),
-                    "--".into(),
-                    self.program.into(),
-                ];
+                let mut argv = setpriv_args(uid, gid);
+                argv.push(self.program.into());
                 argv.extend(self.args.iter().cloned());
                 (bin::SETPRIV, argv)
             }
@@ -167,6 +159,20 @@ impl CommandSpec {
         }
         s
     }
+}
+
+/// The arguments of `setpriv` that drop every privilege and become
+/// `uid:gid`, up to and including the `--` before the program.
+pub fn setpriv_args(uid: u32, gid: u32) -> Vec<OsString> {
+    vec![
+        format!("--reuid={uid}").into(),
+        format!("--regid={gid}").into(),
+        "--clear-groups".into(),
+        "--bounding-set=-all".into(),
+        "--inh-caps=-all".into(),
+        "--no-new-privs".into(),
+        "--".into(),
+    ]
 }
 
 /// Maximum number of bytes of command output retained for diagnostics.

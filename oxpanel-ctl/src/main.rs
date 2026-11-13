@@ -3,8 +3,8 @@
 //! Exit status: 0 on success, 1 on an API error (message on stderr),
 //! 2 on usage errors, 3 when `host reconcile` found drift, 4 when
 //! `vhost install-deps` ran and the installer failed, or when `cert request`
-//! / `cert renew` ran and no certificate was issued; 5 when a backup or
-//! restore waited for with `--wait` failed.
+//! / `cert renew` ran and no certificate was issued; 5 when a backup,
+//! restore or file job waited for with `--wait` failed.
 //!
 //! Database and SFTP passwords are read from standard input, never from arguments.
 // A CLI's whole job is to print.
@@ -37,6 +37,9 @@ fn emit(line: &str) {
 macro_rules! say {
     ($($arg:tt)*) => { emit(&format!($($arg)*)) };
 }
+
+/// `oxpanel-ctl files …` (after `say!`, which it uses).
+mod files;
 use oxpanel_proto::v1::ox_panel_engine_client::OxPanelEngineClient;
 
 #[derive(Parser, Debug)]
@@ -76,6 +79,9 @@ enum Cmd {
     /// SFTP access of tenants (SSH public keys).
     #[command(subcommand)]
     Sftp(SftpCmd),
+    /// A tenant's files, managed as the tenant (the file manager).
+    #[command(subcommand)]
+    Files(files::FilesCmd),
 }
 
 #[derive(Subcommand, Debug)]
@@ -531,6 +537,7 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
         Cmd::Sftp(cmd) => run_sftp(&mut c, cmd).await?,
         Cmd::Db(cmd) => run_db(&mut c, cmd).await?,
         Cmd::Backup(cmd) => run_backup(&mut c, cmd).await?,
+        Cmd::Files(cmd) => files::run(&mut c, cmd).await?,
     })
 }
 

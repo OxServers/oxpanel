@@ -350,6 +350,8 @@ impl TenantService {
         vhost::sync_tenant_configs(&self.ctx, &rec, changed).await?;
         if changed {
             if suspended {
+                // A file job changing the home stops with everything else.
+                crate::files::stop_tenant_jobs(&self.ctx, &rec).await?;
                 crate::php::set_running(&self.ctx, &rec, false).await?;
                 crate::app::set_running_all(&self.ctx, &rec, false).await?;
                 // The keys file goes away, the password hash is locked and
@@ -398,6 +400,8 @@ impl TenantService {
         if crate::db::tenant_has_objects(&self.ctx, name)? {
             return Err(Error::TenantHasDatabases(name.to_string()));
         }
+        // A file job still works in the home.
+        crate::files::refuse_tenant_deletion(&self.ctx, name)?;
         // Backups are the tenant's data too: they are deleted explicitly,
         // never as a side effect, and no job may be in flight.
         crate::backup::refuse_tenant_deletion(&self.ctx, name)
@@ -530,6 +534,7 @@ impl TenantService {
         )
         .await?;
         crate::backup::forget_tenant_jobs(&self.ctx, &name, keep_job)?;
+        crate::files::forget_tenant(&self.ctx, &name)?;
         self.ctx.store.delete_tenant(&name)?;
         Ok(())
     }

@@ -20,7 +20,7 @@ use oxpanel_daemon::ctx::Ctx;
 use oxpanel_daemon::server::Engine;
 use oxpanel_daemon::system::{bin, CommandSpec, FakeSystem, OsUser, RealSystem, System};
 use oxpanel_daemon::tls::TlsService;
-use oxpanel_daemon::{fsutil, nginx, quota, sftp, vhost, worker};
+use oxpanel_daemon::{files, files_worker, fsutil, nginx, quota, sftp, vhost, worker};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const USAGE: &str = "\
@@ -126,6 +126,14 @@ fn main() -> ExitCode {
         init_tracing();
         return run_worker(&args);
     }
+    // `oxpanel-daemon files` / `files-job`: the file manager's worker, run
+    // as a tenant (never as root) on one request from standard input.
+    if let Some(mode) = args
+        .first()
+        .filter(|a| *a == files_worker::SUBCOMMAND || *a == files_worker::JOB_SUBCOMMAND)
+    {
+        return run_files_worker(mode == files_worker::JOB_SUBCOMMAND, args.len());
+    }
     match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -154,6 +162,25 @@ fn run_worker(args: &[String]) -> ExitCode {
             ExitCode::from(failure.code)
         }
     }
+}
+
+/// The file manager's worker. It takes no arguments besides its mode, and
+/// refuses to run as root: its whole point is that the kernel checks every
+/// access against the tenant's identity.
+fn run_files_worker(job: bool, argc: usize) -> ExitCode {
+    if argc != 1 || nix::unistd::geteuid().is_root() || nix::unistd::getuid().is_root() {
+        return ExitCode::from(77);
+    }
+    // As SFTP creates files (0644, directories 0755); the worker also sets
+    // every mode explicitly.
+    nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o022));
+    let (mut input, mut output) = (std::io::stdin().lock(), std::io::stdout().lock());
+    let code = if job {
+        files::serve_job(&mut input, &mut output)
+    } else {
+        files_worker::serve(&mut input, &mut output)
+    };
+    ExitCode::from(code)
 }
 
 async fn daemon() -> ExitCode {
@@ -218,6 +245,13 @@ async fn resume_jobs(ctx: &Ctx, engine: &Engine) {
     engine.backups().spawn_expiry();
     // So do deleted databases past their trash period.
     oxpanel_daemon::db::trash::spawn_purger(ctx.clone());
+    match engine.files().resume_all().await {
+        Ok(0) => {}
+        Ok(n) => info!(jobs = n, "resumed watching running file jobs"),
+        Err(e) => warn!(error = %e, "could not resume running file jobs"),
+    }
+    // Uploads abandoned for a day are removed now, and hourly from here on.
+    engine.files().spawn_sweeper();
 }
 
 async fn run(cli: Cli) -> Result<(), Fatal> {

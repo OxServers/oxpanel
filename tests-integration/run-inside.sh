@@ -1680,6 +1680,214 @@ PY
 else
   echo "skip - MariaDB not installed"
 fi
+echo "== file manager"
+F() { oxpanel-ctl files "$@"; }
+# refused <code> <args…>: the files command fails with that gRPC code.
+refused() { local code="$1" out rc=0; shift; out="$(F "$@" 2>&1 </dev/null)" || rc=$?; [ "$rc" -ne 0 ] && grep -q "error: $code" <<<"$out"; }
+job_state() { sed -n 's/^job=[^ ]* .* state=\([A-Z_]*\) .*/\1/p' <<<"$1" | tail -1; }
+FDIR="$(mktemp -d /root/files-it.XXXXXX)"
+check "create tenant filea" grep -q '^created=true' <(oxpanel-ctl tenant create filea --memory 512M)
+check "create tenant fileb" grep -q '^created=true' <(oxpanel-ctl tenant create fileb)
+check "site filea.test" grep -q '^changed=true' <(oxpanel-ctl vhost set filea.test --tenant filea)
+echo fileb-private-data > /home/fileb/secret; chown fileb:fileb /home/fileb/secret; chmod 600 /home/fileb/secret
+
+echo "-- everyday use, as the tenant"
+check "an editor save (one request)" bash -c 'printf "written-by-the-file-manager" | oxpanel-ctl files write filea public_html/index.html --overwrite | grep -q "^file 0640 27 "'
+check "the site serves it" body_eventually filea.test / written-by-the-file-manager
+check "it belongs to the tenant" test "$(stat -c '%U:%G %a' /home/filea/public_html/index.html)" = "filea:filea 640"
+check "the web server can read it through the inherited ACL" grep -q '^user:nginx:r-x.*#effective:r--' <(getfacl -p /home/filea/public_html/index.html 2>/dev/null)
+as_user filea sh -c 'umask 022; echo by-the-tenant > /home/filea/public_html/by-tenant.html'
+check "mode and ACL are what the tenant's own tools produce" diff <(getfacl -cp /home/filea/public_html/index.html 2>/dev/null) <(getfacl -cp /home/filea/public_html/by-tenant.html 2>/dev/null)
+if selinuxenabled 2>/dev/null; then
+  check "the SELinux label is the default for the path" test "$(stat -c %C /home/filea/public_html/index.html)" = "$(matchpathcon -n /home/filea/public_html/index.html)"
+  echo "info - labels: file manager $(stat -c %C /home/filea/public_html/index.html), made from a root shell through setpriv $(stat -c %C /home/filea/public_html/by-tenant.html)"
+fi
+# The reference is SFTP, the tenant's other way to put files there.
+if [ -x /usr/sbin/sshd ] && command -v sftp >/dev/null; then
+  ssh-keygen -q -t ed25519 -N '' -f "$FDIR/k"
+  oxpanel-ctl sftp add-key filea --key-file "$FDIR/k.pub" >/dev/null
+  echo uploaded-over-sftp > "$FDIR/sftp.html"; chmod 644 "$FDIR/sftp.html"
+  FSFTP="sftp -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o LogLevel=ERROR -i $FDIR/k -b - filea@127.0.0.1"
+  check "a file uploaded over SFTP, for comparison" bash -c 'for i in $(seq 1 40); do echo "put $2/sftp.html public_html/by-sftp.html" | $1 >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1' _ "$FSFTP" "$FDIR"
+  check "mode and ACL are what SFTP produces" diff <(getfacl -cp /home/filea/public_html/index.html 2>/dev/null) <(getfacl -cp /home/filea/public_html/by-sftp.html 2>/dev/null)
+  if selinuxenabled 2>/dev/null; then
+    # Type and level; the SELinux *user* (system_u for what a service creates,
+    # unconfined_u for a login session) plays no part in the targeted policy.
+    lbl() { stat -c %C "$1" | cut -d: -f3-; }
+    check "the SELinux type is what SFTP produces ($(lbl /home/filea/public_html/by-sftp.html))" test "$(lbl /home/filea/public_html/index.html)" = "$(lbl /home/filea/public_html/by-sftp.html)"
+  fi
+fi
+check "a listing shows it" grep -q '^file 0640 27 [0-9]* index.html$' <(F ls filea public_html)
+check "cat returns the content" test "$(F cat filea public_html/index.html)" = written-by-the-file-manager
+head -c $((3 << 20)) /dev/urandom > "$FDIR/big.bin"
+check "a 3 MiB upload in chunks, checked by SHA-256" grep -q '^file 0640 3145728 ' <(F put filea "$FDIR/big.bin" public_html/big.bin)
+check "downloaded in chunks, identical" bash -c 'oxpanel-ctl files get filea public_html/big.bin "$1/big.back" && cmp -s "$1/big.bin" "$1/big.back"' _ "$FDIR"
+check "no partial upload file is left" test -z "$(ls -A /home/filea/public_html | grep '^\.oxpanel')"
+check "the site serves the upload" test "$(curl -s -H 'Host: filea.test' http://127.0.0.1/big.bin | sha256sum)" = "$(sha256sum < "$FDIR/big.bin")"
+check "mkdir with parents" grep -q '^dir 0750 ' <(F mkdir filea public_html/a/b/c --parents)
+check "move" grep -q '^file ' <(F mv filea public_html/by-tenant.html public_html/a/moved.html)
+out="$(F chmod filea public_html/a/moved.html --private)"; echo "$out"
+check "private: mode 0600" grep -q "^file 0600 " <<<"$out"
+code="$(code_of filea.test /a/moved.html)"
+check "private: the web server can no longer read it ($code)" test "$code" = 403 -o "$code" = 404
+check "web readable again" bash -c 'oxpanel-ctl files chmod filea public_html/a/moved.html --web | grep -q "^file 0644 " && test "$(curl -s -H "Host: filea.test" http://127.0.0.1/a/moved.html)" = by-the-tenant'
+check_not "a set-uid mode is refused" F chmod filea public_html/a/moved.html --mode 4755
+check_not "a world-writable mode is refused" F chmod filea public_html/a/moved.html --mode 0777
+check "search by name" grep -q 'public_html/a/moved.html$' <(F find filea "" MOVED)
+check "directory size" grep -qE '^allocated=[0-9]+ apparent=[0-9]+ files=[0-9]+ directories=[0-9]+ truncated=false$' <(F du filea public_html)
+F mkdir filea public_html/copy >/dev/null
+check "copy a tree (job)" grep -q 'state=JOB_STATE_SUCCEEDED' <(F cp filea public_html/copy public_html/a --wait)
+check "the copy is there" test "$(cat /home/filea/public_html/copy/a/moved.html)" = by-the-tenant
+for fmt in zip tar-gz; do
+  check "compress to $fmt (job)" grep -q 'state=JOB_STATE_SUCCEEDED' <(F compress filea public_html "site.$fmt" a copy --format "$fmt" --wait)
+  check "the $fmt archive is the tenant's" test "$(stat -c %U "/home/filea/site.$fmt")" = filea
+  check "extract the $fmt archive (job)" bash -c 'oxpanel-ctl files mkdir filea "x-$1" >/dev/null && oxpanel-ctl files extract filea "site.$1" "x-$1" --wait | grep -q "state=JOB_STATE_SUCCEEDED"' _ "$fmt"
+  check "the $fmt round trip is faithful" diff -r /home/filea/public_html/a "/home/filea/x-$fmt/a"
+done
+check "delete trees (job)" grep -q 'state=JOB_STATE_SUCCEEDED' <(F rm filea x-zip x-tar-gz site.zip site.tar-gz public_html/copy --wait)
+check "they are gone" bash -c '! ls -d /home/filea/x-zip /home/filea/site.zip /home/filea/public_html/copy 2>/dev/null | grep -q .'
+check "jobs are listed" grep -q 'kind=FILE_JOB_KIND_DELETE tenant=filea state=JOB_STATE_SUCCEEDED' <(F jobs filea)
+check_not "another tenant does not see them" grep -q 'job=' <(F jobs fileb)
+
+echo "-- the engine's own directories"
+check "the document root cannot be deleted" bash -c 'oxpanel-ctl files rm filea public_html --wait | grep -q "JOB_STATE_FAILED.*managed by the engine" && test -d /home/filea/public_html'
+check "nor moved" refused FailedPrecondition mv filea public_html elsewhere
+check "nor closed" refused FailedPrecondition chmod filea public_html --private
+check "the home cannot be closed or removed" refused InvalidArgument rm filea ""
+check "the site still works" body_eventually filea.test / written-by-the-file-manager
+
+echo "-- attacks: symlinks, traversal, other tenants"
+as_user filea sh -c 'cd /home/filea && ln -s /etc/passwd pw && ln -s /home/fileb fb && ln -s ../fileb/secret rel && ln -s / root'
+for link in pw rel fb/secret root/etc/passwd; do
+  check "reading through '$link' is refused" refused FailedPrecondition cat filea "$link"
+done
+check "a listing marks links that leave the home" grep -q '^link 0777 .* pw -> /etc/passwd (outside-home)$' <(F ls filea)
+check "listing another tenant's home through a link is refused" refused FailedPrecondition ls filea fb
+check "writing into another tenant's home through a link is refused" refused FailedPrecondition write filea fb/planted
+check "no file appeared in the other home" test ! -e /home/fileb/planted
+check "copying out of the home through a link is refused" bash -c '! oxpanel-ctl files cp filea public_html fb/secret --wait 2>&1 | grep -q JOB_STATE_SUCCEEDED; test ! -e /home/filea/public_html/secret'
+check "deleting a link removes the link only" bash -c 'oxpanel-ctl files rm filea fb --wait | grep -q JOB_STATE_SUCCEEDED && test -f /home/fileb/secret'
+for bad in ../fileb/secret /etc/passwd public_html/../../fileb/secret ./public_html 'public_html//x'; do
+  check "path '$bad' is refused by every command" bash -c '
+    b="$1"; for args in "ls filea $b" "stat filea $b" "cat filea $b" "du filea $b" "mkdir filea $b" "rm filea $b" "find filea $b x" \
+      "mv filea $b public_html/x" "mv filea public_html/index.html $b" "chmod filea $b --private" "cp filea $b public_html/index.html" \
+      "cp filea public_html $b" "compress filea $b a.zip x" "compress filea public_html $b index.html" "extract filea $b public_html" "extract filea a.zip $b"; do
+      # shellcheck disable=SC2086
+      out="$(oxpanel-ctl files $args 2>&1)" && { echo "accepted: $args"; exit 1; }
+      grep -q "error: InvalidArgument" <<<"$out" || { echo "$args: $out"; exit 1; }
+    done' _ "$bad"
+done
+check "write and upload refuse traversal too" bash -c 'echo x | oxpanel-ctl files write filea ../fileb/x 2>&1 | grep -q InvalidArgument && oxpanel-ctl files put filea "$1/big.bin" /tmp/x 2>&1 | grep -q InvalidArgument' _ "$FDIR"
+check "another tenant's file was never touched" test "$(cat /home/fileb/secret)" = fileb-private-data
+# What a tenant cannot plant itself, root plants: a hard link to another
+# tenant's private file. The worker is the tenant, so the kernel says no.
+ln /home/fileb/secret /home/filea/hardlink
+check "a hard link to another tenant's file cannot be read" refused PermissionDenied cat filea hardlink
+check "nor copied" bash -c 'oxpanel-ctl files cp filea public_html hardlink --wait 2>&1 | grep -q JOB_STATE_FAILED && test ! -e /home/filea/public_html/hardlink'
+check "nor archived" bash -c 'oxpanel-ctl files compress filea "" leak.zip hardlink --wait 2>&1 | grep -q JOB_STATE_FAILED; ! grep -aq fileb-private-data /home/filea/leak.zip 2>/dev/null'
+rm -f /home/filea/hardlink /home/filea/leak.zip
+
+echo "-- attacks: names, FIFOs, sparse files"
+check "a name beginning with '-' is just a name" bash -c 'echo dash | oxpanel-ctl files write filea -- -rf && test "$(cat /home/filea/-rf)" = dash && oxpanel-ctl files rm filea --wait -- -rf | grep -q SUCCEEDED && test ! -e /home/filea/-rf && test -f /home/filea/public_html/index.html'
+as_user filea sh -c 'printf x > "/home/filea/bad
+name"'
+check "a name with a newline is listed escaped, on one line" grep -q '^file 0644 1 [0-9]* bad\\nname$' <(F ls filea)
+check "a new name with a newline is refused" bash -c 'echo x | oxpanel-ctl files write filea "$(printf "new\nname")" 2>&1 | grep -q InvalidArgument'
+check "an existing one can be renamed" grep -q 'renamed' <(F mv filea "$(printf 'bad\nname')" renamed)
+as_user filea mkfifo /home/filea/fifo
+check "a FIFO is refused at once, never opened" bash -c 'timeout 20 oxpanel-ctl files cat filea fifo 2>&1 | grep -q FailedPrecondition'
+as_user filea truncate -s 1T /home/filea/sparse.img
+check "a 1 TiB sparse file counts what it occupies" bash -c 'oxpanel-ctl files du filea | grep -qE "^allocated=[0-9]{1,9} apparent=1[0-9]{12} "'
+check "its copy keeps the hole (seconds, not hours)" bash -c 'timeout 120 oxpanel-ctl files cp filea public_html sparse.img --wait | grep -q SUCCEEDED && test "$(stat -c %b /home/filea/public_html/sparse.img)" -lt 1000'
+check "archiving it is refused by the size limit" bash -c 'timeout 120 oxpanel-ctl files compress filea "" s.zip sparse.img --wait 2>&1 | grep -q "JOB_STATE_FAILED.*limit" && test ! -e /home/filea/s.zip'
+F rm filea sparse.img public_html/sparse.img fifo renamed --wait >/dev/null
+
+echo "-- attacks: hostile archives"
+python3 - "$FDIR" <<'PY'
+import io, sys, tarfile, zipfile
+d = sys.argv[1]
+def add(t, name, data=b"x", kind=tarfile.REGTYPE, link="", mode=0o644):
+    i = tarfile.TarInfo(name); i.type = kind; i.linkname = link; i.mode = mode; i.size = len(data) if kind == tarfile.REGTYPE else 0
+    t.addfile(i, io.BytesIO(data) if kind == tarfile.REGTYPE else None)
+with tarfile.open(f"{d}/hostile.tar.gz", "w:gz", format=tarfile.GNU_FORMAT) as t:
+    add(t, "ok.txt", b"fine")
+    add(t, "../../../../tmp/evil-dotdot")
+    add(t, "/tmp/evil-absolute")
+    add(t, "etc-link", kind=tarfile.SYMTYPE, link="/etc")
+    add(t, "etc-link/evil-through-link")
+    add(t, "other-home", kind=tarfile.SYMTYPE, link="../../fileb")
+    add(t, "other-home/evil")
+    add(t, "shadow-hard", kind=tarfile.LNKTYPE, link="/etc/shadow")
+    add(t, "secret-hard", kind=tarfile.LNKTYPE, link="../../fileb/secret")
+    add(t, "null-dev", kind=tarfile.CHRTYPE)
+    add(t, "pipe", kind=tarfile.FIFOTYPE)
+    add(t, "setuid-shell", b"#!/bin/sh\n", mode=0o4755)
+with zipfile.ZipFile(f"{d}/hostile.zip", "w") as z:
+    z.writestr("ok.txt", "fine")
+    z.writestr("../../../../tmp/evil-zip", "x")
+    z.writestr("/tmp/evil-zip-absolute", "x")
+    i = zipfile.ZipInfo("zip-link"); i.external_attr = (0o120777 << 16); z.writestr(i, "/etc")
+with zipfile.ZipFile(f"{d}/bomb.zip", "w", zipfile.ZIP_DEFLATED) as z:
+    z.writestr("bomb.bin", b"\0" * (256 << 20))
+PY
+for a in hostile.tar.gz hostile.zip bomb.zip; do F put filea "$FDIR/$a" "$a" >/dev/null; done
+F mkdir filea xt >/dev/null; F mkdir filea xz >/dev/null; F mkdir filea xb >/dev/null
+out="$(F extract filea hostile.tar.gz xt --wait 2>&1)" || true; echo "$out" | tail -2
+check "a hostile tar.gz is extracted, its tricks skipped" test "$(job_state "$out")" = JOB_STATE_SUCCEEDED
+check "nothing was written outside the destination" bash -c '! ls /tmp/evil-dotdot /tmp/evil-absolute /etc/evil-through-link /home/fileb/evil /home/filea/evil-dotdot 2>/dev/null | grep -q .'
+check "no link out was created, no hard link to /etc/shadow or another home" bash -c 'cd /home/filea/xt && test ! -L etc-link && test ! -L other-home && test ! -e shadow-hard && test ! -e secret-hard && test ! -e pipe'
+check "no device node, no set-uid bit" bash -c 'test ! -e /home/filea/xt/null-dev && test "$(stat -c %a /home/filea/xt/setuid-shell)" = 755'
+check "the honest entry is there" test "$(cat /home/filea/xt/ok.txt)" = fine
+check "the skipped entries are reported" grep -q "skipped .*absolute path" <<<"$out"
+check "fileb is untouched" test "$(ls /home/fileb)" = secret
+out="$(F extract filea hostile.zip xz --wait 2>&1)" || true
+check "a hostile zip likewise" bash -c 'test "$(cat /home/filea/xz/ok.txt)" = fine && ! ls /tmp/evil-zip /tmp/evil-zip-absolute 2>/dev/null | grep -q . && test ! -L /home/filea/xz/zip-link'
+out="$(F extract filea bomb.zip xb --wait 2>&1)" || true; echo "$out" | tail -1
+check "a zip bomb is stopped by the ratio limit" grep -q 'JOB_STATE_FAILED.*expands to more than' <<<"$out"
+check "and leaves no partial file" test -z "$(ls -A /home/filea/xb)"
+F rm filea xt xz xb hostile.tar.gz hostile.zip bomb.zip --wait >/dev/null
+
+echo "-- suspension, scopes, jobs across a daemon restart"
+oxpanel-ctl tenant suspend filea >/dev/null
+check "a suspended tenant's files can be read" test "$(F cat filea public_html/index.html)" = written-by-the-file-manager
+check "but not changed" refused FailedPrecondition mkdir filea suspended-dir
+oxpanel-ctl tenant resume filea >/dev/null
+cp -p /etc/oxpanel/daemon.env /root/daemon.env.files
+echo "OXPANEL_PEER_SCOPES=$(id -u panelapi):read" >> /etc/oxpanel/daemon.env
+systemctl restart oxpanel-daemon
+check "a read-only peer may list" bash -c 'setpriv --reuid=panelapi --regid=panelapi --init-groups --no-new-privs -- oxpanel-ctl files ls filea public_html | grep -q index.html'
+check "but not read content (scope vhost)" bash -c 'setpriv --reuid=panelapi --regid=panelapi --init-groups --no-new-privs -- oxpanel-ctl files cat filea public_html/index.html 2>&1 | grep -q "scope .vhost. required"'
+cp -p /root/daemon.env.files /etc/oxpanel/daemon.env; systemctl restart oxpanel-daemon
+as_user filea sh -c 'mkdir -p /home/filea/bulk && for i in 1 2 3 4 5 6; do head -c $((48 << 20)) /dev/urandom > /home/filea/bulk/r$i; done'
+out="$(F compress filea "" bulk.tar.gz bulk --format tar-gz)"; JOB="$(sed -n 's/^job=\([^ ]*\) .*/\1/p' <<<"$out")"
+check "a long job is still running after the request" test "$(job_state "$out")" = JOB_STATE_RUNNING
+check "it runs as the tenant" test "$(systemctl show -p User --value "oxpanel-files-$JOB.service")" = "$(id -u filea)"
+check "in its slice" test "$(systemctl show -p Slice --value "oxpanel-files-$JOB.service")" = oxpanel-tenant-filea.slice
+systemctl kill -s KILL oxpanel-daemon
+check "the daemon comes back after being killed mid-job" bash -c 'for i in $(seq 1 60); do systemctl -q is-active oxpanel-daemon && exit 0; sleep 1; done; exit 1'
+out="$(timeout 600 oxpanel-ctl files job filea "$JOB" --wait)" || true; echo "$out" | tail -1
+check "the restarted daemon concludes the job" test "$(job_state "$out")" = JOB_STATE_SUCCEEDED
+check "the archive is complete" bash -c 'test "$(tar -tzf /home/filea/bulk.tar.gz | grep -c "^bulk/r")" = 6'
+check "no partial or temporary file is left" test -z "$(ls -A /home/filea | grep '^\.oxpanel')"
+check "the job's request file is gone" test -z "$(ls /var/lib/oxpanel/file-jobs | grep '\.request$')"
+check "no job unit left behind" bash -c '! systemctl list-units --all --no-legend "oxpanel-files-*" | grep -q .'
+
+if grep -q ' disk_quota=true ' <(oxpanel-ctl host info); then
+  echo "-- the disk quota during an upload"
+  check "a 4 MiB quota for fileb" grep -q '^changed=true' <(oxpanel-ctl tenant set-limits fileb --disk 4M)
+  head -c $((8 << 20)) /dev/urandom > "$FDIR/8m.bin"
+  check "an upload beyond the quota fails with RESOURCE_EXHAUSTED" bash -c 'oxpanel-ctl files put fileb "$1/8m.bin" big.bin 2>&1 | grep -q ResourceExhausted' _ "$FDIR"
+  # (useradd may have copied /etc/skel dot-files into the home: only ours count.)
+  check "and leaves no partial file and no target ($(ls -A /home/fileb | tr '\n' ' '))" bash -c '! ls -A /home/fileb | grep -qE "^\.oxpanel-|^big\.bin$"'
+  check "no upload stays recorded" test -z "$(ls /var/lib/oxpanel/uploads)"
+  oxpanel-ctl tenant set-limits fileb >/dev/null
+fi
+check "no drift after the file manager" grep -q '^drifts=0$' <(oxpanel-ctl host reconcile)
+check "remove filea.test" grep -q '^removed=true' <(oxpanel-ctl vhost remove filea.test)
+check "delete filea" grep -q '^deleted=true' <(oxpanel-ctl tenant delete filea --remove-home)
+check "delete fileb" grep -q '^deleted=true' <(oxpanel-ctl tenant delete fileb --remove-home)
+check "their file jobs are forgotten" test -z "$(ls /var/lib/oxpanel/file-jobs)"
+rm -rf "$FDIR"
 
 echo "== teardown"
 check "vhost removed" grep -q '^removed=true' <(oxpanel-ctl vhost remove example.test)
