@@ -17,7 +17,7 @@ if ! podman image exists "$IMAGE"; then
 fi
 
 echo "[it] building release binaries"
-"$ROOT/scripts/dev.sh" cargo build --release --locked -p oxpanel-daemon -p oxpanel-ctl
+"$ROOT/scripts/dev.sh" cargo build --release --locked -p oxpanel-daemon -p oxpanel-ctl -p oxpanel-acme
 
 echo "[it] booting systemd container $NAME"
 podman run -d --name "$NAME" --systemd=always --security-opt label=disable \

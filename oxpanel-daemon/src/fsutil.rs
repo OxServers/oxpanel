@@ -83,6 +83,41 @@ pub fn read_optional(path: &Path) -> Result<Option<Vec<u8>>> {
     }
 }
 
+/// Read a regular file that another, less privileged account may have
+/// written: the final component is never followed if it is a symlink, and
+/// anything that is not a regular file or is larger than `max` is refused.
+/// `None` if there is no such file.
+pub fn read_untrusted(path: &Path, max: u64) -> Result<Option<Vec<u8>>> {
+    use std::io::Read as _;
+    let file = match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags((nix::fcntl::OFlag::O_NOFOLLOW | nix::fcntl::OFlag::O_NONBLOCK).bits())
+        .open(path)
+    {
+        Ok(f) => f,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(Error::io("open", path, e)),
+    };
+    let md = file.metadata().map_err(|e| Error::io("stat", path, e))?;
+    if !md.is_file() || md.len() > max {
+        return Err(Error::Internal(format!(
+            "{} is not a regular file of at most {max} bytes",
+            path.display()
+        )));
+    }
+    let mut bytes = Vec::new();
+    file.take(max + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| Error::io("read", path, e))?;
+    if bytes.len() as u64 > max {
+        return Err(Error::Internal(format!(
+            "{} grew beyond {max} bytes while it was read",
+            path.display()
+        )));
+    }
+    Ok(Some(bytes))
+}
+
 /// Remove a file if it exists. Returns whether anything was removed.
 pub fn remove_if_exists(path: &Path) -> Result<bool> {
     match fs::remove_file(path) {

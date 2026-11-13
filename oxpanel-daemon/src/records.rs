@@ -67,6 +67,70 @@ pub struct VHostRecord {
     /// The application behind this virtual host, if any.
     #[serde(default)]
     pub app: Option<AppRecord>,
+    /// Redirect plain HTTP to HTTPS / send HSTS. Both take effect only while
+    /// `tls` is set.
+    #[serde(default)]
+    pub redirect_https: bool,
+    #[serde(default)]
+    pub hsts: bool,
+    /// The installed certificate, if any.
+    #[serde(default)]
+    pub tls: Option<TlsRecord>,
+    /// Whether Automatic HTTPS looks after this site.
+    #[serde(default)]
+    pub auto_https: AutoHttpsChoice,
+}
+
+/// A site's Automatic HTTPS setting.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AutoHttpsChoice {
+    /// Looked after (whenever the host-wide switch is on).
+    #[default]
+    On,
+    /// The site opted out.
+    Off,
+}
+
+impl AutoHttpsChoice {
+    pub fn from_opt_out(opt_out: bool) -> Self {
+        if opt_out {
+            Self::Off
+        } else {
+            Self::On
+        }
+    }
+
+    pub fn is_on(self) -> bool {
+        self == Self::On
+    }
+}
+
+/// Where a certificate came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CertSource {
+    /// Installed through the API ("bring your own").
+    Uploaded,
+    /// Issued by the ACME certificate authority; renewed automatically.
+    Acme,
+}
+
+/// A virtual host's certificate. The chain is public and kept here, so the
+/// certificate file is rendered from the record like every other file; the
+/// private key exists only in its root-only file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TlsRecord {
+    pub source: CertSource,
+    /// Issuer distinguished name of the leaf certificate.
+    pub issuer: String,
+    pub not_before_unix: u64,
+    pub not_after_unix: u64,
+    /// DNS names of the leaf certificate (may contain wildcards).
+    pub names: Vec<String>,
+    /// The certificate chain exactly as written to the certificate file.
+    pub chain_pem: String,
+    pub installed_at_unix: u64,
 }
 
 /// Which interpreter runs an application.
@@ -358,6 +422,10 @@ mod tests {
             created_at_unix: 0,
             php: false,
             app: None,
+            redirect_https: false,
+            hsts: false,
+            tls: None,
+            auto_https: AutoHttpsChoice::On,
         };
         assert!(s.save_vhost(&v).is_err());
     }

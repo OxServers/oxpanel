@@ -49,6 +49,10 @@ ProtectSystem=strict
 #            forbids init_t from mounting on it, so naming it directly makes the unit fail with
 #            "Failed at step NAMESPACE" on every enforcing host (found by make acceptance).
 # /var/log/nginx: `nginx -t` opens the configured error_log for writing even in test mode.
+# HTTPS needs no further entries: certificates and keys go to /etc/pki/oxpanel (under /etc),
+# ACME signing requests and issued chains to /var/lib/oxpanel-acme (under /var/lib). The ACME
+# client itself never runs in this unit (PrivateNetwork=yes) but in a transient unit started
+# with systemd-run, as the unprivileged account oxpanel-acme.
 ReadWritePaths=/etc /home /var/lib /var/log/nginx
 ProtectHome=no
 ProtectKernelTunables=yes

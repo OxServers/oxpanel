@@ -11,6 +11,10 @@ BuildRequires:  systemd-rpm-macros
 # Rust toolchain: use `rustup` (see rust-toolchain.toml) or the rust-toolset module.
 
 Requires:       nginx
+# Certificates are checked, and ACME keys and signing requests made, with OpenSSL;
+# the ACME client trusts the system's CA bundle.
+Requires:       openssl
+Requires:       ca-certificates
 Requires:       shadow-utils
 Requires:       util-linux
 Requires:       acl
@@ -39,11 +43,12 @@ the operations over gRPC on a UNIX socket authenticated by peer credentials.
 %autosetup -n oxpanel-%{version}
 
 %build
-cargo build --release --locked -p oxpanel-daemon -p oxpanel-ctl
+cargo build --release --locked -p oxpanel-daemon -p oxpanel-ctl -p oxpanel-acme
 
 %install
 install -D -m 0755 target/release/oxpanel-daemon %{buildroot}%{_sbindir}/oxpanel-daemon
 install -D -m 0755 target/release/oxpanel-ctl    %{buildroot}%{_bindir}/oxpanel-ctl
+install -D -m 0755 target/release/oxpanel-acme   %{buildroot}%{_libexecdir}/oxpanel/oxpanel-acme
 install -D -m 0644 packaging/systemd/oxpanel-daemon.service %{buildroot}%{_unitdir}/oxpanel-daemon.service
 install -D -m 0644 packaging/sysusers.d/oxpanel.conf %{buildroot}%{_sysusersdir}/oxpanel.conf
 install -D -m 0644 packaging/tmpfiles.d/oxpanel.conf %{buildroot}%{_tmpfilesdir}/oxpanel.conf
@@ -64,6 +69,9 @@ if /usr/sbin/selinuxenabled 2>/dev/null; then /usr/sbin/setsebool -P httpd_enabl
 
 # The domain tenant applications run in, and the label of their socket directories.
 if /usr/sbin/selinuxenabled 2>/dev/null; then /usr/sbin/semodule -i %{_datadir}/oxpanel/selinux/oxpanel.cil || :; fi
+# The ACME challenge directory was created (by tmpfiles above) before the module
+# that labels it for the web server was loaded.
+if /usr/sbin/selinuxenabled 2>/dev/null; then /usr/sbin/restorecon -R /var/lib/oxpanel-acme /etc/pki/oxpanel || :; fi
 
 %preun
 %systemd_preun oxpanel-daemon.service
@@ -78,6 +86,8 @@ if [ "$1" -eq 0 ] && /usr/sbin/selinuxenabled 2>/dev/null; then /usr/sbin/semodu
 %doc oxpanel-daemon/README.md
 %{_sbindir}/oxpanel-daemon
 %{_bindir}/oxpanel-ctl
+%dir %{_libexecdir}/oxpanel
+%{_libexecdir}/oxpanel/oxpanel-acme
 %{_unitdir}/oxpanel-daemon.service
 %{_sysusersdir}/oxpanel.conf
 %{_tmpfilesdir}/oxpanel.conf

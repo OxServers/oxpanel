@@ -11,11 +11,13 @@ use tracing::{error, info, warn};
 use std::sync::Arc;
 
 use crate::auth::{PeerInfo, Scope, ScopePolicy};
+use crate::auto_https;
 use crate::ctx::Ctx;
 use crate::error::Error;
 use crate::host::{Drift, DriftKind, HostService};
-use crate::records::{AppRuntime, TenantRecord, TenantState, VHostRecord};
+use crate::records::{AppRuntime, CertSource, TenantRecord, TenantState, VHostRecord};
 use crate::tenant::TenantService;
+use crate::tls::{self, CertificateUpload, TlsService};
 use crate::validate::Limits;
 use crate::vhost::{AppRequest, LogKind, VHostRequest, VHostService};
 use oxpanel_proto::v1 as pb;
@@ -28,6 +30,7 @@ pub struct Engine {
     vhosts: VHostService,
     host: HostService,
     scopes: Arc<ScopePolicy>,
+    tls: TlsService,
 }
 
 /// Interceptor type used by [`Engine::into_service`].
@@ -39,8 +42,15 @@ impl Engine {
             scopes: Arc::new(ScopePolicy::new(ctx.config.peer_scopes.clone())),
             tenants: TenantService::new(ctx.clone()),
             vhosts: VHostService::new(ctx.clone()),
+            tls: TlsService::new(ctx.clone()),
             host: HostService::new(ctx),
         }
+    }
+
+    /// The certificate workflows, for the daemon's own renewal timer. Shares
+    /// the "request in flight" bookkeeping with the RPCs.
+    pub fn tls(&self) -> TlsService {
+        self.tls.clone()
     }
 
     /// The tonic service, wrapped so every request must carry a verified peer.
@@ -94,6 +104,16 @@ fn timestamp(unix: u64) -> prost_types::Timestamp {
     }
 }
 
+/// Run `work` on its own task, so it completes even if the RPC that started
+/// it is cancelled.
+async fn detached<T: Send + 'static>(
+    work: impl std::future::Future<Output = Result<T, Error>> + Send + 'static,
+) -> Result<T, Error> {
+    tokio::spawn(work)
+        .await
+        .map_err(|e| Error::Internal(format!("certificate task failed: {e}")))?
+}
+
 fn drift_to(d: &Drift) -> pb::Drift {
     let kind = match d.kind {
         DriftKind::TenantIncomplete => pb::DriftKind::TenantIncomplete,
@@ -109,6 +129,9 @@ fn drift_to(d: &Drift) -> pb::Drift {
         DriftKind::OrphanPhpPool => pb::DriftKind::OrphanPhpPool,
         DriftKind::AppUnitDrift => pb::DriftKind::AppUnitDrift,
         DriftKind::OrphanAppUnit => pb::DriftKind::OrphanAppUnit,
+        DriftKind::TlsCertificateDrift => pb::DriftKind::TlsCertificateDrift,
+        DriftKind::OrphanTlsFile => pb::DriftKind::OrphanTlsFile,
+        DriftKind::OrphanAutoHttpsState => pb::DriftKind::OrphanAutoHttpsState,
     };
     pb::Drift {
         kind: kind.into(),
@@ -142,6 +165,9 @@ fn fail(rpc: &'static str, peer: &str, err: Error) -> Status {
         | Error::NoApp(_)
         | Error::RuntimeTooOld { .. }
         | Error::AppPolicyMissing
+        | Error::CertificateInvalid(_)
+        | Error::TlsUnavailable
+        | Error::AcmeUnavailable(_)
         | Error::NginxInvalid(_) => {
             warn!(rpc, peer, error = %err, "request refused");
             err.into()
@@ -205,6 +231,54 @@ fn vhost_to(rec: &VHostRecord) -> pb::VirtualHost {
             root: a.root.clone(),
             entry: a.entry.clone(),
         }),
+        // Everything about the certificate except its private key.
+        certificate: rec.tls.as_ref().map(|t| pb::Certificate {
+            source: match t.source {
+                CertSource::Uploaded => pb::CertificateSource::Uploaded,
+                CertSource::Acme => pb::CertificateSource::Acme,
+            }
+            .into(),
+            issuer: t.issuer.clone(),
+            not_before: Some(timestamp(t.not_before_unix)),
+            not_after: Some(timestamp(t.not_after_unix)),
+            names: t.names.clone(),
+            uncovered_names: tls::uncovered_names(rec),
+            installed_at: Some(timestamp(t.installed_at_unix)),
+        }),
+        redirect_https: rec.redirect_https,
+        hsts: rec.hsts,
+        auto_https_opt_out: !rec.auto_https.is_on(),
+    }
+}
+
+fn auto_https_to(s: &auto_https::Status) -> pb::AutoHttpsStatus {
+    pb::AutoHttpsStatus {
+        domain: s.domain.clone(),
+        state: match s.state {
+            auto_https::State::Disabled => pb::AutoHttpsState::Disabled,
+            auto_https::State::Pending => pb::AutoHttpsState::Pending,
+            auto_https::State::Covered => pb::AutoHttpsState::Covered,
+            auto_https::State::Partial => pb::AutoHttpsState::Partial,
+            auto_https::State::Failed => pb::AutoHttpsState::Failed,
+            auto_https::State::Uploaded => pb::AutoHttpsState::Uploaded,
+            auto_https::State::Suspended => pb::AutoHttpsState::Suspended,
+        }
+        .into(),
+        covered_names: s.covered.clone(),
+        skipped: s
+            .skipped
+            .iter()
+            .map(|k| pb::AutoHttpsSkippedName {
+                name: k.name.clone(),
+                reason: k.reason.clone(),
+                next_attempt: Some(timestamp(k.next_attempt_unix)),
+                failures: k.failures,
+            })
+            .collect(),
+        last_attempt: s.last_attempt_unix.map(timestamp),
+        next_attempt: s.next_attempt_unix.map(timestamp),
+        last_error: s.last_error.clone().unwrap_or_default(),
+        pending_names: s.pending.clone(),
     }
 }
 
@@ -308,9 +382,16 @@ impl OxPanelEngine for Engine {
                 aliases: r.aliases,
                 php: r.php,
                 app,
+                redirect_https: r.redirect_https,
+                hsts: r.hsts,
+                auto_https: crate::records::AutoHttpsChoice::from_opt_out(r.auto_https_opt_out),
             })
             .await
             .map_err(|e| fail("ConfigureVirtualHost", &peer, e))?;
+        // New site or new names: Automatic HTTPS looks at it once Nginx serves it.
+        if rec.auto_https.is_on() {
+            self.tls.auto_https_soon(rec.domain.clone());
+        }
         Ok(Response::new(pb::ConfigureVirtualHostResponse {
             vhost: Some(vhost_to(&rec)),
             created,
@@ -468,6 +549,14 @@ impl OxPanelEngine for Engine {
             .set_suspended(&r.username, false)
             .await
             .map_err(|e| fail(RPC, &peer, e))?;
+        // Catch up on what was skipped while the tenant was suspended.
+        if changed {
+            if let Ok(sites) = self.vhosts.list(Some(&rec.username)).await {
+                for v in sites {
+                    self.tls.auto_https_soon(v.domain);
+                }
+            }
+        }
         Ok(updated(&rec, changed))
     }
 
@@ -520,6 +609,10 @@ impl OxPanelEngine for Engine {
             node_available: i.runtimes.node,
             python_available: i.runtimes.python,
             node_version: i.node_version,
+            tls_available: i.tls.available,
+            acme_available: i.tls.acme,
+            acme_directory_url: i.tls.acme_directory_url,
+            auto_https_enabled: self.tls.auto_https_enabled(),
         }))
     }
 
@@ -537,6 +630,126 @@ impl OxPanelEngine for Engine {
         info!(rpc = RPC, peer, findings = drifts.len(), "reconciled");
         Ok(Response::new(pb::ReconcileResponse {
             drifts: drifts.iter().map(drift_to).collect(),
+        }))
+    }
+
+    async fn install_certificate(
+        &self,
+        req: Request<pb::InstallCertificateRequest>,
+    ) -> Result<Response<pb::InstallCertificateResponse>, Status> {
+        const RPC: &str = "InstallCertificate";
+        let peer = self.authorise(&req, RPC, Scope::VHost)?;
+        let r = req.into_inner();
+        // Only the domain: the request carries a private key.
+        info!(rpc = RPC, peer, domain = %r.domain, "request");
+        let (rec, changed) = self
+            .tls
+            .install(CertificateUpload {
+                domain: r.domain,
+                chain_pem: r.certificate_chain_pem,
+                key_pem: r.private_key_pem,
+            })
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(pb::InstallCertificateResponse {
+            vhost: Some(vhost_to(&rec)),
+            changed,
+        }))
+    }
+
+    async fn remove_certificate(
+        &self,
+        req: Request<pb::RemoveCertificateRequest>,
+    ) -> Result<Response<pb::RemoveCertificateResponse>, Status> {
+        const RPC: &str = "RemoveCertificate";
+        let peer = self.authorise(&req, RPC, Scope::VHost)?;
+        let r = req.into_inner();
+        info!(rpc = RPC, peer, domain = %r.domain, "request");
+        let (rec, removed) = self
+            .tls
+            .remove(&r.domain)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(pb::RemoveCertificateResponse {
+            vhost: Some(vhost_to(&rec)),
+            removed,
+        }))
+    }
+
+    async fn request_certificate(
+        &self,
+        req: Request<pb::RequestCertificateRequest>,
+    ) -> Result<Response<pb::RequestCertificateResponse>, Status> {
+        const RPC: &str = "RequestCertificate";
+        let peer = self.authorise(&req, RPC, Scope::VHost)?;
+        let r = req.into_inner();
+        info!(rpc = RPC, peer, domain = %r.domain, "request");
+        // On its own task: a caller that gives up (deadline, disconnect) must
+        // not cut the request off between issuing and installing.
+        let tls = self.tls.clone();
+        let outcome = detached(async move { tls.request(&r.domain).await })
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(pb::RequestCertificateResponse {
+            succeeded: outcome.succeeded,
+            output: outcome.output,
+            vhost: Some(vhost_to(&outcome.vhost)),
+        }))
+    }
+
+    async fn renew_certificates(
+        &self,
+        req: Request<pb::RenewCertificatesRequest>,
+    ) -> Result<Response<pb::RenewCertificatesResponse>, Status> {
+        const RPC: &str = "RenewCertificates";
+        let peer = self.authorise(&req, RPC, Scope::VHost)?;
+        info!(rpc = RPC, peer, "request");
+        let tls = self.tls.clone();
+        let renewals = detached(async move { tls.renew_due().await })
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(pb::RenewCertificatesResponse {
+            renewals: renewals
+                .into_iter()
+                .map(|r| pb::CertificateRenewal {
+                    domain: r.domain,
+                    succeeded: r.succeeded,
+                    output: r.output,
+                })
+                .collect(),
+        }))
+    }
+
+    async fn run_auto_https(
+        &self,
+        req: Request<pb::RunAutoHttpsRequest>,
+    ) -> Result<Response<pb::RunAutoHttpsResponse>, Status> {
+        const RPC: &str = "RunAutoHttps";
+        let peer = self.authorise(&req, RPC, Scope::VHost)?;
+        let r = req.into_inner();
+        info!(rpc = RPC, peer, domain = %r.domain, "request");
+        let tls = self.tls.clone();
+        let sites = detached(async move { tls.auto_https_run(&r.domain).await })
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(pb::RunAutoHttpsResponse {
+            sites: sites.iter().map(auto_https_to).collect(),
+        }))
+    }
+
+    async fn get_auto_https_status(
+        &self,
+        req: Request<pb::GetAutoHttpsStatusRequest>,
+    ) -> Result<Response<pb::GetAutoHttpsStatusResponse>, Status> {
+        const RPC: &str = "GetAutoHttpsStatus";
+        let peer = self.authorise(&req, RPC, Scope::Read)?;
+        let r = req.into_inner();
+        let sites = self
+            .tls
+            .auto_https_status(&r.domain)
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(pb::GetAutoHttpsStatusResponse {
+            sites: sites.iter().map(auto_https_to).collect(),
         }))
     }
 }

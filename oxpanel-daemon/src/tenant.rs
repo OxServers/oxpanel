@@ -750,6 +750,10 @@ mod tests {
             created_at_unix: 0,
             php: false,
             app: None,
+            redirect_https: false,
+            hsts: false,
+            tls: None,
+            auto_https: crate::records::AutoHttpsChoice::On,
         })?;
         assert!(matches!(
             h.svc.delete("alice", false).await,

@@ -53,6 +53,8 @@ async fn start_scoped(policy: PeerPolicy, scopes: &[Scope]) -> TestServer {
         .join("conf.d")
         .join("00-oxpanel.conf");
     cfg.socket_path = dir.path().join("oxpanel.sock");
+    cfg.tls_dir = dir.path().join("pki");
+    cfg.acme_dir = dir.path().join("acme");
     if !scopes.is_empty() {
         cfg.peer_scopes.insert(
             nix::unistd::geteuid().as_raw(),
@@ -196,6 +198,9 @@ async fn full_tenant_and_vhost_lifecycle_over_uds() {
     // VHost
     let vh = client
         .configure_virtual_host(pb::ConfigureVirtualHostRequest {
+            redirect_https: false,
+            hsts: false,
+            auto_https_opt_out: false,
             domain: "example.com".into(),
             tenant: "alice".into(),
             document_root: String::new(),
@@ -313,6 +318,9 @@ async fn validation_errors_surface_as_invalid_argument_with_message() {
     assert_eq!(e.code(), Code::InvalidArgument);
     let e = client
         .configure_virtual_host(pb::ConfigureVirtualHostRequest {
+            redirect_https: false,
+            hsts: false,
+            auto_https_opt_out: false,
             domain: "not a domain".into(),
             tenant: "carol".into(),
             document_root: String::new(),
@@ -382,6 +390,9 @@ async fn management_rpcs_over_uds() {
         .expect("create");
     client
         .configure_virtual_host(pb::ConfigureVirtualHostRequest {
+            redirect_https: false,
+            hsts: false,
+            auto_https_opt_out: false,
             domain: "example.com".into(),
             tenant: "alice".into(),
             document_root: String::new(),
@@ -597,6 +608,9 @@ async fn a_scoped_peer_can_only_call_its_scopes() {
     // fails on the missing tenant, not on permissions).
     let e = client
         .configure_virtual_host(pb::ConfigureVirtualHostRequest {
+            redirect_https: false,
+            hsts: false,
+            auto_https_opt_out: false,
             domain: "example.com".into(),
             tenant: "alice".into(),
             document_root: String::new(),
@@ -607,4 +621,142 @@ async fn a_scoped_peer_can_only_call_its_scopes() {
         .await
         .expect_err("no tenant");
     assert_eq!(e.code(), Code::NotFound);
+}
+
+#[tokio::test]
+async fn certificates_over_uds_never_return_the_key() {
+    use oxpanel_daemon::system::fake_tls::{fake_certificate, fake_private_key};
+    let srv = start(allow_me()).await;
+    let mut client = connect(&srv.socket).await.expect("connect");
+    client
+        .create_tenant(pb::CreateTenantRequest {
+            username: "alice".into(),
+            owner: String::new(),
+            limits: None,
+        })
+        .await
+        .expect("create");
+    client
+        .configure_virtual_host(pb::ConfigureVirtualHostRequest {
+            domain: "example.com".into(),
+            tenant: "alice".into(),
+            aliases: vec!["www.example.com".into()],
+            redirect_https: true,
+            ..Default::default()
+        })
+        .await
+        .expect("vhost");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_secs();
+    let chain = fake_certificate("k", "CN=Test CA", now - 60, now + 86_400, &["example.com"]);
+    let key = fake_private_key("k");
+
+    let e = client
+        .install_certificate(pb::InstallCertificateRequest {
+            domain: "example.com".into(),
+            certificate_chain_pem: chain.clone(),
+            private_key_pem: fake_private_key("wrong"),
+        })
+        .await
+        .expect_err("mismatched key");
+    assert_eq!(e.code(), Code::InvalidArgument);
+    assert!(e.message().contains("does not belong"), "{}", e.message());
+
+    let r = client
+        .install_certificate(pb::InstallCertificateRequest {
+            domain: "example.com".into(),
+            certificate_chain_pem: chain,
+            private_key_pem: key.clone(),
+        })
+        .await
+        .expect("install")
+        .into_inner();
+    assert!(r.changed);
+    let v = r.vhost.expect("vhost");
+    assert!(v.redirect_https && !v.hsts);
+    let c = v.certificate.expect("certificate");
+    assert_eq!(c.source, i32::from(pb::CertificateSource::Uploaded));
+    assert_eq!(c.issuer, "CN=Test CA");
+    assert_eq!(c.names, vec!["example.com".to_owned()]);
+    assert_eq!(c.uncovered_names, vec!["www.example.com".to_owned()]);
+    assert!(c.not_after.is_some() && c.installed_at.is_some());
+
+    // No read response carries key material.
+    let listed = client
+        .list_virtual_hosts(pb::ListVirtualHostsRequest::default())
+        .await
+        .expect("list")
+        .into_inner();
+    assert!(!format!("{listed:?}").contains(key.lines().nth(1).expect("body")));
+
+    let r = client
+        .remove_certificate(pb::RemoveCertificateRequest {
+            domain: "example.com".into(),
+        })
+        .await
+        .expect("remove")
+        .into_inner();
+    assert!(r.removed && r.vhost.expect("vhost").certificate.is_none());
+
+    // ACME is not set up in this environment: refused, with the reason.
+    let e = client
+        .request_certificate(pb::RequestCertificateRequest {
+            domain: "example.com".into(),
+        })
+        .await
+        .expect_err("no ACME");
+    assert_eq!(e.code(), Code::FailedPrecondition);
+    assert!(srv
+        .config
+        .tls_dir
+        .join("example.com.key.pending")
+        .metadata()
+        .is_err());
+    let r = client
+        .renew_certificates(pb::RenewCertificatesRequest {})
+        .await
+        .expect("renew")
+        .into_inner();
+    assert!(r.renewals.is_empty());
+}
+
+#[tokio::test]
+async fn a_read_only_peer_cannot_touch_certificates() {
+    let srv = start_scoped(allow_me(), &[Scope::Read]).await;
+    let mut client = connect(&srv.socket).await.expect("connect");
+    let denied = [
+        client
+            .install_certificate(pb::InstallCertificateRequest::default())
+            .await
+            .map(|_| ()),
+        client
+            .remove_certificate(pb::RemoveCertificateRequest::default())
+            .await
+            .map(|_| ()),
+        client
+            .request_certificate(pb::RequestCertificateRequest::default())
+            .await
+            .map(|_| ()),
+        client
+            .renew_certificates(pb::RenewCertificatesRequest {})
+            .await
+            .map(|_| ()),
+        client
+            .run_auto_https(pb::RunAutoHttpsRequest::default())
+            .await
+            .map(|_| ()),
+    ];
+    for r in denied {
+        assert_eq!(r.expect_err("denied").code(), Code::PermissionDenied);
+    }
+    // Reading the Automatic HTTPS status is a read.
+    let status = client
+        .get_auto_https_status(pb::GetAutoHttpsStatusRequest::default())
+        .await
+        .expect("status")
+        .into_inner();
+    assert!(status.sites.is_empty());
+    assert!(srv.sys.calls().is_empty());
 }

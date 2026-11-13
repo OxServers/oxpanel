@@ -19,6 +19,7 @@ use oxpanel_daemon::config::Config;
 use oxpanel_daemon::ctx::Ctx;
 use oxpanel_daemon::server::Engine;
 use oxpanel_daemon::system::{bin, CommandSpec, FakeSystem, OsUser, RealSystem, System};
+use oxpanel_daemon::tls::TlsService;
 use oxpanel_daemon::{fsutil, nginx, vhost};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
@@ -199,6 +200,8 @@ async fn run(cli: Cli) -> Result<(), Fatal> {
     let listener = bind_socket(&ctx.config.socket_path, socket_gid)?;
     let incoming = auth::gate(listener, policy, ctx.sys.clone());
     let engine = Engine::new(ctx.clone());
+    tokio::spawn(renew_certificates_periodically(engine.tls()));
+    tokio::spawn(auto_https_periodically(engine.tls()));
 
     let shutdown = async {
         let mut term =
@@ -239,6 +242,44 @@ async fn run(cli: Cli) -> Result<(), Fatal> {
     served.map_err(|e| Fatal::Runtime(format!("server: {e}")))?;
     info!("stopped");
     Ok(())
+}
+
+/// Renew ACME certificates that are due: a few minutes after start-up (so a
+/// host that was switched off for a while catches up at once) and then twice
+/// a day. Failures are logged and tried again at the next round.
+async fn renew_certificates_periodically(tls: TlsService) {
+    const FIRST: Duration = Duration::from_secs(5 * 60);
+    const EVERY: Duration = Duration::from_secs(12 * 3600);
+    tokio::time::sleep(FIRST).await;
+    loop {
+        match tls.renew_due().await {
+            Ok(renewals) => {
+                for r in &renewals {
+                    if r.succeeded {
+                        info!(domain = %r.domain, "certificate renewed");
+                    } else {
+                        warn!(domain = %r.domain, output = %r.output, "certificate renewal failed; it will be tried again");
+                    }
+                }
+            }
+            Err(e) => warn!(error = %e, "could not check certificates for renewal"),
+        }
+        tokio::time::sleep(EVERY).await;
+    }
+}
+
+/// Automatic HTTPS: a minute after start-up and then every 15 minutes, give
+/// every site that needs one a certificate (back-off decides what is retried).
+async fn auto_https_periodically(tls: TlsService) {
+    if !tls.auto_https_enabled() {
+        info!("automatic HTTPS is off (OXPANEL_AUTO_HTTPS=false)");
+        return;
+    }
+    tokio::time::sleep(oxpanel_daemon::auto_https::FIRST_SWEEP_AFTER).await;
+    loop {
+        tls.auto_https_sweep().await;
+        tokio::time::sleep(oxpanel_daemon::auto_https::SWEEP_EVERY).await;
+    }
 }
 
 /// The real OS, or the in-memory fake for `--dry-run`.
