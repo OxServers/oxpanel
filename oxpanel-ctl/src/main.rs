@@ -1235,7 +1235,7 @@ async fn run_host(
                 .await?
                 .into_inner();
             say!(
-                "version={} selinux={} php={} node={} node_version={} python={} sftp={} sftp_passwords={} disk_quota={} dry_run={} tenants={} vhosts={} uid_range={}-{} load={:.2},{:.2},{:.2} memory_total={} memory_free={} home_disk_total={} home_disk_free={} uptime={} backup_disk_total={} backup_disk_free={} backup_keep={} tls={} acme={} acme_directory={} auto_https={}",
+                "version={} selinux={} php={} node={} node_version={} python={} sftp={} sftp_passwords={} disk_quota={} dry_run={} tenants={} vhosts={} uid_range={}-{} load={:.2},{:.2},{:.2} memory_total={} memory_free={} home_disk_total={} home_disk_free={} uptime={} backup_disk_total={} backup_disk_free={} backup_keep={} db_trash_days={} tls={} acme={} acme_directory={} auto_https={}",
                 i.daemon_version,
                 i.selinux_enabled,
                 i.php_available,
@@ -1265,6 +1265,7 @@ async fn run_host(
                 i.backup_disk_total_bytes,
                 i.backup_disk_free_bytes,
                 i.backup_keep,
+                i.database_trash_days,
                 // Last on the line: scripts match `auto_https=…$`.
                 i.tls_available,
                 i.acme_available,

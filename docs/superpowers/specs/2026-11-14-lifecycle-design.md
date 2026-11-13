@@ -96,13 +96,17 @@ Mechanics:
 - `DeleteDatabase` (same RPC, same `vhost` scope), in this order:
   1. read-only: the database's size; refused (`FAILED_PRECONDITION`) if the
      tenant's trash plus this size would exceed the cap — before anything;
-  2. the database record goes to `deleting`; the tenant's users lose their
+  2. the definitions of views, triggers, routines and events are captured
+     (`SHOW CREATE … ` after `USE`, `sql_mode`, `time_zone`, definer) while
+     the grants still exist: once a view's definer has lost its privileges
+     the server shows the view's stored, fully qualified text, which names
+     the old database (found by the integration test);
+  3. the database record goes to `deleting`; the tenant's users lose their
      grants on the name (`REVOKE`), and every user that held a grant has its
      sessions ended (`KILL USER`, finding 2) — so the grant stops applying
-     now and can never apply to a new database of that name;
-  3. the definitions of views, triggers, routines and events are captured
-     (`SHOW CREATE … ` after `USE`, `sql_mode`, `time_zone`, definer) and the
-     trash record is written (state `moving`) — before anything is dropped;
+     now and can never apply to a new database of that name. The objects are
+     listed again (one created in between is captured too) and the trash
+     record is written (state `moving`) — before anything is dropped;
   4. trash schema created; triggers and views dropped; all tables moved with
      **one** `RENAME TABLE` (atomic); `DROP DATABASE` (routines and events go
      with it); trash record `trashed`; database record deleted.
@@ -220,6 +224,27 @@ exist and the name must be free at once).
   either complete or not requested).
 - While a cascade job runs, no other job for the tenant is started, and the
   refusing `DeleteTenant` is refused.
+
+## Known limitations
+
+- `KILL USER` ends *all* sessions of a user that held a grant on the deleted
+  database, also those working in another database of the tenant (MariaDB
+  cannot end only the sessions inside one database). A site using that user
+  reconnects on its next request.
+- A view whose definer has no privileges any more is printed by the server
+  (and by `mariadb-dump`) with its original database name. Restored under a
+  new name it then refers to the old database (of the same tenant) or fails
+  and is reported; it never reaches another tenant's data (the definer's own
+  grants apply).
+- The dump's own work is done by MariaDB, outside the tenant's slice; only the
+  client side of it is charged to the tenant.
+- Events are re-created as they were (enabled or not). Tenants cannot create
+  events; an event in a tenant database was put there by an administrator.
+- The replay guard relies on the client never splitting inside a text that
+  does not contain the delimiter and on binary mode obeying no backslash
+  command but `\C`. Both were measured on MariaDB 10.5.29; a client that
+  behaves otherwise would need the guard revisited (the unit tests pin the
+  exact scripts).
 
 ## Not included
 

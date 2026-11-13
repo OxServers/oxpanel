@@ -1643,6 +1643,23 @@ PY
   rc=0; out="$(timeout 300 oxpanel-ctl tenant delete lcf --cascade --confirm lcf --wait)" || rc=$?; echo "$out" | tail -2
   check "repeating the request completes the half-done deletion" bash -c 'test "$1" = 0 && grep -q "state=JOB_STATE_SUCCEEDED" <<<"$2" && ! id lcf 2>/dev/null && test "$(schemas_like lcf%)" = 0' _ "$rc" "$out"
 
+  echo "-- databases and their trash are not on the tenant's disk quota"
+  if grep -q ' disk_quota=true ' <(oxpanel-ctl host info); then
+    oxpanel-ctl tenant create lcq --disk 2M >/dev/null
+    oxpanel-ctl db create lcq_big --tenant lcq >/dev/null
+    rootsql "CREATE TABLE lcq_big.b (x LONGBLOB) ENGINE=InnoDB; INSERT INTO lcq_big.b VALUES (REPEAT('x', 4194304)), (REPEAT('y', 4194304))"
+    LQUID="$(id -u lcq)"; LQFS="$(findmnt -no TARGET -T /home)"
+    # KiB charged to the uid on the file system holding the homes.
+    lq_used() { xfs_quota -x -c "report -u -n -N -b -L $LQUID -U $LQUID" "$LQFS" | awk -v u="#$LQUID" '$1 == u { print $2 }'; }
+    check "8 MiB of data in a database of a tenant limited to 2 MiB" test "$(rootsql "SELECT COUNT(*) FROM lcq_big.b")" = 2
+    check "the tenant's quota does not count its database" test "$(lq_used)" -lt 1024
+    oxpanel-ctl db delete lcq_big >/dev/null
+    check "nor the database in its trash" bash -c 'test "$1" -lt 1024 && test "$(oxpanel-ctl db trash-list lcq | grep -c " lcq_big ")" = 1' _ "$(lq_used)"
+    check "cascade-delete lcq" grep -q 'state=JOB_STATE_SUCCEEDED' <(timeout 300 oxpanel-ctl tenant delete lcq --cascade --confirm lcq --wait)
+  else
+    echo "info - no disk quotas on this host: the database/quota check is skipped"
+  fi
+
   echo "-- clean up"
   for t in lca lcb lcz; do
     check "cascade-delete $t" grep -q 'state=JOB_STATE_SUCCEEDED' <(timeout 300 oxpanel-ctl tenant delete "$t" --cascade --confirm "$t" --wait)
