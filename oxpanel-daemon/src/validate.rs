@@ -698,9 +698,210 @@ impl SshPublicKey {
     }
 }
 
+/// Longest suffix of a database or database-user name. With the longest
+/// tenant name (32) and the separator the result is 57 characters, inside
+/// MariaDB's limits (64 for a database, 80 for a user name in 10.5).
+const DB_SUFFIX_MAX: usize = 24;
+/// The separator between the tenant name and the suffix.
+pub const DB_SEPARATOR: char = '_';
+/// Names of MariaDB's own schemas and accounts. The grammar below cannot
+/// produce most of them; `information_schema` and `performance_schema` it
+/// could (a tenant called `information`), so they are refused by name.
+const DB_RESERVED: &[&str] = &[
+    "mysql",
+    "information_schema",
+    "performance_schema",
+    "sys",
+    "root",
+    "mariadb.sys",
+    "test",
+];
+pub const DB_PASSWORD_MIN: usize = 8;
+pub const DB_PASSWORD_MAX: usize = 128;
+
+/// A validated name of a MariaDB database or database user:
+/// `<tenant>_<suffix>` with suffix `^[a-z0-9]{1,24}$`.
+///
+/// The suffix cannot contain the separator, so the tenant is always the text
+/// before the *last* `_` — unambiguous even though tenant names may contain
+/// `_` themselves (`acme_shop_wp` belongs to tenant `acme_shop`, and tenant
+/// `acme` can never create it). Two tenants can therefore never collide, and
+/// the name contains nothing that needs escaping in an SQL identifier or
+/// string (no quote, backtick or backslash).
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct DbName {
+    name: String,
+    tenant: Username,
+}
+
+impl DbName {
+    /// Parse a name whose owner is derived from the name itself.
+    pub fn parse(raw: &str, field: &'static str) -> Result<Self> {
+        let bad = || {
+            Error::invalid(
+                field,
+                format!(
+                    "must be <tenant>_<suffix>, suffix 1..={DB_SUFFIX_MAX} characters a-z, 0-9"
+                ),
+            )
+        };
+        if DB_RESERVED.contains(&raw) {
+            return Err(Error::invalid(field, "name is reserved"));
+        }
+        let (tenant, suffix) = raw.rsplit_once(DB_SEPARATOR).ok_or_else(bad)?;
+        if suffix.is_empty()
+            || suffix.len() > DB_SUFFIX_MAX
+            || !suffix
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+        {
+            return Err(bad());
+        }
+        let tenant = Username::parse_field(tenant, field).map_err(|_| bad())?;
+        Ok(Self {
+            name: raw.to_owned(),
+            tenant,
+        })
+    }
+
+    /// Parse a name that must belong to `tenant`.
+    pub fn parse_for(raw: &str, tenant: &Username, field: &'static str) -> Result<Self> {
+        let name = Self::parse(raw, field)?;
+        if &name.tenant != tenant {
+            return Err(Error::invalid(
+                field,
+                format!("must start with the tenant name and '_' ({tenant}_...)"),
+            ));
+        }
+        Ok(name)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.name
+    }
+
+    /// The tenant this name belongs to.
+    pub fn tenant(&self) -> &Username {
+        &self.tenant
+    }
+}
+
+impl fmt::Display for DbName {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.name)
+    }
+}
+
+/// A database user's password as it arrived in a request: 8..=128
+/// characters without control characters. Policy (strength, rotation) is the
+/// panel's; this is the engine's last line of defence. The value is never
+/// printed: `Debug` is redacted and there is no `Display`.
+#[derive(Clone, PartialEq, Eq)]
+pub struct DbPassword(String);
+
+impl DbPassword {
+    pub fn parse(raw: &str) -> Result<Self> {
+        let field = "password";
+        let n = raw.chars().count();
+        if !(DB_PASSWORD_MIN..=DB_PASSWORD_MAX).contains(&n) {
+            return Err(Error::invalid(
+                field,
+                format!("must be {DB_PASSWORD_MIN}..={DB_PASSWORD_MAX} characters"),
+            ));
+        }
+        if raw.chars().any(char::is_control) {
+            return Err(Error::invalid(field, "must not contain control characters"));
+        }
+        Ok(Self(raw.to_owned()))
+    }
+
+    /// The secret itself; only the hashing code may ask for it.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for DbPassword {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("DbPassword(<redacted>)")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn db_names_belong_to_exactly_one_tenant() -> Result<()> {
+        let acme = Username::parse("acme")?;
+        let acme_shop = Username::parse("acme_shop")?;
+        let n = DbName::parse_for("acme_wp", &acme, "name")?;
+        assert_eq!((n.as_str(), n.tenant()), ("acme_wp", &acme));
+        // The tenant is the text before the last separator.
+        assert_eq!(DbName::parse("acme_shop_wp", "name")?.tenant(), &acme_shop);
+        assert!(is_invalid(DbName::parse_for("acme_shop_wp", &acme, "name")));
+        assert!(DbName::parse_for("acme_shop_wp", &acme_shop, "name").is_ok());
+        assert_eq!(
+            DbName::parse("foo-bar_db1", "name")?.tenant().as_str(),
+            "foo-bar"
+        );
+        let longest = format!("{}_{}", "x".repeat(32), "9".repeat(24));
+        assert_eq!(longest.len(), 57);
+        assert!(DbName::parse(&longest, "name").is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn db_names_reject_injection_reserved_and_foreign_names() {
+        let too_long = format!("acme_{}", "a".repeat(25));
+        for bad in [
+            "",
+            "acme",
+            "acme_",
+            "_wp",
+            "acme_WP",
+            "acme_w-p",
+            "acme_w.p",
+            "acme_wp`; DROP DATABASE mysql; --",
+            "acme_wp'",
+            "acme_wp\"",
+            "acme_wp\\",
+            "acme_wp;",
+            "acme_wp ",
+            "acme_w%",
+            "acme_wp\n",
+            "acme_wp\0",
+            "acme_ẅp",
+            "mysql",
+            "sys",
+            "root",
+            "information_schema",
+            "performance_schema",
+            "mariadb.sys",
+            "root_x",
+            "mysql_x",
+            "ab_x",
+            "Acme_wp",
+            "acme`_wp",
+            "acme'@'%_x",
+            too_long.as_str(),
+        ] {
+            assert!(is_invalid(DbName::parse(bad, "name")), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn db_password_bounds_and_redaction() -> Result<()> {
+        assert!(is_invalid(DbPassword::parse("")));
+        assert!(is_invalid(DbPassword::parse("short77")));
+        assert!(is_invalid(DbPassword::parse(&"a".repeat(129))));
+        assert!(is_invalid(DbPassword::parse("line\nbreak-pw")));
+        assert!(is_invalid(DbPassword::parse("nul\0byte-pw")));
+        let p = DbPassword::parse("it's \"quoted\" \\ `päss` ; --")?;
+        assert_eq!(p.expose(), "it's \"quoted\" \\ `päss` ; --");
+        assert_eq!(format!("{p:?}"), "DbPassword(<redacted>)");
+        Ok(())
+    }
 
     fn is_invalid<T: fmt::Debug>(r: Result<T>) -> bool {
         matches!(r, Err(Error::InvalidInput { .. }))

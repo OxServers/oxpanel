@@ -53,6 +53,9 @@ ProtectSystem=strict
 #            labelled semanage_store_t, a SELinux *security* file type, and the targeted policy
 #            forbids init_t from mounting on it, so naming it directly makes the unit fail with
 #            "Failed at step NAMESPACE" on every enforcing host (found by make acceptance).
+#            It also holds the MariaDB socket (/var/lib/mysql/mysql.sock): connecting to a UNIX
+#            socket needs no write access to its mount, and PrivateNetwork does not affect
+#            path-based sockets. The `mariadb` client runs with --no-defaults and --protocol=socket.
 # /var/log/nginx: `nginx -t` opens the configured error_log for writing even in test mode.
 # HTTPS needs no further entries: certificates and keys go to /etc/pki/oxpanel (under /etc),
 # ACME signing requests and issued chains to /var/lib/oxpanel-acme (under /var/lib). The ACME

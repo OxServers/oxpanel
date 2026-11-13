@@ -47,6 +47,13 @@ case "$INSTALL" in
   *) fail "unknown INSTALL=$INSTALL";;
 esac
 
+# Tenant databases are optional; set MariaDB up exactly as HANDBOOK §3.5 says.
+handbook_block "### 3.5 " > install-mariadb.sh
+[ -s install-mariadb.sh ] || fail "could not extract the §3.5 MariaDB block from HANDBOOK.md"
+if ! bash -e install-mariadb.sh > install-mariadb.log 2>&1; then tail -30 install-mariadb.log; fail "handbook §3.5 MariaDB block failed"; fi
+ok "handbook §3.5 MariaDB block ran clean"
+check "MariaDB is active" systemctl -q is-active mariadb
+
 check "oxpanel group exists" getent group oxpanel
 check "daemon.env is root-owned 0640" test "$(stat -c '%U %a' /etc/oxpanel/daemon.env)" = "root 640"
 check "config dir is root:oxpanel 0750" test "$(stat -c '%U:%G %a' /etc/oxpanel)" = "root:oxpanel 750"

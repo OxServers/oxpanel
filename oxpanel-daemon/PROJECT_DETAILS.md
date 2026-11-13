@@ -112,7 +112,7 @@ deny.toml                       cargo-deny policy
 
 ## 8. Panels and the engine (root / reseller / customer)
 
-The proprietary layer will expose three WHM-style panels. The engine stays
+The proprietary layer will expose three panels (root administrator, reseller, customer). The engine stays
 role-agnostic: all three reach it through the single `panelapi` service
 account, and authorisation (a customer may only touch their own virtual hosts,
 a reseller only tenants with their `owner` label, root everything) is enforced

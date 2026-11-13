@@ -642,15 +642,16 @@ JSON
   # it mounts them on ramfs inside the user namespace, where the unit's user
   # cannot read them. Probe that exact situation; the acceptance VM (phase
   # 20) always runs the check.
-  printf probe > /root/cred-probe; chmod 0600 /root/cred-probe
-  if systemd-run --wait --collect --quiet --unit=oxpanel-it-credprobe -p User=oxpanel-acme \
-       -p LoadCredential=p:/root/cred-probe /usr/bin/test -r /run/credentials/oxpanel-it-credprobe.service/p 2>/dev/null; then
+  # (The probe loads the very file the daemon hands over, so that systemd
+  # and SELinux treat it as they treat the real request. An issued
+  # certificate needs no probe: the full check below then applies.)
+  if grep -q "^succeeded=true" <<<"$out" || systemd-run --wait --collect --quiet --unit=oxpanel-it-credprobe -p User=oxpanel-acme \
+       -p LoadCredential=p:/etc/oxpanel/acme-eab /usr/bin/test -r /run/credentials/oxpanel-it-credprobe.service/p 2>/dev/null; then
     check "EAB: with the binding the certificate is issued" bash -c 'grep -q "^succeeded=true" <<<"$1" && grep -q " source=acme " <<<"$1" && grep -q "binding the account to an external account" <<<"$1"' _ "$out"
   else
     echo "info - SKIPPED here (runs on the acceptance VM): this container's systemd cannot pass a credential to an unprivileged unit"
     check "EAB: the client was given the binding and could not read it in this container" bash -c 'journalctl --no-pager -b -u oxpanel-acme-eab.test | grep -q "cannot read the EAB credential"'
   fi
-  rm -f /root/cred-probe
   check "EAB: the HMAC key never reached the journal or a command line" bash -c '! journalctl --no-pager -b | grep -qF "$1"' _ "$EAB_KEY"
   oxpanel-ctl vhost remove eab.test >/dev/null
   systemctl stop oxpanel-it-pebble-eab
@@ -923,6 +924,165 @@ else
   out="$(oxpanel-ctl tenant create quotab --disk 1G 2>&1 || true)"; echo "$out"
   check "a disk limit is refused, saying what to do" bash -c 'grep -q "FailedPrecondition" <<<"$1" && grep -q "uquota" <<<"$1"' _ "$out"
   check_not "and nothing was created" id quotab
+fi
+
+echo "== databases (MariaDB)"
+if [ -x /usr/bin/mariadb ] && systemctl cat mariadb.service >/dev/null 2>&1 && rpm -q php-mysqlnd >/dev/null 2>&1; then
+  if ! systemctl -q is-active mariadb; then
+    # What docs/HANDBOOK.md §3.5 tells the operator to do (the acceptance VM ran it in phase 10).
+    systemctl enable --now mariadb
+    mariadb --no-defaults --user=root <<'SQL'
+DELETE FROM mysql.global_priv WHERE User='';
+DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%';
+DROP DATABASE IF EXISTS test;
+FLUSH PRIVILEGES;
+SQL
+    printf '[mysqld]\nskip-networking\n' > /etc/my.cnf.d/oxpanel-local.cnf
+    systemctl restart mariadb
+  fi
+  rootsql() { mariadb --no-defaults --user=root --batch --raw --skip-column-names -e "$1"; }
+  # $1 user, $2 password, $3 SQL: as the tenant's database user, over the socket.
+  usersql() { MYSQL_PWD="$2" mariadb --no-defaults --protocol=socket --user="$1" --batch --skip-column-names -e "$3"; }
+  export -f rootsql usersql
+  check "host info reports MariaDB" grep -qE '^database_engine=mariadb available=true version=10\.' <(oxpanel-ctl host info)
+  check "MariaDB does not listen on the network" bash -c '! ss -ltnp 2>/dev/null | grep -q mariadbd'
+  oxpanel-ctl tenant create carol >/dev/null
+  oxpanel-ctl tenant create dave >/dev/null
+  DBPW='Carol-DB-pass-4711'
+  DAVEPW="it's \"quoted\" \\ ; -- DROP"
+
+  # Watch argv of every process and MariaDB's process list while passwords travel.
+  : > /root/db-ps.log
+  ( while :; do ps -eo args >> /root/db-ps.log; rootsql 'SELECT IFNULL(INFO, "") FROM information_schema.PROCESSLIST' >> /root/db-ps.log 2>/dev/null; sleep 0.05; done ) &
+  watcher=$!
+  out="$(oxpanel-ctl db create carol_wp --tenant carol)"
+  check "database created" bash -c 'grep -q "^created=true" <<<"$1" && grep -q "database=carol_wp tenant=carol engine=mariadb" <<<"$1"' _ "$out"
+  check "replay is idempotent" grep -q '^created=false' <(oxpanel-ctl db create carol_wp --tenant carol)
+  check "the database exists on the server" grep -qx carol_wp <(rootsql 'SHOW DATABASES')
+  out="$(printf '%s\n' "$DBPW" | oxpanel-ctl db user-create carol_app --tenant carol)"
+  check "database user created (password on stdin)" grep -q '^created=true' <<<"$out"
+  check "the account is local only, with a connection limit" test "$(rootsql "SELECT Host, max_user_connections FROM mysql.user WHERE User='carol_app'")" = "localhost	25"
+  check "the account holds no global privilege" test "$(rootsql "SELECT COUNT(*) FROM information_schema.USER_PRIVILEGES WHERE GRANTEE = \"'carol_app'@'localhost'\" AND PRIVILEGE_TYPE <> 'USAGE'")" = 0
+  check "grant on the tenant's own database" grep -q '^changed=true' <(oxpanel-ctl db grant carol_app carol_wp)
+  check "the grant pattern escapes _ (no wildcard)" grep -qF 'ON `carol\_wp`.*' <(rootsql "SHOW GRANTS FOR 'carol_app'@'localhost'")
+  check "no GRANT OPTION, FILE, SUPER or PROCESS" bash -c '! rootsql "SHOW GRANTS FOR '"'"'carol_app'"'"'@'"'"'localhost'"'"'" | grep -qE "GRANT OPTION|FILE|SUPER|PROCESS|ALL PRIVILEGES"'
+  oxpanel-ctl db create dave_wp --tenant dave >/dev/null
+  printf '%s\n' "$DAVEPW" | oxpanel-ctl db user-create dave_app --tenant dave >/dev/null
+  oxpanel-ctl db grant dave_app dave_wp >/dev/null
+  check "a password full of SQL metacharacters works" test "$(usersql dave_app "$DAVEPW" 'SELECT CURRENT_USER()')" = "dave_app@localhost"
+  printf '%s\n' "$DBPW-changed" | oxpanel-ctl db user-passwd carol_app >/dev/null
+  check "password change takes effect" test "$(usersql carol_app "$DBPW-changed" 'SELECT 1')" = 1
+  check_not "the old password no longer works" usersql carol_app "$DBPW" 'SELECT 1'
+  printf '%s\n' "$DBPW" | oxpanel-ctl db user-passwd carol_app >/dev/null
+  kill "$watcher"; wait "$watcher" 2>/dev/null || true
+  check "watcher saw processes and MariaDB statements" test "$(wc -l < /root/db-ps.log)" -gt 100
+  check "no password in any process argv or the MariaDB process list" bash -c '! grep -qF -e "$1" -e "Carol-DB-pass" -e "quoted" /root/db-ps.log' _ "$DAVEPW"
+  check "no password and no password hash in the daemon journal" bash -c '! journalctl -u oxpanel-daemon --no-pager | grep -qE "Carol-DB-pass|quoted|\*[0-9A-F]{40}"'
+
+  check "user sees only its own database" test "$(usersql carol_app "$DBPW" 'SHOW DATABASES' | grep -v information_schema)" = carol_wp
+  check_not "user cannot read mysql.*" usersql carol_app "$DBPW" 'SELECT User FROM mysql.user'
+  check_not "user cannot reach another tenant's database" usersql carol_app "$DBPW" 'CREATE TABLE dave_wp.x (i INT)'
+  check_not "user cannot create a database next to its own" usersql carol_app "$DBPW" 'CREATE DATABASE carolXwp'
+  check "user cannot read files" test "$(usersql carol_app "$DBPW" "SELECT LOAD_FILE('/etc/passwd') IS NULL")" = 1
+  check_not "user cannot hand out access" usersql carol_app "$DBPW" "GRANT SELECT ON carol_wp.* TO 'dave_app'@'localhost'"
+  check_not "grant across tenants is refused" oxpanel-ctl db grant carol_app dave_wp
+  for bad in 'carol_wp`; DROP DATABASE mysql; --' "carol_wp'; DROP USER 'root'@'localhost'; --" 'carol_w%' 'carol\_wp' 'mysql' 'dave_x' 'carol_' 'carol_WP'; do
+    check_not "hostile name refused: $bad" oxpanel-ctl db create "$bad" --tenant carol
+    check_not "hostile user name refused: $bad" bash -c 'printf "%s\n" "$2" | oxpanel-ctl db user-create "$1" --tenant carol' _ "$bad" "$DBPW"
+    check_not "hostile grant refused: $bad" oxpanel-ctl db grant carol_app "$bad"
+  done
+  check "the server's own schemas are intact" test "$(rootsql "SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME IN ('mysql','information_schema','performance_schema')")" = 3
+  check "no unrecorded object was created" test "$(rootsql "SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME LIKE 'carol%'")" = 1
+  check_not "short passwords are refused by the engine" bash -c 'printf "short\n" | oxpanel-ctl db user-create carol_two --tenant carol'
+  rootsql "CREATE DATABASE carol_legacy"
+  check_not "a database OxPanel did not create is never adopted" oxpanel-ctl db create carol_legacy --tenant carol
+  check "nor dropped" bash -c 'oxpanel-ctl db delete carol_legacy | grep -q "^deleted=false" && rootsql "SHOW DATABASES" | grep -qx carol_legacy'
+  check "an unrecorded object with a tenant prefix is drift" bash -c 'oxpanel-ctl host reconcile | grep -q "kind=DRIFT_KIND_ORPHAN_DATABASE_OBJECT subject=carol_legacy"'
+  rootsql "DROP DATABASE carol_legacy"
+  check "databases are not drift" grep -q '^drifts=0$' <(oxpanel-ctl host reconcile)
+
+  echo "-- a PHP site using its database"
+  oxpanel-ctl vhost set db.test --tenant carol --php >/dev/null
+  as_user carol sh -c 'cat > /home/carol/public_html/index.php' <<PHP
+<?php
+mysqli_report(MYSQLI_REPORT_OFF);
+\$db = @new mysqli('localhost', 'carol_app', '$DBPW', 'carol_wp', 0, '/var/lib/mysql/mysql.sock');
+if (\$db->connect_errno) { echo 'connect-failed ', \$db->connect_errno, ' ', \$db->connect_error; exit; }
+\$db->query('CREATE TABLE IF NOT EXISTS notes (id INT AUTO_INCREMENT PRIMARY KEY, body VARCHAR(64))');
+\$db->query("INSERT INTO notes (body) VALUES ('hello')");
+\$r = \$db->query("SELECT body FROM notes WHERE body = 'hello' LIMIT 1");
+\$read = (\$r && \$r->fetch_row()[0] === 'hello') ? 'ok' : 'failed';
+\$other = @\$db->select_db('dave_wp') ? 'OPEN' : 'denied';
+\$sys = @\$db->query('SELECT User FROM mysql.user') ? 'OPEN' : 'denied';
+echo "write+read=\$read other=\$other mysql=\$sys";
+PHP
+  check "PHP writes and reads its own database, and nothing else" body_eventually db.test / "write+read=ok other=denied mysql=denied"
+  check "rows written by PHP are in the tenant's database" test "$(rootsql 'SELECT COUNT(*) > 0 FROM carol_wp.notes')" = 1
+  check "database size is reported" bash -c 'oxpanel-ctl db list --tenant carol | grep -qE "^database=carol_wp tenant=carol engine=mariadb size=[1-9][0-9]* "'
+
+  echo "-- an application connecting to the database socket"
+  oxpanel-ctl vhost set dbapp.test --tenant carol --app python --app-root apps/dbapp --app-entry main.py >/dev/null
+  as_user carol sh -c 'cat > /home/carol/apps/dbapp/main.py' <<'PY'
+import os, socket
+from http.server import BaseHTTPRequestHandler
+from socketserver import UnixStreamServer
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        try:
+            s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            s.connect('/var/lib/mysql/mysql.sock')
+            greeting = 'ok' if b'MariaDB' in s.recv(256) else 'unexpected'
+            s.close()
+        except OSError as e:
+            greeting = 'failed:' + type(e).__name__
+        body = f"db-greeting={greeting}".encode()
+        self.send_response(200)
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *args):
+        pass
+
+UnixStreamServer(os.environ['PORT'], Handler).serve_forever()
+PY
+  oxpanel-ctl vhost restart-app dbapp.test >/dev/null
+  check "an application (its own SELinux domain) reaches the MariaDB socket" body_eventually dbapp.test / "db-greeting=ok"
+  oxpanel-ctl vhost remove dbapp.test >/dev/null
+
+  echo "-- suspension, reconcile, lifecycle"
+  usersql carol_app "$DBPW" 'SELECT SLEEP(30)' >/dev/null 2>&1 &
+  sleeper=$!
+  sleep 0.5
+  oxpanel-ctl tenant suspend carol >/dev/null
+  check_not "suspension locks the tenant's database accounts" usersql carol_app "$DBPW" 'SELECT 1'
+  check "the server says why" grep -q 'locked' <(usersql carol_app "$DBPW" 'SELECT 1' 2>&1 || true)
+  check "suspension ends open sessions" bash -c 'for i in $(seq 1 50); do kill -0 "$1" 2>/dev/null || exit 0; sleep 0.1; done; exit 1' _ "$sleeper"
+  check "other tenants' accounts stay unlocked" test "$(usersql dave_app "$DAVEPW" 'SELECT 1')" = 1
+  check "a suspended tenant is not drift" grep -q '^drifts=0$' <(oxpanel-ctl host reconcile)
+  oxpanel-ctl tenant resume carol >/dev/null
+  check "resume unlocks them" test "$(usersql carol_app "$DBPW" 'SELECT 1')" = 1
+  rootsql "GRANT FILE ON *.* TO 'carol_app'@'localhost'; GRANT SELECT ON \`dave\\_wp\`.* TO 'carol_app'@'localhost'"
+  out="$(oxpanel-ctl host reconcile || true)"
+  check "reconcile reports privileges added by hand" bash -c 'grep -q "kind=DRIFT_KIND_DATABASE_PRIVILEGE_DRIFT subject=carol_app .*global privileges: FILE" <<<"$1" && grep -q "SELECT on .dave" <<<"$1"' _ "$out"
+  check "reconcile exits 3 on drift" bash -c 'oxpanel-ctl host reconcile >/dev/null; test $? -eq 3'
+  rootsql "REVOKE FILE ON *.* FROM 'carol_app'@'localhost'; REVOKE SELECT ON \`dave\\_wp\`.* FROM 'carol_app'@'localhost'"
+  rootsql "DROP USER 'dave_app'@'localhost'"
+  check "a missing account is drift" grep -q 'kind=DRIFT_KIND_DATABASE_USER_MISSING subject=dave_app' <(oxpanel-ctl host reconcile || true)
+  printf '%s\n' "$DAVEPW" | oxpanel-ctl db user-passwd dave_app >/dev/null
+  check "setting the password re-creates it with its grants" test "$(usersql dave_app "$DAVEPW" 'SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME = "dave_wp"')" = 1
+  check "no drift after healing" grep -q '^drifts=0$' <(oxpanel-ctl host reconcile)
+  check_not "a tenant with databases cannot be deleted" oxpanel-ctl tenant delete dave
+  check "deleting a database revokes it and drops it" bash -c 'oxpanel-ctl db delete dave_wp | grep -q "^deleted=true" && ! rootsql "SHOW DATABASES" | grep -qx dave_wp && oxpanel-ctl db user-list --tenant dave | grep -q "databases=- "'
+  check "deleting a user drops the account" bash -c 'oxpanel-ctl db user-delete dave_app | grep -q "^deleted=true" && test "$(rootsql "SELECT COUNT(*) FROM mysql.user WHERE User=\"dave_app\"")" = 0'
+  oxpanel-ctl vhost remove db.test >/dev/null
+  oxpanel-ctl db user-delete carol_app >/dev/null
+  oxpanel-ctl db delete carol_wp >/dev/null
+  check "tenants without databases can be deleted" bash -c 'oxpanel-ctl tenant delete carol --remove-home | grep -q "^deleted=true" && oxpanel-ctl tenant delete dave --remove-home | grep -q "^deleted=true"'
+  check "nothing of the tenants is left on the server" test "$(rootsql "SELECT (SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME LIKE 'carol%' OR SCHEMA_NAME LIKE 'dave%') + (SELECT COUNT(*) FROM mysql.user WHERE User LIKE 'carol%' OR User LIKE 'dave%')")" = 0
+  check "no drift after database teardown" grep -q '^drifts=0$' <(oxpanel-ctl host reconcile)
+else
+  echo "skip - MariaDB or php-mysqlnd not installed"
 fi
 
 echo "== dry-run mode: the whole daemon against a fake OS, as an unprivileged user"

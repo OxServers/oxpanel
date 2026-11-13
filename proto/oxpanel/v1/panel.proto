@@ -94,6 +94,27 @@ service OxPanelEngine {
   // Remove the tenant's SFTP password: it cannot start a new session.
   // Running sessions continue unless `end_sessions` is set.
   rpc ClearSftpPassword(ClearSftpPasswordRequest) returns (ClearSftpPasswordResponse);
+  // --- Databases ----------------------------------------------------------
+  // Databases and database users are named "<tenant>_<suffix>" and live on
+  // one engine (DatabaseEngine; today only MariaDB). Names are unique across
+  // engines, so every call after creation addresses an object by name alone.
+  // FAILED_PRECONDITION on every call below (except the lists) when the
+  // engine is not installed, not running or not reachable on its UNIX socket.
+  //
+  // Create a database owned by a tenant.
+  rpc CreateDatabase(CreateDatabaseRequest) returns (CreateDatabaseResponse);
+  rpc ListDatabases(ListDatabasesRequest) returns (ListDatabasesResponse);
+  // Drop a database OxPanel created, with everything in it.
+  rpc DeleteDatabase(DeleteDatabaseRequest) returns (DeleteDatabaseResponse);
+  // Create a database user owned by a tenant. It may connect only locally
+  // and holds no privileges until it is granted a database.
+  rpc CreateDatabaseUser(CreateDatabaseUserRequest) returns (CreateDatabaseUserResponse);
+  rpc ListDatabaseUsers(ListDatabaseUsersRequest) returns (ListDatabaseUsersResponse);
+  rpc SetDatabaseUserPassword(SetDatabaseUserPasswordRequest) returns (SetDatabaseUserPasswordResponse);
+  rpc DeleteDatabaseUser(DeleteDatabaseUserRequest) returns (DeleteDatabaseUserResponse);
+  // Let a tenant's user work in a database of the same tenant.
+  rpc GrantDatabaseAccess(GrantDatabaseAccessRequest) returns (GrantDatabaseAccessResponse);
+  rpc RevokeDatabaseAccess(RevokeDatabaseAccessRequest) returns (RevokeDatabaseAccessResponse);
 }
 
 // Per-tenant resource limits, applied through systemd (cgroups v2).
@@ -382,6 +403,29 @@ message HostInfo {
   // true). When false, SetSftpPassword is refused and sshd offers password
   // authentication to no tenant.
   bool sftp_passwords_allowed = 27;
+  // One entry per database engine the engine supports (today: MariaDB),
+  // whether or not it is installed.
+  repeated DatabaseEngineInfo database_engines = 28;
+  // 29..=31 were set aside for databases and are still unused.
+}
+
+// Database engines OxPanel can manage. More will follow (PostgreSQL,
+// MongoDB); each is an optional host package.
+enum DatabaseEngine {
+  // In a request: the default engine, MariaDB.
+  DATABASE_ENGINE_UNSPECIFIED = 0;
+  DATABASE_ENGINE_MARIADB = 1;
+}
+
+message DatabaseEngineInfo {
+  DatabaseEngine engine = 1;
+  // Installed and answering on its UNIX socket, so tenants may have
+  // databases on it.
+  bool available = 2;
+  // Server version, e.g. "10.5.29-MariaDB"; empty when not available.
+  string version = 3;
+  uint32 database_count = 4;
+  uint32 database_user_count = 5;
 }
 
 message ReconcileRequest {}
@@ -432,6 +476,20 @@ enum DriftKind {
   // The kernel's disk quota for a tenant differs from its recorded limit,
   // or the host no longer enforces quotas.
   DRIFT_KIND_DISK_QUOTA_DRIFT = 21;
+  // A recorded database does not exist on the MariaDB server, its record is
+  // in an interrupted state, or the server could not be asked.
+  DRIFT_KIND_DATABASE_MISSING = 22;
+  // A recorded database user does not exist on the server, or its record is
+  // in an interrupted state.
+  DRIFT_KIND_DATABASE_USER_MISSING = 23;
+  // A database user's privileges, lock state, connection limit or
+  // authentication differ from its record (for example a privilege granted
+  // by hand), or an account OxPanel does not manage holds privileges on a
+  // managed database.
+  DRIFT_KIND_DATABASE_PRIVILEGE_DRIFT = 24;
+  // A database or account on the server that carries a tenant's prefix but
+  // has no record.
+  DRIFT_KIND_ORPHAN_DATABASE_OBJECT = 25;
 }
 
 message Drift {
@@ -694,4 +752,131 @@ message ClearSftpPasswordResponse {
   // false when the tenant had no SFTP password.
   bool cleared = 1;
   Tenant tenant = 2;
+}
+
+// A database owned by a tenant.
+message Database {
+  // "<tenant>_<suffix>", suffix ^[a-z0-9]{1,24}$.
+  string name = 1;
+  string tenant = 2;
+  // Data plus indexes as the server reports them; 0 when the server could
+  // not be asked.
+  uint64 size_bytes = 3;
+  google.protobuf.Timestamp created_at = 4;
+  DatabaseEngine engine = 5;
+}
+
+// A database account owned by a tenant; on MariaDB '<name>'@'localhost'
+// (UNIX socket or loopback only). The password is never stored by the
+// engine nor returned.
+message DatabaseUser {
+  // "<tenant>_<suffix>", suffix ^[a-z0-9]{1,24}$.
+  string name = 1;
+  string tenant = 2;
+  // Databases (of the same tenant) this user may work in.
+  repeated string databases = 3;
+  // Most simultaneous connections (MariaDB MAX_USER_CONNECTIONS).
+  uint32 max_connections = 4;
+  google.protobuf.Timestamp created_at = 5;
+  DatabaseEngine engine = 6;
+}
+
+message CreateDatabaseRequest {
+  string tenant = 1;
+  // Full name; must start with "<tenant>_".
+  string name = 2;
+  // UNSPECIFIED = MariaDB.
+  DatabaseEngine engine = 3;
+}
+
+message CreateDatabaseResponse {
+  Database database = 1;
+  // false when the database already existed.
+  bool created = 2;
+}
+
+message ListDatabasesRequest {
+  // Empty = all tenants.
+  string tenant = 1;
+}
+
+message ListDatabasesResponse {
+  repeated Database databases = 1;
+}
+
+message DeleteDatabaseRequest {
+  string name = 1;
+}
+
+message DeleteDatabaseResponse {
+  // false when OxPanel has no such database.
+  bool deleted = 1;
+}
+
+message CreateDatabaseUserRequest {
+  string tenant = 1;
+  // Full name; must start with "<tenant>_".
+  string name = 2;
+  // 8..=128 characters, no control characters. Used once to derive what the
+  // server stores; never logged, stored or returned. Repeating the request
+  // for a user that exists does NOT change its password (use
+  // SetDatabaseUserPassword).
+  string password = 3;
+  // UNSPECIFIED = MariaDB. A user can only be granted databases of its engine.
+  DatabaseEngine engine = 4;
+}
+
+message CreateDatabaseUserResponse {
+  DatabaseUser user = 1;
+  // false when the user already existed.
+  bool created = 2;
+}
+
+message ListDatabaseUsersRequest {
+  // Empty = all tenants.
+  string tenant = 1;
+}
+
+message ListDatabaseUsersResponse {
+  repeated DatabaseUser users = 1;
+}
+
+message SetDatabaseUserPasswordRequest {
+  string name = 1;
+  // Same rules as CreateDatabaseUserRequest.password.
+  string password = 2;
+}
+
+message SetDatabaseUserPasswordResponse {}
+
+message DeleteDatabaseUserRequest {
+  string name = 1;
+}
+
+message DeleteDatabaseUserResponse {
+  // false when OxPanel has no such user.
+  bool deleted = 1;
+}
+
+message GrantDatabaseAccessRequest {
+  string user = 1;
+  // Must belong to the same tenant as `user`.
+  string database = 2;
+}
+
+message GrantDatabaseAccessResponse {
+  DatabaseUser user = 1;
+  // false when the user already had access.
+  bool changed = 2;
+}
+
+message RevokeDatabaseAccessRequest {
+  string user = 1;
+  string database = 2;
+}
+
+message RevokeDatabaseAccessResponse {
+  DatabaseUser user = 1;
+  // false when the user had no access.
+  bool changed = 2;
 }

@@ -32,6 +32,11 @@ Recommends:     npm
 # handbook). Without them, those features are reported unavailable.
 Recommends:     openssh-server
 Recommends:     xfsprogs
+# Tenant databases are optional too, and a database server is a decision for
+# the operator (HANDBOOK §3.5 installs, hardens and starts it), so these are
+# only suggested: dnf does not install them by itself.
+Suggests:       mariadb-server
+Suggests:       php-mysqlnd
 Requires:       policycoreutils
 Requires:       policycoreutils-python-utils
 Requires:       libselinux-utils

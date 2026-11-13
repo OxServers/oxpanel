@@ -941,3 +941,260 @@ async fn a_read_only_peer_cannot_touch_certificates() {
     assert!(status.sites.is_empty());
     assert!(srv.sys.calls().is_empty());
 }
+
+#[tokio::test]
+async fn database_rpcs_over_uds() {
+    const PASSWORD: &str = "Secret-pass-123";
+    let srv = start(allow_me()).await;
+    let mut client = connect(&srv.socket).await.expect("connect");
+    for name in ["alice", "bob"] {
+        client
+            .create_tenant(pb::CreateTenantRequest {
+                username: name.into(),
+                ..Default::default()
+            })
+            .await
+            .expect("tenant");
+    }
+    let mariadb = i32::from(pb::DatabaseEngine::Mariadb);
+
+    // Without MariaDB: reported, and every creation refused before anything.
+    let info = client
+        .get_host_info(pb::GetHostInfoRequest {})
+        .await
+        .expect("host info")
+        .into_inner();
+    assert_eq!(info.database_engines.len(), 1);
+    assert!(info
+        .database_engines
+        .iter()
+        .all(|e| e.engine == mariadb && !e.available && e.version.is_empty()));
+    let err = client
+        .create_database(pb::CreateDatabaseRequest {
+            tenant: "alice".into(),
+            name: "alice_wp".into(),
+            engine: 0,
+        })
+        .await
+        .expect_err("no MariaDB");
+    assert_eq!(err.code(), Code::FailedPrecondition, "{err:?}");
+    assert!(err.message().contains("not installed"), "{err:?}");
+
+    srv.sys.install_mariadb();
+    let info = client
+        .get_host_info(pb::GetHostInfoRequest {})
+        .await
+        .expect("host info")
+        .into_inner();
+    assert!(info
+        .database_engines
+        .first()
+        .is_some_and(|e| e.available && e.version.contains("MariaDB")));
+
+    // UNSPECIFIED is MariaDB; an engine number this build does not know is refused.
+    let err = client
+        .create_database(pb::CreateDatabaseRequest {
+            tenant: "alice".into(),
+            name: "alice_wp".into(),
+            engine: 99,
+        })
+        .await
+        .expect_err("unknown engine");
+    assert_eq!(err.code(), Code::InvalidArgument);
+    let db = client
+        .create_database(pb::CreateDatabaseRequest {
+            tenant: "alice".into(),
+            name: "alice_wp".into(),
+            engine: 0,
+        })
+        .await
+        .expect("create database")
+        .into_inner();
+    assert!(db.created);
+    assert_eq!(db.database.as_ref().map(|d| d.engine), Some(mariadb));
+    for (tenant, name) in [
+        ("alice", "bob_wp"),
+        ("alice", "alice_wp`; DROP DATABASE mysql; --"),
+        ("alice", "mysql"),
+    ] {
+        let err = client
+            .create_database(pb::CreateDatabaseRequest {
+                tenant: tenant.into(),
+                name: name.into(),
+                engine: mariadb,
+            })
+            .await
+            .expect_err("bad name");
+        assert_eq!(err.code(), Code::InvalidArgument, "{name}");
+    }
+
+    let user = client
+        .create_database_user(pb::CreateDatabaseUserRequest {
+            tenant: "alice".into(),
+            name: "alice_app".into(),
+            password: PASSWORD.into(),
+            engine: mariadb,
+        })
+        .await
+        .expect("create user")
+        .into_inner();
+    assert!(user.created);
+    assert!(!format!("{user:?}").contains(PASSWORD));
+    let err = client
+        .create_database_user(pb::CreateDatabaseUserRequest {
+            tenant: "alice".into(),
+            name: "alice_two".into(),
+            password: "short".into(),
+            engine: mariadb,
+        })
+        .await
+        .expect_err("short password");
+    assert_eq!(err.code(), Code::InvalidArgument);
+    assert!(err.message().contains("password"));
+
+    let granted = client
+        .grant_database_access(pb::GrantDatabaseAccessRequest {
+            user: "alice_app".into(),
+            database: "alice_wp".into(),
+        })
+        .await
+        .expect("grant")
+        .into_inner();
+    assert!(granted.changed);
+    assert_eq!(
+        granted.user.map(|u| u.databases),
+        Some(vec!["alice_wp".to_owned()])
+    );
+    client
+        .create_database(pb::CreateDatabaseRequest {
+            tenant: "bob".into(),
+            name: "bob_wp".into(),
+            engine: mariadb,
+        })
+        .await
+        .expect("bob's database");
+    let err = client
+        .grant_database_access(pb::GrantDatabaseAccessRequest {
+            user: "alice_app".into(),
+            database: "bob_wp".into(),
+        })
+        .await
+        .expect_err("cross-tenant grant");
+    assert_eq!(err.code(), Code::InvalidArgument);
+
+    let listed = client
+        .list_databases(pb::ListDatabasesRequest {
+            tenant: "alice".into(),
+        })
+        .await
+        .expect("list")
+        .into_inner();
+    assert_eq!(
+        listed
+            .databases
+            .iter()
+            .map(|d| (d.name.as_str(), d.size_bytes > 0))
+            .collect::<Vec<_>>(),
+        vec![("alice_wp", true)]
+    );
+    let users = client
+        .list_database_users(pb::ListDatabaseUsersRequest::default())
+        .await
+        .expect("list users")
+        .into_inner();
+    assert_eq!(users.users.len(), 1);
+    assert!(!format!("{users:?}").contains(PASSWORD));
+    client
+        .set_database_user_password(pb::SetDatabaseUserPasswordRequest {
+            name: "alice_app".into(),
+            password: "Another-pass-456".into(),
+        })
+        .await
+        .expect("password");
+    let none = client
+        .set_database_user_password(pb::SetDatabaseUserPasswordRequest {
+            name: "alice_nobody".into(),
+            password: "Another-pass-456".into(),
+        })
+        .await
+        .expect_err("no such user");
+    assert_eq!(none.code(), Code::NotFound);
+
+    // The tenant cannot be deleted while it owns databases.
+    let err = client
+        .delete_tenant(pb::DeleteTenantRequest {
+            username: "alice".into(),
+            remove_home: true,
+        })
+        .await
+        .expect_err("tenant has databases");
+    assert_eq!(err.code(), Code::FailedPrecondition);
+    let reconcile = client
+        .reconcile(pb::ReconcileRequest {})
+        .await
+        .expect("reconcile")
+        .into_inner();
+    assert!(reconcile.drifts.is_empty(), "{:?}", reconcile.drifts);
+
+    assert!(
+        client
+            .revoke_database_access(pb::RevokeDatabaseAccessRequest {
+                user: "alice_app".into(),
+                database: "alice_wp".into(),
+            })
+            .await
+            .expect("revoke")
+            .into_inner()
+            .changed
+    );
+    assert!(
+        client
+            .delete_database_user(pb::DeleteDatabaseUserRequest {
+                name: "alice_app".into()
+            })
+            .await
+            .expect("delete user")
+            .into_inner()
+            .deleted
+    );
+    for name in ["alice_wp", "bob_wp"] {
+        let r = client
+            .delete_database(pb::DeleteDatabaseRequest { name: name.into() })
+            .await
+            .expect("delete database")
+            .into_inner();
+        assert!(r.deleted, "{name}");
+    }
+    assert!(
+        client
+            .delete_tenant(pb::DeleteTenantRequest {
+                username: "alice".into(),
+                remove_home: true,
+            })
+            .await
+            .expect("tenant without databases")
+            .into_inner()
+            .deleted
+    );
+}
+
+#[tokio::test]
+async fn database_mutations_need_the_vhost_scope() {
+    let srv = start_scoped(allow_me(), &[Scope::Read]).await;
+    srv.sys.install_mariadb();
+    let mut client = connect(&srv.socket).await.expect("connect");
+    let err = client
+        .create_database_user(pb::CreateDatabaseUserRequest {
+            tenant: "alice".into(),
+            name: "alice_app".into(),
+            password: "Secret-pass-123".into(),
+            engine: 0,
+        })
+        .await
+        .expect_err("read scope");
+    assert_eq!(err.code(), Code::PermissionDenied);
+    client
+        .list_databases(pb::ListDatabasesRequest::default())
+        .await
+        .expect("read scope may list");
+}

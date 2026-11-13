@@ -44,6 +44,10 @@ pub enum DriftKind {
     OrphanSftpAccess,
     SshdConfigDrift,
     DiskQuotaDrift,
+    DatabaseMissing,
+    DatabaseUserMissing,
+    DatabasePrivilegeDrift,
+    OrphanDatabaseObject,
 }
 
 /// One difference between a record and the operating system.
@@ -56,7 +60,11 @@ pub struct Drift {
 }
 
 impl Drift {
-    fn new(kind: DriftKind, subject: impl Into<String>, detail: impl Into<String>) -> Self {
+    pub(crate) fn new(
+        kind: DriftKind,
+        subject: impl Into<String>,
+        detail: impl Into<String>,
+    ) -> Self {
         Self {
             kind,
             subject: subject.into(),
@@ -96,6 +104,8 @@ pub struct HostInfo {
     /// Installed Node.js version; empty if none.
     pub node_version: String,
     pub stats: HostStats,
+    /// Per database engine: availability, version, databases and users.
+    pub databases: Vec<crate::db::EngineFacts>,
     pub tls: TlsSupport,
     pub facilities: Facilities,
 }
@@ -155,6 +165,7 @@ impl HostService {
                 disk_quota: quota.available,
                 disk_quota_detail: quota.detail,
             },
+            databases: crate::db::facts(&self.ctx).await?,
         })
     }
 
@@ -208,6 +219,7 @@ impl HostService {
         check_tls(cfg, &vhosts, &mut out)?;
         check_sftp(&self.ctx, &tenants, &mut out).await?;
         check_quotas(&self.ctx, &tenants, &mut out).await?;
+        out.extend(crate::db::drifts(&self.ctx, &tenants).await?);
         Ok(out)
     }
 

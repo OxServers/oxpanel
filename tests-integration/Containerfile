@@ -67,3 +67,7 @@ RUN rustup component add llvm-tools-preview \
 RUN dnf -y install --setopt=install_weak_deps=False openssh-server openssh-clients xfsprogs \
     && dnf clean all && rm -rf /var/cache/dnf \
     && systemctl enable sshd
+
+# MariaDB (tenant databases) and the PHP driver for it, for the integration test.
+RUN dnf -y install --setopt=install_weak_deps=False mariadb-server php-mysqlnd \
+    && dnf clean all && rm -rf /var/cache/dnf

@@ -19,6 +19,9 @@
 //!   [`auto_https`] does so for every site by itself.
 //! - [`sftp`]     — SFTP-only file access for tenants (sshd drop-in, keys, chroot).
 //! - [`quota`]    — per-tenant disk quotas (XFS user quotas).
+//! - [`db`]       — tenant databases and database users; one submodule per
+//!   engine ([`db::mariadb`] is the only place that builds SQL or talks to
+//!   the server).
 //! - [`host`]     — host information and record ↔ OS reconciliation.
 //! - [`auth`]     — peer-credential gate for the UNIX socket.
 //! - [`server`]   — gRPC ↔ domain mapping.
@@ -40,6 +43,7 @@ pub mod auth;
 pub mod auto_https;
 pub mod config;
 pub mod ctx;
+pub mod db;
 pub mod error;
 pub mod fsutil;
 pub mod host;

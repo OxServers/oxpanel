@@ -19,6 +19,7 @@ use crate::error::Result;
 
 pub mod command;
 pub mod fake;
+mod fake_mariadb;
 pub mod fake_tls;
 pub mod real;
 
@@ -57,6 +58,8 @@ pub mod bin {
     /// OxPanel's own ACME client. Never run by the daemon itself (which has no
     /// network) but in a transient unit, as an unprivileged account.
     pub const OXPANEL_ACME: &str = "/usr/libexec/oxpanel/oxpanel-acme";
+    /// Optional: the MariaDB client, only needed once tenants have databases.
+    pub const MARIADB: &str = "/usr/bin/mariadb";
     /// Login shell given to every tenant account.
     pub const NOLOGIN: &str = "/sbin/nologin";
     /// Membership of the group that confines tenants in sshd.

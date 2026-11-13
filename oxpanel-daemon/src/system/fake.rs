@@ -11,6 +11,7 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use super::fake_mariadb::FakeMariaDb;
 use super::{
     bin, shadow_password_state, CommandOutput, CommandSpec, HostStats, OsUser, PasswordState,
     QuotaState, System,
@@ -22,8 +23,9 @@ struct Inner {
     users: BTreeMap<String, OsUser>,
     groups: BTreeMap<String, u32>,
     calls: Vec<CommandSpec>,
-    /// Scripted outcomes consumed in order per program.
-    scripted: BTreeMap<&'static str, VecDeque<(i32, String)>>,
+    /// Scripted outcomes consumed in order per program; `None` lets that
+    /// invocation run normally.
+    scripted: BTreeMap<&'static str, VecDeque<Option<(i32, String)>>>,
     selinux_enabled: bool,
     /// Supplementary group memberships: account name -> gids.
     memberships: BTreeMap<String, Vec<u32>>,
@@ -33,6 +35,8 @@ struct Inner {
     missing: Vec<&'static str>,
     /// What `node --version` prints; `None` = a supported version.
     node_version: Option<String>,
+    /// The emulated MariaDB server; `None` = MariaDB is not installed.
+    mariadb: Option<FakeMariaDb>,
     /// Keys the fake `openssl genpkey` has handed out.
     generated_keys: u32,
     /// Lifetime of certificates the fake ACME client delivers; `None` = 90 days.
@@ -235,7 +239,15 @@ impl FakeSystem {
             i.scripted
                 .entry(program)
                 .or_default()
-                .push_back((code, stderr.to_owned()));
+                .push_back(Some((code, stderr.to_owned())));
+        }
+    }
+
+    /// Let the next invocation of `program` run normally, so that a
+    /// following [`Self::script_failure`] hits the one after it.
+    pub fn script_pass_through(&self, program: &'static str) {
+        if let Ok(mut i) = self.inner.lock() {
+            i.scripted.entry(program).or_default().push_back(None);
         }
     }
 
@@ -266,6 +278,46 @@ impl FakeSystem {
         if let Ok(mut i) = self.inner.lock() {
             i.acme_refuses = refuses;
         }
+    }
+
+    /// Install an (empty, running) emulated MariaDB server. Without this
+    /// call the fake host has no MariaDB, like a host without the package.
+    pub fn install_mariadb(&self) {
+        if let Ok(mut i) = self.inner.lock() {
+            i.mariadb.get_or_insert_with(FakeMariaDb::default);
+        }
+    }
+
+    /// Start or stop the emulated server (stopped: connections are refused).
+    pub fn set_mariadb_running(&self, running: bool) {
+        if let Ok(mut i) = self.inner.lock() {
+            if let Some(db) = i.mariadb.as_mut() {
+                db.stopped = !running;
+            }
+        }
+    }
+
+    /// Run statements on the emulated server as its administrator would by
+    /// hand, behind the daemon's back. Not recorded in [`Self::calls`].
+    pub fn mariadb_admin(&self, script: &str) -> Result<String> {
+        let mut i = self.lock()?;
+        let db = i
+            .mariadb
+            .as_mut()
+            .ok_or_else(|| Error::Internal("fake MariaDB is not installed".into()))?;
+        match db.execute(script) {
+            (0, stdout, _) => Ok(stdout),
+            (_, _, stderr) => Err(Error::Internal(stderr)),
+        }
+    }
+
+    /// Every script the daemon sent to the MariaDB client, in order.
+    pub fn mariadb_scripts(&self) -> Vec<String> {
+        self.calls_to(bin::MARIADB)
+            .into_iter()
+            .filter_map(|c| c.stdin)
+            .map(|bytes| String::from_utf8_lossy(&bytes).into_owned())
+            .collect()
     }
 
     /// Forget recorded commands (tests call this after harness setup).
@@ -377,7 +429,7 @@ fn fake_chpasswd(i: &mut Inner, spec: &CommandSpec) -> CommandOutput {
     let Some(input) = spec.stdin.as_ref() else {
         return output(program, 1, "", "chpasswd: no input");
     };
-    let text = String::from_utf8_lossy(input.expose()).into_owned();
+    let text = String::from_utf8_lossy(input).into_owned();
     for line in text.lines() {
         let Some((user, password)) = line.split_once(':') else {
             return output(program, 1, "", "chpasswd: line 1: missing new password");
@@ -450,9 +502,10 @@ fn limit_value(command: &str, key: &str) -> Option<u64> {
 /// `systemd-run … -- xfs_quota -x -c <command>… <device>`: apply `limit`
 /// commands to the fake quota table and write what `report` commands print to
 /// the file the transient unit's standard output is directed to.
-/// Commands of the HTTPS and disk-quota workflows: OpenSSL, the ACME client
-/// and `xfs_quota` in their transient units. `None` for anything else.
-fn fake_tls_and_quota(i: &mut Inner, spec: &CommandSpec) -> Option<CommandOutput> {
+/// Commands of the HTTPS, disk-quota and database workflows: OpenSSL, the
+/// ACME client and `xfs_quota` in their transient units, and the MariaDB
+/// client. `None` for anything else.
+fn fake_tls_quota_and_db(i: &mut Inner, spec: &CommandSpec) -> Option<CommandOutput> {
     let args = &spec.args;
     let program = spec.program;
     Some(match program {
@@ -470,6 +523,15 @@ fn fake_tls_and_quota(i: &mut Inner, spec: &CommandSpec) -> Option<CommandOutput
             output(program, code, "", &stderr)
         }
         bin::SYSTEMD_RUN if args.iter().any(|a| a == bin::XFS_QUOTA) => fake_xfs_quota(i, args),
+        bin::MARIADB => {
+            let script =
+                String::from_utf8_lossy(spec.stdin.as_deref().unwrap_or_default()).into_owned();
+            let Some(db) = i.mariadb.as_mut() else {
+                return Some(output(program, 127, "", "mariadb: not installed"));
+            };
+            let (code, stdout, stderr) = db.execute(&script);
+            output(program, code, &stdout, &stderr)
+        }
         _ => return None,
     })
 }
@@ -551,13 +613,14 @@ impl System for FakeSystem {
             .scripted
             .get_mut(spec.program)
             .and_then(VecDeque::pop_front)
+            .flatten()
         {
             return Ok(output(spec.program, code, "", &stderr));
         }
         if let Some(out) = fake_ssh_and_accounts(&mut i, &spec) {
             return Ok(out);
         }
-        if let Some(out) = fake_tls_and_quota(&mut i, &spec) {
+        if let Some(out) = fake_tls_quota_and_db(&mut i, &spec) {
             return Ok(out);
         }
         let args = &spec.args;
@@ -701,9 +764,9 @@ impl System for FakeSystem {
     }
 
     async fn is_installed(&self, program: &'static str) -> bool {
-        self.inner
-            .lock()
-            .is_ok_and(|i| !i.missing.contains(&program))
+        self.inner.lock().is_ok_and(|i| {
+            !i.missing.contains(&program) && (program != bin::MARIADB || i.mariadb.is_some())
+        })
     }
 
     async fn host_stats(&self, _path: &Path) -> Result<HostStats> {

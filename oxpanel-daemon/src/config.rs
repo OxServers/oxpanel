@@ -92,6 +92,15 @@ pub struct Config {
     pub acme_eab_file: Option<PathBuf>,
     /// Automatic HTTPS: obtain certificates for sites without being asked.
     pub auto_https: crate::records::AutoHttpsChoice,
+    /// UNIX socket of the local MariaDB server.
+    pub mariadb_socket: PathBuf,
+    /// Most databases one tenant may have.
+    pub db_max_databases: u32,
+    /// Most database users one tenant may have.
+    pub db_max_users: u32,
+    /// MariaDB `MAX_USER_CONNECTIONS` given to database users created from
+    /// now on (1..=10000).
+    pub db_max_user_connections: u32,
 }
 
 /// Let's Encrypt's production directory.
@@ -134,6 +143,10 @@ impl Default for Config {
             acme_eab_file: None,
             // A new site gets HTTPS by itself (the owner's intent).
             auto_https: crate::records::AutoHttpsChoice::On,
+            mariadb_socket: PathBuf::from("/var/lib/mysql/mysql.sock"),
+            db_max_databases: 20,
+            db_max_users: 20,
+            db_max_user_connections: 25,
         }
     }
 }
@@ -171,6 +184,7 @@ impl Config {
         path("OXPANEL_SSHD_DROPIN_FILE", &mut c.sshd_dropin_file)?;
         path("OXPANEL_SFTP_KEYS_DIR", &mut c.sftp_keys_dir)?;
         c.sftp_from_lookup(&get)?;
+        path("OXPANEL_MARIADB_SOCKET", &mut c.mariadb_socket)?;
 
         if let Some(g) = get("OXPANEL_SOCKET_GROUP") {
             let g = g.trim();
@@ -230,6 +244,7 @@ impl Config {
         path("OXPANEL_TLS_DIR", &mut c.tls_dir)?;
         path("OXPANEL_ACME_DIR", &mut c.acme_dir)?;
         c.acme_from_lookup(&get)?;
+        c.db_from_lookup(&get)?;
         c.validate()?;
         Ok(c)
     }
@@ -336,6 +351,7 @@ impl Config {
             ("OXPANEL_ACME_DIR", &self.acme_dir),
             ("OXPANEL_SSHD_DROPIN_FILE", &self.sshd_dropin_file),
             ("OXPANEL_SFTP_KEYS_DIR", &self.sftp_keys_dir),
+            ("OXPANEL_MARIADB_SOCKET", &self.mariadb_socket),
         ] {
             check_path(key, p)?;
         }
@@ -369,7 +385,23 @@ impl Config {
                 "OXPANEL_NGINX_INCLUDE_FILE must not live inside OXPANEL_NGINX_CONF_DIR",
             ));
         }
+        if !(1..=10_000).contains(&self.db_max_user_connections) {
+            return Err(Error::invalid(
+                "config",
+                "OXPANEL_DB_MAX_USER_CONNECTIONS must be 1..=10000",
+            ));
+        }
         Ok(())
+    }
+
+    /// `state_dir/databases`.
+    pub fn databases_dir(&self) -> PathBuf {
+        self.state_dir.join("databases")
+    }
+
+    /// `state_dir/db-users`.
+    pub fn db_users_dir(&self) -> PathBuf {
+        self.state_dir.join("db-users")
     }
 
     /// `state_dir/tenants`.
@@ -409,6 +441,20 @@ pub enum SftpPasswords {
 }
 
 impl Config {
+    /// The database part of [`Config::from_lookup`].
+    fn db_from_lookup(&mut self, get: &impl Fn(&str) -> Option<String>) -> Result<()> {
+        if let Some(v) = get("OXPANEL_DB_MAX_DATABASES") {
+            self.db_max_databases = parse_u32("OXPANEL_DB_MAX_DATABASES", &v)?;
+        }
+        if let Some(v) = get("OXPANEL_DB_MAX_USERS") {
+            self.db_max_users = parse_u32("OXPANEL_DB_MAX_USERS", &v)?;
+        }
+        if let Some(v) = get("OXPANEL_DB_MAX_USER_CONNECTIONS") {
+            self.db_max_user_connections = parse_u32("OXPANEL_DB_MAX_USER_CONNECTIONS", &v)?;
+        }
+        Ok(())
+    }
+
     /// The SFTP part of [`Config::from_lookup`].
     fn sftp_from_lookup(&mut self, get: &impl Fn(&str) -> Option<String>) -> Result<()> {
         for (key, target) in [
@@ -552,6 +598,22 @@ fn parse_bool(key: &str, raw: &str) -> Result<bool> {
     }
 }
 
+/// For unit-test harnesses: move the locations the feature modules write to
+/// (certificates, ACME, SFTP, the sshd drop-in, the scratch directory next
+/// to the socket) into `dir`, so no test touches the host's `/etc`, `/run`
+/// or `/var/lib`.
+#[cfg(test)]
+pub(crate) fn sandbox_feature_paths(cfg: &mut Config, dir: &Path) {
+    cfg.tls_dir = dir.join("pki");
+    cfg.acme_dir = dir.join("acme");
+    cfg.sftp_keys_dir = dir.join("sftp-keys");
+    cfg.sshd_dropin_file = dir.join("sshd_config.d").join("60-oxpanel.conf");
+    cfg.socket_path = dir.join("run").join("oxpanel.sock");
+    for d in [dir.join("sshd_config.d"), dir.join("run")] {
+        std::fs::create_dir_all(&d).unwrap_or_else(|e| panic!("{}: {e}", d.display()));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -677,6 +739,21 @@ mod tests {
         assert_eq!(c.tenant_group, "hosting");
         assert_eq!(c.sftp_chroot_dir(), PathBuf::from("/srv/state/sftp"));
         assert_eq!(c.scratch_dir(), PathBuf::from("/run/ox/scratch"));
+        assert!(from(&[("OXPANEL_MARIADB_SOCKET", "mysql.sock")]).is_err());
+        assert!(from(&[("OXPANEL_MARIADB_SOCKET", "/run/my sql.sock")]).is_err());
+        assert!(from(&[("OXPANEL_DB_MAX_USER_CONNECTIONS", "0")]).is_err());
+        assert!(from(&[("OXPANEL_DB_MAX_DATABASES", "many")]).is_err());
+        assert!(from(&[
+            ("OXPANEL_MARIADB_SOCKET", "/run/mysqld/mysqld.sock"),
+            ("OXPANEL_DB_MAX_DATABASES", "0"),
+            ("OXPANEL_DB_MAX_USERS", "3"),
+            ("OXPANEL_DB_MAX_USER_CONNECTIONS", "10"),
+        ])
+        .is_ok_and(|c| (
+            c.db_max_databases,
+            c.db_max_users,
+            c.db_max_user_connections
+        ) == (0, 3, 10)));
         assert!(from(&[
             ("OXPANEL_NGINX_CONF_DIR", "/etc/nginx/conf.d"),
             ("OXPANEL_NGINX_INCLUDE_FILE", "/etc/nginx/conf.d/x.conf")
