@@ -930,11 +930,11 @@ with a disk limit (`DISK_QUOTA_DRIFT`).
 ```sh
 make image         # AlmaLinux 9 dev/test image (one-time)
 make check         # rustfmt --check, clippy pedantic -D warnings, tests, cargo-deny, feature traceability
-make test          # @COUNT_TOTAL@ tests (fake OS, no root): unit, property, gRPC surface, crash safety, perf budgets
+make test          # 288 tests (fake OS, no root): unit, property, gRPC surface, crash safety, perf budgets
 make traceability  # every row of docs/FEATURES.md maps to tests that exist (docs/traceability.map)
 make coverage      # line coverage of the daemon (cargo-llvm-cov; run `make image` once first)
 make bench         # engine benchmark against the fake OS (docs/PERFORMANCE.md); never part of `make check`
-make integration   # boots systemd in a container, installs from packaging/, runs @COUNT_IT@ assertions
+make integration   # boots systemd in a container, installs from packaging/, runs 681 assertions
                    # (HTTPS/ACME against a local Pebble downloaded at test time; OXPANEL_IT_SKIP_ACME=1 skips it)
 make rpm           # build the RPM from the working tree into dist/rpms/
 make acceptance    # REAL AlmaLinux 9 VM (KVM, SELinux enforcing): install like a user, run all phases
@@ -962,7 +962,7 @@ workstation; you only need `/dev/kvm` to be readable — and drives it over SSH.
 
 Phases: **10** install (`dnf install` of the RPM or the handbook's source install; MariaDB set up as in §3.5; services start; `--check-config`) ·
 **15** host preparation for disk quotas: runs §9.1's block, reboots, checks the quota option is on ·
-**20** the @COUNT_P20@-check integration suite on the real host (`tests-integration/run-inside.sh`: everything above plus HTTPS and ACME against a local test CA, SFTP, quotas, databases and backups) ·
+**20** the 703-check integration suite on the real host (`tests-integration/run-inside.sh`: everything above plus HTTPS and ACME against a local test CA, SFTP, quotas, databases and backups) ·
 **30** SELinux: enforcing, docroot labels, `semanage` rule lifecycle, site serves, **zero AVC denials** ·
 **40** sandbox: private network/UTS/mount namespaces, seccomp, capability bounding set, read-only `/usr` ·
 **50** `systemctl restart`, `SIGKILL` + auto-restart, a record forced back to `provisioning` is resumed with exactly one `useradd` ·
