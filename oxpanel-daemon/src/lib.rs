@@ -14,6 +14,8 @@
 //! - [`tenant`], [`vhost`] — the provisioning workflows.
 //! - [`php`]      — per-tenant PHP-FPM instances.
 //! - [`app`]      — Node.js and Python applications behind virtual hosts.
+//! - [`tls`]      — certificates of virtual hosts; [`acme`] obtains them from a
+//!   certificate authority through a separate, unprivileged client.
 //! - [`host`]     — host information and record ↔ OS reconciliation.
 //! - [`auth`]     — peer-credential gate for the UNIX socket.
 //! - [`server`]   — gRPC ↔ domain mapping.
@@ -29,6 +31,7 @@
     )
 )]
 
+pub mod acme;
 pub mod app;
 pub mod auth;
 pub mod config;
@@ -43,6 +46,7 @@ pub mod server;
 pub mod system;
 pub mod systemd;
 pub mod tenant;
+pub mod tls;
 pub mod validate;
 pub mod vhost;
 

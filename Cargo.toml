@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["oxpanel-proto", "oxpanel-daemon", "oxpanel-ctl"]
+members = ["oxpanel-proto", "oxpanel-daemon", "oxpanel-ctl", "oxpanel-acme"]
 
 [workspace.package]
 version = "0.1.0"
@@ -32,6 +32,8 @@ sd-notify = "0.5"
 # Serialisation for on-disk tenant records
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# PEM bodies (already in the tree through tonic)
+base64 = "0.22"
 # Tests
 tempfile = "3"
 

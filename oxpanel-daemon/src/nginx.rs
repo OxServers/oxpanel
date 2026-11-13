@@ -58,11 +58,50 @@ server {
     server_tokens off;
     return 444;
 }
+
+# The same for HTTPS: refuse the TLS handshake for unknown names, so no
+# tenant's certificate (or site) is ever shown for a name it does not own.
+server {
+    listen 443 ssl default_server;
+    listen [::]:443 ssl default_server;
+    server_tokens off;
+    ssl_reject_handshake on;
+}
 ",
         );
     }
     Ok(s)
 }
+
+/// The certificate of a virtual host and how HTTPS is offered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TlsBlock<'a> {
+    /// Absolute paths of the certificate chain and its private key.
+    pub certificate: &'a Path,
+    pub key: &'a Path,
+    /// Answer plain HTTP with a redirect to HTTPS.
+    pub redirect: bool,
+    /// Send `Strict-Transport-Security` over HTTPS.
+    pub hsts: bool,
+}
+
+/// Protocol settings of every HTTPS server block: TLS 1.2 and 1.3 with
+/// forward-secret AEAD suites only (Mozilla "intermediate" without the
+/// finite-field DHE suites, so no DH parameters are needed), a shared session
+/// cache and no session tickets (their keys would otherwise have to be
+/// rotated). No OCSP stapling: it needs a resolver and outbound requests from
+/// the web server, and Let's Encrypt no longer runs OCSP responders.
+const TLS_SETTINGS: &str = "    ssl_protocols TLSv1.2 TLSv1.3;
+    ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache shared:oxpanel_tls:10m;
+    ssl_session_timeout 1d;
+    ssl_session_tickets off;
+";
+
+/// What browsers are told with `hsts`: HTTPS only, for one year, for this
+/// name alone (no `includeSubDomains`, no `preload`).
+const HSTS_HEADER: &str = "    add_header Strict-Transport-Security \"max-age=31536000\" always;\n";
 
 /// What goes into one server block.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -81,11 +120,21 @@ pub struct ServerBlock<'a> {
     pub php_socket: Option<&'a Path>,
     /// Socket of the virtual host's application, if it runs one.
     pub app_socket: Option<&'a Path>,
+    /// Directory ACME HTTP-01 challenge files are served from.
+    pub acme_challenge_dir: &'a Path,
+    /// Set when the virtual host has a certificate: it is served over HTTPS too.
+    pub tls: Option<TlsBlock<'a>>,
 }
 
-/// Render a complete, self-contained server block.
+/// Render the complete, self-contained configuration of one virtual host: a
+/// server block for port 80 and, with a certificate, one for port 443.
+///
+/// - Every site that is not suspended answers ACME HTTP-01 challenges on
+///   port 80, also while it redirects everything else to HTTPS.
+/// - A suspended site answers 503 on both ports (over HTTPS still with its
+///   own certificate, so visitors see the 503 and not a certificate error),
+///   never redirects and answers no challenges.
 pub fn render_server_block(b: &ServerBlock<'_>) -> Result<String> {
-    let root = safe_path_str(b.document_root)?;
     let access_log = safe_path_str(b.access_log)?;
     let error_log = safe_path_str(b.error_log)?;
     let mut names = String::from(b.domain.as_str());
@@ -93,28 +142,97 @@ pub fn render_server_block(b: &ServerBlock<'_>) -> Result<String> {
         names.push(' ');
         names.push_str(a.as_str());
     }
-    if b.suspended {
+    let logs = format!(
+        "    access_log {access_log};
+    error_log {error_log};
+    server_tokens off;
+"
+    );
+    let acme = format!(
+        "
+    # ACME HTTP-01 challenges, answered from a directory only the ACME client
+    # writes (before the dot-file rule below, which would hide them).
+    location ^~ /.well-known/acme-challenge/ {{
+        alias {}/;
+        default_type text/plain;
+        disable_symlinks on;
+    }}
+",
+        safe_path_str(b.acme_challenge_dir)?
+    );
+    let tls = match &b.tls {
+        None => None,
+        Some(t) => Some(format!(
+            "    ssl_certificate {};
+    ssl_certificate_key {};
+{TLS_SETTINGS}",
+            safe_path_str(t.certificate)?,
+            safe_path_str(t.key)?
+        )),
+    };
+    let (label, http, https) = if b.suspended {
         // No `root`: a suspended site serves nothing from the tenant's files.
-        return Ok(format!(
-            "{HEADER}# tenant: {tenant} (suspended)
+        let body = format!(
+            "{logs}
+    location / {{
+        add_header Retry-After 3600 always;
+        return 503;
+    }}
+"
+        );
+        (" (suspended)", body.clone(), body)
+    } else {
+        let site = render_site(b, &logs)?;
+        let redirect = b.tls.as_ref().is_some_and(|t| t.redirect);
+        let http = if redirect {
+            format!(
+                "{logs}{acme}
+    location / {{
+        return 301 https://$host$request_uri;
+    }}
+"
+            )
+        } else {
+            format!("{site}{acme}")
+        };
+        let hsts = if b.tls.as_ref().is_some_and(|t| t.hsts) {
+            HSTS_HEADER
+        } else {
+            ""
+        };
+        ("", http, format!("{hsts}{site}"))
+    };
+    let mut out = format!(
+        "{HEADER}# tenant: {tenant}{label}
 server {{
     listen 80;
     listen [::]:80;
     server_name {names};
 
-    access_log {access_log};
-    error_log {error_log};
-    server_tokens off;
-
-    location / {{
-        add_header Retry-After 3600 always;
-        return 503;
-    }}
-}}
+{http}}}
 ",
-            tenant = b.tenant,
-        ));
+        tenant = b.tenant,
+    );
+    if let Some(tls) = tls {
+        let block = format!(
+            "
+server {{
+    listen 443 ssl http2;
+    listen [::]:443 ssl http2;
+    server_name {names};
+
+{tls}{https}}}
+"
+        );
+        out.push_str(&block);
     }
+    Ok(out)
+}
+
+/// What an active site serves, identically over HTTP and HTTPS: everything
+/// between `server_name` and the closing brace.
+fn render_site(b: &ServerBlock<'_>, logs: &str) -> Result<String> {
+    let root = safe_path_str(b.document_root)?;
     // Without PHP a script must never be handed out as a download: its
     // source routinely holds database passwords.
     let no_php = "
@@ -168,19 +286,10 @@ server {{
         ),
     };
     Ok(format!(
-        "{HEADER}# tenant: {tenant}
-server {{
-    listen 80;
-    listen [::]:80;
-    server_name {names};
-
-    root {root};
+        "    root {root};
     index {index};
 
-    access_log {access_log};
-    error_log {error_log};
-    server_tokens off;
-    autoindex off;
+{logs}    autoindex off;
     # Refuse to serve through symlinks whose target the tenant does not own.
     disable_symlinks if_not_owner;
 
@@ -193,9 +302,7 @@ server {{
     location / {{
         try_files {tries};
     }}
-{extra}}}
-",
-        tenant = b.tenant,
+{extra}"
     ))
 }
 
@@ -352,6 +459,8 @@ mod tests {
             error_log: Path::new("/var/log/nginx/oxpanel/example.com.error.log"),
             php_socket: None,
             app_socket: None,
+            acme_challenge_dir: Path::new("/var/lib/oxpanel-acme/challenges"),
+            tls: None,
         })?;
         assert!(s.starts_with(HEADER));
         assert!(s.contains("server_name example.com www.example.com example.net;\n"));
@@ -389,6 +498,8 @@ mod tests {
                 error_log: Path::new("/var/log/nginx/oxpanel/example.com.error.log"),
                 php_socket: None,
                 app_socket: None,
+                acme_challenge_dir: Path::new("/var/lib/oxpanel-acme/challenges"),
+                tls: None,
             });
             assert!(r.is_err(), "{bad}");
         }
@@ -411,6 +522,10 @@ mod tests {
         assert!(with_default.contains("listen 80 default_server;"));
         assert!(with_default.contains("listen [::]:80 default_server;"));
         assert!(with_default.contains("return 444;"));
+        // Unknown names on 443 get no certificate at all, not a tenant's.
+        assert!(with_default.contains(
+            "listen 443 ssl default_server;\n    listen [::]:443 ssl default_server;\n    server_tokens off;\n    ssl_reject_handshake on;"
+        ));
         assert!(
             !render_include(Path::new("/etc/nginx/oxpanel.d"), false)?.contains("default_server")
         );
@@ -524,6 +639,8 @@ mod tests {
             error_log: Path::new("/var/log/nginx/oxpanel/example.com.error.log"),
             php_socket: None,
             app_socket: None,
+            acme_challenge_dir: Path::new("/var/lib/oxpanel-acme/challenges"),
+            tls: None,
         })?;
         assert!(s.contains("server_name example.com www.example.com;"));
         assert!(s.contains("return 503;"));
@@ -546,6 +663,8 @@ mod tests {
             error_log: Path::new("/var/log/nginx/oxpanel/example.com.error.log"),
             php_socket: Some(Path::new("/run/oxpanel-php/alice/php.sock")),
             app_socket: None,
+            acme_challenge_dir: Path::new("/var/lib/oxpanel-acme/challenges"),
+            tls: None,
         })?;
         assert!(s.contains("index index.php index.html index.htm;"));
         assert!(s.contains("try_files $uri $uri/ /index.php$is_args$args;"));
@@ -569,6 +688,8 @@ mod tests {
             error_log: Path::new("/var/log/nginx/oxpanel/example.com.error.log"),
             php_socket: Some(Path::new("/run/x.sock; include /etc/shadow")),
             app_socket: None,
+            acme_challenge_dir: Path::new("/var/lib/oxpanel-acme/challenges"),
+            tls: None,
         });
         assert!(bad.is_err());
         Ok(())
@@ -587,6 +708,8 @@ mod tests {
             error_log: Path::new("/var/log/nginx/oxpanel/example.com.error.log"),
             php_socket: None,
             app_socket: Some(Path::new("/run/oxpanel-app/example.com/app.sock")),
+            acme_challenge_dir: Path::new("/var/lib/oxpanel-acme/challenges"),
+            tls: None,
         })?;
         assert!(s.contains("location / {\n        try_files $uri @app;\n    }"));
         assert!(s.contains("proxy_pass http://unix:/run/oxpanel-app/example.com/app.sock:;"));
@@ -607,8 +730,70 @@ mod tests {
             error_log: Path::new("/var/log/nginx/oxpanel/example.com.error.log"),
             php_socket: None,
             app_socket: Some(Path::new("/run/a.sock:/admin; proxy_pass http://evil")),
+            acme_challenge_dir: Path::new("/var/lib/oxpanel-acme/challenges"),
+            tls: None,
         });
         assert!(bad.is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn https_block_mirrors_the_site_for_php_and_applications() -> Result<()> {
+        let alice = Username::parse("alice")?;
+        let domain = d("example.com");
+        let tls = TlsBlock {
+            certificate: Path::new("/etc/pki/oxpanel/example.com.crt"),
+            key: Path::new("/etc/pki/oxpanel/example.com.key"),
+            redirect: false,
+            hsts: false,
+        };
+        let block = |php: Option<&'static Path>, app: Option<&'static Path>| ServerBlock {
+            domain: &domain,
+            aliases: &[],
+            tenant: &alice,
+            document_root: Path::new("/home/alice/public_html"),
+            suspended: false,
+            access_log: Path::new("/var/log/nginx/oxpanel/example.com.access.log"),
+            error_log: Path::new("/var/log/nginx/oxpanel/example.com.error.log"),
+            php_socket: php,
+            app_socket: app,
+            acme_challenge_dir: Path::new("/var/lib/oxpanel-acme/challenges"),
+            tls: Some(tls),
+        };
+        for (php, app, marker) in [
+            (
+                Some(Path::new("/run/oxpanel-php/alice/php.sock")),
+                None,
+                "fastcgi_pass unix:/run/oxpanel-php/alice/php.sock;",
+            ),
+            (
+                None,
+                Some(Path::new("/run/oxpanel-app/example.com/app.sock")),
+                "proxy_set_header X-Forwarded-Proto $scheme;",
+            ),
+        ] {
+            let s = render_server_block(&block(php, app))?;
+            let (http, https) = s
+                .split_once("\nserver {\n    listen 443")
+                .unwrap_or_default();
+            assert!(http.contains(marker) && https.contains(marker), "{s}");
+            // `include fastcgi_params` passes HTTPS=on to PHP over TLS.
+            assert!(https.contains("ssl_certificate /etc/pki/oxpanel/example.com.crt;"));
+            assert!(https.contains("ssl_certificate_key /etc/pki/oxpanel/example.com.key;"));
+            assert!(https.contains("ssl_session_tickets off;"));
+            assert!(!https.contains("ssl_stapling"));
+            assert!(http.contains("location ^~ /.well-known/acme-challenge/ {\n        alias /var/lib/oxpanel-acme/challenges/;"));
+        }
+        // A hostile certificate path cannot inject directives either.
+        let bad = TlsBlock {
+            key: Path::new("/etc/pki/x.key; include /etc/shadow"),
+            ..tls
+        };
+        assert!(render_server_block(&ServerBlock {
+            tls: Some(bad),
+            ..block(None, None)
+        })
+        .is_err());
         Ok(())
     }
 }

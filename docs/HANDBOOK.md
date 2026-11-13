@@ -54,8 +54,8 @@ not touch an account, unit or Nginx file it has no record for.
 | Web server | `nginx` from AppStream, with the stock `/etc/nginx/nginx.conf` (it must `include /etc/nginx/conf.d/*.conf;`, which the stock file does). |
 | Tools | `shadow-utils` (useradd/userdel), `util-linux` (setpriv), `acl` (setfacl), `coreutils` (mkdir, du), `policycoreutils` (restorecon); on SELinux-enabled hosts also `policycoreutils-python-utils` (semanage) and `libselinux-utils` (selinuxenabled). The RPM pulls all of these in. |
 | SELinux | Enforcing is supported and is the target; the daemon detects it at start-up and labels tenant content accordingly. The booleans `httpd_enable_homedirs` and `httpd_read_user_content` must be on (the RPM sets them; the source install block sets them), because document roots live under tenant homes. |
-| Network | None. The API is a local UNIX socket; the daemon has no network access at all under its unit. |
-| Ports | Nginx on 80 (v0.1.0 does not manage TLS). |
+| Network | None for the daemon: the API is a local UNIX socket and the daemon has no network access at all under its unit. Only the ACME client (`oxpanel-acme`, run in a transient unit) connects out, to the certificate authority over HTTPS. |
+| Ports | Nginx on 80, and on 443 for sites with a certificate. OxPanel does not manage the firewall: open both (`sudo firewall-cmd --permanent --add-service=http --add-service=https && sudo firewall-cmd --reload`). ACME HTTP-01 validation needs port 80 reachable from the internet. |
 
 ## 3. Installation
 
@@ -98,28 +98,30 @@ The package installs:
 | `/usr/lib/sysusers.d/oxpanel.conf` | creates the `oxpanel` group |
 | `/usr/lib/tmpfiles.d/oxpanel.conf` | `/etc/oxpanel` (`root:oxpanel 0750`) |
 | `/etc/oxpanel/daemon.env` | configuration (`%config(noreplace)`, `0640`) |
+| `/usr/libexec/oxpanel/oxpanel-acme` | ACME client, started by the daemon in a transient unit as `oxpanel-acme` |
 
 ### 3.2 From source, on the target host
 
 ```sh
 sudo dnf module enable -y nodejs:22        # Node.js applications need version 22 or newer
-sudo dnf install -y gcc git nginx shadow-utils util-linux acl policycoreutils policycoreutils-python-utils libselinux-utils logrotate php-fpm nodejs npm
+sudo dnf install -y gcc git nginx shadow-utils util-linux acl policycoreutils policycoreutils-python-utils libselinux-utils logrotate openssl ca-certificates php-fpm nodejs npm
 # SELinux: sites live under tenant homes, so the web server must be allowed to traverse and read them.
 if sudo selinuxenabled; then sudo setsebool -P httpd_enable_homedirs=on httpd_read_user_content=on httpd_unified=on; fi
 curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal && source ~/.cargo/env
 
 git clone https://github.com/OxServers/oxpanel.git && cd oxpanel
-cargo build --release --locked -p oxpanel-daemon -p oxpanel-ctl
+cargo build --release --locked -p oxpanel-daemon -p oxpanel-ctl -p oxpanel-acme
 
 sudo install -m0755 target/release/oxpanel-daemon /usr/sbin/oxpanel-daemon
 sudo install -m0755 target/release/oxpanel-ctl    /usr/bin/oxpanel-ctl
+sudo install -Dm0755 target/release/oxpanel-acme  /usr/libexec/oxpanel/oxpanel-acme
 sudo install -Dm0644 packaging/systemd/oxpanel-daemon.service /etc/systemd/system/oxpanel-daemon.service
 sudo install -Dm0644 packaging/sysusers.d/oxpanel.conf        /usr/lib/sysusers.d/oxpanel.conf
 sudo install -Dm0644 packaging/tmpfiles.d/oxpanel.conf        /usr/lib/tmpfiles.d/oxpanel.conf
 sudo install -Dm0640 packaging/daemon.env                     /etc/oxpanel/daemon.env
 sudo install -Dm0644 packaging/logrotate.d/oxpanel            /etc/logrotate.d/oxpanel
 sudo install -Dm0644 packaging/selinux/oxpanel.cil            /usr/share/oxpanel/selinux/oxpanel.cil
-# SELinux: the domain tenant applications (Node.js, Python) run in.
+# SELinux: the domain tenant applications (Node.js, Python) run in, and the label of the ACME challenge directory.
 if sudo selinuxenabled; then sudo semodule -i /usr/share/oxpanel/selinux/oxpanel.cil; fi
 sudo systemd-sysusers && sudo systemd-tmpfiles --create oxpanel.conf
 sudo systemctl daemon-reload
@@ -183,6 +185,12 @@ valid. After editing: `sudo systemctl restart oxpanel-daemon`.
 | `OXPANEL_PHP_CONF_DIR` | `/etc/oxpanel-php` | One PHP-FPM configuration per tenant that uses PHP. World-readable (each tenant's FPM reads its own); holds no secrets. |
 | `OXPANEL_WEB_USER` | `nginx` | Account the web-server workers run as; receives ACL grants on document roots. Must exist, must not be root, must not be inside the tenant uid range. |
 | `OXPANEL_COMMAND_TIMEOUT_SECS` | `60` | Upper bound for any single external command (`useradd`, `nginx -t`, …). |
+| `OXPANEL_TLS_DIR` | `/etc/pki/oxpanel` | Certificates and private keys of sites (root `0700`). |
+| `OXPANEL_ACME_DIR` | `/var/lib/oxpanel-acme` | Working directories shared with the ACME client. Created by `tmpfiles.d/oxpanel.conf` and labelled by the SELinux module: change those too if you move it. Must not overlap `OXPANEL_TLS_DIR`. |
+| `OXPANEL_ACME_DIRECTORY_URL` | Let's Encrypt production | ACME directory, `https://` only (staging: `https://acme-staging-v02.api.letsencrypt.org/directory`). |
+| `OXPANEL_ACME_CA_FILE` | *(system trust store)* | PEM bundle the ACME client trusts for the authority's HTTPS (private/test CA). Must be readable by `oxpanel-acme` and outside `/home` and `/root`. |
+| `OXPANEL_ACME_EMAIL` | *(none)* | Contact address registered with the ACME account. |
+| `OXPANEL_ACME_RENEW_DAYS` | `30` | Renew ACME certificates this many days (1–60) before expiry; checked 5 minutes after start and every 12 hours. |
 | `OXPANEL_LOG` | `info` | `tracing` filter: `info`, `debug`, `oxpanel_daemon=trace`, … |
 | `OXPANEL_DRY_RUN` | `false` | Use the in-memory fake OS (development only — see §11). |
 
@@ -359,6 +367,21 @@ sudo oxpanel-ctl vhost set api.acme.example --tenant acme --app python \
      --app-root apps/api --app-entry main.py --root apps/api/public
 sudo oxpanel-ctl vhost install-deps api.acme.example      # pip install -r requirements.txt
 
+# HTTPS with your own certificate (chain: certificate first, then intermediates;
+# the key unencrypted). Refused if the key does not match, the certificate has
+# expired or does not cover the domain; aliases it does not cover are listed.
+sudo oxpanel-ctl cert install acme.example --chain acme.example.chain.pem --key acme.example.key
+# domain=acme.example certificate=present source=uploaded ... names=acme.example,www.acme.example uncovered=- ...
+
+# Or from Let's Encrypt (HTTP-01: every name must point at this host, port 80 open).
+# Renewed automatically 30 days before expiry; `cert renew` does it now.
+sudo oxpanel-ctl cert request acme.example
+sudo oxpanel-ctl cert show acme.example
+
+# Redirect HTTP to HTTPS; HSTS (browsers remember it for a year — only when HTTPS is there to stay)
+sudo oxpanel-ctl vhost set acme.example --tenant acme --alias www.acme.example --redirect-https --hsts
+sudo oxpanel-ctl cert remove acme.example     # back to HTTP only (redirect and HSTS stop with it)
+
 # The end of a site's access log, or its error log
 sudo oxpanel-ctl vhost log acme.example
 sudo oxpanel-ctl vhost log acme.example --error --bytes 64K
@@ -454,6 +477,9 @@ needs to confirm a site is live, poll it.
 | `/run/oxpanel-app/<domain>/app.sock` | directory `<t>:<t> 0750` + ACL `user:nginx:--x` | socket Nginx proxies to; created by the application |
 | `/usr/share/oxpanel/selinux/oxpanel.cil` | `root 0644` | SELinux module: the `oxpanel_app_t` domain and the socket-directory label |
 | `/run/oxpanel/oxpanel.sock` | `root:oxpanel 0660` | API socket |
+| `/etc/pki/oxpanel/<domain>.crt`, `.key` | directory `root 0700`; key `0600` | a site's certificate chain (also kept in its record) and private key (only here) |
+| `/var/lib/oxpanel-acme/{account,challenges,issued}` | `oxpanel-acme` | the ACME client's account key (`0700`), HTTP-01 tokens (served by Nginx; SELinux `httpd_sys_content_t`), issued chains |
+| `/var/lib/oxpanel-acme/csr` | `root 0755` | signing requests the daemon hands to the client (public) |
 | SELinux hosts | | `semanage fcontext` equivalence `<docroot> = /usr/share/nginx/html` (labels the tree `httpd_sys_content_t`; a plain rule would be overridden by `file_contexts.homedirs`) |
 
 Records are the source of truth for *what OxPanel owns*. Back up
@@ -603,6 +629,11 @@ configuration with `nginx -t` on every change.
 | `DeadlineExceeded` | A tool hung longer than `OXPANEL_COMMAND_TIMEOUT_SECS` (SSSD/NSS lookups are the usual suspect). |
 | `Internal` | Details are in the journal only, by design. |
 | Site returns 403/404 right after `vhost set` | Reload race (worker swap) — retry after a moment. Persisting 403 with SELinux: check `ausearch -m avc -ts recent`; the docroot should be `httpd_sys_content_t`. |
+| `FailedPrecondition: OpenSSL is not installed` | `sudo dnf install openssl` (the RPM requires it). |
+| `FailedPrecondition: ACME is not available on this host: …` | The message names what is missing: the client binary, the `oxpanel-acme` account (`systemd-sysusers`) or a directory under `/var/lib/oxpanel-acme` (`systemd-tmpfiles --create oxpanel.conf`). `oxpanel-ctl host info` shows `acme=true` once it is in place. |
+| `cert request` prints `succeeded=false` | The certificate authority's reason follows the client's output, e.g. DNS of a name does not point here, port 80 is closed, or a rate limit. Try `OXPANEL_ACME_DIRECTORY_URL=https://acme-staging-v02.api.letsencrypt.org/directory` while experimenting. A request sent in the same instant as the `vhost set` that created the site can lose the race with Nginx's reload (`connection` error, EOF): repeat it. The site keeps whatever certificate it had. |
+| `InvalidArgument: certificate rejected: …` | The message says which check failed (key does not belong, expired, not valid for the domain, encrypted key). Nothing was changed. |
+| `openssl s_client -servername <unknown>` fails the handshake | Intended: the 443 catch-all rejects names no site with a certificate owns, so no tenant's certificate is ever shown for them. |
 | `curl http://<ip>/` closes the connection | Intended: the catch-all `default_server` returns 444 for hosts no tenant owns. |
 | `stat /home/<t>` shows `0710` | Expected with the ACL; `getfacl` shows `group::---` and `other::---`. |
 
@@ -611,8 +642,9 @@ configuration with `nginx -t` on every change.
 ```sh
 make image         # AlmaLinux 9 dev/test image (one-time)
 make check         # rustfmt --check, clippy pedantic -D warnings, tests, cargo-deny
-make test          # 106 unit + 6 gRPC end-to-end tests (fake OS, no root)
-make integration   # boots systemd in a container, installs from packaging/, runs 224 assertions
+make test          # unit + gRPC end-to-end tests (fake OS, no root)
+make integration   # boots systemd in a container, installs from packaging/, runs the root assertions
+                   # (HTTPS/ACME against a local Pebble downloaded at test time; OXPANEL_IT_SKIP_ACME=1 skips it)
 make rpm           # build the RPM from the working tree into dist/rpms/
 make acceptance    # REAL AlmaLinux 9 VM (KVM, SELinux enforcing): install like a user, run all phases
 ./scripts/dev.sh cargo <anything>   # run cargo inside the image
@@ -706,6 +738,10 @@ uninstall and remove `/var/lib/oxpanel`, `/etc/nginx/oxpanel.d`,
   tenants. Grant it to service accounts and administrators only, never to
   tenants.
 - Keep `/etc/oxpanel/daemon.env` root-readable (`0640`, as installed).
+- Private keys of sites live only in `/etc/pki/oxpanel` (root `0700`). They are
+  never logged, never returned by the API and never on a command line; the
+  ACME client runs as `oxpanel-acme` and cannot read them (it only ever sees
+  signing requests). Back up `/etc/pki/oxpanel` with `/var/lib/oxpanel`.
 - Two unit directives cannot be verified in the container-based integration
   test: `PrivateNetwork=` and `ProtectHostname=`. They are standard systemd
   features and expected to work on a real host, but confirm with

@@ -121,6 +121,6 @@ not per object; per-owner confinement is a possible later refinement.
 1. ~~Per-peer scopes; `UpdateTenantLimits` / `UpdateTenantOwner`; suspend/resume; usage; host info; `Reconcile`~~ — done (management milestone).
 2. Confined SELinux domain (`oxpanel_t`) and a capability *allow*-list for the unit; a confining policy for `oxpanel_app_t` (today it only labels applications so the web server can be allowed to reach exactly them).
 3. ~~Per-tenant PHP-FPM in the tenant slice; per-vhost logs~~ — done (hosting milestone 2a). Node.js and Python applications likewise (one sandboxed service per site, UNIX socket, own SELinux domain). Next: runtime version choice, per-tenant PHP settings, application environment variables.
-4. TLS for virtual hosts (ACME).
+4. ~~TLS for virtual hosts (ACME)~~ — done (M2b): uploaded and ACME (HTTP-01) certificates; the ACME client `oxpanel-acme` runs unprivileged outside the daemon. Next: DNS-01 / wildcard certificates.
 5. Repair mode for `Reconcile` (today it reports only).
 6. Split privileged helper behind the `System` trait.

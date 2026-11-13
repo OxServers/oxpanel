@@ -53,6 +53,21 @@ service OxPanelEngine {
   // Compare every record with the operating system and report differences.
   // Read-only: nothing is repaired.
   rpc Reconcile(ReconcileRequest) returns (ReconcileResponse);
+
+  // Install a certificate chain and its private key for a virtual host
+  // ("bring your own certificate"); the site is then also served on port 443.
+  // The key must match the certificate, the certificate must cover the
+  // virtual host's domain and be within its validity period.
+  rpc InstallCertificate(InstallCertificateRequest) returns (InstallCertificateResponse);
+  // Remove a virtual host's certificate and key; the site is HTTP-only again.
+  rpc RemoveCertificate(RemoveCertificateRequest) returns (RemoveCertificateResponse);
+  // Obtain (or renew now) a certificate for the virtual host's domain and
+  // aliases from the configured ACME certificate authority (HTTP-01).
+  // May take a minute or two.
+  rpc RequestCertificate(RequestCertificateRequest) returns (RequestCertificateResponse);
+  // Renew every ACME certificate that is due. The engine also does this by
+  // itself twice a day.
+  rpc RenewCertificates(RenewCertificatesRequest) returns (RenewCertificatesResponse);
 }
 
 // Per-tenant resource limits, applied through systemd (cgroups v2).
@@ -146,6 +161,11 @@ message VirtualHost {
   bool php = 6;
   // Set when the virtual host runs an application.
   App app = 7;
+  // The installed certificate; absent when the site is HTTP-only.
+  Certificate certificate = 8;
+  // As requested; they take effect only while a certificate is installed.
+  bool redirect_https = 9;
+  bool hsts = 10;
 }
 
 enum AppRuntime {
@@ -188,6 +208,14 @@ message ConfigureVirtualHostRequest {
   // Run an application behind this virtual host. Cannot be combined with
   // `php`. FAILED_PRECONDITION if the runtime is not installed on the host.
   App app = 6;
+  // Answer plain-HTTP requests with a redirect to HTTPS. Takes effect only
+  // while a certificate is installed (ACME challenges are still answered
+  // over HTTP).
+  bool redirect_https = 7;
+  // Send `Strict-Transport-Security: max-age=31536000` over HTTPS. Browsers
+  // remember it for a year: enable it only once HTTPS is there to stay.
+  // Takes effect only while a certificate is installed.
+  bool hsts = 8;
 }
 
 message ConfigureVirtualHostResponse {
@@ -286,6 +314,13 @@ message HostInfo {
   // Installed Node.js version, e.g. "22.11.0"; empty if none. A version
   // older than 22 is reported here while `node_available` stays false.
   string node_version = 19;
+  // OpenSSL is installed, so certificates can be installed.
+  bool tls_available = 20;
+  // The ACME client, its account and its directories are in place, so
+  // certificates can be requested.
+  bool acme_available = 21;
+  // The ACME directory certificates are requested from.
+  string acme_directory_url = 22;
 }
 
 message ReconcileRequest {}
@@ -319,6 +354,11 @@ enum DriftKind {
   DRIFT_KIND_APP_UNIT_DRIFT = 12;
   // An oxpanel-app-*.service unit that no virtual host accounts for.
   DRIFT_KIND_ORPHAN_APP_UNIT = 13;
+  // A virtual host's certificate file is missing or differs from the record,
+  // or its private key is missing or readable by others.
+  DRIFT_KIND_TLS_CERTIFICATE_DRIFT = 14;
+  // A file in the OxPanel certificate directory that no virtual host accounts for.
+  DRIFT_KIND_ORPHAN_TLS_FILE = 15;
 }
 
 message Drift {
@@ -372,4 +412,77 @@ message InstallAppDependenciesResponse {
   bool succeeded = 1;
   // The end of the installer's output.
   string output = 2;
+}
+
+enum CertificateSource {
+  CERTIFICATE_SOURCE_UNSPECIFIED = 0;
+  // Installed with InstallCertificate.
+  CERTIFICATE_SOURCE_UPLOADED = 1;
+  // Obtained with RequestCertificate; renewed automatically.
+  CERTIFICATE_SOURCE_ACME = 2;
+}
+
+// What is known about a virtual host's certificate. The private key is never
+// part of any response.
+message Certificate {
+  CertificateSource source = 1;
+  // Issuer distinguished name, e.g. "CN=R11,O=Let's Encrypt,C=US".
+  string issuer = 2;
+  google.protobuf.Timestamp not_before = 3;
+  google.protobuf.Timestamp not_after = 4;
+  // DNS names the certificate is valid for (may contain wildcards).
+  repeated string names = 5;
+  // Server names of the virtual host the certificate does NOT cover;
+  // browsers will show a warning for these.
+  repeated string uncovered_names = 6;
+  google.protobuf.Timestamp installed_at = 7;
+}
+
+message InstallCertificateRequest {
+  string domain = 1;
+  // PEM: the certificate for the domain first, then its intermediates.
+  string certificate_chain_pem = 2;
+  // PEM, unencrypted (PKCS#8, RSA or EC). Never logged, never returned.
+  string private_key_pem = 3;
+}
+
+message InstallCertificateResponse {
+  VirtualHost vhost = 1;
+  // false when exactly this certificate and key were already installed.
+  bool changed = 2;
+}
+
+message RemoveCertificateRequest {
+  string domain = 1;
+}
+
+message RemoveCertificateResponse {
+  VirtualHost vhost = 1;
+  // false when the virtual host had no certificate.
+  bool removed = 2;
+}
+
+message RequestCertificateRequest {
+  string domain = 1;
+}
+
+message RequestCertificateResponse {
+  // false when the certificate authority did not issue; `output` says why.
+  bool succeeded = 1;
+  // What the ACME client reported.
+  string output = 2;
+  VirtualHost vhost = 3;
+}
+
+message RenewCertificatesRequest {}
+
+message CertificateRenewal {
+  string domain = 1;
+  bool succeeded = 2;
+  string output = 3;
+}
+
+message RenewCertificatesResponse {
+  // One entry per certificate that was due; empty when none was.
+  repeated CertificateRenewal renewals = 1;
 }

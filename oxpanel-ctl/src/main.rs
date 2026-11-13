@@ -2,7 +2,8 @@
 //!
 //! Exit status: 0 on success, 1 on an API error (message on stderr),
 //! 2 on usage errors, 3 when `host reconcile` found drift, 4 when
-//! `vhost install-deps` ran and the installer failed.
+//! `vhost install-deps` ran and the installer failed, or when `cert request`
+//! / `cert renew` ran and no certificate was issued.
 // A CLI's whole job is to print.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
@@ -60,6 +61,9 @@ enum Cmd {
     /// The engine and the host it runs on.
     #[command(subcommand)]
     Host(HostCmd),
+    /// HTTPS certificates of virtual hosts.
+    #[command(subcommand)]
+    Cert(CertCmd),
 }
 
 #[derive(Subcommand, Debug)]
@@ -162,6 +166,13 @@ enum VhostCmd {
         /// Program to run, relative to the application directory (default app.js / app.py).
         #[arg(long, default_value = "", requires = "app")]
         app_entry: String,
+        /// Redirect plain HTTP to HTTPS (takes effect once a certificate is installed).
+        #[arg(long)]
+        redirect_https: bool,
+        /// Send Strict-Transport-Security over HTTPS. Browsers remember it for a
+        /// year: enable only once HTTPS is there to stay.
+        #[arg(long)]
+        hsts: bool,
     },
     /// Restart the site's application (after putting new code in place).
     RestartApp {
@@ -193,6 +204,31 @@ enum VhostCmd {
         #[arg(long, default_value = "")]
         tenant: String,
     },
+}
+
+#[derive(Subcommand, Debug)]
+enum CertCmd {
+    /// Install a certificate chain and its private key ("bring your own").
+    /// The key is read from a file and sent in the request body.
+    Install {
+        domain: String,
+        /// PEM file: the certificate first, then its intermediates.
+        #[arg(long)]
+        chain: PathBuf,
+        /// PEM file with the unencrypted private key.
+        #[arg(long)]
+        key: PathBuf,
+    },
+    /// Remove the certificate; the site is served over HTTP only again.
+    Remove { domain: String },
+    /// Obtain (or renew now) a certificate from the ACME authority.
+    /// Exits with status 4 when none was issued.
+    Request { domain: String },
+    /// Renew every ACME certificate that is due.
+    /// Exits with status 4 when a renewal failed.
+    Renew,
+    /// Show a virtual host's certificate.
+    Show { domain: String },
 }
 
 #[derive(clap::ValueEnum, Debug, Clone, Copy)]
@@ -303,6 +339,7 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
         Cmd::Tenant(cmd) => run_tenant(&mut c, cmd).await?,
         Cmd::Vhost(cmd) => run_vhost(&mut c, cmd).await?,
         Cmd::Host(cmd) => run_host(&mut c, cmd).await?,
+        Cmd::Cert(cmd) => run_cert(&mut c, cmd).await?,
     })
 }
 
@@ -454,9 +491,13 @@ async fn run_vhost(
             app,
             app_root,
             app_entry,
+            redirect_https,
+            hsts,
         } => {
             let r = c
                 .configure_virtual_host(pb::ConfigureVirtualHostRequest {
+                    redirect_https,
+                    hsts,
                     domain,
                     tenant,
                     document_root: root,
@@ -523,6 +564,128 @@ async fn run_vhost(
     Ok(ExitCode::SUCCESS)
 }
 
+/// One line about a virtual host's certificate (`certificate=-` when none).
+fn print_certificate(v: &pb::VirtualHost) {
+    let Some(c) = &v.certificate else {
+        say!("domain={} certificate=-", v.domain);
+        return;
+    };
+    let not_before = c.not_before.as_ref().map_or(0, |t| t.seconds);
+    let not_after = c.not_after.as_ref().map_or(0, |t| t.seconds);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
+    let source = match pb::CertificateSource::try_from(c.source) {
+        Ok(pb::CertificateSource::Uploaded) => "uploaded",
+        Ok(pb::CertificateSource::Acme) => "acme",
+        _ => "unknown",
+    };
+    let list = |names: &[String]| {
+        if names.is_empty() {
+            "-".to_owned()
+        } else {
+            names.join(",")
+        }
+    };
+    say!(
+        "domain={} certificate=present source={} not_before={} not_after={} expires_in_days={} names={} uncovered={} redirect_https={} hsts={} issuer={}",
+        v.domain,
+        source,
+        not_before,
+        not_after,
+        not_after.saturating_sub(now).div_euclid(86_400),
+        list(&c.names),
+        list(&c.uncovered_names),
+        v.redirect_https,
+        v.hsts,
+        c.issuer,
+    );
+}
+
+async fn run_cert(
+    c: &mut OxPanelEngineClient<Channel>,
+    cmd: CertCmd,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    match cmd {
+        CertCmd::Install { domain, chain, key } => {
+            let certificate_chain_pem = std::fs::read_to_string(&chain)
+                .map_err(|e| format!("cannot read {}: {e}", chain.display()))?;
+            let private_key_pem = std::fs::read_to_string(&key)
+                .map_err(|e| format!("cannot read {}: {e}", key.display()))?;
+            let r = c
+                .install_certificate(pb::InstallCertificateRequest {
+                    domain,
+                    certificate_chain_pem,
+                    private_key_pem,
+                })
+                .await?
+                .into_inner();
+            say!("changed={}", r.changed);
+            if let Some(v) = &r.vhost {
+                print_certificate(v);
+            }
+        }
+        CertCmd::Remove { domain } => {
+            let r = c
+                .remove_certificate(pb::RemoveCertificateRequest { domain })
+                .await?
+                .into_inner();
+            say!("removed={}", r.removed);
+        }
+        CertCmd::Request { domain } => {
+            let r = c
+                .request_certificate(pb::RequestCertificateRequest { domain })
+                .await?
+                .into_inner();
+            for line in r.output.lines() {
+                say!("{line}");
+            }
+            say!("succeeded={}", r.succeeded);
+            if let Some(v) = &r.vhost {
+                print_certificate(v);
+            }
+            if !r.succeeded {
+                return Ok(ExitCode::from(EXIT_INSTALL_FAILED));
+            }
+        }
+        CertCmd::Renew => {
+            let r = c
+                .renew_certificates(pb::RenewCertificatesRequest {})
+                .await?
+                .into_inner();
+            say!("renewals={}", r.renewals.len());
+            let mut failed = false;
+            for n in &r.renewals {
+                say!("domain={} succeeded={}", n.domain, n.succeeded);
+                if !n.succeeded {
+                    failed = true;
+                    for line in n.output.lines() {
+                        say!("  {line}");
+                    }
+                }
+            }
+            if failed {
+                return Ok(ExitCode::from(EXIT_INSTALL_FAILED));
+            }
+        }
+        CertCmd::Show { domain } => {
+            let vhosts = c
+                .list_virtual_hosts(pb::ListVirtualHostsRequest {
+                    tenant: String::new(),
+                })
+                .await?
+                .into_inner()
+                .vhosts;
+            let v = vhosts
+                .iter()
+                .find(|v| v.domain == domain)
+                .ok_or_else(|| tonic::Status::not_found(format!("no virtual host {domain}")))?;
+            print_certificate(v);
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 async fn run_host(
     c: &mut OxPanelEngineClient<Channel>,
     cmd: HostCmd,
@@ -534,7 +697,7 @@ async fn run_host(
                 .await?
                 .into_inner();
             say!(
-                "version={} selinux={} php={} node={} node_version={} python={} dry_run={} tenants={} vhosts={} uid_range={}-{} load={:.2},{:.2},{:.2} memory_total={} memory_free={} home_disk_total={} home_disk_free={} uptime={}",
+                "version={} selinux={} php={} node={} node_version={} python={} dry_run={} tenants={} vhosts={} uid_range={}-{} load={:.2},{:.2},{:.2} memory_total={} memory_free={} home_disk_total={} home_disk_free={} uptime={} tls={} acme={} acme_directory={}",
                 i.daemon_version,
                 i.selinux_enabled,
                 i.php_available,
@@ -558,6 +721,9 @@ async fn run_host(
                 i.home_disk_total_bytes,
                 i.home_disk_free_bytes,
                 i.uptime_seconds,
+                i.tls_available,
+                i.acme_available,
+                i.acme_directory_url,
             );
         }
         HostCmd::Reconcile => {

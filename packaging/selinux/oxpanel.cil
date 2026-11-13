@@ -40,6 +40,12 @@
 ; The web server may connect to application sockets, and only to those.
 (allow httpd_t oxpanel_app_t (unix_stream_socket (connectto)))
 
+; ACME HTTP-01 challenge tokens: written by the ACME client, served by the web
+; server under /.well-known/acme-challenge/ of every site. Labelled as ordinary
+; web content (read-only for httpd_t); the rest of /var/lib/oxpanel-acme stays
+; var_lib_t, which the web server cannot read.
+(filecon "/var/lib/oxpanel-acme/challenges(/.*)?" any (system_u object_r httpd_sys_content_t ((s0) (s0))))
+
 ; Runtime directories of applications: sockets created inside inherit the
 ; type, which the web server is allowed to write to.
 (filecon "/var/run/oxpanel-app(/.*)?" any (system_u object_r httpd_var_run_t ((s0) (s0))))

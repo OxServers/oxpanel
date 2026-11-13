@@ -59,7 +59,24 @@ pub struct Config {
     pub dry_run: bool,
     /// `tracing` filter directive, e.g. `info` or `oxpanel_daemon=debug`.
     pub log_filter: String,
+    /// Certificates (`<domain>.crt`) and private keys (`<domain>.key`) of
+    /// virtual hosts. Root-only.
+    pub tls_dir: PathBuf,
+    /// Working directories shared with the ACME client (see [`crate::acme`]).
+    pub acme_dir: PathBuf,
+    /// ACME directory certificates are requested from.
+    pub acme_directory_url: String,
+    /// PEM bundle the ACME client trusts instead of the system's, for a
+    /// private or test certificate authority.
+    pub acme_ca_file: Option<PathBuf>,
+    /// Contact address registered with the ACME account.
+    pub acme_email: Option<String>,
+    /// ACME certificates are renewed once they expire within this time.
+    pub acme_renew_before: Duration,
 }
+
+/// Let's Encrypt's production directory.
+pub const DEFAULT_ACME_DIRECTORY_URL: &str = "https://acme-v02.api.letsencrypt.org/directory";
 
 impl Default for Config {
     fn default() -> Self {
@@ -84,6 +101,12 @@ impl Default for Config {
             command_timeout: Duration::from_secs(60),
             dry_run: false,
             log_filter: "info".to_owned(),
+            tls_dir: PathBuf::from("/etc/pki/oxpanel"),
+            acme_dir: PathBuf::from("/var/lib/oxpanel-acme"),
+            acme_directory_url: DEFAULT_ACME_DIRECTORY_URL.to_owned(),
+            acme_ca_file: None,
+            acme_email: None,
+            acme_renew_before: Duration::from_secs(30 * 86_400),
         }
     }
 }
@@ -178,8 +201,85 @@ impl Config {
         if let Some(v) = get("OXPANEL_LOG") {
             c.log_filter = v;
         }
+        path("OXPANEL_TLS_DIR", &mut c.tls_dir)?;
+        path("OXPANEL_ACME_DIR", &mut c.acme_dir)?;
+        c.acme_from_lookup(&get)?;
         c.validate()?;
         Ok(c)
+    }
+
+    /// The `OXPANEL_ACME_*` settings.
+    fn acme_from_lookup(&mut self, get: &impl Fn(&str) -> Option<String>) -> Result<()> {
+        if let Some(v) = get("OXPANEL_ACME_DIRECTORY_URL") {
+            v.trim().clone_into(&mut self.acme_directory_url);
+        }
+        if let Some(v) = get("OXPANEL_ACME_CA_FILE") {
+            let v = v.trim();
+            self.acme_ca_file = (!v.is_empty()).then(|| PathBuf::from(v));
+        }
+        if let Some(v) = get("OXPANEL_ACME_EMAIL") {
+            let v = v.trim();
+            self.acme_email = (!v.is_empty()).then(|| v.to_owned());
+        }
+        if let Some(v) = get("OXPANEL_ACME_RENEW_DAYS") {
+            let days = parse_u32("OXPANEL_ACME_RENEW_DAYS", &v)?;
+            if !(1..=60).contains(&days) {
+                return Err(Error::invalid(
+                    "config",
+                    "OXPANEL_ACME_RENEW_DAYS must be 1..=60",
+                ));
+            }
+            self.acme_renew_before = Duration::from_secs(u64::from(days) * 86_400);
+        }
+        Ok(())
+    }
+
+    /// The ACME settings end up in the argument vector of the ACME client
+    /// (through `systemd-run`, which expands `$` and `%`), so they get an
+    /// allow-list too.
+    fn validate_acme(&self) -> Result<()> {
+        let url = &self.acme_directory_url;
+        let rest = url.strip_prefix("https://").unwrap_or_default();
+        if rest.is_empty()
+            || url.len() > 255
+            || !rest.bytes().all(|b| {
+                b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'~' | b':' | b'/')
+            })
+        {
+            return Err(Error::invalid(
+                "config",
+                "OXPANEL_ACME_DIRECTORY_URL must be an https:// URL made of A-Z, a-z, 0-9 and . - _ ~ : /",
+            ));
+        }
+        if let Some(p) = &self.acme_ca_file {
+            check_path("OXPANEL_ACME_CA_FILE", p)?;
+        }
+        if let Some(email) = &self.acme_email {
+            let ok = email.len() <= 254
+                && email.split_once('@').is_some_and(|(local, host)| {
+                    !local.is_empty()
+                        && local.bytes().all(|b| {
+                            b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'+' | b'-')
+                        })
+                        && crate::validate::Domain::parse(host).is_ok()
+                });
+            if !ok {
+                return Err(Error::invalid(
+                    "config",
+                    "OXPANEL_ACME_EMAIL must be a plain address such as hostmaster@example.com",
+                ));
+            }
+        }
+        if self.tls_dir == self.acme_dir
+            || self.tls_dir.starts_with(&self.acme_dir)
+            || self.acme_dir.starts_with(&self.tls_dir)
+        {
+            return Err(Error::invalid(
+                "config",
+                "OXPANEL_TLS_DIR and OXPANEL_ACME_DIR must be separate directories",
+            ));
+        }
+        Ok(())
     }
 
     /// Cross-field checks.
@@ -193,9 +293,12 @@ impl Config {
             ("OXPANEL_SYSTEMD_UNIT_DIR", &self.systemd_unit_dir),
             ("OXPANEL_NGINX_LOG_DIR", &self.nginx_log_dir),
             ("OXPANEL_PHP_CONF_DIR", &self.php_conf_dir),
+            ("OXPANEL_TLS_DIR", &self.tls_dir),
+            ("OXPANEL_ACME_DIR", &self.acme_dir),
         ] {
             check_path(key, p)?;
         }
+        self.validate_acme()?;
         if self.uid_min < 1000 {
             return Err(Error::invalid(
                 "config",
@@ -413,6 +516,27 @@ mod tests {
         assert!(from(&[("OXPANEL_NGINX_CONF_DIR", "/etc/nginx/ox;panel.d")]).is_err());
         assert!(from(&[("OXPANEL_HOME_BASE", "/srv/web-homes_v2")]).is_ok());
         assert!(from(&[("OXPANEL_WEB_USER", "nginx;rm")]).is_err());
+        for bad in [
+            "http://ca.example/directory",
+            "https://",
+            "https://ca.example/dir?x=$HOME",
+            "https://ca.example/%n",
+            "https://ca.example/a b",
+        ] {
+            assert!(
+                from(&[("OXPANEL_ACME_DIRECTORY_URL", bad)]).is_err(),
+                "{bad}"
+            );
+        }
+        assert!(
+            from(&[("OXPANEL_ACME_DIRECTORY_URL", "https://localhost:14000/dir")])
+                .is_ok_and(|c| c.acme_directory_url == "https://localhost:14000/dir")
+        );
+        assert!(from(&[("OXPANEL_ACME_EMAIL", "ops+tls@example.com")]).is_ok());
+        assert!(from(&[("OXPANEL_ACME_EMAIL", "ops@example.com --evil")]).is_err());
+        assert!(from(&[("OXPANEL_ACME_CA_FILE", "/etc/pki/my ca.pem")]).is_err());
+        assert!(from(&[("OXPANEL_ACME_RENEW_DAYS", "0")]).is_err());
+        assert!(from(&[("OXPANEL_TLS_DIR", "/var/lib/oxpanel-acme/keys")]).is_err());
         assert!(from(&[
             ("OXPANEL_NGINX_CONF_DIR", "/etc/nginx/conf.d"),
             ("OXPANEL_NGINX_INCLUDE_FILE", "/etc/nginx/conf.d/x.conf")

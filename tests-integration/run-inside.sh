@@ -15,6 +15,7 @@ if [ "${SKIP_INSTALL:-0}" != 1 ]; then
   echo "== install (as the RPM would)"
   install -m0755 /work/target/release/oxpanel-daemon /usr/sbin/oxpanel-daemon
   install -m0755 /work/target/release/oxpanel-ctl /usr/bin/oxpanel-ctl
+  install -Dm0755 /work/target/release/oxpanel-acme /usr/libexec/oxpanel/oxpanel-acme
   install -Dm0644 /work/packaging/systemd/oxpanel-daemon.service /etc/systemd/system/oxpanel-daemon.service
   install -Dm0644 /work/packaging/sysusers.d/oxpanel.conf /usr/lib/sysusers.d/oxpanel.conf
   install -Dm0644 /work/packaging/tmpfiles.d/oxpanel.conf /usr/lib/tmpfiles.d/oxpanel.conf
@@ -379,6 +380,189 @@ check "the site is static again" body_eventually node.test /static.txt static-fi
 check "removing the sites removes the remaining unit" bash -c 'oxpanel-ctl vhost remove py.test | grep -q "^removed=true" && oxpanel-ctl vhost remove node.test | grep -q "^removed=true" && ! systemctl -q is-active "$1" && test ! -e /etc/systemd/system/"$1"' _ "$PYU"
 check "no runtime directories left behind" bash -c '! ls /run/oxpanel-app/*/app.sock >/dev/null 2>&1'
 check "no drift after application teardown" grep -q '^drifts=0$' <(oxpanel-ctl host reconcile)
+
+echo "== HTTPS: bring your own certificate"
+T=/root/tls-it; rm -rf "$T"; mkdir -p "$T"
+https_of() { curl -s --resolve "$1:443:127.0.0.1" --cacert "$3" "https://$1$2"; }
+https_code() { curl -s -o /dev/null -w '%{http_code}' --resolve "$1:443:127.0.0.1" --cacert "$3" "https://$1$2"; }
+https_eventually() { local i; for i in $(seq 1 50); do [ "$(https_of "$1" "$2" "$3")" = "$4" ] && return 0; sleep 0.1; done; return 1; }
+https_code_eventually() { local i; for i in $(seq 1 50); do [ "$(https_code "$1" "$2" "$3")" = "$4" ] && return 0; sleep 0.1; done; return 1; }
+served_fingerprint() { openssl s_client -connect 127.0.0.1:443 -servername "$1" </dev/null 2>/dev/null | openssl x509 -noout -fingerprint -sha256 2>/dev/null; }
+# A private CA and leaf certificates: leaf <name> <key> <SANs> [openssl x509 date options...]
+openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -keyout "$T/ca.key" -out "$T/ca.crt" -subj "/CN=OxPanel IT CA" -days 3 2>/dev/null
+leaf() {
+  local name="$1" key="$2" sans="$3"; shift 3
+  openssl req -new -key "$T/$key" -subj "/CN=$name" -out "$T/$name.csr" 2>/dev/null
+  openssl x509 -req -in "$T/$name.csr" -CA "$T/ca.crt" -CAkey "$T/ca.key" -set_serial "0x$(openssl rand -hex 8)" \
+    -extfile <(printf 'subjectAltName=%s\nbasicConstraints=CA:FALSE\n' "$sans") -out "$T/$name.crt" "$@" 2>/dev/null
+}
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$T/site.key" 2>/dev/null
+openssl genpkey -algorithm EC -pkeyopt ec_paramgen_curve:P-256 -out "$T/other.key" 2>/dev/null
+leaf example.test site.key "DNS:example.test,DNS:www.example.test" -days 2
+cat "$T/example.test.crt" "$T/ca.crt" > "$T/example.test.chain"
+leaf expired.example.test site.key "DNS:example.test" -not_before 20200101000000Z -not_after 20200201000000Z
+leaf wrongname.test site.key "DNS:wrongname.test"
+check "host info reports TLS support" grep -q ' tls=true ' <(oxpanel-ctl host info)
+check "a key that does not match is refused" grep -q 'InvalidArgument.*does not belong' <(oxpanel-ctl cert install example.test --chain "$T/example.test.chain" --key "$T/other.key" 2>&1 || true)
+check "an expired certificate is refused" grep -q 'InvalidArgument.*expired' <(oxpanel-ctl cert install example.test --chain "$T/expired.example.test.crt" --key "$T/site.key" 2>&1 || true)
+check "a certificate for another name is refused" grep -q 'InvalidArgument.*not valid for example.test' <(oxpanel-ctl cert install example.test --chain "$T/wrongname.test.crt" --key "$T/site.key" 2>&1 || true)
+check "a refused certificate leaves nothing behind" bash -c 'test ! -e /etc/pki/oxpanel/example.test.crt && test ! -e /etc/pki/oxpanel/example.test.key && ! ls /etc/pki/oxpanel/*.new >/dev/null 2>&1 && ! grep -q 443 /etc/nginx/oxpanel.d/example.test.conf'
+check "the refused key never reached the journal" bash -c '! journalctl -u oxpanel-daemon --no-pager | grep -q "PRIVATE KEY"'
+out="$(oxpanel-ctl cert install example.test --chain "$T/example.test.chain" --key "$T/site.key")"
+echo "$out"
+check "certificate installed" bash -c 'grep -q "^changed=true" <<<"$1" && grep -q " source=uploaded " <<<"$1" && grep -q " names=example.test,www.example.test uncovered=- " <<<"$1"' _ "$out"
+check "certificate directory is root-only" test "$(stat -c '%U %a' /etc/pki/oxpanel)" = "root 700"
+check "private key is root 0600" test "$(stat -c '%U %a' /etc/pki/oxpanel/example.test.key)" = "root 600"
+check "the key is not in the record" bash -c '! grep -q "PRIVATE" /var/lib/oxpanel/vhosts/example.test.json && ! grep -qF "$(sed -n 2p "$1")" /var/lib/oxpanel/vhosts/example.test.json' _ "$T/site.key"
+check "the key never appeared on a command line or in the journal" bash -c '! journalctl --no-pager -b | grep -qF "$(sed -n 2p "$1")"' _ "$T/site.key"
+check "a tenant cannot read the key" bash -c '! setpriv --reuid=bob --regid=bob --clear-groups -- cat /etc/pki/oxpanel/example.test.key >/dev/null 2>&1'
+check "nginx -t passes with HTTPS" nginx -t
+check "HTTPS serves the site with the uploaded certificate" https_eventually example.test / "$T/ca.crt" hello-from-alice
+check "HTTPS serves the alias too" https_eventually www.example.test / "$T/ca.crt" hello-from-alice
+check "the certificate served is exactly the uploaded one" test "$(served_fingerprint example.test)" = "$(openssl x509 -in "$T/example.test.crt" -noout -fingerprint -sha256)"
+check "HTTP/2 is offered" test "$(curl -s -o /dev/null -w '%{http_version}' --http2 --resolve example.test:443:127.0.0.1 --cacert "$T/ca.crt" https://example.test/)" = 2
+check "TLS 1.2 is accepted" test "$(curl -s -o /dev/null -w '%{http_code}' --tlsv1.2 --tls-max 1.2 --resolve example.test:443:127.0.0.1 --cacert "$T/ca.crt" https://example.test/)" = 200
+check "TLS 1.1 is refused" bash -c '! openssl s_client -connect 127.0.0.1:443 -servername example.test -tls1_1 </dev/null >/dev/null 2>&1'
+check "plain HTTP still serves the site (no redirect unless asked)" body_eventually example.test / hello-from-alice
+check "dot-files are 404 over HTTPS too" test "$(https_code example.test /.env "$T/ca.crt")" = 404
+check "an unknown name on 443 gets no certificate" bash -c '! openssl s_client -connect 127.0.0.1:443 -servername other.test </dev/null 2>/dev/null | grep -q "BEGIN CERTIFICATE"'
+check "a request without SNI gets no certificate" bash -c '! openssl s_client -connect 127.0.0.1:443 -noservername </dev/null 2>/dev/null | grep -q "BEGIN CERTIFICATE"'
+check "an unknown name on 443 never reaches a tenant" bash -c '! curl -sk --resolve other.test:443:127.0.0.1 https://other.test/ >/dev/null 2>&1'
+check "installing the same certificate again changes nothing" grep -q '^changed=false' <(oxpanel-ctl cert install example.test --chain "$T/example.test.chain" --key "$T/site.key")
+check "cert show reports it" grep -q '^domain=example.test certificate=present source=uploaded ' <(oxpanel-ctl cert show example.test)
+check "HTTPS is not drift" grep -q '^drifts=0$' <(oxpanel-ctl host reconcile)
+
+out="$(oxpanel-ctl vhost set example.test --tenant alice --alias www.example.test --redirect-https)"
+check "redirect switched on (certificate kept)" bash -c 'grep -q "^changed=true" <<<"$1" && test -e /etc/pki/oxpanel/example.test.crt' _ "$out"
+check "HTTP redirects to HTTPS" code_eventually example.test /x 301
+check "the redirect keeps host and path" grep -qi '^location: https://example.test/x?y=1' <(curl -s -D- -o /dev/null -H 'Host: example.test' 'http://127.0.0.1/x?y=1')
+setpriv --reuid=oxpanel-acme --regid=oxpanel-acme --clear-groups -- sh -c 'echo challenge-ok > /var/lib/oxpanel-acme/challenges/it-probe-token'
+check "ACME challenges are still answered over HTTP while redirecting" body_eventually example.test /.well-known/acme-challenge/it-probe-token challenge-ok
+check "the challenge directory is not reachable over HTTPS" test "$(https_code example.test /.well-known/acme-challenge/it-probe-token "$T/ca.crt")" = 404
+check "HSTS is off by default" bash -c '! curl -s -D- -o /dev/null --resolve example.test:443:127.0.0.1 --cacert "$1" https://example.test/ | grep -qi strict-transport' _ "$T/ca.crt"
+oxpanel-ctl vhost set example.test --tenant alice --alias www.example.test --redirect-https --hsts >/dev/null
+check "HSTS is sent over HTTPS when enabled" bash -c 'for i in $(seq 1 50); do curl -s -D- -o /dev/null --resolve example.test:443:127.0.0.1 --cacert "$1" https://example.test/ | grep -qi "^strict-transport-security: max-age=31536000" && exit 0; sleep 0.1; done; exit 1' _ "$T/ca.crt"
+check "HSTS is not sent over plain HTTP" bash -c '! curl -s -D- -o /dev/null -H "Host: example.test" http://127.0.0.1/ | grep -qi strict-transport'
+
+check "suspend: HTTPS answers 503 with the site's own certificate" bash -c 'oxpanel-ctl tenant suspend alice >/dev/null' && check "suspended HTTPS site is 503" https_code_eventually example.test / "$T/ca.crt" 503
+check "suspended site does not redirect" code_eventually example.test / 503
+check "suspended site answers no ACME challenges" test "$(code_of example.test /.well-known/acme-challenge/it-probe-token)" = 503
+check_not "no certificate can be requested for a suspended tenant" oxpanel-ctl cert request example.test
+oxpanel-ctl tenant resume alice >/dev/null
+check "resumed HTTPS site serves content" https_eventually example.test / "$T/ca.crt" hello-from-alice
+rm -f /var/lib/oxpanel-acme/challenges/it-probe-token
+
+cp -p /etc/pki/oxpanel/example.test.crt "$T/crt.bak"
+echo edited >> /etc/pki/oxpanel/example.test.crt
+chmod 0644 /etc/pki/oxpanel/example.test.key
+echo stray > /etc/pki/oxpanel/stray.pem
+out="$(oxpanel-ctl host reconcile || true)"
+echo "$out"
+check "reconcile reports the edited certificate and the opened key" test "$(grep -c '^kind=DRIFT_KIND_TLS_CERTIFICATE_DRIFT subject=example.test ' <<<"$out")" = 2
+check "reconcile reports the stray file" grep -q '^kind=DRIFT_KIND_ORPHAN_TLS_FILE subject=/etc/pki/oxpanel/stray.pem ' <<<"$out"
+rm -f /etc/pki/oxpanel/stray.pem
+check "installing again heals the certificate files" grep -q '^changed=true' <(oxpanel-ctl cert install example.test --chain "$T/example.test.chain" --key "$T/site.key")
+check "key is root-only again" test "$(stat -c '%a' /etc/pki/oxpanel/example.test.key)" = 600
+check "no drift after healing" grep -q '^drifts=0$' <(oxpanel-ctl host reconcile)
+
+echo "== HTTPS: PHP and Node.js applications"
+oxpanel-ctl vhost set tlsphp.test --tenant bob --php >/dev/null
+as_user bob sh -c 'echo "<?php echo \"https=\" . (\$_SERVER[\"HTTPS\"] ?? \"unset\") . \" port=\" . \$_SERVER[\"SERVER_PORT\"];" > /home/bob/public_html/index.php'
+leaf tlsphp.test other.key "DNS:tlsphp.test"
+check "certificate for the PHP site (EC key) installed" grep -q '^changed=true' <(oxpanel-ctl cert install tlsphp.test --chain "$T/tlsphp.test.crt" --key "$T/other.key")
+check "PHP sees HTTPS=on over HTTPS" https_eventually tlsphp.test / "$T/ca.crt" "https=on port=443"
+check "PHP sees no HTTPS over HTTP" body_eventually tlsphp.test / "https=unset port=80"
+oxpanel-ctl vhost set tlsnode.test --tenant bob --app node >/dev/null
+as_user bob sh -c 'cat > /home/bob/apps/tlsnode.test/app.js' <<'JS'
+require('http').createServer((req, res) => {
+  res.end(`node proto=${req.headers['x-forwarded-proto']} host=${req.headers.host}`);
+}).listen(process.env.PORT);
+JS
+oxpanel-ctl vhost restart-app tlsnode.test >/dev/null
+leaf tlsnode.test other.key "DNS:tlsnode.test"
+check "certificate for the Node.js site installed" grep -q '^changed=true' <(oxpanel-ctl cert install tlsnode.test --chain "$T/tlsnode.test.crt" --key "$T/other.key")
+check "the Node.js app sees X-Forwarded-Proto https over HTTPS" https_eventually tlsnode.test /p "$T/ca.crt" "node proto=https host=tlsnode.test"
+check "the Node.js app sees X-Forwarded-Proto http over HTTP" body_eventually tlsnode.test /p "node proto=http host=tlsnode.test"
+check "removing a certificate makes the site HTTP-only again" bash -c 'oxpanel-ctl cert remove tlsnode.test | grep -q "^removed=true" && test ! -e /etc/pki/oxpanel/tlsnode.test.key && test ! -e /etc/pki/oxpanel/tlsnode.test.crt && ! grep -q 443 /etc/nginx/oxpanel.d/tlsnode.test.conf'
+check "after removal the name gets no certificate on 443" bash -c 'for i in $(seq 1 50); do openssl s_client -connect 127.0.0.1:443 -servername tlsnode.test </dev/null 2>/dev/null | grep -q "BEGIN CERTIFICATE" || exit 0; sleep 0.1; done; exit 1'
+check "second removal is a no-op" grep -q '^removed=false' <(oxpanel-ctl cert remove tlsnode.test)
+check "removing a site removes its certificate" bash -c 'oxpanel-ctl vhost remove tlsphp.test | grep -q "^removed=true" && test ! -e /etc/pki/oxpanel/tlsphp.test.key && test ! -e /etc/pki/oxpanel/tlsphp.test.crt'
+oxpanel-ctl vhost remove tlsnode.test >/dev/null
+check "no drift after the HTTPS sites" grep -q '^drifts=0$' <(oxpanel-ctl host reconcile)
+
+echo "== HTTPS: ACME end to end against a local test CA (Pebble)"
+if [ "${OXPANEL_IT_SKIP_ACME:-0}" = 1 ]; then
+  echo "SKIPPED: ACME end to end (OXPANEL_IT_SKIP_ACME=1)"
+else
+  # Pebble, Let's Encrypt's ACME test server, from its pinned release.
+  PEBBLE=/usr/local/bin/oxpanel-it-pebble
+  PEBBLE_URL=https://github.com/letsencrypt/pebble/releases/download/v2.10.1/pebble-linux-amd64.tar.gz
+  PEBBLE_SHA256=4f2fcb5bca8c85c9cf73ad140fccfc0d2be40bd81ab99879c79b7b8a0b4f70ed
+  if [ ! -x "$PEBBLE" ]; then
+    curl -sSfL -o "$T/pebble.tar.gz" "$PEBBLE_URL" || fail "cannot download Pebble (set OXPANEL_IT_SKIP_ACME=1 to skip the ACME checks)"
+    check "Pebble download matches the pinned checksum" bash -c 'echo "$1  $2" | sha256sum -c --quiet' _ "$PEBBLE_SHA256" "$T/pebble.tar.gz"
+    tar -xzf "$T/pebble.tar.gz" -C "$T"
+    install -m0755 "$T/pebble-linux-amd64/linux/amd64/pebble" "$PEBBLE"
+  fi
+  # Outside /root and /home: the ACME client's unit (ProtectHome=yes) must read the CA.
+  P=/usr/local/share/oxpanel-it; mkdir -p "$P"
+  cp "$T/ca.crt" "$P/ca.crt"
+  leaf localhost other.key "DNS:localhost,IP:127.0.0.1"
+  cp "$T/localhost.crt" "$P/pebble.crt"; install -m0600 "$T/other.key" "$P/pebble.key"
+  # Certificates valid for 10 days, so a renewal (due 30 days ahead) can be tested at once.
+  cat > "$P/pebble.json" <<JSON
+{"pebble": {"listenAddress": "127.0.0.1:14000", "managementListenAddress": "127.0.0.1:15000",
+  "certificate": "$P/pebble.crt", "privateKey": "$P/pebble.key", "httpPort": 80, "tlsPort": 5001,
+  "ocspResponderURL": "", "externalAccountBindingRequired": false,
+  "profiles": {"default": {"description": "OxPanel IT", "validityPeriod": 864000}}}}
+JSON
+  systemd-run --unit=oxpanel-it-pebble --collect --setenv=PEBBLE_VA_NOSLEEP=1 "$PEBBLE" -config "$P/pebble.json" >/dev/null
+  check "Pebble is up" bash -c 'for i in $(seq 1 100); do curl -sf --cacert "$1" https://localhost:14000/dir >/dev/null && exit 0; sleep 0.1; done; exit 1' _ "$P/ca.crt"
+  cp -p /etc/hosts "$T/hosts.bak"
+  echo "127.0.0.1 acme.test www.acme.test" >> /etc/hosts
+  cp -p /etc/oxpanel/daemon.env "$T/daemon.env.bak"
+  printf 'OXPANEL_ACME_DIRECTORY_URL=https://localhost:14000/dir\nOXPANEL_ACME_CA_FILE=%s/ca.crt\nOXPANEL_ACME_EMAIL=hostmaster@example.org\n' "$P" >> /etc/oxpanel/daemon.env
+  systemctl restart oxpanel-daemon
+  check "host info reports ACME against the test CA" grep -q ' acme=true acme_directory=https://localhost:14000/dir' <(oxpanel-ctl host info)
+  oxpanel-ctl vhost set acme.test --tenant alice --alias www.acme.test --redirect-https >/dev/null
+  as_user alice sh -c 'mkdir -p /home/alice/public_html && echo hello-from-alice > /home/alice/public_html/index.html'
+  # `systemctl reload nginx` returns before the new workers serve the new site;
+  # until then the catch-all closes the connection on the CA's validation request.
+  check "acme.test is live over HTTP before the request" code_eventually acme.test / 200
+  check "www.acme.test too" code_eventually www.acme.test / 200
+  out="$(oxpanel-ctl cert request acme.test || true)"
+  echo "$out" | tail -8
+  check "ACME: certificate issued and installed" bash -c 'grep -q "^succeeded=true" <<<"$1" && grep -q " source=acme " <<<"$1" && grep -q " names=acme.test,www.acme.test uncovered=- " <<<"$1"' _ "$out"
+  curl -sf --cacert "$P/ca.crt" https://localhost:15000/roots/0 > "$T/pebble-root.pem"
+  check "ACME: the site is served over HTTPS with the issued certificate" https_eventually acme.test / "$T/pebble-root.pem" hello-from-alice
+  check "ACME: the alias too" https_eventually www.acme.test / "$T/pebble-root.pem" hello-from-alice
+  check "ACME: HTTP redirects" code_eventually acme.test / 301
+  check "ACME: private key is root 0600" test "$(stat -c '%U %a' /etc/pki/oxpanel/acme.test.key)" = "root 600"
+  check "ACME: no challenge, request, reply or pending key is left behind" bash -c 'test -z "$(find /var/lib/oxpanel-acme/challenges /var/lib/oxpanel-acme/csr /var/lib/oxpanel-acme/issued -mindepth 1)" && ! ls /etc/pki/oxpanel/*.pending >/dev/null 2>&1'
+  check "ACME: the client ran as oxpanel-acme (it owns its account key, 0600)" bash -c 'test "$(stat -c "%U %a" /var/lib/oxpanel-acme/account/*.pk8)" = "oxpanel-acme 600"'
+  check "ACME: the client's account cannot read any site key" bash -c '! setpriv --reuid=oxpanel-acme --regid=oxpanel-acme --clear-groups -- cat /etc/pki/oxpanel/acme.test.key >/dev/null 2>&1'
+  check "ACME: the client's output reached the journal" bash -c 'journalctl --no-pager -u oxpanel-acme-acme.test.service | grep -q "certificate issued"'
+  check "ACME: not drift" grep -q '^drifts=0$' <(oxpanel-ctl host reconcile)
+  before="$(sha256sum /etc/pki/oxpanel/acme.test.crt)"
+  out="$(oxpanel-ctl cert renew || true)"
+  echo "$out"
+  check "ACME: a certificate expiring within 30 days is renewed" bash -c 'grep -q "^renewals=1$" <<<"$1" && grep -q "^domain=acme.test succeeded=true$" <<<"$1"' _ "$out"
+  check "ACME: the renewed certificate is a new one" test "$(sha256sum /etc/pki/oxpanel/acme.test.crt)" != "$before"
+  check "ACME: the renewed certificate is served" bash -c 'for i in $(seq 1 50); do test "$(openssl s_client -connect 127.0.0.1:443 -servername acme.test </dev/null 2>/dev/null | openssl x509 -noout -fingerprint -sha256)" = "$(openssl x509 -in /etc/pki/oxpanel/acme.test.crt -noout -fingerprint -sha256)" && exit 0; sleep 0.1; done; exit 1'
+  oxpanel-ctl vhost set unreachable.test --tenant alice >/dev/null
+  check "unreachable.test is live over HTTP" code_eventually unreachable.test / 200
+  check "ACME: a name the CA cannot validate fails with the reason (exit 4)" bash -c 'oxpanel-ctl cert request unreachable.test > /root/acme-fail.out 2>&1; rc=$?; grep -q "^succeeded=false" /root/acme-fail.out && grep -q "unreachable.test" /root/acme-fail.out && test $rc -eq 4'
+  check "ACME: a failed request installs nothing" bash -c 'test ! -e /etc/pki/oxpanel/unreachable.test.crt && ! ls /etc/pki/oxpanel/*.pending >/dev/null 2>&1 && grep -q "certificate=-" <(oxpanel-ctl cert show unreachable.test)'
+  oxpanel-ctl vhost remove unreachable.test >/dev/null
+  check "ACME: removing the site removes the certificate" bash -c 'oxpanel-ctl vhost remove acme.test | grep -q "^removed=true" && test ! -e /etc/pki/oxpanel/acme.test.key'
+  systemctl stop oxpanel-it-pebble
+  cp -p "$T/hosts.bak" /etc/hosts
+  cp -p "$T/daemon.env.bak" /etc/oxpanel/daemon.env
+  systemctl restart oxpanel-daemon
+  check "daemon restarts with the default ACME settings" systemctl -q is-active oxpanel-daemon
+  rm -rf "$P" "$PEBBLE"
+fi
+check "certificate removed with the last HTTPS check" grep -q '^removed=true' <(oxpanel-ctl cert remove example.test)
 
 echo "== teardown"
 check "vhost removed" grep -q '^removed=true' <(oxpanel-ctl vhost remove example.test)

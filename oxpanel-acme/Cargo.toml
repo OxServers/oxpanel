@@ -1,0 +1,31 @@
+[package]
+name = "oxpanel-acme"
+description = "OxPanel's ACME (RFC 8555, HTTP-01) client: run by oxpanel-daemon in an unprivileged transient unit to obtain certificates"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+publish = false
+
+[[bin]]
+name = "oxpanel-acme"
+path = "src/main.rs"
+
+[dependencies]
+# HTTPS to the certificate authority. `rustls-no-provider`: no bundled root
+# certificates (the operating system's trust store is used, see main.rs) and
+# the crypto provider is chosen below. No OpenSSL (deny.toml).
+ureq = { version = "3.5", default-features = false, features = ["rustls-no-provider"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+# ES256 account key and request signatures; the same library rustls uses.
+ring = "0.17"
+base64.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

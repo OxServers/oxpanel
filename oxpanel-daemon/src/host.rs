@@ -37,6 +37,8 @@ pub enum DriftKind {
     OrphanPhpPool,
     AppUnitDrift,
     OrphanAppUnit,
+    TlsCertificateDrift,
+    OrphanTlsFile,
 }
 
 /// One difference between a record and the operating system.
@@ -66,6 +68,16 @@ pub struct Runtimes {
     pub python: bool,
 }
 
+/// What the host offers for HTTPS.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TlsSupport {
+    /// OpenSSL is installed: certificates can be installed.
+    pub available: bool,
+    /// The ACME client and its directories are in place.
+    pub acme: bool,
+    pub acme_directory_url: String,
+}
+
 /// Engine and host facts for the panel's overview.
 #[derive(Debug, Clone, PartialEq)]
 pub struct HostInfo {
@@ -79,6 +91,7 @@ pub struct HostInfo {
     /// Installed Node.js version; empty if none.
     pub node_version: String,
     pub stats: HostStats,
+    pub tls: TlsSupport,
 }
 
 #[derive(Debug, Clone)]
@@ -111,6 +124,11 @@ impl HostService {
             },
             node_version,
             stats: self.ctx.sys.host_stats(&cfg.home_base).await?,
+            tls: TlsSupport {
+                available: self.ctx.sys.is_installed(bin::OPENSSL).await,
+                acme: crate::acme::unavailable_reason(&self.ctx).await?.is_none(),
+                acme_directory_url: cfg.acme_directory_url.clone(),
+            },
         })
     }
 
@@ -161,6 +179,7 @@ impl HostService {
         }
         check_php_pools(cfg, &tenants, &vhosts, &mut out)?;
         check_apps(cfg, self.ctx.selinux, &by_name, &vhosts, &mut out)?;
+        check_tls(cfg, &vhosts, &mut out)?;
         Ok(out)
     }
 
@@ -354,6 +373,62 @@ fn check_apps(
     Ok(())
 }
 
+/// Certificates: the chain file must be what the record holds, the key must
+/// exist and be closed to everyone but root, and nothing else may live in
+/// the certificate directory. (Whether the key still belongs to the
+/// certificate is not checked here: that needs OpenSSL, and reconciliation
+/// runs nothing.)
+fn check_tls(cfg: &Config, vhosts: &[VHostRecord], out: &mut Vec<Drift>) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let mut known: BTreeSet<PathBuf> = BTreeSet::new();
+    for v in vhosts {
+        let domain = Domain::parse(&v.domain)?;
+        // The key of a certificate request in flight (or one that was interrupted).
+        known.insert(crate::tls::pending_key_path(&cfg.tls_dir, &domain));
+        let Some(tls) = &v.tls else {
+            continue;
+        };
+        let cert = crate::tls::cert_path(&cfg.tls_dir, &domain);
+        let key = crate::tls::key_path(&cfg.tls_dir, &domain);
+        if let Some(problem) = compare_file(&cert, &tls.chain_pem)? {
+            out.push(Drift::new(
+                DriftKind::TlsCertificateDrift,
+                v.domain.as_str(),
+                format!("{} {problem}", cert.display()),
+            ));
+        }
+        let key_problem = match std::fs::symlink_metadata(&key) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some("is missing"),
+            Err(e) => return Err(crate::Error::io("lstat", &key, e)),
+            Ok(md) if !md.is_file() => Some("is not a regular file"),
+            // The daemon's own uid: root in production.
+            Ok(md) if md.mode() & 0o077 != 0 || md.uid() != nix::unistd::geteuid().as_raw() => {
+                Some("is not a root-only file (expected mode 0600, owner root)")
+            }
+            Ok(_) => None,
+        };
+        if let Some(problem) = key_problem {
+            out.push(Drift::new(
+                DriftKind::TlsCertificateDrift,
+                v.domain.as_str(),
+                format!("{} {problem}", key.display()),
+            ));
+        }
+        known.insert(cert);
+        known.insert(key);
+    }
+    for path in fsutil::list_files_with_suffix(&cfg.tls_dir, "")? {
+        if !known.contains(&path) {
+            out.push(Drift::new(
+                DriftKind::OrphanTlsFile,
+                path.to_string_lossy(),
+                "no virtual host accounts for this file",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// `None` when the file holds exactly `expected`.
 fn compare_file(path: &Path, expected: &str) -> Result<Option<&'static str>> {
     Ok(match fsutil::read_optional(path)? {
@@ -543,6 +618,9 @@ mod tests {
             created_at_unix: 0,
             php: false,
             app: None,
+            redirect_https: false,
+            hsts: false,
+            tls: None,
         };
         h.ctx.store.save_vhost(&orphan_site)?;
 

@@ -54,6 +54,9 @@ pub struct VHostRequest {
     pub aliases: Vec<String>,
     pub php: bool,
     pub app: Option<AppRequest>,
+    /// Redirect plain HTTP to HTTPS / send HSTS, once a certificate is installed.
+    pub redirect_https: bool,
+    pub hsts: bool,
 }
 
 /// An application as requested on the wire; empty strings mean "default".
@@ -172,6 +175,10 @@ impl VHostService {
                 .map_or_else(now_unix, |e| e.created_at_unix),
             php: req.php,
             app: app_rec,
+            redirect_https: req.redirect_https,
+            hsts: req.hsts,
+            // The certificate is not part of the request: it stays as it is.
+            tls: existing.as_ref().and_then(|e| e.tls.clone()),
         };
         // The pool must be listening before Nginx is told to use it.
         let pool_changed = if rec.php {
@@ -189,24 +196,37 @@ impl VHostService {
         if record_changed {
             self.ctx.store.save_vhost(&rec)?;
         }
-        // PHP was switched off here: drop the pool if no other site needs it.
-        let pool_removed = if !rec.php && existing.as_ref().is_some_and(|e| e.php) {
-            self.remove_pool_if_unused(&tenant_rec).await?
-        } else {
-            false
-        };
-        // The application was switched off here: stop it and drop its unit.
-        let app_removed = if rec.app.is_none() && existing.as_ref().is_some_and(|e| e.app.is_some())
-        {
-            app::remove_app(&self.ctx, &domain).await?
-        } else {
-            false
-        };
-        let changed = changed || record_changed || pool_removed || app_removed;
+        let switched_off = self
+            .drop_switched_off(&tenant_rec, &domain, existing.as_ref(), &rec)
+            .await?;
+        let changed = changed || record_changed || switched_off;
         if changed {
             info!(%domain, %tenant, root = %abs_root.display(), php = rec.php, app = rec.app.as_ref().map_or("-", |a| a.runtime.as_str()), "virtual host configured");
         }
         Ok((rec, changed))
+    }
+
+    /// Stop what `rec` no longer uses compared with `existing`: the tenant's
+    /// PHP pool (if no other site needs it) and the site's application.
+    /// Returns whether anything was removed.
+    async fn drop_switched_off(
+        &self,
+        tenant_rec: &TenantRecord,
+        domain: &Domain,
+        existing: Option<&VHostRecord>,
+        rec: &VHostRecord,
+    ) -> Result<bool> {
+        let pool_removed = if !rec.php && existing.is_some_and(|e| e.php) {
+            self.remove_pool_if_unused(tenant_rec).await?
+        } else {
+            false
+        };
+        let app_removed = if rec.app.is_none() && existing.is_some_and(|e| e.app.is_some()) {
+            app::remove_app(&self.ctx, domain).await?
+        } else {
+            false
+        };
+        Ok(pool_removed || app_removed)
     }
 
     /// Every server name must be unique across the whole host.
@@ -335,6 +355,8 @@ impl VHostService {
                 }
             }
         }
+        // Nginx no longer refers to the certificate: it goes with the site.
+        crate::tls::remove_material(&self.ctx, &domain)?;
         self.ctx.store.delete_vhost(&domain)?;
         // Nginx has reloaded and no longer holds the logs open for this name.
         let (access_log, error_log) = log_paths(cfg, &domain);
@@ -575,6 +597,15 @@ pub(crate) fn render_vhost(
     let (access_log, error_log) = log_paths(cfg, &domain);
     let socket = vhost.php.then(|| php::socket_path(&name));
     let app_socket = vhost.app.as_ref().map(|_| app::socket_path(&domain));
+    let challenges = crate::acme::challenge_dir(cfg);
+    let certificate = crate::tls::cert_path(&cfg.tls_dir, &domain);
+    let key = crate::tls::key_path(&cfg.tls_dir, &domain);
+    let tls = vhost.tls.as_ref().map(|_| nginx::TlsBlock {
+        certificate: &certificate,
+        key: &key,
+        redirect: vhost.redirect_https,
+        hsts: vhost.hsts,
+    });
     nginx::render_server_block(&nginx::ServerBlock {
         domain: &domain,
         aliases: &aliases,
@@ -585,6 +616,8 @@ pub(crate) fn render_vhost(
         error_log: &error_log,
         php_socket: socket.as_deref(),
         app_socket: app_socket.as_deref(),
+        acme_challenge_dir: &challenges,
+        tls,
     })
 }
 

@@ -79,6 +79,19 @@ pub enum Error {
     #[error("virtual host '{0}' does not run an application")]
     NoApp(String),
 
+    /// The certificate or key offered for a virtual host cannot be used.
+    /// Never carries key material.
+    #[error("certificate rejected: {0}")]
+    CertificateInvalid(String),
+
+    /// Certificates need OpenSSL, which is not installed.
+    #[error("OpenSSL is not installed on this host (install openssl)")]
+    TlsUnavailable,
+
+    /// The host is not set up for requesting certificates.
+    #[error("ACME is not available on this host: {0}")]
+    AcmeUnavailable(String),
+
     #[error("{program} exited with {status}")]
     CommandFailed {
         program: String,
@@ -153,6 +166,9 @@ impl Error {
                 | Self::RuntimeTooOld { .. }
                 | Self::AppPolicyMissing
                 | Self::Unauthorised
+                | Self::CertificateInvalid(_)
+                | Self::TlsUnavailable
+                | Self::AcmeUnavailable(_)
         )
     }
 }
@@ -166,7 +182,12 @@ impl From<Error> for Status {
             "internal error; see the oxpanel-daemon journal".to_owned()
         };
         match err {
-            Error::InvalidInput { .. } => Status::invalid_argument(message),
+            Error::InvalidInput { .. } | Error::CertificateInvalid(_) => {
+                Status::invalid_argument(message)
+            }
+            Error::TlsUnavailable | Error::AcmeUnavailable(_) => {
+                Status::failed_precondition(message)
+            }
             Error::TenantExists(_) | Error::SpecMismatch(_) => Status::already_exists(message),
             Error::TenantNotFound(_) | Error::VHostNotFound(_) => Status::not_found(message),
             Error::NotManaged(_)

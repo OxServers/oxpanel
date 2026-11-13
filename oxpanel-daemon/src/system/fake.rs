@@ -29,6 +29,10 @@ struct Inner {
     missing: Vec<&'static str>,
     /// What `node --version` prints; `None` = a supported version.
     node_version: Option<String>,
+    /// Keys the fake `openssl genpkey` has handed out.
+    generated_keys: u32,
+    /// Lifetime of certificates the fake ACME client delivers; `None` = 90 days.
+    acme_lifetime: Option<u64>,
 }
 
 #[derive(Debug, Default)]
@@ -95,6 +99,13 @@ impl FakeSystem {
     pub fn set_node_version(&self, version: &str) {
         if let Ok(mut i) = self.inner.lock() {
             i.node_version = Some(version.to_owned());
+        }
+    }
+
+    /// Make the fake ACME client deliver certificates valid for `secs` seconds.
+    pub fn set_acme_lifetime(&self, secs: u64) {
+        if let Ok(mut i) = self.inner.lock() {
+            i.acme_lifetime = Some(secs);
         }
     }
 
@@ -250,6 +261,15 @@ impl System for FakeSystem {
             bin::SYSTEMCTL if args.first().is_some_and(|a| a == "show") => {
                 // Two units are queried; only the first has anything running.
                 output(program, 0, "MemoryCurrent=1048576\nCPUUsageNSec=5000000\nTasksCurrent=3\n\nMemoryCurrent=[not set]\nCPUUsageNSec=[not set]\nTasksCurrent=[not set]\n", "")
+            }
+            bin::OPENSSL => {
+                let (code, stdout, stderr) = super::fake_tls::openssl(args, &mut i.generated_keys);
+                output(program, code, &stdout, &stderr)
+            }
+            // The ACME client in its transient unit (other uses of systemd-run just succeed).
+            bin::SYSTEMD_RUN if args.iter().any(|a| a == bin::OXPANEL_ACME) => {
+                let (code, stderr) = super::fake_tls::acme_client(args, i.acme_lifetime.unwrap_or(90 * 86_400));
+                output(program, code, "", &stderr)
             }
             // systemctl, restorecon, setfacl and anything else: succeed silently.
             _ => output(program, 0, "", ""),
