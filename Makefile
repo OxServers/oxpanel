@@ -2,7 +2,7 @@
 # so no host toolchain is required beyond podman.
 DEV := ./scripts/dev.sh
 
-.PHONY: help image rig-image build release test clippy fmt fmt-check deny check integration rpm acceptance acceptance-destroy clean
+.PHONY: help image rig-image build release test clippy fmt fmt-check deny check integration rpm acceptance acceptance-destroy clean bench coverage traceability
 
 help:
 	@echo "make image        build the AlmaLinux 9 dev/test image"
@@ -12,7 +12,10 @@ help:
 	@echo "make clippy       clippy, pedantic, warnings are errors"
 	@echo "make fmt          rustfmt in place"
 	@echo "make deny         cargo-deny: advisories, licenses, bans"
-	@echo "make check        fmt-check + clippy + test + deny"
+	@echo "make check        fmt-check + clippy + test + deny + traceability"
+	@echo "make traceability every FEATURES.md row maps to tests that exist (docs/traceability.map)"
+	@echo "make bench        engine benchmark against the fake OS (ARGS=\"--tenants 1000,10000 --vhosts 5000\"); not part of check"
+	@echo "make coverage     line coverage of oxpanel-daemon (cargo-llvm-cov; run make image once first)"
 	@echo "make integration  real root integration test in a systemd container"
 	@echo "make rpm          build the RPM from the working tree into dist/rpms/"
 	@echo "make acceptance   real AlmaLinux 9 VM (KVM, SELinux enforcing): install RPM, run all phases"
@@ -43,7 +46,20 @@ fmt-check:
 deny:
 	$(DEV) cargo deny check
 
-check: fmt-check clippy test deny
+check: fmt-check clippy test deny traceability
+
+traceability:
+	./scripts/traceability.sh
+
+# Release build: debug numbers mean nothing. OXPANEL_BENCH_DIR=/dev/shm keeps
+# the state on tmpfs (CPU cost without fsync). Output is Markdown for docs/PERFORMANCE.md.
+bench:
+	$(DEV) cargo run --release -p oxpanel-bench -- $(ARGS)
+
+# Line coverage of the daemon (library + binary) from all its tests. The gate
+# (--fail-under-lines) is set in scripts/coverage.sh.
+coverage:
+	$(DEV) ./scripts/coverage.sh
 
 integration:
 	./scripts/integration-test.sh

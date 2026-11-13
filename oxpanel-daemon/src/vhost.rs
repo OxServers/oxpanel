@@ -189,18 +189,20 @@ impl VHostService {
         if record_changed {
             self.ctx.store.save_vhost(&rec)?;
         }
-        // PHP was switched off here: drop the pool if no other site needs it.
-        let pool_removed = if !rec.php && existing.as_ref().is_some_and(|e| e.php) {
-            self.remove_pool_if_unused(&tenant_rec).await?
-        } else {
+        // PHP is off here: drop the pool if no other site needs it. Decided by
+        // what is on disk, not by what the previous record said: a request
+        // that switched PHP off may have been interrupted after the record
+        // was saved, and repeating it must still remove the pool.
+        let pool_removed = if rec.php {
             false
+        } else {
+            self.remove_pool_if_unused(&tenant_rec, None).await?
         };
-        // The application was switched off here: stop it and drop its unit.
-        let app_removed = if rec.app.is_none() && existing.as_ref().is_some_and(|e| e.app.is_some())
-        {
-            app::remove_app(&self.ctx, &domain).await?
-        } else {
+        // Likewise for the application: a unit for a site without one goes.
+        let app_removed = if rec.app.is_some() {
             false
+        } else {
+            app::remove_app(&self.ctx, &domain).await?
         };
         let changed = changed || record_changed || pool_removed || app_removed;
         if changed {
@@ -335,18 +337,22 @@ impl VHostService {
                 }
             }
         }
-        self.ctx.store.delete_vhost(&domain)?;
         // Nginx has reloaded and no longer holds the logs open for this name.
         let (access_log, error_log) = log_paths(cfg, &domain);
         fsutil::remove_if_exists(&access_log)?;
         fsutil::remove_if_exists(&error_log)?;
         if rec.php {
             if let Some(t) = self.ctx.store.load_tenant(&Username::parse(&rec.tenant)?)? {
-                self.remove_pool_if_unused(&t).await?;
+                self.remove_pool_if_unused(&t, Some(&domain)).await?;
             }
         }
         // Whatever the record says: a unit for this name must not outlive the site.
         app::remove_app(&self.ctx, &domain).await?;
+        // The record goes last. Until then a repeated request finds it and
+        // finishes whatever an interrupted attempt left behind; deleting it
+        // first would strand a running PHP pool or application with nothing
+        // left that says OxPanel owns it.
+        self.ctx.store.delete_vhost(&domain)?;
         info!(%domain, tenant = %rec.tenant, "virtual host removed");
         Ok(true)
     }
@@ -389,17 +395,46 @@ impl VHostService {
     pub async fn install_app_dependencies(&self, domain: &str) -> Result<(bool, String)> {
         let domain = Domain::parse(domain)?;
         let (tenant, rec) = self.load_app_vhost(&domain)?;
-        app::install_dependencies(&self.ctx, &tenant, &rec).await
+        let (succeeded, output) = app::install_dependencies(&self.ctx, &tenant, &rec).await?;
+        if succeeded {
+            // Minutes may have passed without the lock. Restart only what the
+            // records call for *now*: a tenant suspended or a site removed
+            // while the installer ran must stay stopped.
+            let _guard = self.ctx.lock.lock().await;
+            match self.load_app_vhost(&domain) {
+                Ok((_, current)) => app::restart(&self.ctx, &current).await?,
+                Err(
+                    e @ (Error::TenantNotReady(_)
+                    | Error::TenantNotFound(_)
+                    | Error::VHostNotFound(_)
+                    | Error::NoApp(_)),
+                ) => {
+                    info!(%domain, reason = %e, "dependencies installed; application not restarted");
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Ok((succeeded, output))
     }
 
-    /// Remove the tenant's PHP-FPM pool once none of its virtual hosts uses PHP.
-    async fn remove_pool_if_unused(&self, tenant: &TenantRecord) -> Result<bool> {
-        let still_used = self
-            .ctx
-            .store
-            .list_vhosts()?
-            .iter()
-            .any(|v| v.tenant == tenant.username && v.php);
+    /// Remove the tenant's PHP-FPM pool once none of its virtual hosts uses
+    /// PHP. `except` names a virtual host that is being removed and therefore
+    /// no longer counts, although its record still exists.
+    async fn remove_pool_if_unused(
+        &self,
+        tenant: &TenantRecord,
+        except: Option<&Domain>,
+    ) -> Result<bool> {
+        let cfg = &self.ctx.config;
+        let name = Username::parse(&tenant.username)?;
+        let files = php::PoolFiles::for_tenant(&cfg.php_conf_dir, &cfg.systemd_unit_dir, &name);
+        if !files.unit.exists() && !files.conf.exists() {
+            // Nothing to remove: skip reading every virtual-host record.
+            return Ok(false);
+        }
+        let still_used = self.ctx.store.list_vhosts()?.iter().any(|v| {
+            v.tenant == tenant.username && v.php && except.is_none_or(|d| v.domain != d.as_str())
+        });
         if still_used {
             return Ok(false);
         }
@@ -485,6 +520,13 @@ impl VHostService {
             .await?;
         if !out.success() && !already_absent(&out.stderr_lossy()) {
             return out.into_result().map(|_| ());
+        }
+        // The tenant owns this directory and may have deleted it (or renamed
+        // it away): there is then nothing to relabel, and `restorecon` would
+        // fail on the missing path, making the site impossible to remove and
+        // the tenant impossible to delete.
+        if root.symlink_metadata().is_err() {
+            return Ok(());
         }
         self.ctx
             .sys
@@ -590,7 +632,7 @@ pub(crate) fn render_vhost(
 
 /// Read up to `limit` bytes from the end of `path`, dropping a leading
 /// partial line. A log that does not exist yet (no request so far) is empty.
-fn tail_file(path: &Path, limit: u64) -> Result<(String, bool)> {
+pub(crate) fn tail_file(path: &Path, limit: u64) -> Result<(String, bool)> {
     use std::io::{Read as _, Seek as _, SeekFrom};
     let mut file = match std::fs::File::open(path) {
         Ok(f) => f,
@@ -1021,6 +1063,44 @@ mod tests {
             h.tenants.delete("bob", true).await,
             Err(Error::TenantHasVHosts(_))
         ));
+        Ok(())
+    }
+
+    /// Defect found by acceptance phase 80: a tenant that deletes its own
+    /// document root (by mistake, or on purpose) made `RemoveVirtualHost` fail
+    /// on SELinux hosts, because `restorecon` was run on the missing path. The
+    /// site could then never be removed, nor the tenant deleted.
+    #[tokio::test]
+    async fn a_site_whose_document_root_the_tenant_deleted_can_still_be_removed() -> Result<()> {
+        let h = harness(true).await;
+        h.vhosts.configure(req("example.com", "alice")).await?;
+        let root = h.config.home_base.join("alice").join("public_html");
+        // The fake OS creates directories for real inside the sandbox.
+        if root.exists() {
+            std::fs::remove_dir_all(&root).map_err(|e| Error::io("rm", &root, e))?;
+        } else {
+            std::fs::create_dir_all(&root).map_err(|e| Error::io("mkdir", &root, e))?;
+            std::fs::remove_dir_all(&root).map_err(|e| Error::io("rm", &root, e))?;
+        }
+        let before = h.sys.calls_to(bin::RESTORECON).len();
+        // A real `restorecon` exits 255 on a missing path.
+        h.sys.script_failure(
+            bin::RESTORECON,
+            255,
+            "restorecon: lstat(/x) failed: No such file or directory",
+        );
+        assert!(h.vhosts.remove("example.com").await?);
+        assert_eq!(
+            h.sys.calls_to(bin::RESTORECON).len(),
+            before,
+            "nothing to relabel: restorecon must not be run on a missing path"
+        );
+        assert!(h
+            .sys
+            .calls_to(bin::SEMANAGE)
+            .iter()
+            .any(|c| args(c).starts_with(&["fcontext".to_owned(), "-d".to_owned()])));
+        assert!(h.vhosts.list(None).await?.is_empty(), "the record is gone");
         Ok(())
     }
 

@@ -153,7 +153,8 @@ pub fn render_unit(
     let run_dir = safe_path_str(&run_dir)?;
     let sock = socket_path(domain);
     let sock = safe_path_str(&sock)?;
-    let slice = &tenant.slice_unit;
+    // Derived from the validated name, not copied from the record (see php::render_unit).
+    let slice = systemd::slice_unit_name(&name);
     let runtime = app.runtime.as_str();
     let setfacl = bin::SETFACL;
     let launcher = launcher(app.runtime);
@@ -390,13 +391,18 @@ pub async fn restart(ctx: &Ctx, vhost: &VHostRecord) -> Result<()> {
 /// Install the application's dependencies as the tenant. Runs in a transient
 /// unit (the daemon has no network), sandboxed like the application itself and
 /// inside the tenant's slice. Returns whether the installer succeeded and the
-/// end of its output; a failing installer is a result, not an error.
+/// end of its output; a failing installer is a result, not an error. Does
+/// not restart the application (see `VHostService::install_app_dependencies`).
 pub async fn install_dependencies(
     ctx: &Ctx,
     tenant: &TenantRecord,
     vhost: &VHostRecord,
 ) -> Result<(bool, String)> {
     let (domain, app) = parts(vhost)?;
+    // Re-validated: these strings come from records and become unit properties.
+    let name = Username::parse(&tenant.username)?;
+    RelPath::parse_field(&app.root, "app.root")?;
+    let slice = systemd::slice_unit_name(&name);
     let root = app_root(tenant, app);
     let home = safe_path_str(&tenant.home)?;
     let root_str = safe_path_str(&root)?;
@@ -412,9 +418,9 @@ pub async fn install_dependencies(
         .args(["--wait", "--collect", "--quiet"])
         .arg(format!("--unit={unit}"));
     for property in [
-        format!("User={}", tenant.username),
-        format!("Group={}", tenant.username),
-        format!("Slice={}", tenant.slice_unit),
+        format!("User={name}"),
+        format!("Group={name}"),
+        format!("Slice={slice}"),
         format!("WorkingDirectory={root_str}"),
         format!("Environment=HOME={home}"),
         format!("ReadWritePaths={home}"),
@@ -471,9 +477,8 @@ pub async fn install_dependencies(
         }
         output.push_str(&own);
     }
-    if succeeded && !tenant.suspended {
-        restart(ctx, vhost).await?;
-    }
+    // Restarting the application is the caller's job: it must be decided
+    // under the mutation lock, from the records as they are by then.
     Ok((succeeded, output))
 }
 

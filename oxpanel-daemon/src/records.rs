@@ -163,6 +163,13 @@ impl Store {
         list(&self.tenants_dir)
     }
 
+    /// Number of tenant records, without reading them: `GetHostInfo` is polled
+    /// by dashboards and must not parse every file for a number. A damaged
+    /// record is still a record, so it counts.
+    pub fn count_tenants(&self) -> Result<usize> {
+        Ok(fsutil::list_files_with_suffix(&self.tenants_dir, ".json")?.len())
+    }
+
     pub fn load_vhost(&self, domain: &Domain) -> Result<Option<VHostRecord>> {
         load(&self.vhost_path(domain))
     }
@@ -183,6 +190,11 @@ impl Store {
 
     pub fn list_vhosts(&self) -> Result<Vec<VHostRecord>> {
         list(&self.vhosts_dir)
+    }
+
+    /// Number of virtual-host records, without reading them (see [`Self::count_tenants`]).
+    pub fn count_vhosts(&self) -> Result<usize> {
+        Ok(fsutil::list_files_with_suffix(&self.vhosts_dir, ".json")?.len())
     }
 }
 
@@ -265,6 +277,21 @@ mod tests {
         assert!(s.delete_tenant(&alice)?);
         assert!(!s.delete_tenant(&alice)?);
         assert_eq!(s.list_tenants()?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn counting_records_does_not_read_them() -> Result<()> {
+        let (_d, s) = store();
+        s.save_tenant(&tenant("alice"))?;
+        fsutil::write_atomic(
+            &s.tenant_path(&Username::parse("bob")?),
+            b"{not json",
+            0o600,
+        )?;
+        assert_eq!(s.count_tenants()?, 2, "a damaged record is still a record");
+        assert_eq!(s.list_tenants()?.len(), 1);
+        assert_eq!(s.count_vhosts()?, 0);
         Ok(())
     }
 

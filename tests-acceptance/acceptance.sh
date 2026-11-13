@@ -7,7 +7,7 @@ HERE=/work/tests-acceptance; WORK=/work
 source "$HERE/lib.sh"
 
 OUT="${OUT:-/out}"; CACHE="${CACHE:-/cache}"
-INSTALL="${INSTALL:-git}"; PHASES="${PHASES:-10 20 30 40 50 60 70}"; SOAK_N="${SOAK_N:-20}"
+INSTALL="${INSTALL:-git}"; PHASES="${PHASES:-10 20 30 40 50 60 70 80 90}"; SOAK_N="${SOAK_N:-20}"
 ACCEL="${ACCEL:-kvm}"; CONTINUE="${CONTINUE:-0}"; KEEP="${KEEP:-0}"; REFRESH_IMAGE="${REFRESH_IMAGE:-0}"
 GIT_URL="${GIT_URL:-}"; GIT_REF="${GIT_REF:-}"; RPM_DIR="${RPM_DIR:-/work/dist/rpms}"
 TARGET="${TARGET:-}"; TARGET_PORT="${TARGET_PORT:-22}"; TARGET_KEY="${TARGET_KEY:-}"; I_UNDERSTAND="${I_UNDERSTAND:-0}"
@@ -148,6 +148,8 @@ run_phase() { # <NN> → script name
           else P_NUM+=(60); P_NAME+=(reboot-post); P_STATUS+=(NO-SSH); P_SECS+=(300); P_OK+=(0); P_FAIL+=("VM did not come back after reboot"); rc=1; fi
         fi;;
     70) run_remote 70-soak "$PHASE_TIMEOUT" "cd /root/acc && $(phase_env) bash phases/70-soak.sh" || rc=$?;;
+    80) run_remote 80-attacks "$PHASE_TIMEOUT" "cd /root/acc && $(phase_env) bash phases/80-attacks.sh" || rc=$?;;
+    90) run_remote 90-performance "$PHASE_TIMEOUT" "cd /root/acc && $(phase_env) bash phases/90-performance.sh" || rc=$?;;
     *) die "unknown phase $n";;
   esac
   return $rc
@@ -208,7 +210,7 @@ report() {
 log "oxpanel acceptance · install=$INSTALL · phases=[$PHASES] · keep=$KEEP"
 if [ -n "$TARGET" ]; then
   SSH_USER="${TARGET%@*}"; SSH_HOST="${TARGET#*@}"; SSH_PORT="$TARGET_PORT"; KEY="$TARGET_KEY"
-  for p in $PHASES; do case "$p" in 60|70) [ "$I_UNDERSTAND" = 1 ] || die "phases 60/70 reboot $TARGET and create accounts on it; set I_UNDERSTAND=1 to allow";; esac; done
+  for p in $PHASES; do case "$p" in 60|70|80|90) [ "$I_UNDERSTAND" = 1 ] || die "phases 60/70/80/90 reboot or load $TARGET and create accounts on it; set I_UNDERSTAND=1 to allow";; esac; done
   vm_wait_ssh 30 || die "cannot reach $TARGET"
   log "using $TARGET: $(vm_ssh 'echo "$(cat /etc/almalinux-release 2>/dev/null || uname -o) · $(uname -r) · SELinux $(getenforce 2>/dev/null || echo n/a)"')"
 else
@@ -219,6 +221,7 @@ fi
 log "copying test payload"
 vm_ssh 'mkdir -p /root/acc/phases /root/acc/rpms'
 vm_scp "$HERE"/phases/*.sh /root/acc/phases/
+vm_scp "$HERE"/phases/attack /root/acc/phases/
 vm_scp "$WORK/tests-integration/run-inside.sh" "$WORK/docs/HANDBOOK.md" /root/acc/
 if [ "$INSTALL" = rpm ]; then
   ls "$RPM_DIR"/oxpanel-daemon-*.rpm >/dev/null 2>&1 || die "no RPMs in $RPM_DIR (run make rpm)"

@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 1740cdbd7dfc4c53c3f6804fcfade1b9f3605fbc327b00d30b600e0ac309bfad # shrinks to evil = "a\nAaa=/", slot = 1, python = false

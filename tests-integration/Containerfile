@@ -53,3 +53,11 @@ RUN dnf -y install --setopt=install_weak_deps=False php-fpm logrotate \
 RUN dnf -y module enable nodejs:22 \
     && dnf -y install --setopt=install_weak_deps=False nodejs npm \
     && dnf clean all && rm -rf /var/cache/dnf
+
+# Line coverage (make coverage): LLVM's instrumentation tools and cargo-llvm-cov
+# (prebuilt musl binary).
+ARG CARGO_LLVM_COV_VERSION=0.6.21
+RUN rustup component add llvm-tools-preview \
+    && curl -sSfL "https://github.com/taiki-e/cargo-llvm-cov/releases/download/v${CARGO_LLVM_COV_VERSION}/cargo-llvm-cov-x86_64-unknown-linux-musl.tar.gz" \
+      | tar -xz -C /usr/local/cargo/bin cargo-llvm-cov \
+    && cargo llvm-cov --version

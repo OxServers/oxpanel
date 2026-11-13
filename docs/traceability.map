@@ -1,0 +1,311 @@
+# Feature traceability: every row of docs/FEATURES.md -> the automated tests that prove it.
+#
+# Checked by scripts/traceability.sh (make traceability, and CI). It fails when
+#   * a FEATURES.md row has no entry here, or an entry has no reference;
+#   * an entry here names a row that no longer exists;
+#   * a referenced test no longer exists.
+#
+# Format. A header line "[<section>] <feature>" (the "## " heading and the first
+# table cell of the row), then indented reference lines:
+#   unit <module> <test>      fn <test> in oxpanel-daemon/src/<module>.rs (mod tests)
+#   it <file> <test>          fn <test> in oxpanel-daemon/tests/<file>.rs
+#   sh <path> <text>          the text occurs in a check of that shell suite
+#                             (tests-integration/run-inside.sh, tests-acceptance/phases/NN-*.sh)
+# Integration checks run in a systemd container (make integration) and again on
+# the real SELinux host (make acceptance, phase 20); phases 30-90 only there.
+
+[Tenant accounts] Create tenant
+  unit tenant create_runs_exact_useradd_and_becomes_ready
+  sh tests-integration/run-inside.sh login disabled
+  sh tests-integration/run-inside.sh primary group is dedicated
+[Tenant accounts] Private home
+  unit tenant create_runs_exact_useradd_and_becomes_ready
+  sh tests-integration/run-inside.sh home is 0700
+  sh tests-integration/run-inside.sh home owned by alice:alice
+[Tenant accounts] Resource limits (cgroups v2)
+  unit systemd renders_only_requested_limits
+  unit tenant update_limits_rewrites_units_and_is_idempotent
+  it properties a_slice_unit_carries_exactly_the_requested_limits
+  sh tests-integration/run-inside.sh slice limits visible to systemd
+  sh tests-integration/run-inside.sh user-slice drop-in written
+[Tenant accounts] Safe unit naming
+  unit systemd dashes_are_escaped_so_tenants_never_nest
+  it properties distinct_usernames_get_distinct_units
+  sh tests-integration/run-inside.sh escaped slice is not nested under another tenant
+[Tenant accounts] Owner label
+  unit tenant owner_label_is_stored_filtered_and_part_of_the_spec
+  it properties an_accepted_owner_label_is_plain
+  sh tests-integration/run-inside.sh owner filter lists only that owner's tenants
+[Tenant accounts] Get / list
+  unit tenant owner_label_is_stored_filtered_and_part_of_the_spec
+  it grpc_uds full_tenant_and_vhost_lifecycle_over_uds
+  sh tests-integration/run-inside.sh authorised peer via oxpanel group membership works
+[Tenant accounts] Delete tenant
+  unit tenant delete_flow
+  unit tenant delete_refuses_while_vhosts_exist
+  sh tests-integration/run-inside.sh tenant with vhosts cannot be deleted
+  sh tests-integration/run-inside.sh home gone
+[Tenant accounts] SELinux
+  unit tenant selinux_hosts_get_relabelled
+  sh tests-acceptance/phases/30-selinux.sh home has the standard home label
+[Tenant accounts] Idempotent
+  unit tenant create_is_idempotent_and_detects_spec_drift
+  it crash_safety uninterrupted_workflows_are_consistent_and_idempotent
+  sh tests-integration/run-inside.sh replay is idempotent (created=false)
+[Tenant accounts] Resumable
+  unit tenant interrupted_provisioning_resumes
+  unit tenant record_is_claimed_before_useradd_so_a_crash_leaves_no_orphan
+  it crash_safety every_workflow_survives_interruption_at_every_command
+  sh tests-acceptance/phases/50-resume.sh identical CreateTenant resumes
+[Tenant accounts] Never adopts foreign accounts
+  unit tenant never_adopts_a_foreign_account_or_group
+  sh tests-integration/run-inside.sh foreign account is never adopted
+[Tenant accounts] Update limits
+  unit tenant update_limits_rewrites_units_and_is_idempotent
+  unit tenant update_limits_is_completed_by_a_retry_after_a_failed_reload
+  it grpc_surface concurrent_updates_of_one_tenant_are_not_lost
+  sh tests-integration/run-inside.sh new MemoryMax is live in systemd
+[Tenant accounts] Update owner
+  unit tenant update_owner_sets_clears_and_validates
+  sh tests-integration/run-inside.sh owner label replaced
+[Tenant accounts] Suspend / resume
+  unit vhost suspend_turns_every_site_of_the_tenant_into_503_and_resume_restores
+  unit vhost suspend_rolls_back_every_file_when_nginx_rejects
+  unit vhost suspension_stops_php_after_the_sites_and_resume_starts_it_first
+  sh tests-integration/run-inside.sh suspended site answers 503
+  sh tests-integration/run-inside.sh resume changed=true
+[Tenant accounts] Usage
+  unit tenant usage_runs_exact_commands_and_sums_both_slices
+  unit tenant cgroup_usage_parsing_tolerates_unset_and_garbage
+  it properties no_text_makes_a_parser_panic
+  sh tests-integration/run-inside.sh disk usage is measured
+[Tenant accounts] Reserved names
+  unit tenant reserved_and_malformed_names_never_reach_the_os
+  unit validate username_rejects_dangerous_names
+  sh tests-integration/run-inside.sh reserved name refused
+
+[Virtual hosts (Nginx)] Configure
+  unit vhost configure_creates_root_as_tenant_sets_acls_and_activates
+  unit nginx renders_server_block_with_aliases_and_hardening
+  sh tests-integration/run-inside.sh nginx serves tenant content
+[Virtual hosts (Nginx)] Per-site logs
+  unit vhost logs_are_per_site_readable_by_tail_and_removed_with_the_site
+  unit proptests the_tail_of_any_file_is_bounded_and_starts_at_a_line
+  sh tests-integration/run-inside.sh access log is readable through the API
+  sh tests-integration/run-inside.sh log directory is closed to tenants
+[Virtual hosts (Nginx)] PHP source is never served
+  unit nginx php_block_passes_only_existing_scripts_to_the_tenant_socket
+  sh tests-integration/run-inside.sh a static site never hands out PHP source
+[Virtual hosts (Nginx)] Start-up convergence
+  unit vhost start_up_convergence_rewrites_stale_files_once
+[Virtual hosts (Nginx)] Aliases
+  unit vhost ownership_and_name_uniqueness_are_enforced
+  sh tests-integration/run-inside.sh alias served too
+  sh tests-integration/run-inside.sh bob cannot take alice's alias
+[Virtual hosts (Nginx)] Document root
+  unit vhost configure_creates_root_as_tenant_sets_acls_and_activates
+  unit vhost symlinked_document_root_is_refused
+  it properties an_accepted_relative_path_stays_below_the_home
+  sh tests-integration/run-inside.sh docroot owned by alice
+[Virtual hosts (Nginx)] Web-server access without opening the home
+  unit vhost configure_creates_root_as_tenant_sets_acls_and_activates
+  sh tests-integration/run-inside.sh nginx has traverse on home
+  sh tests-integration/run-inside.sh home other entry closed
+[Virtual hosts (Nginx)] Hardened server block
+  unit nginx renders_server_block_with_aliases_and_hardening
+  it properties an_nginx_block_is_its_template_whatever_the_inputs
+  sh tests-integration/run-inside.sh dot-files are 404
+  sh tests-integration/run-inside.sh symlink to /etc/shadow is not served
+[Virtual hosts (Nginx)] Validate → activate → roll back
+  unit vhost invalid_nginx_config_rolls_back_and_leaves_no_record
+  unit nginx install_rolls_back_on_invalid_config
+  unit nginx install_validates_then_reloads_and_is_idempotent
+[Virtual hosts (Nginx)] Catch-all default server
+  unit nginx include_can_carry_a_catch_all_default_server
+  unit nginx ensure_include_validates_and_rolls_back
+  sh tests-integration/run-inside.sh unknown host does not reach tenant
+  sh tests-integration/run-inside.sh bare-IP request does not reach tenant
+[Virtual hosts (Nginx)] SELinux
+  unit vhost selinux_hosts_get_persistent_labels
+  it crash_safety every_workflow_survives_interruption_on_selinux_hosts
+  sh tests-acceptance/phases/30-selinux.sh docroot labelled httpd_sys_content_t
+[Virtual hosts (Nginx)] Remove / list
+  unit vhost remove_and_list
+  it crash_safety every_workflow_survives_interruption_at_every_command
+  sh tests-integration/run-inside.sh config gone
+[Virtual hosts (Nginx)] Idempotent
+  unit vhost configure_is_idempotent
+  sh tests-integration/run-inside.sh vhost replay is idempotent (changed=false)
+
+[PHP (per-tenant PHP-FPM)] Opt-in per virtual host
+  unit vhost php_is_refused_cleanly_when_not_installed
+  unit vhost php_site_gets_a_pool_started_before_nginx_uses_it
+  sh tests-integration/run-inside.sh host info reports PHP
+[PHP (per-tenant PHP-FPM)] One FPM instance per tenant, running as the tenant
+  unit php unit_runs_as_the_tenant_in_its_slice_without_privileges
+  it properties a_php_pool_is_its_template_whatever_the_tenant
+  sh tests-integration/run-inside.sh FPM master runs as the tenant, not root
+[PHP (per-tenant PHP-FPM)] Inside the tenant's limits
+  unit php unit_runs_as_the_tenant_in_its_slice_without_privileges
+  sh tests-integration/run-inside.sh pool lives in the tenant slice
+  sh tests-integration/run-inside.sh memory limit applies to PHP
+[PHP (per-tenant PHP-FPM)] Sandboxed unit
+  unit php unit_runs_as_the_tenant_in_its_slice_without_privileges
+  sh tests-integration/run-inside.sh PHP temp files are private to the unit
+[PHP (per-tenant PHP-FPM)] Socket only the web server can reach
+  unit nginx php_block_passes_only_existing_scripts_to_the_tenant_socket
+  sh tests-integration/run-inside.sh another tenant cannot connect to the socket
+  sh tests-integration/run-inside.sh socket ACL names the web server
+[PHP (per-tenant PHP-FPM)] Confined scripts
+  unit php pool_conf_confines_php_to_the_tenant
+  sh tests-integration/run-inside.sh PHP runs as the tenant, confined by open_basedir
+[PHP (per-tenant PHP-FPM)] Safe Nginx hand-off
+  unit nginx php_block_passes_only_existing_scripts_to_the_tenant_socket
+  sh tests-integration/run-inside.sh path-info trick (file.jpg/x.php) is not executed
+  sh tests-integration/run-inside.sh script under a dot-directory is not executed
+[PHP (per-tenant PHP-FPM)] Lifecycle
+  unit vhost pool_lives_exactly_as_long_as_a_php_site_needs_it
+  unit vhost suspension_stops_php_after_the_sites_and_resume_starts_it_first
+  it crash_safety every_workflow_survives_interruption_at_every_command
+  sh tests-integration/run-inside.sh switching PHP off removes the pool
+  sh tests-acceptance/phases/60-reboot-post.sh PHP pool came back by itself after reboot
+[PHP (per-tenant PHP-FPM)] SELinux
+  sh tests-integration/run-inside.sh PHP runs as the tenant, confined by open_basedir
+  sh tests-acceptance/phases/70-soak.sh zero AVC denials
+[PHP (per-tenant PHP-FPM)] Reconciliation
+  unit host reports_php_pool_drift_and_orphans
+  sh tests-integration/run-inside.sh php pool is not drift
+
+[Node.js and Python applications] Opt-in per virtual host
+  unit vhost app_requests_are_validated_before_anything_happens
+  unit vhost node_older_than_22_is_refused_before_anything_is_created
+  unit host info_reports_node_version_and_usability
+  sh tests-integration/run-inside.sh app and php cannot be combined
+[Node.js and Python applications] One service per application, running as the tenant
+  unit app node_unit_runs_as_the_tenant_on_a_private_socket
+  it properties an_application_unit_is_its_template_whatever_the_inputs
+  sh tests-integration/run-inside.sh app process runs as the tenant, not root
+  sh tests-integration/run-inside.sh app lives in the tenant slice
+[Node.js and Python applications] No TCP ports
+  unit app node_unit_runs_as_the_tenant_on_a_private_socket
+  sh tests-integration/run-inside.sh the app listens on no TCP port
+  sh tests-integration/run-inside.sh another tenant cannot connect to the app socket
+[Node.js and Python applications] Source is never web-readable
+  unit nginx app_block_serves_static_files_and_proxies_the_rest
+  unit vhost app_requests_are_validated_before_anything_happens
+  sh tests-integration/run-inside.sh application source is never served as a file
+  sh tests-integration/run-inside.sh application directory is not opened to the web server
+[Node.js and Python applications] Python virtualenv
+  unit vhost python_app_gets_its_own_virtualenv_created_as_the_tenant
+  unit app python_unit_uses_the_apps_own_virtualenv
+  sh tests-integration/run-inside.sh virtualenv created by the tenant
+[Node.js and Python applications] Dependencies
+  unit vhost restart_and_dependency_installation_run_exact_commands
+  unit vhost python_dependencies_install_into_the_virtualenv
+  unit vhost a_failing_installer_is_a_result_and_restarts_nothing
+  it grpc_surface a_running_dependency_installation_blocks_nobody
+  it grpc_surface an_installation_cannot_revive_a_suspended_or_removed_application
+  sh tests-integration/run-inside.sh npm install runs as the tenant and succeeds
+[Node.js and Python applications] Restart and output
+  unit vhost restart_and_dependency_installation_run_exact_commands
+  sh tests-integration/run-inside.sh restart-app picks up the new code
+  sh tests-integration/run-inside.sh application output is readable through the API
+[Node.js and Python applications] Lifecycle
+  unit vhost app_lifecycle_follows_the_site_and_the_tenant
+  it crash_safety every_workflow_survives_interruption_at_every_command
+  sh tests-integration/run-inside.sh switching the app off removes its unit and keeps the code
+  sh tests-integration/run-inside.sh suspend stops every application of the tenant
+  sh tests-acceptance/phases/60-reboot-post.sh Node app came back by itself after reboot
+[Node.js and Python applications] SELinux
+  unit vhost selinux_hosts_run_apps_in_their_own_domain_and_need_the_module
+  sh tests-integration/run-inside.sh SELinux: the app runs in its own domain
+  sh tests-acceptance/phases/30-selinux.sh OxPanel policy module is loaded
+[Node.js and Python applications] Reconciliation
+  unit host reports_app_unit_drift_and_orphans
+  sh tests-integration/run-inside.sh applications are not drift
+
+[API, transport and authentication] gRPC over a UNIX socket only
+  it grpc_uds full_tenant_and_vhost_lifecycle_over_uds
+  sh tests-integration/run-inside.sh socket is root:oxpanel 0660
+[API, transport and authentication] Kernel-verified peers
+  unit auth policy_decisions
+  it grpc_uds unauthorised_peer_is_cut_off_before_grpc
+  it grpc_surface every_rpc_is_refused_for_an_unauthorised_peer
+  it properties a_peer_outside_every_list_is_never_allowed
+  sh tests-integration/run-inside.sh process groups alone do not grant access
+[API, transport and authentication] Fail-closed interceptor
+  unit server interceptor_fails_closed_without_peer_info
+  unit auth scopes_confine_listed_uids_only
+[API, transport and authentication] Strict input validation
+  unit validate domain_rejects_invalid_names
+  unit validate relpath_rejects_traversal_and_metacharacters
+  it properties one_dangerous_character_is_always_refused
+  it properties traversal_is_refused_wherever_it_is_put
+  it grpc_surface malformed_requests_are_refused_without_side_effects
+  it grpc_surface random_requests_never_panic_or_corrupt_state
+[API, transport and authentication] Precise error codes
+  unit error code_mapping
+  unit error internal_errors_are_redacted
+  it grpc_uds validation_errors_surface_as_invalid_argument_with_message
+  it grpc_uds internal_failures_are_redacted
+  it properties internal_error_detail_never_reaches_the_client
+[API, transport and authentication] Limits
+  it grpc_surface oversized_requests_are_refused_before_decoding
+  it grpc_surface idle_and_abusive_connections_do_not_starve_other_clients
+[API, transport and authentication] Per-peer scopes
+  unit auth scopes_confine_listed_uids_only
+  it grpc_surface every_rpc_has_a_scope_decision
+  it grpc_surface every_rpc_is_refused_without_its_scope_and_passes_with_it
+  it grpc_uds a_scoped_peer_can_only_call_its_scopes
+  it properties a_confined_peer_holds_exactly_its_scopes
+  sh tests-integration/run-inside.sh scoped peer cannot delete tenants
+[API, transport and authentication] Serialised mutations
+  it grpc_surface concurrent_clients_neither_deadlock_nor_corrupt_state
+  it grpc_surface concurrent_updates_of_one_tenant_are_not_lost
+
+[Operations] `oxpanel-ctl`
+  it grpc_uds management_rpcs_over_uds
+  sh tests-integration/run-inside.sh a failing installation is reported with exit status 4
+  sh tests-integration/run-inside.sh reconcile exits 3 on drift
+[Operations] Host information
+  unit host info_counts_records_and_reports_host_stats
+  sh tests-integration/run-inside.sh host info reports the version
+[Operations] Reconciliation
+  unit host a_consistent_host_has_no_drift_and_reconcile_runs_nothing
+  unit host reports_account_unit_and_config_drift
+  unit host reports_home_incomplete_tenants_and_orphans
+  sh tests-integration/run-inside.sh reconcile finds 3 differences
+  sh tests-integration/run-inside.sh reconcile repaired nothing (read-only)
+[Operations] Configuration
+  unit config defaults_are_valid
+  unit config rejects_bad_values
+  unit config parses_lists_and_flags
+  it properties any_environment_gives_a_safe_configuration_or_an_error
+  sh tests-integration/run-inside.sh an unknown scope name is rejected by --check-config
+[Operations] Preflight
+  sh tests-integration/run-inside.sh a non-root user cannot start the daemon
+  sh tests-integration/run-inside.sh a missing web-server account is refused
+  sh tests-integration/run-inside.sh a tenant as the web-server account is refused
+  sh tests-integration/run-inside.sh a missing socket group is refused
+  sh tests-acceptance/phases/10-install.sh --check-config passes
+[Operations] systemd integration
+  sh tests-integration/run-inside.sh daemon is active (Type=notify handshake completed)
+  sh tests-acceptance/phases/50-resume.sh Restart=on-failure brought the daemon back after SIGKILL
+[Operations] Hardened unit
+  sh tests-acceptance/phases/40-sandbox.sh NoNewPrivs=1
+  sh tests-acceptance/phases/40-sandbox.sh seccomp filter active
+  sh tests-acceptance/phases/40-sandbox.sh daemon has its own network namespace
+[Operations] Packaging
+  sh tests-acceptance/phases/10-install.sh rpm -V is clean
+  sh tests-acceptance/phases/10-install.sh socket is root:oxpanel 0660
+[Operations] Dry-run mode
+  sh tests-integration/run-inside.sh an unprivileged client creates a tenant in it
+  sh tests-integration/run-inside.sh no real account was created
+  unit config parses_lists_and_flags
+[Operations] Records
+  unit records records_are_root_only_files
+  unit records corrupt_record_fails_its_own_load_but_not_listing
+  unit records save_validates_names_so_records_cannot_escape_the_directory
+  it properties records_round_trip_and_damaged_ones_block_only_themselves
+  it properties a_record_cannot_be_saved_outside_the_state_directory
+  sh tests-integration/run-inside.sh record is root-only

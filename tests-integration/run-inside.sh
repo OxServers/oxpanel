@@ -380,6 +380,35 @@ check "removing the sites removes the remaining unit" bash -c 'oxpanel-ctl vhost
 check "no runtime directories left behind" bash -c '! ls /run/oxpanel-app/*/app.sock >/dev/null 2>&1'
 check "no drift after application teardown" grep -q '^drifts=0$' <(oxpanel-ctl host reconcile)
 
+echo "== dry-run mode: the whole daemon against a fake OS, as an unprivileged user"
+DRY=/tmp/oxpanel-dry; rm -rf "$DRY"; install -d -o panelapi -g panelapi -m 0700 "$DRY"
+dry() { setpriv --reuid=panelapi --regid=panelapi --clear-groups --no-new-privs -- env \
+  OXPANEL_STATE_DIR="$DRY/state" OXPANEL_HOME_BASE="$DRY/home" OXPANEL_SYSTEMD_UNIT_DIR="$DRY/systemd" \
+  OXPANEL_NGINX_CONF_DIR="$DRY/nginx/oxpanel.d" OXPANEL_NGINX_INCLUDE_FILE="$DRY/nginx/00-oxpanel.conf" \
+  OXPANEL_NGINX_LOG_DIR="$DRY/log" OXPANEL_PHP_CONF_DIR="$DRY/php" OXPANEL_SOCKET_PATH="$DRY/sock" \
+  OXPANEL_SOCKET_GROUP= OXPANEL_ALLOWED_UIDS="$(id -u panelapi)" "$@"; }
+dry /usr/sbin/oxpanel-daemon --dry-run > /root/dry-run.log 2>&1 &
+DRYPID=$!
+for _ in $(seq 1 50); do [ -S "$DRY/sock" ] && break; sleep 0.1; done
+check "the dry-run daemon runs without root and opens its socket" test -S "$DRY/sock"
+check "an unprivileged client creates a tenant in it" grep -q '^created=true' <(dry oxpanel-ctl tenant create dryt --memory 64M)
+check "and a virtual host" grep -q '^changed=true' <(dry oxpanel-ctl vhost set dry.test --tenant dryt)
+check "the fake host reports the dry-run flag" grep -q ' dry_run=true' <(dry oxpanel-ctl host info)
+check "the records are written under the dry-run state directory" test -f "$DRY/state/tenants/dryt.json"
+check_not "no real account was created" id dryt
+check "no real unit or Nginx file was written" bash -c '! ls /etc/systemd/system/oxpanel-tenant-dryt.slice /etc/nginx/oxpanel.d/dry.test.conf 2>/dev/null | grep -q .'
+kill "$DRYPID"; wait "$DRYPID" 2>/dev/null || true
+check "the real daemon was not disturbed" systemctl -q is-active oxpanel-daemon
+rm -rf "$DRY"
+
+echo "== preflight refusals"
+check "--check-config passes on this host" /usr/sbin/oxpanel-daemon --check-config
+check "a non-root user cannot start the daemon" bash -c '! setpriv --reuid=panelapi --regid=panelapi --clear-groups -- /usr/sbin/oxpanel-daemon --check-config >/dev/null 2>&1'
+check "a missing web-server account is refused" bash -c '! OXPANEL_WEB_USER=nosuchweb1 /usr/sbin/oxpanel-daemon --check-config >/dev/null 2>&1'
+check "root as the web-server account is refused" bash -c '! OXPANEL_WEB_USER=root /usr/sbin/oxpanel-daemon --check-config >/dev/null 2>&1'
+check "a tenant as the web-server account is refused" bash -c '! OXPANEL_WEB_USER=bob /usr/sbin/oxpanel-daemon --check-config >/dev/null 2>&1'
+check "a missing socket group is refused" bash -c '! OXPANEL_SOCKET_GROUP=nosuchgrp1 /usr/sbin/oxpanel-daemon --check-config >/dev/null 2>&1'
+
 echo "== teardown"
 check "vhost removed" grep -q '^removed=true' <(oxpanel-ctl vhost remove example.test)
 check "config gone" test ! -e /etc/nginx/oxpanel.d/example.test.conf

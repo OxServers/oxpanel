@@ -24,6 +24,43 @@ jobs:
         run: ./scripts/dev.sh cargo test --all-targets
       - name: cargo-deny
         run: ./scripts/dev.sh cargo deny check
+      - name: feature traceability (every FEATURES.md row maps to tests that exist)
+        run: ./scripts/traceability.sh
+
+  coverage:
+    name: line coverage of oxpanel-daemon
+    runs-on: ubuntu-latest
+    needs: check
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build target-OS image
+        run: podman build -t localhost/oxpanel-dev:alma9 -f tests-integration/Containerfile tests-integration
+      - name: Coverage (fails under the floor in scripts/coverage.sh)
+        run: COVERAGE_HTML=1 ./scripts/dev.sh ./scripts/coverage.sh
+      - name: Upload HTML report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-${{ github.sha }}
+          path: target/llvm-cov/html/
+          if-no-files-found: ignore
+
+  bench:
+    name: engine benchmark (nightly, informational)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    needs: check
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build target-OS image
+        run: podman build -t localhost/oxpanel-dev:alma9 -f tests-integration/Containerfile tests-integration
+      - name: make bench (1,000 tenants, 2,000 virtual hosts)
+        run: ./scripts/dev.sh cargo run --release -p oxpanel-bench -- --tenants 1000 --vhosts 2000 --seconds 3 | tee bench.md
+      - name: Upload numbers
+        uses: actions/upload-artifact@v4
+        with:
+          name: bench-${{ github.sha }}
+          path: bench.md
 
   integration:
     name: root integration (systemd container)

@@ -46,6 +46,11 @@ pub mod tenant;
 pub mod validate;
 pub mod vhost;
 
+/// Property tests of crate-private parsers (the public ones are covered by
+/// `tests/properties.rs`).
+#[cfg(test)]
+mod proptests;
+
 pub use error::{Error, Result};
 /// Generated API types (re-exported from `oxpanel-proto`).
 pub use oxpanel_proto as proto;
