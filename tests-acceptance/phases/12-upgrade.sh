@@ -62,13 +62,14 @@ check "the new host info shows the databases" bash -c 'oxpanel-ctl host info | g
 check "an SFTP key can be added to the pre-existing tenant" bash -c "ssh-keygen -q -t ed25519 -N '' -f /root/acc/upg.key && oxpanel-ctl sftp add-key $T --key-file /root/acc/upg.key.pub --label upg | grep -q '^changed=true'"
 check "a database for it" oxpanel-ctl db create ${T}_shop --tenant $T
 check "a backup of it, waited for" bash -c "oxpanel-ctl backup create $T --wait | grep -q 'state=JOB_STATE_SUCCEEDED'"
+check "the file manager works on the pre-existing tenant's home" bash -c "printf upgraded-by-file-manager | oxpanel-ctl files write $T public_html/fm.html >/dev/null && curl -s -H 'Host: static.upg.test' http://127.0.0.1/fm.html | grep -qx upgraded-by-file-manager"
+check "a file-manager job on it, waited for" bash -c "oxpanel-ctl files compress $T '' site.tar.gz public_html --format tar-gz --wait | grep -q 'state=JOB_STATE_SUCCEEDED'"
+check "a database of it goes to the trash and comes back under a new name" bash -c "id=\$(oxpanel-ctl db delete ${T}_shop | sed -n 's/.* trash_id=\([^ ]*\) .*/\1/p') && oxpanel-ctl db trash-list $T | grep -q \"^\$id ${T}_shop \" && oxpanel-ctl db trash-restore $T \"\$id\" ${T}_shop2 >/dev/null && oxpanel-ctl db list --tenant $T | grep -q 'database=${T}_shop2'"
 check "the old sites are still fine after those" bash -c 'curl -s -H "Host: static.upg.test" http://127.0.0.1/ | grep -qx static-old'
 check "a second run of the installer changes nothing" bash -c 'bash release/install.sh --yes 2>&1 | grep -q "^RESULT: ok changes=0 "'
 
-# ---- clean up what this phase made
-oxpanel-ctl db delete ${T}_shop >/dev/null 2>&1
-for id in $(oxpanel-ctl backup list $T | sed -n 's/^backup=\([^ ]*\).*/\1/p'); do oxpanel-ctl backup delete $T "$id" >/dev/null 2>&1; done
-for d in static.upg.test php.upg.test app.upg.test; do oxpanel-ctl vhost remove $d >/dev/null 2>&1; done
-check "the tenant is deleted again" oxpanel-ctl tenant delete $T --remove-home
+# ---- clean up what this phase made: the pre-existing tenant goes in one step
+check "the upgraded tenant is deleted with everything it has (cascade)" bash -c "oxpanel-ctl tenant delete $T --cascade --confirm $T --wait | grep -q 'kind=JOB_KIND_DELETE_TENANT .* state=JOB_STATE_SUCCEEDED'"
+check "nothing of it is left" bash -c "! id $T 2>/dev/null && test ! -e /home/$T && test -z \"\$(ls /etc/nginx/oxpanel.d | grep upg.test)\" && test -z \"\$(oxpanel-ctl backup list $T 2>/dev/null)\""
 n=$(avc_count); if [ "$n" = 0 ]; then ok "zero AVC denials"; else avc_dump; fail "$n AVC denial(s)"; fi
 phase_end

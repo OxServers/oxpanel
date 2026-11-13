@@ -14,6 +14,8 @@ check "its page" as_user $T sh -c 'echo kept-page > /home/unin1/public_html/inde
 check "a database" oxpanel-ctl db create ${T}_data --tenant $T
 check "a table with a row in it" mariadb --no-defaults -u root -e "CREATE TABLE ${T}_data.t (v INT); INSERT INTO ${T}_data.t VALUES (42)"
 check "a backup" bash -c "oxpanel-ctl backup create $T --wait | grep -q 'state=JOB_STATE_SUCCEEDED'"
+check "a database in the trash" bash -c "oxpanel-ctl db create ${T}_old --tenant $T >/dev/null && oxpanel-ctl db delete ${T}_old | grep -q ' trash_id='"
+check "a file-manager job in the history" bash -c "oxpanel-ctl files compress $T '' page.tar.gz public_html --format tar-gz --wait | grep -q 'state=JOB_STATE_SUCCEEDED'"
 eventually "the site answers" 20 1 http_body_is keep.unin.test / kept-page
 
 # Asked non-interactively without --yes: it must do nothing.
@@ -36,6 +38,8 @@ check "the tenant account is still there" getent passwd $T
 check "its home and page are still there" test "$(cat /home/$T/public_html/index.html)" = kept-page
 check "its database and data are still there" bash -c "[ \"\$(mariadb --no-defaults -u root -N -B -e 'SELECT v FROM ${T}_data.t')\" = 42 ]"
 check "its backup is still there" bash -c "ls /var/lib/oxpanel-backups/$T/*/ | grep -q ."
+check "its deleted database is still in the trash" bash -c "[ \"\$(mariadb --no-defaults -u root -N -B -e \"SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME LIKE 'oxpanel\\_trash\\_%'\")\" -ge 1 ]"
+check "the uninstaller named the trash and the jobs among what it left" bash -c 'grep -q "trash" uninstall.log && grep -q "jobs" uninstall.log'
 check "the records are still there" test -f /var/lib/oxpanel/tenants/$T.json
 check "Nginx is still installed and running" bash -c 'rpm -q nginx && systemctl -q is-active nginx'
 check "Nginx still serves the site" http_body_is keep.unin.test / kept-page
@@ -51,10 +55,13 @@ check "the engine knows the tenant again (its records were kept)" bash -c "oxpan
 check "its site is still served" http_body_is keep.unin.test / kept-page
 check "its database is still listed" bash -c "oxpanel-ctl db list --tenant $T | grep -q 'database=${T}_data'"
 check "its backup is still listed" bash -c "oxpanel-ctl backup list $T | grep -q '^backup='"
+check "its trash is still listed" bash -c "oxpanel-ctl db trash-list $T | grep -q ' ${T}_old '"
+check "its file-manager job history is still listed" bash -c "oxpanel-ctl files jobs $T | grep -q 'kind=FILE_JOB_KIND_COMPRESS tenant=$T state=JOB_STATE_SUCCEEDED'"
 check "the fail2ban jail is back" bash -c 'fail2ban-client status sshd >/dev/null'
 check "reconcile is clean" bash -c 'oxpanel-ctl host reconcile | grep -qx "drifts=0"'
 
 oxpanel-ctl db delete ${T}_data >/dev/null 2>&1
+oxpanel-ctl db trash-purge $T >/dev/null 2>&1
 for id in $(oxpanel-ctl backup list $T | sed -n 's/^backup=\([^ ]*\).*/\1/p'); do oxpanel-ctl backup delete $T "$id" >/dev/null 2>&1; done
 oxpanel-ctl vhost remove keep.unin.test >/dev/null 2>&1
 check "clean up: the tenant is deleted" oxpanel-ctl tenant delete $T --remove-home

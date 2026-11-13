@@ -126,7 +126,13 @@ if [ "$1" -eq 0 ] && /usr/sbin/selinuxenabled 2>/dev/null; then /usr/sbin/semodu
 - SFTP access for tenants (keys, opt-in passwords) confined by an sshd
   drop-in; XFS user disk quotas (disk and inode limits).
 - Tenant databases and database users on MariaDB, with grants.
-- Backup and restore jobs; retained backups of deleted tenants.
+- Backup and restore jobs, with database dumps; retained backups of deleted
+  tenants; retention in days.
+- A database trash (deleted databases kept 30 days by default, restorable
+  under a new name) and the deletion of a customer with everything it has,
+  in one step and optionally after a final backup (a job).
+- A file manager: list, read, edit, upload, move, copy, delete, compress and
+  extract a tenant's files, always as the tenant and beneath its home.
 - Engine: more drift kinds in Reconcile, per-peer API scopes, the OxPanel
   SELinux module (oxpanel_app_t), a fail2ban jail template under
   /usr/share/oxpanel/fail2ban. The one-command installer (install.sh)

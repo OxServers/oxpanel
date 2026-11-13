@@ -1184,7 +1184,7 @@ workstation; you only need `/dev/kvm` to be readable — and drives it over SSH.
 | `TARGET=user@host` | | Use a machine you provide instead of a VM (`TARGET_KEY=path` for the key). Phases 15/60/70/80/90 reboot it, create accounts and attack them, so this needs `I_UNDERSTAND=1`. |
 
 Phases: **10** install (`dnf install` of the RPM or the handbook's source install; MariaDB set up as in §3.5; services start; `--check-config`) ·
-**12** (upgrade mode) upgrade 0.1.0 to the current release with `install.sh`: tenants, sites and limits survive ·
+**12** (upgrade mode) upgrade 0.1.0 to the current release with `install.sh`: tenants, sites and limits survive, and the new features (SFTP, databases and their trash, backups, the file manager, deleting the tenant in one step) work on the pre-existing tenant ·
 **15** host preparation for disk quotas: runs §9.1's block (in installer mode the installer already did it, and is run again after the reboot), reboots, checks the quota option is on ·
 **16** (installer mode) fail2ban: wrong SFTP passwords from one address of a network namespace get it banned, a correct login from another address works, an address on the ignore list is never banned, no AVC denials ·
 **20** the 703-check integration suite on the real host (`tests-integration/run-inside.sh`: everything above plus HTTPS and ACME against a local test CA, SFTP, quotas, databases and backups) ·
@@ -1198,7 +1198,7 @@ other tenants and the engine, escape through planted links, exhaust memory, task
 suspension or deletion, smuggle requests; every attempt must fail (`docs/SECURITY.md`) ·
 **90** performance on the real host: 100 tenants with a site each, time per step and its growth, Nginx reload time, daemon memory
 (`docs/PERFORMANCE.md`) ·
-**95** (installer mode) `install.sh --uninstall` keeps a tenant's account, home, database, backup and site, and installing again finds the tenant.
+**95** (installer mode) `install.sh --uninstall` keeps a tenant's account, home, database, database trash, backup, file-manager job history and site, and installing again finds the tenant with all of them.
 
 Results land in `dist/acceptance/<UTC stamp>/` (`latest` symlink): `report.md`
 with a per-phase table and failure context, `phases/*.log`, the VM's journals,
@@ -1240,15 +1240,18 @@ with a static, a PHP and a Node.js site made with the old engine keep their
 accounts, limits and sites, `host reconcile` is clean, and the new features work on
 them). The unit restarts automatically and the daemon re-renders its configuration
 when it starts, records are versioned (`version` field) and older
-records load with defaults for new fields. Backup and restore jobs that are
-running keep running in their own units and are picked up by the new daemon.
+records load with defaults for new fields. Backup, restore and file-manager jobs
+that are running keep running in their own units and are picked up by the new
+daemon; a customer deletion (cascade) that was running continues where it stopped.
 
 **Uninstall the engine, keep the tenants:** `sudo ./install.sh --uninstall` (asks first;
 `--yes` to skip the question). It removes the engine package (and the panel package, if
 installed) and what the installer itself added (the fail2ban jail file, the repository
 file), and **never** touches customers' accounts, homes, databases or backups. It prints
 what it left, in short: tenant accounts and homes, `/var/lib/oxpanel` (so installing again
-finds every tenant), MariaDB with its data and its hardening file, `/var/lib/oxpanel-backups`,
+finds every tenant, and the records of jobs in progress, which a reinstalled engine concludes
+or continues), MariaDB with its data and its hardening file (and the deleted databases in the
+trash, which only the engine purges), `/var/lib/oxpanel-backups`,
 `/etc/pki/oxpanel`, the Nginx files of the sites (they keep being served), the sshd drop-in
 and the SFTP keys, per-tenant slices, PHP and application units (still running, no longer
 manageable; Node.js and Python applications need the OxPanel SELinux module that the
@@ -1263,8 +1266,9 @@ sudo dnf remove oxpanel-daemon
 # the backups in /var/lib/oxpanel-backups
 ```
 
-**Remove everything:** delete every virtual host and tenant through the API
-first (`backup delete`, `vhost remove`, `tenant delete --remove-home`) — that is the only path
+**Remove everything:** delete every tenant through the API first (`tenant delete NAME
+--cascade --confirm NAME --wait` removes a tenant with its sites, databases, trash, backups
+that are not retained and home in one job) — that is the only path
 that cleans up accounts, ACLs, SELinux rules and units consistently — then
 uninstall and remove `/var/lib/oxpanel`, `/var/lib/oxpanel-backups`, `/etc/nginx/oxpanel.d`,
 `/etc/nginx/conf.d/00-oxpanel.conf`, `/etc/oxpanel`, and the `oxpanel` group.
