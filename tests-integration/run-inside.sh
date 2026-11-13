@@ -1686,7 +1686,9 @@ CONF
   check "its MX still answers, its site's A does not" bash -c "test \"\$(dig +short @127.0.0.1 dnsa.oxtest MX | wc -l)\" = 2 && test -z \"\$(dig +short @127.0.0.1 dnsa.oxtest A)\""
   check "reset to defaults removes the tenant's records" bash -c "oxpanel-ctl dns zone-reset dnsa.oxtest --tenant dnsa | grep -q '^zone=dnsa.oxtest .* records=0 '"
   for z in dnsa.oxtest sig.parent.oxtest; do check "delete zone $z" grep -q '^deleted=true' <(oxpanel-ctl dns zone-delete "$z" --tenant dnsa); done
-  check "no zone file left" test -z "$(ls /var/lib/oxpanel-dns/zones | grep -v '^catalog.oxpanel.invalid.zone')"
+  left="$(ls -A /var/lib/oxpanel-dns/zones /var/lib/oxpanel-dns/keys | grep -v -e '^catalog.oxpanel.invalid.zone' -e '^/' -e '^$' || true)"
+  [ -z "$left" ] || echo "left behind: $left"
+  check "no zone file or key left" test -z "$left"
   check "dnsa deleted" grep -q '^deleted=true' <(oxpanel-ctl tenant delete dnsa --remove-home)
   check "no drift after DNS hosting" eventually 40 bash -c "oxpanel-ctl host reconcile | grep -q '^drifts=0$'"
   systemctl stop oxtest-dns-secondary 2>/dev/null || true

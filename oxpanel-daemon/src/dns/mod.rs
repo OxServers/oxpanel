@@ -209,13 +209,26 @@ pub fn zone_of_site(ctx: &Ctx, site: &VHostRecord) -> String {
     if !ctx.config.dns.enabled || !site.dns.is_on() {
         return String::new();
     }
-    ZoneStore::new(&ctx.config)
-        .list()
-        .unwrap_or_default()
-        .into_iter()
-        .find(|z| z.tenant == site.tenant && is_within(&site.domain, &z.zone))
-        .map(|z| z.zone)
-        .unwrap_or_default()
+    // Zones never overlap: the zone holding the name, if any, is the one
+    // whose apex is the name or one of its parents (a handful of lookups,
+    // not a scan of every zone: listings call this once per site).
+    let store = ZoneStore::new(&ctx.config);
+    let mut name = site.domain.as_str();
+    loop {
+        if let Ok(apex) = Domain::parse(name) {
+            if let Ok(Some(z)) = store.load(&apex) {
+                return if z.tenant == site.tenant {
+                    z.zone
+                } else {
+                    String::new()
+                };
+            }
+        }
+        match name.split_once('.') {
+            Some((_, parent)) if parent.contains('.') => name = parent,
+            _ => return String::new(),
+        }
+    }
 }
 
 // ---- zone-level rules ------------------------------------------------------
