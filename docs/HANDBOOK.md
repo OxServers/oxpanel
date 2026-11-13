@@ -228,6 +228,7 @@ valid. After editing: `sudo systemctl restart oxpanel-daemon`.
 | `OXPANEL_SFTP_KEYS_DIR` | `/etc/oxpanel-sftp` | Per-tenant SFTP keys files (root-owned). |
 | `OXPANEL_BACKUP_DIR` | `/var/lib/oxpanel-backups` | Backup store: `<dir>/<tenant>/<backup id>/`, root-only. Must not be inside `OXPANEL_HOME_BASE` and must be writable under the unit's `ReadWritePaths` (anything below `/var/lib` is). |
 | `OXPANEL_BACKUP_KEEP` | `7` | Complete backups kept per tenant (1–365); older ones are removed when a new one completes. |
+| `OXPANEL_DB_TRASH_DAYS` | `30` | Days a deleted database stays in its tenant's trash before it is purged (1–366); checked at start-up and hourly. |
 | `OXPANEL_BACKUP_MIN_FREE_BYTES` | `1073741824` | Space that must stay free on the backup file system: a backup that could eat into it is refused, and no archive may grow into it. |
 | `OXPANEL_BACKUP_TIMEOUT_SECS` | `21600` | Upper bound for one backup or restore job (≥ 60). |
 | `OXPANEL_COMMAND_TIMEOUT_SECS` | `60` | Upper bound for any single external command (`useradd`, `nginx -t`, …). |
@@ -478,12 +479,32 @@ sudo oxpanel-ctl db grant acme_shopapp acme_shop
 sudo oxpanel-ctl db list --tenant acme        # database=acme_shop tenant=acme engine=mariadb size=…
 #   in the application: host "localhost", user "acme_shopapp", database "acme_shop"
 
-# Back up the tenant (home + the engine's records), waiting for the job;
+# Deleting a database moves it to the tenant's trash (no dump, instant): its
+# grants are revoked, the sessions of its users end, the name is free at once.
+# It is purged after 30 days (OXPANEL_DB_TRASH_DAYS); the trash does not count
+# against the disk limit but is capped (--db-trash, default = the disk limit)
+sudo oxpanel-ctl db delete acme_shop          # deleted=true trash_id=t1794571200999 purge_at=1797163200
+sudo oxpanel-ctl db trash-list acme
+# t1794571200999 acme_shop size=16384 deleted_at=1794571200 purge_at=1797163200 objects=3
+# total=16384 cap=5368709120
+# Bring it back — always under a NEW name (refused if it exists), with no
+# grants: grant it again. Views, triggers, routines and events come back; one
+# that cannot be re-created is printed with its reason (and its definition is
+# in the API response)
+sudo oxpanel-ctl db trash-restore acme t1794571200999 acme_shop2
+# restored=acme_shop2
+sudo oxpanel-ctl db grant acme_shopapp acme_shop2
+# Or empty the trash early: one item, or all of them
+sudo oxpanel-ctl db trash-purge acme t1794571200999
+sudo oxpanel-ctl db trash-purge acme
+
+# Back up the tenant (home, the engine's records and every database), waiting for the job;
 # without --wait it prints the job id at once (`backup job <id>` to look again)
 sudo oxpanel-ctl backup create acme --wait
 # job=j1794571200123 kind=JOB_KIND_BACKUP tenant=acme backup=b1794571200123 state=JOB_STATE_SUCCEEDED ...
 sudo oxpanel-ctl backup list acme
-# backup=b1794571200123 tenant=acme state=BACKUP_STATE_READY created_at=1794571200 size=48213 domains=acme.example,shop.acme.example members=home:home.tar.gz:47101,records:records.json:1112
+# backup=b1794571200123 tenant=acme state=BACKUP_STATE_READY created_at=1794571200 size=52371 domains=acme.example,shop.acme.example members=db-acme_shop.objects.json:…,db-acme_shop.sql.gz:…,home:home.tar.gz:47101,records:records.json:1112
+#   database acme_shop size=16384 dump=db-acme_shop.sql.gz objects=db-acme_shop.objects.json
 # Put the files back. You must choose what happens to files that exist now:
 # --overwrite replaces them, --keep-existing leaves them and restores only
 # what is missing. PHP/apps stop meanwhile; apps get their virtualenv and
@@ -492,23 +513,38 @@ sudo oxpanel-ctl backup list acme
 sudo oxpanel-ctl backup restore acme b1794571200123 --keep-existing --wait
 # restored_entries=12 skipped_entries=40
 # site=app.acme.example dependencies_ok=true detail=dependencies reinstalled from package.json
+# A database comes back separately from the files, always into a NEW name
+# (never over an existing database), without grants
+sudo oxpanel-ctl backup restore-db acme b1794571200123 acme_shop acme_shopold --wait
 sudo oxpanel-ctl backup delete acme b1794571200123
 
-# Closing a customer's account: a final backup kept for 6 months after the
-# deletion (then removed automatically); other backups must go first
+# A final backup kept for 6 months (or --retain-days 1-366) after the
+# deletion, then removed automatically
 sudo oxpanel-ctl backup create acme --retain-months 6 --wait
 sudo oxpanel-ctl backup list-retained
 # backup=b1794571300456 tenant=acme state=BACKUP_STATE_READY created_at=... retain_until=1810349000 ...
 # After the deletion it is listed with tenant_deleted=true; a new tenant named
 # acme never sees it. The customer came back as acme2: restore it there
 sudo oxpanel-ctl backup restore-retained b1794571300456 --from acme --to acme2 --overwrite --wait
+sudo oxpanel-ctl backup restore-retained-db b1794571300456 --from acme --to acme2 acme_shop acme2_shop --wait
 # ...or drop it early
 sudo oxpanel-ctl backup delete acme b1794571300456 --tenant-deleted
 
-# Tear down (order matters: vhosts and databases first; backups that are not
-# retained block deleting the tenant)
+# Closing a customer's account in one go: sites, certificates, PHP and
+# applications, SFTP access, databases, users and the database trash (dropped
+# at once), backups that are not retained, the account and its home. The name
+# must be given twice; with --final-backup-days a backup of files and
+# databases is taken first and kept that long (1-366 days) — nothing is
+# deleted unless it completes. A job: --wait follows it (exit 5 if it failed);
+# if the daemon stops meanwhile it continues at start-up, and repeating the
+# command completes a deletion that stopped half-way.
+sudo oxpanel-ctl tenant delete acme --cascade --confirm acme --final-backup-days 90 --wait
+
+# Without --cascade, deleting a tenant is refused while it still has sites,
+# databases, users, trash, backups that are not retained or a running job:
 sudo oxpanel-ctl db user-delete acme_shopapp
-sudo oxpanel-ctl db delete acme_shop          # drops the database and everything in it
+sudo oxpanel-ctl db delete acme_shop          # to the trash
+sudo oxpanel-ctl db trash-purge acme          # and gone
 sudo oxpanel-ctl vhost remove shop.acme.example
 sudo oxpanel-ctl vhost remove acme.example
 for id in $(sudo oxpanel-ctl backup list acme | sed -n 's/^backup=\([^ ]*\).*/\1/p'); do sudo oxpanel-ctl backup delete acme "$id"; done
@@ -759,7 +795,20 @@ outlive the tenant, are hidden from any later tenant of the same name, and
 are removed by the daemon when their date passes (at start-up and hourly).
 `backup list-retained`, `backup delete … --tenant-deleted` and `backup
 restore-retained <id> --from <deleted tenant> --to <tenant>` (needs the
-`delete` scope) are the operator's tools for them.
+`delete` scope) are the operator's tools for them (`--retain-days 1..366` and
+`--days` work as well as months).
+Every database of the tenant is in the backup: `mariadb-dump
+--single-transaction` (tables, data, views) as root over the socket, inside
+the job's sandbox and priorities, plus the triggers, routines and events as
+JSON captured by the daemon. A failed dump fails the whole backup. With
+databases recorded and MariaDB down, `backup create` is refused. A database
+is restored on its own, into a new name only: `backup restore-db <tenant>
+<id> <database> <new name>` (or `restore-retained-db` for a deleted tenant's
+retained backup). The restored database has no grants. Stored objects are
+re-created one by one through the hardened client; one whose definer is not
+one of the tenant's users is dropped and listed in the job (`not-recreated`).
+Do not feed these dumps to `mariadb` by hand as root unless you trust every
+routine in them: see §13.
 Backups leave out `node_modules`, Python virtualenvs (any directory holding
 a `pyvenv.cfg`, and each Python application's `.venv`) and the `.cache` /
 `.npm` caches; `backup list` shows how many directories were left out
@@ -1060,4 +1109,15 @@ uninstall and remove `/var/lib/oxpanel`, `/var/lib/oxpanel-backups`, `/etc/nginx
   those logs root-only. Do not give tenants `root` or any account with
   `CREATE USER`/`GRANT OPTION` — OxPanel's isolation between tenants rests on
   the grants it writes.
+- Restoring tenant SQL as root is dangerous. A tenant can write a stored
+  routine or trigger whose body makes the `mariadb` client split it
+  differently from the server (a `--` followed by a control character is a
+  comment to the server, not to the client; `\g` in it sends a statement).
+  Replayed by `mariadb-dump --routines | mariadb` as root — the usual
+  migration recipe — that runs SQL of the tenant's choosing as root
+  (demonstrated on MariaDB 10.5). OxPanel's own dumps leave triggers, routines
+  and events out of the SQL and re-creates them safely; if you move databases
+  by hand, load dumps with `mariadb --binary-mode --sandbox` and without
+  `--routines`/`--triggers`/`--events`, or as an account that holds only the
+  target database.
 - Report security issues privately to the maintainers, not in public issues.
