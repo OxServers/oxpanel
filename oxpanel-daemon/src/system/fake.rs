@@ -7,10 +7,11 @@
 
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::OsString;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use super::{bin, CommandOutput, CommandSpec, HostStats, OsUser, System};
+use super::{bin, CommandOutput, CommandSpec, HostStats, OsUser, QuotaState, System};
 use crate::error::{Error, Result};
 
 #[derive(Debug, Default)]
@@ -29,6 +30,21 @@ struct Inner {
     missing: Vec<&'static str>,
     /// What `node --version` prints; `None` = a supported version.
     node_version: Option<String>,
+    /// User quotas are enforced on the (one) fake file system.
+    quota_enforced: bool,
+    /// Per-uid quota state of the fake file system.
+    quotas: BTreeMap<u32, FakeQuota>,
+    /// The sshd drop-in is not in effect (`sshd -T` shows the defaults).
+    sshd_unconfined: bool,
+}
+
+/// One user's row in the fake quota table (blocks in KiB, as `xfs_quota` prints).
+#[derive(Debug, Default, Clone, Copy)]
+struct FakeQuota {
+    blocks_used: u64,
+    blocks_hard: u64,
+    inodes_used: u64,
+    inodes_hard: u64,
 }
 
 #[derive(Debug, Default)]
@@ -36,9 +52,58 @@ pub struct FakeSystem {
     inner: Mutex<Inner>,
 }
 
+/// Block device of the fake file system that holds tenant homes.
+pub const FAKE_DEVICE: &str = "/dev/fake0";
+/// The group every tenant is put in (the default `OXPANEL_TENANT_GROUP`),
+/// which exists on a fake host just as the package creates it on a real one.
+pub const FAKE_TENANT_GROUP: (&str, u32) = ("oxpanel-tenants", 989);
+
 impl FakeSystem {
     pub fn new() -> Self {
-        Self::default()
+        let fake = Self::default();
+        fake.add_group(FAKE_TENANT_GROUP.0, FAKE_TENANT_GROUP.1);
+        fake
+    }
+
+    /// Turn kernel-enforced user quotas on the fake file system on or off.
+    pub fn set_quota_enforced(&self, on: bool) {
+        if let Ok(mut i) = self.inner.lock() {
+            i.quota_enforced = on;
+        }
+    }
+
+    /// Pretend `uid` owns this much on the fake file system.
+    pub fn set_quota_usage(&self, uid: u32, blocks_kib: u64, inodes: u64) {
+        if let Ok(mut i) = self.inner.lock() {
+            let q = i.quotas.entry(uid).or_default();
+            q.blocks_used = blocks_kib;
+            q.inodes_used = inodes;
+        }
+    }
+
+    /// Change a limit behind the daemon's back (KiB, inodes).
+    pub fn set_quota_limits(&self, uid: u32, blocks_hard_kib: u64, inodes_hard: u64) {
+        if let Ok(mut i) = self.inner.lock() {
+            let q = i.quotas.entry(uid).or_default();
+            q.blocks_hard = blocks_hard_kib;
+            q.inodes_hard = inodes_hard;
+        }
+    }
+
+    /// The `(block limit in KiB, inode limit)` the fake kernel holds for `uid`.
+    pub fn quota_limits(&self, uid: u32) -> (u64, u64) {
+        self.inner
+            .lock()
+            .ok()
+            .and_then(|i| i.quotas.get(&uid).map(|q| (q.blocks_hard, q.inodes_hard)))
+            .unwrap_or_default()
+    }
+
+    /// Make `sshd -T` report an sshd that ignores the OxPanel drop-in.
+    pub fn set_sshd_unconfined(&self, on: bool) {
+        if let Ok(mut i) = self.inner.lock() {
+            i.sshd_unconfined = on;
+        }
     }
 
     fn lock(&self) -> Result<std::sync::MutexGuard<'_, Inner>> {
@@ -154,6 +219,125 @@ fn output(program: &'static str, code: i32, stdout: &str, stderr: &str) -> Comma
     }
 }
 
+/// `gpasswd --add|--delete <user> <group>` on the fake account database.
+fn fake_gpasswd(i: &mut Inner, args: &[OsString]) -> CommandOutput {
+    let program = bin::GPASSWD;
+    let arg = |n: usize| args.get(n).map(|a| a.to_string_lossy().into_owned());
+    let (Some(verb), Some(user), Some(group)) = (arg(0), arg(1), arg(2)) else {
+        return output(program, 2, "", "gpasswd: usage");
+    };
+    let Some(gid) = i.groups.get(&group).copied() else {
+        return output(
+            program,
+            3,
+            "",
+            &format!("gpasswd: group '{group}' does not exist in /etc/group"),
+        );
+    };
+    if !i.users.contains_key(&user) {
+        return output(
+            program,
+            3,
+            "",
+            &format!("gpasswd: user '{user}' does not exist"),
+        );
+    }
+    let members = i.memberships.entry(user.clone()).or_default();
+    match verb.as_str() {
+        "--add" => {
+            if !members.contains(&gid) {
+                members.push(gid);
+            }
+            output(program, 0, "", "")
+        }
+        "--delete" if members.contains(&gid) => {
+            members.retain(|g| *g != gid);
+            output(program, 0, "", "")
+        }
+        "--delete" => output(
+            program,
+            3,
+            "",
+            &format!("gpasswd: user '{user}' is not a member of '{group}'"),
+        ),
+        _ => output(program, 2, "", "gpasswd: usage"),
+    }
+}
+
+/// The value of `key=` inside an `xfs_quota` `limit` command, in the unit it
+/// was given (`5120k` → 5120).
+fn limit_value(command: &str, key: &str) -> Option<u64> {
+    command
+        .split(' ')
+        .find_map(|w| w.strip_prefix(key)?.strip_prefix('='))
+        .and_then(|v| v.trim_end_matches('k').parse().ok())
+}
+
+/// `systemd-run … -- xfs_quota -x -c <command>… <device>`: apply `limit`
+/// commands to the fake quota table and write what `report` commands print to
+/// the file the transient unit's standard output is directed to.
+fn fake_xfs_quota(i: &mut Inner, args: &[OsString]) -> CommandOutput {
+    let program = bin::SYSTEMD_RUN;
+    let args: Vec<String> = args
+        .iter()
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
+    let Some(out_path) = args
+        .iter()
+        .find_map(|a| a.strip_prefix("--property=StandardOutput=truncate:"))
+    else {
+        return output(program, 1, "", "fake: no StandardOutput file");
+    };
+    let mut text = String::new();
+    if !i.quota_enforced || args.last().map(String::as_str) != Some(FAKE_DEVICE) {
+        // What the real tool does on a file system without quotas: nothing.
+        return match std::fs::write(out_path, text) {
+            Ok(()) => output(program, 0, "", ""),
+            Err(e) => output(program, 1, "", &format!("fake: {e}")),
+        };
+    }
+    let commands = args
+        .iter()
+        .zip(args.iter().skip(1))
+        .filter(|(flag, _)| *flag == "-c")
+        .map(|(_, command)| command.as_str());
+    for command in commands {
+        let uid = command
+            .rsplit(' ')
+            .next()
+            .and_then(|w| w.parse::<u32>().ok());
+        if command.starts_with("limit ") {
+            let Some(uid) = uid else {
+                return output(program, 1, "", "fake: limit without a uid");
+            };
+            let q = i.quotas.entry(uid).or_default();
+            q.blocks_hard = limit_value(command, "bhard").unwrap_or(q.blocks_hard);
+            q.inodes_hard = limit_value(command, "ihard").unwrap_or(q.inodes_hard);
+        } else if command.starts_with("report ") {
+            // `-L <uid> -U <uid>` restricts the report to one user.
+            let only = command
+                .split(' ')
+                .skip_while(|w| *w != "-L")
+                .nth(1)
+                .and_then(|w| w.parse::<u32>().ok());
+            for (uid, q) in &i.quotas {
+                if only.is_none_or(|o| o == *uid) {
+                    let _ = writeln!(
+                        text,
+                        "#{uid:<10} {:>10} {:>10} {:>10}     00 [--------] {:>10} {:>10} {:>10}     00 [--------]",
+                        q.blocks_used, q.blocks_hard, q.blocks_hard, q.inodes_used, q.inodes_hard, q.inodes_hard
+                    );
+                }
+            }
+            text.push('\n');
+        }
+    }
+    match std::fs::write(out_path, text) {
+        Ok(()) => output(program, 0, "", ""),
+        Err(e) => output(program, 1, "", &format!("fake: {e}")),
+    }
+}
+
 fn create_private_dir(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(path)?;
@@ -213,6 +397,7 @@ impl System for FakeSystem {
                     return Ok(output(program, 6, "", &format!("userdel: user '{name}' does not exist")));
                 };
                 i.groups.remove(&name);
+                i.memberships.remove(&name);
                 if has_flag(args, "--remove") || has_flag(args, "-r") {
                     let _ = std::fs::remove_dir_all(&user.home);
                     i.removed_homes.push(user.home);
@@ -250,6 +435,17 @@ impl System for FakeSystem {
             bin::SYSTEMCTL if args.first().is_some_and(|a| a == "show") => {
                 // Two units are queried; only the first has anything running.
                 output(program, 0, "MemoryCurrent=1048576\nCPUUsageNSec=5000000\nTasksCurrent=3\n\nMemoryCurrent=[not set]\nCPUUsageNSec=[not set]\nTasksCurrent=[not set]\n", "")
+            }
+            bin::GPASSWD => fake_gpasswd(&mut i, args),
+            bin::SYSTEMD_RUN if args.iter().any(|a| a == bin::XFS_QUOTA) => fake_xfs_quota(&mut i, args),
+            // `sshd -T -C user=…`: the effective settings for one account.
+            bin::SSHD if args.first().is_some_and(|a| a == "-T") => {
+                let effective = if i.sshd_unconfined {
+                    "forcecommand none\nchrootdirectory none\nauthorizedkeysfile .ssh/authorized_keys\n"
+                } else {
+                    "forcecommand internal-sftp\nchrootdirectory /fake/%u\nauthorizedkeysfile /fake/%u\ndisableforwarding yes\n"
+                };
+                output(program, 0, effective, "")
             }
             // systemctl, restorecon, setfacl and anything else: succeed silently.
             _ => output(program, 0, "", ""),
@@ -323,6 +519,14 @@ impl System for FakeSystem {
             uptime_secs: 3600,
             disk_total_bytes: 100 << 30,
             disk_free_bytes: 80 << 30,
+        })
+    }
+
+    async fn quota_state(&self, _path: &Path) -> Result<QuotaState> {
+        Ok(QuotaState {
+            fs_type: "xfs".to_owned(),
+            device: PathBuf::from(FAKE_DEVICE),
+            user_quota_enforced: self.lock()?.quota_enforced,
         })
     }
 }

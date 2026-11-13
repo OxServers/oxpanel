@@ -20,7 +20,9 @@ echo "[it] building release binaries"
 "$ROOT/scripts/dev.sh" cargo build --release --locked -p oxpanel-daemon -p oxpanel-ctl
 
 echo "[it] booting systemd container $NAME"
-podman run -d --name "$NAME" --systemd=always --security-opt label=disable \
+# SYS_ADMIN (inside the container's user namespace only): systemd must be able
+# to bind-mount tenant homes into their SFTP chroot directories.
+podman run -d --name "$NAME" --systemd=always --security-opt label=disable --cap-add SYS_ADMIN \
   -v "$ROOT:/work:ro" -v "${OXPANEL_TARGET_VOLUME:-oxpanel-target}":/work/target:ro "$IMAGE" >/dev/null
 trap 'echo "[it] logs:"; podman exec "$NAME" journalctl -u oxpanel-daemon --no-pager -o short-monotonic 2>/dev/null | tail -60 || true; podman rm -f "$NAME" >/dev/null' EXIT
 

@@ -53,3 +53,9 @@ RUN dnf -y install --setopt=install_weak_deps=False php-fpm logrotate \
 RUN dnf -y module enable nodejs:22 \
     && dnf -y install --setopt=install_weak_deps=False nodejs npm \
     && dnf clean all && rm -rf /var/cache/dnf
+
+# SFTP access for tenants (sshd with OxPanel's drop-in; the client for the
+# integration test) and xfsprogs (xfs_quota, for disk quotas on XFS hosts).
+RUN dnf -y install --setopt=install_weak_deps=False openssh-server openssh-clients xfsprogs \
+    && dnf clean all && rm -rf /var/cache/dnf \
+    && systemctl enable sshd

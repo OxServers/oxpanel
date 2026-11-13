@@ -22,7 +22,8 @@ see "Not yet included" at the end so nobody assumes otherwise.
 | Update limits | `UpdateTenantLimits` replaces the tenant's limits (a complete set, not a patch): both unit files are rewritten and applied with `daemon-reload`, so the new values are live immediately. Repeating the call completes an interrupted attempt. |
 | Update owner | `UpdateTenantOwner` replaces or clears the owner label (e.g. moving a customer to another reseller). Touches no OS state. |
 | Suspend / resume | `SuspendTenant` re-renders every virtual host of the tenant to answer `503` with `Retry-After` and no document root, validates once and reloads; all files are restored if Nginx rejects the result. Files, limits and the account are untouched; sites added while suspended are born suspended. `ResumeTenant` reverses it. |
-| Usage | `GetTenantUsage`: current memory, total CPU time and task count from systemd (tenant slice + login-session slice), and disk space allocated under the home (`du`, one file system, no symlink following). |
+| Usage | `GetTenantUsage`: current memory, total CPU time and task count from systemd (tenant slice + login-session slice), and disk space: from the quota system where disk quotas are enforced (no tree walk), otherwise allocated under the home (`du`, one file system, no symlink following). |
+| Disk quotas | `ResourceLimits.disk_max_bytes` / `inodes_max` (`--disk 5G --inodes 200000`), set at creation and by `UpdateTenantLimits`: an **XFS user quota** enforced by the kernel — everything the tenant's uid owns on the file system holding the homes counts, whoever wrote it (SFTP, PHP, an application), and a write beyond it fails with "Disk quota exceeded". The host must mount that file system with `uquota` (handbook §9.1; the daemon never remounts or edits fstab). Where it does not, `GetHostInfo` says so (`disk_quota_available=false` and what to change) and a disk limit is refused with `FAILED_PRECONDITION` before anything is created — never silently accepted. Every tenant's kernel limits are set (including "none", so a re-used uid inherits nothing) and verified against the quota report; deletion clears them. |
 | Reserved names | `root`, `nginx`, `apache`, `oxpanel*`, `systemd-*`, `wheel`, `sudo`, … are rejected before anything touches the OS. |
 
 ## Virtual hosts (Nginx)
@@ -73,6 +74,19 @@ see "Not yet included" at the end so nobody assumes otherwise.
 | SELinux | Works enforcing with zero denials. Applications run in their own domain, `oxpanel_app_t` (a small CIL module shipped with the package), so the web server is allowed to connect to application sockets and to nothing else; socket directories are labelled `httpd_var_run_t`. If the module is missing, enabling an application is refused with the command that installs it. |
 | Reconciliation | An edited or missing application unit is `APP_UNIT_DRIFT`, a stray one `ORPHAN_APP_UNIT`. |
 
+## SFTP access
+
+| Feature | Detail |
+|---|---|
+| SFTP only | `AddSftpKey` / `RemoveSftpKey` / `ListSftpKeys` (`oxpanel-ctl sftp add-key|remove-key|list-keys`). A tenant with a key can log in with any SFTP client — and do nothing else: no shell or command, no terminal, no TCP/socket/agent/X11 forwarding, no tunnels (`ForceCommand internal-sftp`, `DisableForwarding`, every key line `restrict`). |
+| Confined to its own home | sshd chroots the tenant into a root-owned directory that contains nothing but its home, bind-mounted at its real path (`/home/<t>`): other tenants, `/home` itself and the rest of the system are not visible at all. The home keeps its owner, mode and ACLs; the mount is a systemd mount unit, enabled, so it survives a reboot. |
+| Files just work | Uploads belong to the tenant and inherit the home's default ACL and SELinux label (same inodes), so Nginx serves them and PHP and applications read and write them; files written by PHP and applications can be downloaded and removed over SFTP. |
+| Keys only OxPanel can change | Keys are validated strictly (one `id_*.pub` line, no options; Ed25519, ECDSA, RSA 2048–16384 bits, FIDO variants; DSA refused; blob decoded and checked; OpenSSH `SHA256:` fingerprint), at most 20 per tenant, stored in the record and rendered to `/etc/oxpanel-sftp/<t>` (root-owned, readable only by that tenant). A compromised site cannot add a key. No passwords. |
+| Every tenant confined | All tenant accounts are in the group `oxpanel-tenants`, and OxPanel's own sshd drop-in (`/etc/ssh/sshd_config.d/60-oxpanel.conf`; `sshd_config` is never edited) applies to that group only — also to tenants without keys, so writing `~/.ssh/authorized_keys` gives a tenant nothing. The drop-in is validated with `sshd -t` before sshd is reloaded and rolled back if rejected; before a key is accepted, `sshd -T` must confirm the tenant would really be confined. Root and every other account are unaffected. |
+| Lifecycle | Suspension withdraws the keys file and ends running sessions (every session lands in the tenant's `user-<uid>.slice`, which also applies the tenant's limits to it); resume restores it. Removing a key ends the tenant's sessions; removing the last one removes keys file, mount and chroot. Deleting a tenant removes all of it first. |
+| Reconciliation | `SFTP_ACCESS_DRIFT`, `ORPHAN_SFTP_ACCESS`, `SSHD_CONFIG_DRIFT`; quotas: `DISK_QUOTA_DRIFT` (kernel limit differs from the record, or the host stopped enforcing quotas). |
+| SELinux | Works enforcing with zero denials (uploads, serving, PHP, sessions). |
+
 ## API, transport and authentication
 
 | Feature | Detail |
@@ -90,8 +104,8 @@ see "Not yet included" at the end so nobody assumes otherwise.
 
 | Feature | Detail |
 |---|---|
-| `oxpanel-ctl` | Command-line client: `tenant create|get|list|set-limits|set-owner|suspend|resume|usage|delete`, `vhost set|log|restart-app|install-deps|remove|list`, `host info|reconcile`, human-readable sizes (`512M`, `2G`). |
-| Host information | `GetHostInfo`: engine version, SELinux and dry-run state, tenant and virtual-host counts, the tenant uid range (capacity), load averages, memory, uptime, and size/free space of the file system holding tenant homes. |
+| `oxpanel-ctl` | Command-line client: `tenant create|get|list|set-limits|set-owner|suspend|resume|usage|delete`, `vhost set|log|restart-app|install-deps|remove|list`, `sftp add-key|remove-key|list-keys`, `host info|reconcile`, human-readable sizes (`512M`, `2G`). |
+| Host information | `GetHostInfo`: engine version, SELinux and dry-run state, tenant and virtual-host counts, the tenant uid range (capacity), load averages, memory, uptime, size/free space of the file system holding tenant homes, whether SFTP can be offered, and whether disk quotas are enforced (with what to change if not). |
 | Reconciliation | `Reconcile` compares every record with the operating system and reports differences: interrupted tenants, missing or mismatched accounts, invalid homes, edited or missing unit files, missing or edited Nginx files, virtual hosts without a tenant, and orphan files in OxPanel's own directories. Strictly read-only — most findings are healed by repeating the original request. `oxpanel-ctl host reconcile` exits `3` when drift is found. |
 | Configuration | Environment variables `OXPANEL_*` (from `/etc/oxpanel/daemon.env`); every value has a production default. `--check-config` validates configuration and host prerequisites without starting. |
 | Preflight | Refuses to start without root, without the required tools (`useradd`, `userdel`, `nginx`, `systemctl`, `setpriv`, `setfacl`, `mkdir`, `du`, and on SELinux hosts `restorecon`, `semanage`), if the socket group does not exist, or if the web user is root / a tenant. |
@@ -110,4 +124,4 @@ see "Not yet included" at the end so nobody assumes otherwise.
 
 ## Not yet included
 
-To be explicit, v0.1.0 does **not** provide: TLS/ACME certificates, a choice of PHP version or per-tenant PHP settings (the host's `php-fpm` package is used as installed), a choice of Node.js/Python version per application (the host's packages are used; Node.js must be 22 or newer), other runtimes, custom start commands or environment variables for applications, a confining SELinux policy for applications, DNS, mail, databases, FTP/SFTP/SSH access for tenants, disk quotas, backups, automatic repair of drift found by `Reconcile`, a confined SELinux domain for the daemon itself, or historical metrics. These are on the roadmap in `oxpanel-daemon/PROJECT_DETAILS.md`.
+To be explicit, v0.1.0 does **not** provide: TLS/ACME certificates, a choice of PHP version or per-tenant PHP settings (the host's `php-fpm` package is used as installed), a choice of Node.js/Python version per application (the host's packages are used; Node.js must be 22 or newer), other runtimes, custom start commands or environment variables for applications, a confining SELinux policy for applications, DNS, mail, databases, FTP or SSH shell access for tenants, SFTP passwords, disk quotas on file systems other than XFS (or project quotas), backups, automatic repair of drift found by `Reconcile`, a confined SELinux domain for the daemon itself, or historical metrics. These are on the roadmap in `oxpanel-daemon/PROJECT_DETAILS.md`.

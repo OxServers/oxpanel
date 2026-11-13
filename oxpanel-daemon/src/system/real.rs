@@ -12,7 +12,7 @@ use std::ffi::CString;
 use nix::unistd::{fchown, getgrouplist, Gid, Group, Uid, User};
 use tracing::{debug, warn};
 
-use super::{CommandOutput, CommandSpec, HostStats, OsUser, System};
+use super::{CommandOutput, CommandSpec, HostStats, OsUser, QuotaState, System};
 use crate::error::{Error, Result};
 
 /// Environment handed to every child process. Nothing from the daemon's own
@@ -218,6 +218,27 @@ impl System for RealSystem {
         })
         .await
         .map_err(|e| Error::Internal(format!("host_stats task: {e}")))?
+    }
+
+    async fn quota_state(&self, path: &Path) -> Result<QuotaState> {
+        let path: PathBuf = path.to_owned();
+        tokio::task::spawn_blocking(move || {
+            let dev = std::fs::metadata(&path)
+                .map_err(|e| Error::io("stat", &path, e))?
+                .dev();
+            // /proc/self is part of ProcSubset=pid, so this works in the sandbox.
+            let mountinfo = Path::new("/proc/self/mountinfo");
+            let text =
+                std::fs::read_to_string(mountinfo).map_err(|e| Error::io("read", mountinfo, e))?;
+            Ok(super::parse_mountinfo(
+                &text,
+                nix::sys::stat::major(dev),
+                nix::sys::stat::minor(dev),
+            )
+            .unwrap_or_default())
+        })
+        .await
+        .map_err(|e| Error::Internal(format!("quota_state task: {e}")))?
     }
 }
 

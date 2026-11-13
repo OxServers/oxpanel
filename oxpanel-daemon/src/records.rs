@@ -49,6 +49,26 @@ pub struct TenantRecord {
     /// records written before suspension existed.
     #[serde(default)]
     pub suspended: bool,
+    /// SSH public keys that may log in over SFTP as this tenant. SFTP access
+    /// exists exactly while this list is not empty. Absent in records written
+    /// before SFTP existed.
+    #[serde(default)]
+    pub sftp_keys: Vec<SftpKeyRecord>,
+}
+
+/// One SSH public key of a tenant. Everything in here is public.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SftpKeyRecord {
+    /// Key type as OpenSSH names it, e.g. `ssh-ed25519`.
+    pub key_type: String,
+    /// The key itself, base64.
+    pub blob: String,
+    /// `SHA256:…`, as `ssh-keygen -l` prints it; identifies the key in the API.
+    pub fingerprint: String,
+    /// Free-form name given by the owner (`laptop`); may be empty.
+    #[serde(default)]
+    pub label: String,
+    pub added_at_unix: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -152,6 +172,10 @@ impl Store {
 
     pub fn save_tenant(&self, rec: &TenantRecord) -> Result<()> {
         let name = Username::parse(&rec.username)?;
+        // Keys are rendered into a file sshd trusts: only valid ones are stored.
+        for key in &rec.sftp_keys {
+            crate::sftp::check_key_record(key)?;
+        }
         save(&self.tenant_path(&name), rec)
     }
 
@@ -249,6 +273,7 @@ mod tests {
             state: TenantState::Ready,
             owner: String::new(),
             suspended: false,
+            sftp_keys: Vec::new(),
         }
     }
 

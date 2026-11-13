@@ -11,7 +11,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 RIG="${OXPANEL_RIG_IMAGE:-localhost/oxpanel-rig:alma9}"
 DEV="${OXPANEL_DEV_IMAGE:-localhost/oxpanel-dev:alma9}"
 export INSTALL="${INSTALL:-git}" KEEP="${KEEP:-0}" ACCEL="${ACCEL:-kvm}" TARGET="${TARGET:-}" CONTINUE="${CONTINUE:-0}"
-export PHASES="${PHASES:-10 20 30 40 50 60 70}" SOAK_N="${SOAK_N:-20}" I_UNDERSTAND="${I_UNDERSTAND:-0}" REFRESH_IMAGE="${REFRESH_IMAGE:-0}"
+export PHASES="${PHASES:-10 15 20 30 40 50 60 70}" SOAK_N="${SOAK_N:-20}" I_UNDERSTAND="${I_UNDERSTAND:-0}" REFRESH_IMAGE="${REFRESH_IMAGE:-0}"
 export GIT_URL="${GIT_URL:-}" GIT_REF="${GIT_REF:-}" VM_CPUS="${VM_CPUS:-}" VM_MEM="${VM_MEM:-}"
 export PHASE_TIMEOUT="${PHASE_TIMEOUT:-900}" INSTALL_TIMEOUT="${INSTALL_TIMEOUT:-2400}" TARGET_PORT="${TARGET_PORT:-22}"
 say() { echo "[acceptance] $*" >&2; }

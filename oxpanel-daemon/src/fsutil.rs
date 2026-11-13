@@ -97,6 +97,34 @@ pub fn remove_if_exists(path: &Path) -> Result<bool> {
     }
 }
 
+/// Remove a directory if it exists **and is empty**. Returns whether it was
+/// removed. Never recursive: a directory that still has content (or is a
+/// mount point) is an error, so nothing this daemon did not put there can be
+/// deleted through it.
+pub fn remove_empty_dir(dir: &Path) -> Result<bool> {
+    match fs::remove_dir(dir) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(Error::io("rmdir", dir, e)),
+    }
+}
+
+/// Names of the entries directly inside `dir`, sorted; empty if it does not exist.
+pub fn list_entry_names(dir: &Path) -> Result<Vec<String>> {
+    let rd = match fs::read_dir(dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(Error::io("readdir", dir, e)),
+    };
+    let mut out = Vec::new();
+    for entry in rd {
+        let entry = entry.map_err(|e| Error::io("readdir", dir, e))?;
+        out.push(entry.file_name().to_string_lossy().into_owned());
+    }
+    out.sort();
+    Ok(out)
+}
+
 /// Regular files directly inside `dir` whose name ends with `suffix`, sorted.
 pub fn list_files_with_suffix(dir: &Path, suffix: &str) -> Result<Vec<PathBuf>> {
     let rd = match fs::read_dir(dir) {
@@ -197,6 +225,24 @@ mod tests {
         let link = dir.path().join("lnk");
         std::os::unix::fs::symlink(&d, &link).map_err(|e| Error::io("symlink", &link, e))?;
         assert!(ensure_dir(&link, 0o700).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn remove_empty_dir_never_removes_content() -> Result<()> {
+        let dir = tempfile::tempdir().map_err(|e| Error::io("tempdir", "/tmp", e))?;
+        let d = dir.path().join("a");
+        ensure_dir(&d.join("b"), 0o755)?;
+        write_atomic(&d.join("b").join("keep"), b"x", 0o644)?;
+        assert_eq!(list_entry_names(&d)?, vec!["b"]);
+        assert!(remove_empty_dir(&d).is_err(), "not empty");
+        assert!(remove_empty_dir(&d.join("b")).is_err(), "not empty");
+        assert!(d.join("b").join("keep").exists());
+        remove_if_exists(&d.join("b").join("keep"))?;
+        assert!(remove_empty_dir(&d.join("b"))?);
+        assert!(remove_empty_dir(&d)?);
+        assert!(!remove_empty_dir(&d)?, "already gone");
+        assert_eq!(list_entry_names(&d)?, Vec::<String>::new());
         Ok(())
     }
 

@@ -49,6 +49,14 @@ pub struct Config {
     /// Account the web server workers run as; it is granted traverse/read
     /// access to document roots through POSIX ACLs.
     pub web_user: String,
+    /// Group every tenant account is a member of. sshd confines its members
+    /// to chrooted SFTP (see [`crate::sftp`]). Created by the package.
+    pub tenant_group: String,
+    /// The sshd configuration drop-in OxPanel owns.
+    pub sshd_dropin_file: PathBuf,
+    /// One authorized-keys file per tenant with SFTP access, outside the
+    /// tenant's home so that the tenant cannot edit it.
+    pub sftp_keys_dir: PathBuf,
     /// Install a catch-all `default_server` that closes connections for
     /// unknown host names, so no tenant ever becomes the default site.
     pub nginx_default_server: bool,
@@ -80,6 +88,9 @@ impl Default for Config {
             nginx_log_dir: PathBuf::from("/var/log/nginx/oxpanel"),
             php_conf_dir: PathBuf::from("/etc/oxpanel-php"),
             web_user: "nginx".to_owned(),
+            tenant_group: "oxpanel-tenants".to_owned(),
+            sshd_dropin_file: PathBuf::from("/etc/ssh/sshd_config.d/60-oxpanel.conf"),
+            sftp_keys_dir: PathBuf::from("/etc/oxpanel-sftp"),
             nginx_default_server: true,
             command_timeout: Duration::from_secs(60),
             dry_run: false,
@@ -118,6 +129,18 @@ impl Config {
         path("OXPANEL_SYSTEMD_UNIT_DIR", &mut c.systemd_unit_dir)?;
         path("OXPANEL_NGINX_LOG_DIR", &mut c.nginx_log_dir)?;
         path("OXPANEL_PHP_CONF_DIR", &mut c.php_conf_dir)?;
+        path("OXPANEL_SSHD_DROPIN_FILE", &mut c.sshd_dropin_file)?;
+        path("OXPANEL_SFTP_KEYS_DIR", &mut c.sftp_keys_dir)?;
+        if let Some(v) = get("OXPANEL_TENANT_GROUP") {
+            let v = v.trim();
+            if !is_plain_name(v) {
+                return Err(Error::invalid(
+                    "config",
+                    "OXPANEL_TENANT_GROUP must be a plain group name",
+                ));
+            }
+            v.clone_into(&mut c.tenant_group);
+        }
 
         if let Some(g) = get("OXPANEL_SOCKET_GROUP") {
             let g = g.trim();
@@ -147,11 +170,7 @@ impl Config {
         }
         if let Some(v) = get("OXPANEL_WEB_USER") {
             let v = v.trim();
-            if v.is_empty()
-                || !v
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
-            {
+            if !is_plain_name(v) {
                 return Err(Error::invalid(
                     "config",
                     "OXPANEL_WEB_USER must be a plain account name",
@@ -193,6 +212,8 @@ impl Config {
             ("OXPANEL_SYSTEMD_UNIT_DIR", &self.systemd_unit_dir),
             ("OXPANEL_NGINX_LOG_DIR", &self.nginx_log_dir),
             ("OXPANEL_PHP_CONF_DIR", &self.php_conf_dir),
+            ("OXPANEL_SSHD_DROPIN_FILE", &self.sshd_dropin_file),
+            ("OXPANEL_SFTP_KEYS_DIR", &self.sftp_keys_dir),
         ] {
             check_path(key, p)?;
         }
@@ -237,6 +258,29 @@ impl Config {
     pub fn vhosts_dir(&self) -> PathBuf {
         self.state_dir.join("vhosts")
     }
+
+    /// `state_dir/sftp`: one root-owned chroot directory per tenant with SFTP
+    /// access; the tenant's home is bind-mounted inside it.
+    pub fn sftp_chroot_dir(&self) -> PathBuf {
+        self.state_dir.join("sftp")
+    }
+
+    /// Root-only directory next to the socket where commands that must run
+    /// outside the daemon's sandbox leave their output (see [`crate::quota`]).
+    pub fn scratch_dir(&self) -> PathBuf {
+        self.socket_path
+            .parent()
+            .unwrap_or(&self.state_dir)
+            .join("scratch")
+    }
+}
+
+/// An account or group name that is safe in ACL specifications and in
+/// configuration files: non-empty, `A-Z a-z 0-9 _ -` only.
+fn is_plain_name(v: &str) -> bool {
+    !v.is_empty()
+        && v.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
 }
 
 /// Configured paths end up inside Nginx directives and `semanage` regular
@@ -413,6 +457,19 @@ mod tests {
         assert!(from(&[("OXPANEL_NGINX_CONF_DIR", "/etc/nginx/ox;panel.d")]).is_err());
         assert!(from(&[("OXPANEL_HOME_BASE", "/srv/web-homes_v2")]).is_ok());
         assert!(from(&[("OXPANEL_WEB_USER", "nginx;rm")]).is_err());
+        assert!(from(&[("OXPANEL_TENANT_GROUP", "hosting users")]).is_err());
+        assert!(from(&[("OXPANEL_TENANT_GROUP", "")]).is_err());
+        assert!(from(&[("OXPANEL_SSHD_DROPIN_FILE", "sshd.conf")]).is_err());
+        assert!(from(&[("OXPANEL_SFTP_KEYS_DIR", "/etc/ox panel")]).is_err());
+        let c = from(&[
+            ("OXPANEL_TENANT_GROUP", "hosting"),
+            ("OXPANEL_STATE_DIR", "/srv/state"),
+            ("OXPANEL_SOCKET_PATH", "/run/ox/api.sock"),
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(c.tenant_group, "hosting");
+        assert_eq!(c.sftp_chroot_dir(), PathBuf::from("/srv/state/sftp"));
+        assert_eq!(c.scratch_dir(), PathBuf::from("/run/ox/scratch"));
         assert!(from(&[
             ("OXPANEL_NGINX_CONF_DIR", "/etc/nginx/conf.d"),
             ("OXPANEL_NGINX_INCLUDE_FILE", "/etc/nginx/conf.d/x.conf")

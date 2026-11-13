@@ -37,6 +37,10 @@ pub enum DriftKind {
     OrphanPhpPool,
     AppUnitDrift,
     OrphanAppUnit,
+    SftpAccessDrift,
+    OrphanSftpAccess,
+    SshdConfigDrift,
+    DiskQuotaDrift,
 }
 
 /// One difference between a record and the operating system.
@@ -79,6 +83,18 @@ pub struct HostInfo {
     /// Installed Node.js version; empty if none.
     pub node_version: String,
     pub stats: HostStats,
+    pub facilities: Facilities,
+}
+
+/// What tenants can be given on this host beyond web hosting.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Facilities {
+    /// sshd is installed and confines tenants (see [`crate::sftp`]).
+    pub sftp: bool,
+    /// Disk limits are enforced by the kernel (see [`crate::quota`]).
+    pub disk_quota: bool,
+    /// What was found about quotas, and what to do if they are unavailable.
+    pub disk_quota_detail: String,
 }
 
 #[derive(Debug, Clone)]
@@ -97,6 +113,7 @@ impl HostService {
         let node_version = app::node_version(&self.ctx).await?.unwrap_or_default();
         let node_usable =
             app::major_of(&node_version).is_some_and(|major| major >= app::MIN_NODE_MAJOR);
+        let quota = crate::quota::availability(&self.ctx).await?;
         Ok(HostInfo {
             selinux: self.ctx.selinux,
             dry_run: cfg.dry_run,
@@ -111,6 +128,11 @@ impl HostService {
             },
             node_version,
             stats: self.ctx.sys.host_stats(&cfg.home_base).await?,
+            facilities: Facilities {
+                sftp: crate::sftp::is_available(&self.ctx).await?,
+                disk_quota: quota.available,
+                disk_quota_detail: quota.detail,
+            },
         })
     }
 
@@ -161,6 +183,8 @@ impl HostService {
         }
         check_php_pools(cfg, &tenants, &vhosts, &mut out)?;
         check_apps(cfg, self.ctx.selinux, &by_name, &vhosts, &mut out)?;
+        check_sftp(&self.ctx, &tenants, &mut out).await?;
+        check_quotas(&self.ctx, &tenants, &mut out).await?;
         Ok(out)
     }
 
@@ -354,6 +378,129 @@ fn check_apps(
     Ok(())
 }
 
+/// SFTP: the sshd drop-in, every tenant's membership of the tenant group,
+/// the keys file and mount unit of every tenant with keys, and anything in
+/// OxPanel's SFTP locations that no tenant accounts for. File checks only:
+/// whether a mount is currently active is not looked at.
+async fn check_sftp(ctx: &Ctx, tenants: &[TenantRecord], out: &mut Vec<Drift>) -> Result<()> {
+    use crate::sftp::{self, SftpPaths};
+    let cfg = &ctx.config;
+    if ctx.sys.is_installed(bin::SSHD).await {
+        let path = &cfg.sshd_dropin_file;
+        if let Some(problem) = compare_file(path, &sftp::render_sshd_dropin(cfg)?)? {
+            out.push(Drift::new(
+                DriftKind::SshdConfigDrift,
+                path.to_string_lossy(),
+                format!("{problem}; tenants are not confined to SFTP until the daemon restarts or a key is added"),
+            ));
+        }
+    }
+    let group = ctx.sys.group_by_name(&cfg.tenant_group).await?;
+    let mut known: BTreeSet<PathBuf> = BTreeSet::new();
+    for t in tenants.iter().filter(|t| t.state == TenantState::Ready) {
+        let subject = t.username.as_str();
+        // A missing account is reported as such already.
+        let exists = ctx.sys.user_by_name(subject).await?.is_some();
+        let member = match group {
+            Some(gid) => ctx.sys.groups_of(subject, t.gid).await?.contains(&gid),
+            None => false,
+        };
+        if exists && !member {
+            out.push(Drift::new(
+                DriftKind::SftpAccessDrift,
+                subject,
+                format!("the account is not in group '{}'", cfg.tenant_group),
+            ));
+        }
+        if t.sftp_keys.is_empty() {
+            continue;
+        }
+        let paths = SftpPaths::for_tenant(cfg, t)?;
+        let mut expected = vec![(&paths.mount_unit, Some(sftp::render_mount_unit(t, &paths)?))];
+        // While suspended there must be no keys file at all.
+        let keys = (!t.suspended)
+            .then(|| sftp::render_keys_file(t))
+            .transpose()?;
+        expected.push((&paths.keys_file, keys));
+        for (path, contents) in expected {
+            let problem = match contents {
+                Some(c) => compare_file(path, &c)?,
+                None => path
+                    .exists()
+                    .then_some("exists although the tenant is suspended"),
+            };
+            if let Some(problem) = problem {
+                out.push(Drift::new(
+                    DriftKind::SftpAccessDrift,
+                    subject,
+                    format!("{} {problem}", path.display()),
+                ));
+            }
+        }
+        known.insert(paths.keys_file.clone());
+        known.insert(paths.mount_unit.clone());
+        known.insert(paths.chroot.clone());
+    }
+    let mut ours: Vec<PathBuf> = Vec::new();
+    for dir in [&cfg.sftp_keys_dir, &cfg.sftp_chroot_dir()] {
+        ours.extend(fsutil::list_entry_names(dir)?.iter().map(|n| dir.join(n)));
+    }
+    let chroot_units = systemd::mount_unit_name(&cfg.sftp_chroot_dir())?;
+    let prefix = format!("{}-", chroot_units.trim_end_matches(".mount"));
+    ours.extend(
+        fsutil::list_files_with_suffix(&cfg.systemd_unit_dir, ".mount")?
+            .into_iter()
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(&prefix))
+            }),
+    );
+    for path in ours {
+        if !known.contains(&path) {
+            out.push(Drift::new(
+                DriftKind::OrphanSftpAccess,
+                path.to_string_lossy(),
+                "no tenant with SFTP keys accounts for this",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Disk quotas: the kernel's limits for every ready tenant equal the record
+/// (including "none"), and a recorded limit is still enforceable at all.
+async fn check_quotas(ctx: &Ctx, tenants: &[TenantRecord], out: &mut Vec<Drift>) -> Result<()> {
+    use crate::quota;
+    let ready = || tenants.iter().filter(|t| t.state == TenantState::Ready);
+    let Some(table) = quota::report_all(ctx).await? else {
+        let detail = quota::availability(ctx).await?.detail;
+        for t in ready().filter(|t| t.limits.has_disk_quota()) {
+            out.push(Drift::new(
+                DriftKind::DiskQuotaDrift,
+                t.username.as_str(),
+                format!("the record has a disk limit, but it is not enforced: {detail}"),
+            ));
+        }
+        return Ok(());
+    };
+    for t in ready() {
+        let row = table.get(&t.uid).copied().unwrap_or_default();
+        let (bytes, inodes) = quota::expected_limits(&t.limits);
+        if (row.limit_bytes, row.inodes_limit) != (bytes, inodes) {
+            out.push(Drift::new(
+                DriftKind::DiskQuotaDrift,
+                t.username.as_str(),
+                format!(
+                    "the kernel limits uid {} to {} bytes / {} inodes, the record says {bytes} / {inodes} (0 = none); repeat UpdateTenantLimits",
+                    t.uid, row.limit_bytes, row.inodes_limit
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// `None` when the file holds exactly `expected`.
 fn compare_file(path: &Path, expected: &str) -> Result<Option<&'static str>> {
     Ok(match fsutil::read_optional(path)? {
@@ -398,10 +545,14 @@ mod tests {
             .join("nginx")
             .join("conf.d")
             .join("00-oxpanel.conf");
+        cfg.sftp_keys_dir = dir.path().join("sftp-keys");
+        cfg.sshd_dropin_file = dir.path().join("sshd_config.d").join("60-oxpanel.conf");
+        cfg.socket_path = dir.path().join("run").join("oxpanel.sock");
         for d in [
             &cfg.home_base,
             &cfg.systemd_unit_dir,
             &dir.path().join("nginx").join("conf.d"),
+            &dir.path().join("sshd_config.d"),
         ] {
             std::fs::create_dir_all(d).unwrap_or_else(|e| panic!("{e}"));
         }
@@ -434,6 +585,10 @@ mod tests {
                 .await
                 .unwrap_or_else(|e| panic!("{e}"));
         }
+        // As the daemon does at start.
+        crate::sftp::converge_all(&h.ctx)
+            .await
+            .unwrap_or_else(|e| panic!("{e}"));
         h.sys.clear_calls();
         h
     }
@@ -705,6 +860,122 @@ mod tests {
         let i = h.host.info().await?;
         assert!(!i.runtimes.node);
         assert_eq!(i.node_version, "");
+        Ok(())
+    }
+
+    const KEY: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGNQ8nctDOzq4yQ8Bix4hfkkqCQw0kkYzl6hc7hg7rRo";
+
+    #[tokio::test]
+    async fn reports_sftp_drift_and_orphans() -> Result<()> {
+        use crate::sftp::{SftpPaths, SftpService};
+        let h = harness().await;
+        let cfg = &h.ctx.config;
+        let sftp = SftpService::new(h.ctx.clone());
+        sftp.add_key("alice", KEY, "").await?;
+        assert_eq!(
+            h.host.reconcile().await?,
+            vec![],
+            "fresh access is not drift"
+        );
+        assert!(h.host.info().await?.facilities.sftp);
+        h.tenants.set_suspended("alice", true).await?;
+        assert_eq!(
+            h.host.reconcile().await?,
+            vec![],
+            "suspended: no keys file, no drift"
+        );
+        h.tenants.set_suspended("alice", false).await?;
+
+        let alice = h.tenants.get("alice").await?;
+        let paths = SftpPaths::for_tenant(cfg, &alice)?;
+        std::fs::write(&paths.keys_file, "ssh-ed25519 AAAA intruder\n")
+            .map_err(|e| Error::io("write", &paths.keys_file, e))?;
+        std::fs::remove_file(&paths.mount_unit)
+            .map_err(|e| Error::io("unlink", &paths.mount_unit, e))?;
+        std::fs::write(&cfg.sshd_dropin_file, "# edited\n")
+            .map_err(|e| Error::io("write", &cfg.sshd_dropin_file, e))?;
+        let stray_keys = cfg.sftp_keys_dir.join("ghost");
+        std::fs::write(&stray_keys, "x").map_err(|e| Error::io("write", &stray_keys, e))?;
+        let stray_unit = cfg.systemd_unit_dir.join(crate::systemd::mount_unit_name(
+            &cfg.sftp_chroot_dir()
+                .join("ghost")
+                .join("home")
+                .join("ghost"),
+        )?);
+        std::fs::write(&stray_unit, "x").map_err(|e| Error::io("write", &stray_unit, e))?;
+        // Not ours: another mount unit on the host.
+        let foreign = cfg.systemd_unit_dir.join("srv-data.mount");
+        std::fs::write(&foreign, "x").map_err(|e| Error::io("write", &foreign, e))?;
+        h.sys
+            .run_ok(
+                crate::system::CommandSpec::new(bin::GPASSWD, cfg.command_timeout).args([
+                    "--delete",
+                    "foo-bar",
+                    "oxpanel-tenants",
+                ]),
+            )
+            .await?;
+        h.sys.clear_calls();
+        let dropin = cfg.sshd_dropin_file.to_string_lossy().into_owned();
+        let (stray_keys, stray_unit) = (
+            stray_keys.to_string_lossy().into_owned(),
+            stray_unit.to_string_lossy().into_owned(),
+        );
+        assert_eq!(
+            kinds(&h.host.reconcile().await?),
+            vec![
+                (DriftKind::SshdConfigDrift, dropin.as_str()),
+                (DriftKind::SftpAccessDrift, "alice"),
+                (DriftKind::SftpAccessDrift, "alice"),
+                (DriftKind::SftpAccessDrift, "foo-bar"),
+                (DriftKind::OrphanSftpAccess, stray_keys.as_str()),
+                (DriftKind::OrphanSftpAccess, stray_unit.as_str()),
+            ]
+        );
+        assert!(h.sys.calls().is_empty(), "reconcile is read-only");
+        assert!(!h.host.info().await?.facilities.sftp, "edited drop-in");
+        // Repeating the request (or a restart) heals all but the orphans.
+        sftp.add_key("alice", KEY, "").await?;
+        crate::sftp::converge_all(&h.ctx).await?;
+        assert_eq!(
+            h.host.reconcile().await?.len(),
+            2,
+            "only the orphans remain"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reports_disk_quota_drift() -> Result<()> {
+        let h = harness().await;
+        let disk = Limits::default()
+            .with_disk(10 << 20, 0)
+            .unwrap_or_else(|e| panic!("{e}"));
+        h.sys.set_quota_enforced(true);
+        let i = h.host.info().await?.facilities;
+        assert!(i.disk_quota, "{}", i.disk_quota_detail);
+        h.tenants.update_limits("alice", disk).await?;
+        assert_eq!(h.host.reconcile().await?, vec![]);
+        // Changed behind the daemon's back; a uid with a limit it should not have.
+        h.sys.set_quota_limits(20_000, 1, 0);
+        h.sys.set_quota_limits(20_001, 5, 5);
+        assert_eq!(
+            kinds(&h.host.reconcile().await?),
+            vec![
+                (DriftKind::DiskQuotaDrift, "alice"),
+                (DriftKind::DiskQuotaDrift, "foo-bar"),
+            ]
+        );
+        // The host stops enforcing quotas (e.g. booted without the option).
+        h.sys.set_quota_enforced(false);
+        let i = h.host.info().await?.facilities;
+        assert!(!i.disk_quota && i.disk_quota_detail.contains("uquota"));
+        let drifts = h.host.reconcile().await?;
+        assert_eq!(kinds(&drifts), vec![(DriftKind::DiskQuotaDrift, "alice")]);
+        assert!(drifts
+            .first()
+            .is_some_and(|d| d.detail.contains("not enforced")));
         Ok(())
     }
 }

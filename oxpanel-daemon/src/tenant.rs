@@ -15,6 +15,7 @@ use crate::system::{bin, CommandSpec};
 use crate::systemd;
 use crate::validate::{Limits, OwnerLabel, Username};
 use crate::vhost;
+use crate::{quota, sftp};
 
 const GECOS: &str = "OxPanel tenant";
 
@@ -98,6 +99,8 @@ impl TenantService {
             };
         }
 
+        // A disk limit this host cannot enforce is refused before anything exists.
+        quota::require_available(&self.ctx, &limits).await?;
         // No record: the name must be entirely unused. Never adopt an account
         // OxPanel did not create.
         if self.ctx.sys.user_by_name(name.as_str()).await?.is_some() {
@@ -120,6 +123,7 @@ impl TenantService {
             state: TenantState::Provisioning,
             owner,
             suspended: false,
+            sftp_keys: Vec::new(),
         };
         // Claim the name and uid *before* the irreversible step, so a crash
         // can never leave behind an account the daemon refuses to recognise.
@@ -183,6 +187,10 @@ impl TenantService {
             .sys
             .ensure_private_dir(&rec.home, rec.uid, rec.gid)
             .await?;
+        // Every tenant is a member of the group sshd confines to SFTP.
+        sftp::ensure_membership(&self.ctx, &rec).await?;
+        // Also without a disk limit: the uid may have had one before.
+        quota::apply(&self.ctx, &rec).await?;
         systemd::apply_tenant_limits(
             self.ctx.sys.as_ref(),
             &self.ctx.config.systemd_unit_dir,
@@ -275,6 +283,7 @@ impl TenantService {
         let name = Username::parse(username)?;
         let _guard = self.ctx.lock.lock().await;
         let mut rec = self.load_ready(&name)?;
+        quota::require_available(&self.ctx, &limits).await?;
         let changed = rec.limits != limits;
         if changed {
             rec.limits = limits;
@@ -289,6 +298,7 @@ impl TenantService {
             self.ctx.config.command_timeout,
         )
         .await?;
+        quota::apply(&self.ctx, &rec).await?;
         if changed {
             info!(tenant = %name, "limits updated");
         }
@@ -335,6 +345,19 @@ impl TenantService {
                 crate::php::set_running(&self.ctx, &rec, false).await?;
                 crate::app::set_running_all(&self.ctx, &rec, false).await?;
             }
+            // SFTP follows the sites: the keys file goes away with the
+            // suspension (and running sessions are ended) and returns with
+            // the resumption. A tenant without keys has neither.
+            if suspended {
+                sftp::suspend_access(&self.ctx, &rec).await?;
+            } else if !rec.sftp_keys.is_empty() {
+                // The sites are back already; a host whose sshd cannot take
+                // the keys right now must not keep them down. `Reconcile`
+                // reports the missing keys file until access is restored.
+                if let Err(e) = sftp::ensure_access(&self.ctx, &rec).await {
+                    warn!(tenant = %name, error = %e, "resumed, but SFTP access could not be restored");
+                }
+            }
             self.ctx.store.save_tenant(&rec)?;
             info!(tenant = %name, suspended, "suspension changed");
         }
@@ -365,6 +388,16 @@ impl TenantService {
             .await?;
         let (memory_current_bytes, cpu_usage_nsec, tasks_current) =
             parse_cgroup_usage(&show.stdout_lossy());
+        // The quota system knows without walking the tree, when it is on.
+        if let Some(row) = quota::usage(&self.ctx, rec.uid).await? {
+            return Ok(TenantUsage {
+                memory_current_bytes,
+                cpu_usage_nsec,
+                tasks_current,
+                disk_usage_bytes: row.used_bytes,
+                measured_at_unix: now_unix(),
+            });
+        }
         // -x: stay on the home's file system; du never follows symlinks.
         let du = self
             .ctx
@@ -416,6 +449,12 @@ impl TenantService {
         }
 
         let timeout = self.ctx.config.command_timeout;
+        // SFTP first: the home must not be removed while it is still mounted
+        // into the chroot directory, and userdel refuses an account that has
+        // running sessions (`remove_access` ends them).
+        sftp::remove_access(&self.ctx, &rec).await?;
+        // The uid will be given to another tenant one day; not its limits.
+        quota::clear(&self.ctx, rec.uid).await?;
         if self.ctx.sys.user_by_name(name.as_str()).await?.is_some() {
             let mut cmd = CommandSpec::new(bin::USERDEL, timeout);
             if remove_home {

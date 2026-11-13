@@ -23,6 +23,11 @@ Recommends:     php-fpm
 # only after `dnf module enable nodejs:22`. (Python 3 is part of the base system.)
 Recommends:     nodejs >= 1:22
 Recommends:     npm
+# SFTP access for tenants needs sshd (normally installed already); disk
+# quotas need xfs_quota and an XFS /home mounted with user quotas (see the
+# handbook). Without them, those features are reported unavailable.
+Recommends:     openssh-server
+Recommends:     xfsprogs
 Requires:       policycoreutils
 Requires:       policycoreutils-python-utils
 Requires:       libselinux-utils

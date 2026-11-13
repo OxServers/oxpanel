@@ -56,6 +56,8 @@ not touch an account, unit or Nginx file it has no record for.
 | SELinux | Enforcing is supported and is the target; the daemon detects it at start-up and labels tenant content accordingly. The booleans `httpd_enable_homedirs` and `httpd_read_user_content` must be on (the RPM sets them; the source install block sets them), because document roots live under tenant homes. |
 | Network | None. The API is a local UNIX socket; the daemon has no network access at all under its unit. |
 | Ports | Nginx on 80 (v0.1.0 does not manage TLS). |
+| SFTP (optional) | `openssh-server` with the stock `/etc/ssh/sshd_config`, which includes `/etc/ssh/sshd_config.d/*.conf` (the AlmaLinux default). OxPanel adds one drop-in there and never edits `sshd_config`. Without sshd, `host info` shows `sftp=false` and adding a key is refused. |
+| Disk quotas (optional) | Tenant homes on **XFS mounted with user quotas** (`uquota`), and `xfsprogs`. This is a mount option the operator sets once (§9.1); without it `host info` shows `disk_quota=false` and a disk limit is refused with the change to make. |
 
 ## 3. Installation
 
@@ -359,6 +361,17 @@ sudo oxpanel-ctl vhost set api.acme.example --tenant acme --app python \
      --app-root apps/api --app-entry main.py --root apps/api/public
 sudo oxpanel-ctl vhost install-deps api.acme.example      # pip install -r requirements.txt
 
+# SFTP: give the tenant a key (its id_*.pub line). It can then `sftp acme@host`
+# — SFTP only, no shell, no forwarding, inside its own home (/home/acme)
+sudo oxpanel-ctl sftp add-key acme --key-file acme_laptop.pub --label laptop
+# changed=true
+# fingerprint=SHA256:… type=ssh-ed25519 label=laptop added_at=1794571200
+sudo oxpanel-ctl sftp list-keys acme
+sudo oxpanel-ctl sftp remove-key acme SHA256:…    # ends its sessions; the last key removes access
+
+# A disk limit (needs quotas on the host, §9.1): 5 GiB and 200 000 files
+sudo oxpanel-ctl tenant set-limits acme --memory 1G --cpu-weight 25 --tasks-max 200 --disk 5G --inodes 200000
+
 # The end of a site's access log, or its error log
 sudo oxpanel-ctl vhost log acme.example
 sudo oxpanel-ctl vhost log acme.example --error --bytes 64K
@@ -371,15 +384,19 @@ sudo oxpanel-ctl tenant delete acme --remove-home
 
 Limits: `--memory` is `0` (unlimited) or ≥ 16 MiB; `--cpu-weight` and
 `--io-weight` are `0` (systemd default, 100) or 1–10000; `--tasks-max` is `0`
-(default) or ≥ 1. Names: user names `^[a-z][a-z0-9_-]{2,31}$` (reserved system
+(default) or ≥ 1; `--disk` is `0` (unlimited) or ≥ 1 MiB and `--inodes` `0` or
+≥ 100 (both kernel quotas, refused on a host without them). Names: user names `^[a-z][a-z0-9_-]{2,31}$` (reserved system
 names refused); domains lower-case ASCII labels (punycode `xn--` allowed, no
 wildcards, no IP literals); `--root` is relative, with components made of
 `A-Z a-z 0-9 . _ -` only; `--owner` is `^[a-z0-9][a-z0-9_.-]{0,63}$`.
 
-**Uploading content:** tenants have no login in v0.1.0. Put files in place as
-the tenant so ownership stays correct, e.g.
+**Uploading content:** give the tenant an SFTP key (`sftp add-key`); the
+tenant (or its developer) uploads with any SFTP client and lands in its home,
+`/home/<tenant>`. Files uploaded that way belong to the tenant and inherit the
+default ACL and SELinux label, so Nginx serves them and PHP and applications
+can use them without further steps. As root, put files in place as the tenant
+so ownership stays correct, e.g.
 `sudo setpriv --reuid=acme --regid=acme --clear-groups -- cp -r site/. /home/acme/public_html/`.
-Files inherit the default ACL, so Nginx can read them without further steps.
 
 ## 7. Using the gRPC API from the panel
 
@@ -454,6 +471,12 @@ needs to confirm a site is live, poll it.
 | `/run/oxpanel-app/<domain>/app.sock` | directory `<t>:<t> 0750` + ACL `user:nginx:--x` | socket Nginx proxies to; created by the application |
 | `/usr/share/oxpanel/selinux/oxpanel.cil` | `root 0644` | SELinux module: the `oxpanel_app_t` domain and the socket-directory label |
 | `/run/oxpanel/oxpanel.sock` | `root:oxpanel 0660` | API socket |
+| `/etc/ssh/sshd_config.d/60-oxpanel.conf` | `root 0600` | `Match Group oxpanel-tenants`: SFTP only, chroot, keys from `/etc/oxpanel-sftp`, no forwarding; applies to tenants only |
+| `/etc/oxpanel-sftp/<username>` | `root 0640` + ACL `user:<t>:r--`, directory `0711` | the tenant's SFTP keys (each line `restrict …`); absent while suspended |
+| `/var/lib/oxpanel/sftp/<username>/` | `root 0755` | SFTP chroot; contains only `home/<username>`, the tenant's home bind-mounted |
+| `/etc/systemd/system/var-lib-oxpanel-sftp-<name>-home-<name>.mount` | `root 0644` | that bind mount (enabled, so it returns after a reboot) |
+| group `oxpanel-tenants` | | every tenant account is a member; grants no file access |
+| XFS user quota of the tenant's uid | | the disk and inode limit (`xfs_quota -x -c 'report -u -n -b -i' /`) |
 | SELinux hosts | | `semanage fcontext` equivalence `<docroot> = /usr/share/nginx/html` (labels the tree `httpd_sys_content_t`; a plain rule would be overridden by `file_contexts.homedirs`) |
 
 Records are the source of truth for *what OxPanel owns*. Back up
@@ -533,9 +556,8 @@ The application runs with `NODE_ENV=production`, the application directory as
 its working directory, the tenant's home as `HOME`, and a private `/tmp`. If a
 site answers **502**, the application is not listening: `vhost log <domain>
 --app` shows why (a crash loop stops after five quick failures;
-`vhost restart-app` starts it again). Until tenants have file access
-(SFTP is the next milestone), put code in place as the tenant, as for static
-content.
+`vhost restart-app` starts it again). Tenants upload code over SFTP (or you
+put it in place as the tenant, as for static content).
 
 **Checking for drift** — `oxpanel-ctl host reconcile` compares every record
 with the accounts, homes, unit files and Nginx files, and prints one line per
@@ -555,6 +577,10 @@ What to do with each finding:
 | `APP_UNIT_DRIFT` | An application's unit was edited or removed. | Repeat `vhost set … --app …` for the site. |
 | `ORPHAN_APP_UNIT` | An application unit no site accounts for. | Inspect and remove by hand. |
 | `ORPHAN_PHP_POOL` | A PHP-FPM file no PHP-enabled site accounts for. | Inspect and remove by hand. |
+| `SFTP_ACCESS_DRIFT` | A tenant's SFTP keys file or mount unit was edited or removed, a keys file exists while it is suspended, or the account left the `oxpanel-tenants` group. | Repeat `sftp add-key` with one of its keys (or restart the daemon). |
+| `ORPHAN_SFTP_ACCESS` | A keys file, mount unit or chroot directory no tenant with keys accounts for. | Inspect and remove by hand (`systemctl disable --now` the mount unit first). |
+| `SSHD_CONFIG_DRIFT` | `/etc/ssh/sshd_config.d/60-oxpanel.conf` was edited or removed: tenants may not be confined. | Restart the daemon (it rewrites and validates the file). |
+| `DISK_QUOTA_DRIFT` | The kernel's quota for a tenant differs from its recorded limit, or the host no longer enforces quotas. | Repeat `tenant set-limits` with the recorded limits; for the second case see §9.1. |
 | `ORPHAN_NGINX_CONFIG` / `ORPHAN_SLICE_UNIT` | A file in OxPanel's directories that no record accounts for. | Inspect and remove by hand; OxPanel will not touch what it did not record. |
 
 **Recovering a stuck tenant** — a record in `provisioning` or `deleting`
@@ -573,6 +599,44 @@ Existing connections are closed on restart; the panel should reconnect.
 
 **Restarting Nginx by hand** is safe; the daemon re-validates the whole
 configuration with `nginx -t` on every change.
+
+**SFTP access** — every tenant account is in the group `oxpanel-tenants`, and
+the daemon keeps `/etc/ssh/sshd_config.d/60-oxpanel.conf` in place whenever
+sshd is installed (validated with `sshd -t` before sshd is reloaded; rolled
+back if sshd rejects it). For members of that group sshd allows nothing but
+SFTP, chrooted into a directory that contains only the tenant's own home, with
+keys only OxPanel can change — also for tenants that have no key, so a
+compromised site cannot give itself a login by writing
+`~/.ssh/authorized_keys`. Root and every other account are not affected. Only
+public keys are accepted (no passwords). Check what sshd will do for an
+account: `sshd -T -C user=acme,host=x,addr=127.0.0.1 | grep -E 'forcecommand|chroot'`.
+Suspending a tenant withdraws its keys file and ends its running sessions;
+`tenant resume` restores them. Removing a key also ends the tenant's running
+sessions.
+
+### 9.1 Disk quotas: preparing the host
+
+Disk limits are XFS user quotas on the file system that holds `/home`. XFS
+decides at mount time whether quotas are enforced, so this is a one-time host
+change that OxPanel does not make for you. On the AlmaLinux default layout
+`/home` is on the root file system, which needs a kernel argument:
+
+```sh
+findmnt -no FSTYPE,OPTIONS -T /home     # xfs …,usrquota → already done
+dnf -y install xfsprogs
+grubby --update-kernel=ALL --args=rootflags=uquota
+```
+
+Then reboot. With `/home` on its own XFS file system instead, add `uquota` to
+its options in `/etc/fstab` and remount it (`umount /home && mount /home`,
+with nothing using it) or reboot. Afterwards `findmnt -T /home` shows
+`usrquota`, and `oxpanel-ctl host info` shows `disk_quota=true` (its
+`disk_quota_detail=` line says what was found either way). The limit counts
+everything the tenant's uid owns on that file system, and a write beyond it
+fails with "Disk quota exceeded". `tenant usage` then reports the quota
+system's figure instead of walking the home. If the option is ever lost, the
+kernel stops enforcing the limits and `host reconcile` reports every tenant
+with a disk limit (`DISK_QUOTA_DRIFT`).
 
 ## 10. Troubleshooting
 
@@ -605,6 +669,10 @@ configuration with `nginx -t` on every change.
 | Site returns 403/404 right after `vhost set` | Reload race (worker swap) — retry after a moment. Persisting 403 with SELinux: check `ausearch -m avc -ts recent`; the docroot should be `httpd_sys_content_t`. |
 | `curl http://<ip>/` closes the connection | Intended: the catch-all `default_server` returns 444 for hosts no tenant owns. |
 | `stat /home/<t>` shows `0710` | Expected with the ACL; `getfacl` shows `group::---` and `other::---`. |
+| `FailedPrecondition: disk quotas are not available: …` | The file system holding `/home` does not enforce user quotas; the message says what to change (§9.1). |
+| `FailedPrecondition: SFTP is not available on this host: …` | sshd is missing, rejected the drop-in, or would not apply it (e.g. `sshd_config` has no `Include /etc/ssh/sshd_config.d/*.conf`); the message says which. |
+| SFTP login fails with "Permission denied (publickey)" | Wrong key, tenant suspended (no keys file), or the key was removed. `journalctl -u sshd` shows sshd's reason. |
+| SFTP connection is closed before authentication | OpenSSH 9.8+ (AlmaLinux 9.8 ships 9.9) briefly blocks an address after repeated failed logins (`PerSourcePenalties`); it lifts by itself. This applies to the host's whole sshd, not only tenants. |
 
 ## 11. Development and testing
 
@@ -631,13 +699,14 @@ workstation; you only need `/dev/kvm` to be readable — and drives it over SSH.
 | `INSTALL=git` | *(default)* | The VM runs this handbook's §3.2 "From source" block **verbatim** (cloned from GitHub), then the §3.4 verification block. This is the "user installing from git" test; it exercises what is on the remote, not your working tree. |
 | `INSTALL=rpm` | | Builds the RPM from your working tree and `dnf install`s it in the VM. Fast path for uncommitted changes and for the packaging. |
 | `GIT_REF=<branch or sha>` | current branch | Which commit the git install checks out. CI passes the pushed SHA. |
-| `PHASES="10 20 30 40 50 60 70"` | all | Subset of phases (below). |
+| `PHASES="10 15 20 30 40 50 60 70"` | all | Subset of phases (below). |
 | `KEEP=1` | | Leave the VM running afterwards; the report prints the `ssh` line (`make acceptance-destroy` removes it). |
 | `SOAK_N=20` | | Cycles for the soak phase. |
 | `CONTINUE=1` | | Run remaining phases after a failure. |
 | `TARGET=user@host` | | Use a machine you provide instead of a VM (`TARGET_KEY=path` for the key). Phases 60/70 reboot it and create accounts, so this needs `I_UNDERSTAND=1`. |
 
 Phases: **10** install (`dnf install` of the RPM or the handbook's source install; services start; `--check-config`) ·
+**15** host preparation for disk quotas: runs §9.1's block, reboots, checks the quota option is on ·
 **20** the 79-check integration suite on the real host ·
 **30** SELinux: enforcing, docroot labels, `semanage` rule lifecycle, site serves, **zero AVC denials** ·
 **40** sandbox: private network/UTS/mount namespaces, seccomp, capability bounding set, read-only `/usr` ·
@@ -706,6 +775,8 @@ uninstall and remove `/var/lib/oxpanel`, `/etc/nginx/oxpanel.d`,
   tenants. Grant it to service accounts and administrators only, never to
   tenants.
 - Keep `/etc/oxpanel/daemon.env` root-readable (`0640`, as installed).
+- Never add an administrator or service account to the `oxpanel-tenants`
+  group: sshd confines its members to chrooted SFTP with OxPanel's keys.
 - Two unit directives cannot be verified in the container-based integration
   test: `PrivateNetwork=` and `ProtectHostname=`. They are standard systemd
   features and expected to work on a real host, but confirm with

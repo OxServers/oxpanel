@@ -14,7 +14,8 @@ use crate::auth::{PeerInfo, Scope, ScopePolicy};
 use crate::ctx::Ctx;
 use crate::error::Error;
 use crate::host::{Drift, DriftKind, HostService};
-use crate::records::{AppRuntime, TenantRecord, TenantState, VHostRecord};
+use crate::records::{AppRuntime, SftpKeyRecord, TenantRecord, TenantState, VHostRecord};
+use crate::sftp::SftpService;
 use crate::tenant::TenantService;
 use crate::validate::Limits;
 use crate::vhost::{AppRequest, LogKind, VHostRequest, VHostService};
@@ -27,6 +28,7 @@ pub struct Engine {
     tenants: TenantService,
     vhosts: VHostService,
     host: HostService,
+    sftp: SftpService,
     scopes: Arc<ScopePolicy>,
 }
 
@@ -39,6 +41,7 @@ impl Engine {
             scopes: Arc::new(ScopePolicy::new(ctx.config.peer_scopes.clone())),
             tenants: TenantService::new(ctx.clone()),
             vhosts: VHostService::new(ctx.clone()),
+            sftp: SftpService::new(ctx.clone()),
             host: HostService::new(ctx),
         }
     }
@@ -109,6 +112,10 @@ fn drift_to(d: &Drift) -> pb::Drift {
         DriftKind::OrphanPhpPool => pb::DriftKind::OrphanPhpPool,
         DriftKind::AppUnitDrift => pb::DriftKind::AppUnitDrift,
         DriftKind::OrphanAppUnit => pb::DriftKind::OrphanAppUnit,
+        DriftKind::SftpAccessDrift => pb::DriftKind::SftpAccessDrift,
+        DriftKind::OrphanSftpAccess => pb::DriftKind::OrphanSftpAccess,
+        DriftKind::SshdConfigDrift => pb::DriftKind::SshdConfigDrift,
+        DriftKind::DiskQuotaDrift => pb::DriftKind::DiskQuotaDrift,
     };
     pb::Drift {
         kind: kind.into(),
@@ -142,6 +149,10 @@ fn fail(rpc: &'static str, peer: &str, err: Error) -> Status {
         | Error::NoApp(_)
         | Error::RuntimeTooOld { .. }
         | Error::AppPolicyMissing
+        | Error::SftpUnavailable(_)
+        | Error::SftpKeyNotFound { .. }
+        | Error::TooManySftpKeys(_)
+        | Error::DiskQuotaUnavailable(_)
         | Error::NginxInvalid(_) => {
             warn!(rpc, peer, error = %err, "request refused");
             err.into()
@@ -156,7 +167,8 @@ fn fail(rpc: &'static str, peer: &str, err: Error) -> Status {
 
 fn limits_from(l: Option<pb::ResourceLimits>) -> Result<Limits, Error> {
     let l = l.unwrap_or_default();
-    Limits::parse(l.memory_max_bytes, l.cpu_weight, l.io_weight, l.tasks_max)
+    Limits::parse(l.memory_max_bytes, l.cpu_weight, l.io_weight, l.tasks_max)?
+        .with_disk(l.disk_max_bytes, l.inodes_max)
 }
 
 fn limits_to(l: &Limits) -> pb::ResourceLimits {
@@ -165,6 +177,18 @@ fn limits_to(l: &Limits) -> pb::ResourceLimits {
         cpu_weight: l.cpu_weight.unwrap_or(0),
         io_weight: l.io_weight.unwrap_or(0),
         tasks_max: l.tasks_max.unwrap_or(0),
+        disk_max_bytes: l.disk_max_bytes.unwrap_or(0),
+        inodes_max: l.inodes_max.unwrap_or(0),
+    }
+}
+
+fn sftp_key_to(k: &SftpKeyRecord) -> pb::SftpKey {
+    pb::SftpKey {
+        fingerprint: k.fingerprint.clone(),
+        key_type: k.key_type.clone(),
+        public_key: format!("{} {}", k.key_type, k.blob),
+        label: k.label.clone(),
+        added_at: Some(timestamp(k.added_at_unix)),
     }
 }
 
@@ -185,6 +209,7 @@ fn tenant_to(rec: &TenantRecord) -> pb::Tenant {
         state: state.into(),
         owner: rec.owner.clone(),
         suspended: rec.suspended,
+        sftp_key_count: u32::try_from(rec.sftp_keys.len()).unwrap_or(u32::MAX),
     }
 }
 
@@ -520,6 +545,9 @@ impl OxPanelEngine for Engine {
             node_available: i.runtimes.node,
             python_available: i.runtimes.python,
             node_version: i.node_version,
+            sftp_available: i.facilities.sftp,
+            disk_quota_available: i.facilities.disk_quota,
+            disk_quota_detail: i.facilities.disk_quota_detail,
         }))
     }
 
@@ -537,6 +565,62 @@ impl OxPanelEngine for Engine {
         info!(rpc = RPC, peer, findings = drifts.len(), "reconciled");
         Ok(Response::new(pb::ReconcileResponse {
             drifts: drifts.iter().map(drift_to).collect(),
+        }))
+    }
+
+    async fn add_sftp_key(
+        &self,
+        req: Request<pb::AddSftpKeyRequest>,
+    ) -> Result<Response<pb::AddSftpKeyResponse>, Status> {
+        const RPC: &str = "AddSftpKey";
+        // Giving someone a way to log in is a tenant-level change.
+        let peer = self.authorise(&req, RPC, Scope::Tenant)?;
+        let r = req.into_inner();
+        // The key itself is public, but there is no reason to log it.
+        info!(rpc = RPC, peer, username = %r.username, "request");
+        let (_, key, changed) = self
+            .sftp
+            .add_key(&r.username, &r.public_key, &r.label)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(pb::AddSftpKeyResponse {
+            key: Some(sftp_key_to(&key)),
+            changed,
+        }))
+    }
+
+    async fn remove_sftp_key(
+        &self,
+        req: Request<pb::RemoveSftpKeyRequest>,
+    ) -> Result<Response<pb::RemoveSftpKeyResponse>, Status> {
+        const RPC: &str = "RemoveSftpKey";
+        let peer = self.authorise(&req, RPC, Scope::Tenant)?;
+        let r = req.into_inner();
+        info!(rpc = RPC, peer, username = %r.username, fingerprint = %r.fingerprint, "request");
+        let rec = self
+            .sftp
+            .remove_key(&r.username, &r.fingerprint)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(pb::RemoveSftpKeyResponse {
+            remaining: u32::try_from(rec.sftp_keys.len()).unwrap_or(u32::MAX),
+        }))
+    }
+
+    async fn list_sftp_keys(
+        &self,
+        req: Request<pb::ListSftpKeysRequest>,
+    ) -> Result<Response<pb::ListSftpKeysResponse>, Status> {
+        const RPC: &str = "ListSftpKeys";
+        let peer = self.authorise(&req, RPC, Scope::Read)?;
+        let r = req.into_inner();
+        let keys = self
+            .sftp
+            .list_keys(&r.username)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(pb::ListSftpKeysResponse {
+            keys: keys.iter().map(sftp_key_to).collect(),
         }))
     }
 }
@@ -565,9 +649,20 @@ mod tests {
             cpu_weight: Some(10),
             io_weight: None,
             tasks_max: Some(3),
+            disk_max_bytes: Some(1 << 30),
+            inodes_max: Some(10_000),
         };
         let pbv = limits_to(&l);
+        assert_eq!(pbv.disk_max_bytes, 1 << 30);
         assert_eq!(limits_from(Some(pbv)).ok(), Some(l));
         assert_eq!(limits_from(None).ok(), Some(Limits::default()));
+        let too_small = pb::ResourceLimits {
+            disk_max_bytes: 4096,
+            ..pb::ResourceLimits::default()
+        };
+        assert!(matches!(
+            limits_from(Some(too_small)),
+            Err(Error::InvalidInput { .. })
+        ));
     }
 }

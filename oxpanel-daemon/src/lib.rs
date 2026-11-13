@@ -14,6 +14,8 @@
 //! - [`tenant`], [`vhost`] — the provisioning workflows.
 //! - [`php`]      — per-tenant PHP-FPM instances.
 //! - [`app`]      — Node.js and Python applications behind virtual hosts.
+//! - [`sftp`]     — SFTP-only file access for tenants (sshd drop-in, keys, chroot).
+//! - [`quota`]    — per-tenant disk quotas (XFS user quotas).
 //! - [`host`]     — host information and record ↔ OS reconciliation.
 //! - [`auth`]     — peer-credential gate for the UNIX socket.
 //! - [`server`]   — gRPC ↔ domain mapping.
@@ -38,8 +40,10 @@ pub mod fsutil;
 pub mod host;
 pub mod nginx;
 pub mod php;
+pub mod quota;
 pub mod records;
 pub mod server;
+pub mod sftp;
 pub mod system;
 pub mod systemd;
 pub mod tenant;
