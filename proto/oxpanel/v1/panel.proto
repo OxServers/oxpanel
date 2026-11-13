@@ -143,6 +143,24 @@ service OxPanelEngine {
   // backup id, the name of the tenant it was taken from and the target.
   // The ordinary RestoreBackup never reaches such a backup.
   rpc RestoreRetainedBackup(RestoreRetainedBackupRequest) returns (StartJobResponse);
+  // The tenant's deleted databases (DeleteDatabase moves a database to the
+  // tenant's trash; it is purged automatically after the host's trash
+  // period, 30 days by default).
+  rpc ListDatabaseTrash(ListDatabaseTrashRequest) returns (ListDatabaseTrashResponse);
+  // Bring a deleted database back under a NEW name of the same tenant
+  // (refused if that name exists). The database gets no grants: grant it
+  // to a user afterwards. Views, triggers, routines and events are
+  // re-created; any that cannot be are returned with their definition.
+  rpc RestoreDatabaseTrash(RestoreDatabaseTrashRequest) returns (RestoreDatabaseTrashResponse);
+  // Empty the trash early: one deleted database, or all of the tenant's.
+  rpc PurgeDatabaseTrash(PurgeDatabaseTrashRequest) returns (PurgeDatabaseTrashResponse);
+  // Restore one database of one of the tenant's own backups into a NEW
+  // database name of the tenant (never over an existing database). Files
+  // are restored separately (RestoreBackup). Returns at once with a job.
+  rpc RestoreBackupDatabase(RestoreBackupDatabaseRequest) returns (StartJobResponse);
+  // Operator action: the same from a retained backup of a DELETED tenant
+  // into an existing tenant (see RestoreRetainedBackup).
+  rpc RestoreRetainedBackupDatabase(RestoreRetainedBackupDatabaseRequest) returns (StartJobResponse);
 }
 
 // Per-tenant resource limits, applied through systemd (cgroups v2).
@@ -165,6 +183,13 @@ message ResourceLimits {
   // Number of files and directories the tenant may own there. 0 = unlimited;
   // otherwise at least 100. Same precondition as disk_max_bytes.
   uint64 inodes_max = 6;
+  // Most bytes the tenant's database trash may hold (deleted databases, by
+  // the size the server reported when they were deleted). A DeleteDatabase
+  // that would exceed it is refused until older trash is purged. 0 = as much
+  // as disk_max_bytes (unlimited when that is 0). Databases and their trash
+  // never count against disk_max_bytes: their files belong to the database
+  // server.
+  uint64 db_trash_max_bytes = 7;
 }
 
 message Tenant {
@@ -228,13 +253,33 @@ message ListTenantsResponse {
 
 message DeleteTenantRequest {
   string username = 1;
-  // Also delete the home directory. Default: keep it.
+  // Also delete the home directory. Default: keep it. (A cascade always
+  // removes it.)
   bool remove_home = 2;
+  // Delete the tenant with everything it has: applications and PHP, sites
+  // with their certificates and Automatic HTTPS state, SFTP access,
+  // databases, database users and the database trash (dropped at once),
+  // backups that are not retained, then the account and its home. Without
+  // it, DeleteTenant refuses while any of these exist. Returns a job.
+  bool cascade = 3;
+  // Required with cascade: the tenant's name again, exactly. Anything else
+  // is INVALID_ARGUMENT and nothing is touched.
+  string confirm_username = 4;
+  // With cascade: first take a backup (files and databases) and keep it for
+  // this many days (1 to 366) after the deletion; nothing is deleted unless
+  // it completes. 0 = no final backup.
+  uint32 final_backup_retain_days = 5;
 }
 
 message DeleteTenantResponse {
-  // false when the tenant did not exist.
+  // false when the tenant did not exist (or, with cascade, when a job was
+  // started instead: see `job`).
   bool deleted = 1;
+  // Cascade: the deletion job (GetJob).
+  Job job = 2;
+  // Cascade: false when a deletion of this tenant was already running and
+  // is returned instead.
+  bool started = 3;
 }
 
 message VirtualHost {
@@ -440,6 +485,8 @@ message HostInfo {
   // whether or not it is installed.
   repeated DatabaseEngineInfo database_engines = 28;
   // 29..=31 were set aside for databases and are still unused.
+  // Days a deleted database stays in a tenant's trash before it is purged.
+  uint32 database_trash_days = 35;
 }
 
 // Database engines OxPanel can manage. More will follow (PostgreSQL,
@@ -533,6 +580,11 @@ enum DriftKind {
   // A backup that was never completed and has no running job, or a job
   // recorded as running whose backup or tenant is gone.
   DRIFT_KIND_BACKUP_INCOMPLETE = 29;
+  // A deleted database whose trash schema is gone, whose move into the trash
+  // or restore was interrupted, or that is past its purge date.
+  DRIFT_KIND_DATABASE_TRASH_DRIFT = 30;
+  // An oxpanel_trash_* schema on the server that no trash record accounts for.
+  DRIFT_KIND_ORPHAN_DATABASE_TRASH = 31;
 }
 
 message Drift {
@@ -854,6 +906,11 @@ message DeleteDatabaseRequest {
 message DeleteDatabaseResponse {
   // false when OxPanel has no such database.
   bool deleted = 1;
+  // The database is in the tenant's trash under this id (empty when
+  // nothing was deleted) and is purged automatically at `purge_at`. Its
+  // name is free at once.
+  string trash_id = 2;
+  google.protobuf.Timestamp purge_at = 3;
 }
 
 message CreateDatabaseUserRequest {
@@ -938,7 +995,10 @@ message BackupMember {
   string name = 1;
   // What it holds: "home" (the tenant's home directory as a gzip-compressed
   // tar archive) or "records" (the engine's records of the tenant and its
-  // virtual hosts, JSON). Clients must tolerate kinds they do not know.
+  // virtual hosts, JSON), "mariadb" (a database's tables, data and views,
+  // gzip-compressed SQL from mariadb-dump) or "mariadb-objects" (its
+  // triggers, routines and events, JSON). Clients must tolerate kinds they
+  // do not know.
   string kind = 2;
   uint64 size_bytes = 3;
   // Lower-case hexadecimal SHA-256, verified before a restore.
@@ -971,6 +1031,18 @@ message Backup {
   // pyvenv.cfg is listed here, so nothing is left out silently.
   repeated string excluded = 11;
   uint64 excluded_count = 12;
+  // The tenant's databases in this backup (its trash is not backed up).
+  repeated BackupDatabase databases = 13;
+}
+
+message BackupDatabase {
+  string name = 1;
+  DatabaseEngine engine = 2;
+  // Data plus indexes on the server when the backup started.
+  uint64 size_bytes = 3;
+  // The members holding it.
+  string dump_member = 4;
+  string objects_member = 5;
 }
 
 // What a restore does with files that already exist in the home.
@@ -997,6 +1069,10 @@ enum JobKind {
   JOB_KIND_UNSPECIFIED = 0;
   JOB_KIND_BACKUP = 1;
   JOB_KIND_RESTORE = 2;
+  // A database restored from a backup under a new name.
+  JOB_KIND_RESTORE_DATABASE = 3;
+  // A tenant deleted with everything it has (DeleteTenant with cascade).
+  JOB_KIND_DELETE_TENANT = 4;
 }
 
 enum JobState {
@@ -1033,6 +1109,14 @@ message Job {
   // reinstalled. A failure here does not make the restore FAILED; `message`
   // names the sites.
   repeated JobSiteResult sites = 13;
+  // Database restores: the database in the backup and the name it was
+  // restored under, and the objects that could not be re-created.
+  string database = 14;
+  string new_name = 15;
+  repeated DatabaseObjectIssue object_issues = 16;
+  // Tenant deletions: where the deletion stands ("final-backup",
+  // "removing").
+  string phase = 17;
 }
 
 message CreateBackupRequest {
@@ -1040,6 +1124,8 @@ message CreateBackupRequest {
   // 0: an ordinary backup. 1-12: retained for that many months (see
   // RetainBackup) — e.g. the final backup before deleting the tenant.
   uint32 retain_months = 2;
+  // The same in days, 1-366. Give months or days, not both.
+  uint32 retain_days = 3;
 }
 
 message StartJobResponse {
@@ -1088,6 +1174,8 @@ message RetainBackupRequest {
   string backup_id = 2;
   // 1 to 12.
   uint32 retain_months = 3;
+  // Or 1 to 366 days (give months or days, not both).
+  uint32 retain_days = 4;
 }
 
 message ListRetainedBackupsRequest {}
@@ -1100,4 +1188,89 @@ message RestoreRetainedBackupRequest {
   string target_tenant = 3;
   // Required: UNSPECIFIED is INVALID_ARGUMENT.
   OnExisting on_existing = 4;
+}
+
+// A view, trigger, routine or event that a restore did not re-create.
+message DatabaseObjectIssue {
+  // "view", "trigger", "procedure", "function" or "event".
+  string kind = 1;
+  string name = 2;
+  // Why: it failed on the server (the server's error), its definer is not
+  // one of the tenant's database users, or its text cannot be replayed
+  // safely.
+  string reason = 3;
+  // The complete CREATE statement, so that it can be re-created by hand.
+  string definition = 4;
+}
+
+// A deleted database in a tenant's trash.
+message TrashedDatabase {
+  // Assigned by the engine: "t" followed by digits.
+  string id = 1;
+  // The name the database had (now free).
+  string name = 2;
+  string tenant = 3;
+  DatabaseEngine engine = 4;
+  google.protobuf.Timestamp deleted_at = 5;
+  google.protobuf.Timestamp purge_at = 6;
+  // Data plus indexes when it was deleted.
+  uint64 size_bytes = 7;
+  // Views, triggers, routines and events kept with it.
+  uint32 object_count = 8;
+}
+
+message ListDatabaseTrashRequest {
+  string tenant = 1;
+}
+
+message ListDatabaseTrashResponse {
+  // Oldest first.
+  repeated TrashedDatabase databases = 1;
+  // Their total size, and the most the tenant's trash may hold (0 = no limit).
+  uint64 total_bytes = 2;
+  uint64 cap_bytes = 3;
+}
+
+message RestoreDatabaseTrashRequest {
+  string tenant = 1;
+  string trash_id = 2;
+  // Required: a name of the same tenant that does not exist. The old name is
+  // never used implicitly.
+  string new_name = 3;
+}
+
+message RestoreDatabaseTrashResponse {
+  Database database = 1;
+  repeated DatabaseObjectIssue object_issues = 2;
+}
+
+message PurgeDatabaseTrashRequest {
+  string tenant = 1;
+  // One deleted database; empty = all of the tenant's.
+  string trash_id = 2;
+}
+
+message PurgeDatabaseTrashResponse {
+  // How many were purged.
+  uint32 purged = 1;
+}
+
+message RestoreBackupDatabaseRequest {
+  string tenant = 1;
+  string backup_id = 2;
+  // The database as listed in the backup.
+  string database = 3;
+  // Required: a name of this tenant that does not exist.
+  string new_name = 4;
+}
+
+message RestoreRetainedBackupDatabaseRequest {
+  string backup_id = 1;
+  // The (deleted) tenant the backup was taken from, as listed.
+  string source_tenant = 2;
+  // The existing tenant that receives the database.
+  string target_tenant = 3;
+  string database = 4;
+  // Required: a name of the target tenant that does not exist.
+  string new_name = 5;
 }

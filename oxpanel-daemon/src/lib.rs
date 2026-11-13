@@ -50,6 +50,7 @@ pub mod db;
 pub mod error;
 pub mod fsutil;
 pub mod host;
+pub mod lifecycle;
 pub mod nginx;
 pub mod php;
 pub mod quota;

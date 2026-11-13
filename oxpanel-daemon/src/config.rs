@@ -101,6 +101,9 @@ pub struct Config {
     /// MariaDB `MAX_USER_CONNECTIONS` given to database users created from
     /// now on (1..=10000).
     pub db_max_user_connections: u32,
+    /// Days a deleted database stays in the tenant's trash before it is
+    /// purged (1..=366; the owner's decision is 30).
+    pub db_trash_days: u32,
     /// Where backups are stored: `<backup_dir>/<tenant>/<backup id>/`. Root
     /// only; never inside a tenant home.
     pub backup_dir: PathBuf,
@@ -159,6 +162,7 @@ impl Default for Config {
             db_max_databases: 20,
             db_max_users: 20,
             db_max_user_connections: 25,
+            db_trash_days: 30,
             backup_dir: PathBuf::from("/var/lib/oxpanel-backups"),
             backup_keep: 7,
             backup_min_free_bytes: 1 << 30,
@@ -412,7 +416,18 @@ impl Config {
                 "OXPANEL_DB_MAX_USER_CONNECTIONS must be 1..=10000",
             ));
         }
+        if !(1..=366).contains(&self.db_trash_days) {
+            return Err(Error::invalid(
+                "config",
+                "OXPANEL_DB_TRASH_DAYS must be 1..=366",
+            ));
+        }
         Ok(())
+    }
+
+    /// `state_dir/db-trash`: one record per database in a tenant's trash.
+    pub fn db_trash_dir(&self) -> PathBuf {
+        self.state_dir.join("db-trash")
     }
 
     /// `state_dir/databases`.
@@ -527,6 +542,9 @@ impl Config {
         }
         if let Some(v) = get("OXPANEL_DB_MAX_USER_CONNECTIONS") {
             self.db_max_user_connections = parse_u32("OXPANEL_DB_MAX_USER_CONNECTIONS", &v)?;
+        }
+        if let Some(v) = get("OXPANEL_DB_TRASH_DAYS") {
+            self.db_trash_days = parse_u32("OXPANEL_DB_TRASH_DAYS", &v)?;
         }
         Ok(())
     }

@@ -52,6 +52,10 @@ pub const EXIT_TOO_LARGE: u8 = 11;
 pub const EXIT_ARCHIVER: u8 = 12;
 /// Anything else (I/O on the archive, spawning).
 pub const EXIT_INTERNAL: u8 = 13;
+/// `mariadb-dump` (or its compressor) failed: the backup is incomplete.
+pub const EXIT_DUMP: u8 = 14;
+/// Loading a dump into the new database failed.
+pub const EXIT_LOAD: u8 = 15;
 
 const RESULT_MODE: u32 = 0o600;
 const ARCHIVE_MODE: u32 = 0o600;
@@ -59,6 +63,13 @@ const BUFFER: usize = 128 * 1024;
 
 /// Member kind of the tenant's home archive.
 pub const KIND_HOME: &str = "home";
+/// Member kind of a database dump (tables, data, views; gzip'd SQL).
+pub const KIND_MARIADB: &str = "mariadb";
+
+/// `db-<name>.sql.gz`: the dump member of a database.
+pub fn dump_member(database: &str) -> String {
+    format!("db-{database}.sql.gz")
+}
 
 /// Prefix of the line with which a restore worker reports its counts (the
 /// daemon reads it back from the journal). `tar`'s own lines start with
@@ -115,6 +126,10 @@ pub enum Task {
         output: PathBuf,
         max_bytes: u64,
         venvs: Vec<String>,
+        /// Databases dumped next to the home archive (`db-<name>.sql.gz`),
+        /// over the MariaDB socket `socket`.
+        databases: Vec<String>,
+        socket: PathBuf,
     },
     /// Verify `input` against `sha256` and `size`, then extract it into
     /// `home` as `uid:gid`.
@@ -127,6 +142,15 @@ pub enum Task {
         size: u64,
         on_existing: OnExisting,
     },
+    /// Verify the dump `input` against `sha256` and `size`, then load it into
+    /// the (new, empty) database `database` over the socket `socket`.
+    RestoreDb {
+        input: PathBuf,
+        sha256: String,
+        size: u64,
+        socket: PathBuf,
+        database: String,
+    },
 }
 
 impl Task {
@@ -134,7 +158,7 @@ impl Task {
     /// [`Task::parse`].
     pub fn to_args(&self) -> Vec<OsString> {
         let mut out: Vec<OsString> = vec![SUBCOMMAND.into()];
-        let mut pair = |flag: &str, value: OsString| {
+        let pair = |out: &mut Vec<OsString>, flag: &str, value: OsString| {
             out.push(flag.into());
             out.push(value);
         };
@@ -146,18 +170,17 @@ impl Task {
                 output,
                 max_bytes,
                 venvs,
+                databases,
+                socket,
             } => {
-                pair("backup", uid.to_string().into());
-                pair("--gid", gid.to_string().into());
-                pair("--home", home.clone().into());
-                pair("--output", output.clone().into());
-                pair("--max-bytes", max_bytes.to_string().into());
-                let venvs = if venvs.is_empty() {
-                    "-".to_owned()
-                } else {
-                    venvs.join(",")
-                };
-                pair("--venvs", venvs.into());
+                pair(&mut out, "backup", uid.to_string().into());
+                pair(&mut out, "--gid", gid.to_string().into());
+                pair(&mut out, "--home", home.clone().into());
+                pair(&mut out, "--output", output.clone().into());
+                pair(&mut out, "--max-bytes", max_bytes.to_string().into());
+                pair(&mut out, "--venvs", list_arg(venvs).into());
+                pair(&mut out, "--databases", list_arg(databases).into());
+                pair(&mut out, "--socket", socket.clone().into());
             }
             Self::Restore {
                 uid,
@@ -168,13 +191,27 @@ impl Task {
                 size,
                 on_existing,
             } => {
-                pair("restore", uid.to_string().into());
-                pair("--gid", gid.to_string().into());
-                pair("--home", home.clone().into());
-                pair("--input", input.clone().into());
-                pair("--sha256", sha256.clone().into());
-                pair("--size", size.to_string().into());
-                pair("--existing", on_existing.as_str().into());
+                pair(&mut out, "restore", uid.to_string().into());
+                pair(&mut out, "--gid", gid.to_string().into());
+                pair(&mut out, "--home", home.clone().into());
+                pair(&mut out, "--input", input.clone().into());
+                pair(&mut out, "--sha256", sha256.clone().into());
+                pair(&mut out, "--size", size.to_string().into());
+                pair(&mut out, "--existing", on_existing.as_str().into());
+            }
+            Self::RestoreDb {
+                input,
+                sha256,
+                size,
+                socket,
+                database,
+            } => {
+                out.push("restore-db".into());
+                pair(&mut out, "--input", input.clone().into());
+                pair(&mut out, "--sha256", sha256.clone().into());
+                pair(&mut out, "--size", size.to_string().into());
+                pair(&mut out, "--socket", socket.clone().into());
+                pair(&mut out, "--database", database.clone().into());
             }
         }
         out
@@ -186,12 +223,18 @@ impl Task {
     /// --size <n>`. Strict: unknown, missing or repeated arguments are errors.
     pub fn parse(args: &[String]) -> Result<Self> {
         let bad = |why: String| Error::invalid("worker", why);
-        let [sub, mode, uid, rest @ ..] = args else {
-            return Err(bad("expected: worker backup|restore <uid> …".into()));
+        let [sub, mode, rest @ ..] = args else {
+            return Err(bad("expected: worker backup|restore|restore-db …".into()));
         };
         if sub != SUBCOMMAND {
             return Err(bad(format!("unknown subcommand '{sub}'")));
         }
+        // `restore-db` has no uid: it runs no program as the tenant.
+        let (uid, rest) = match (mode.as_str(), rest) {
+            ("restore-db", rest) => (None, rest),
+            (_, [uid, rest @ ..]) => (Some(uid.as_str()), rest),
+            _ => return Err(bad("the uid is missing".into())),
+        };
         let mut flags = std::collections::BTreeMap::new();
         for pair in rest.chunks(2) {
             let [flag, value] = pair else {
@@ -201,63 +244,114 @@ impl Task {
                 return Err(bad(format!("'{flag}' is given twice")));
             }
         }
-        let mut take = |flag: &str| {
-            flags
-                .remove(flag)
-                .ok_or_else(|| bad(format!("'{flag}' is missing")))
-        };
-        let number = |flag: &str, v: &str| {
-            v.parse::<u64>()
-                .map_err(|_| bad(format!("'{flag}' must be a number")))
-        };
-        let id = |flag: &str, v: &str| match v.parse::<u32>() {
-            // Never root: the archiver must not run with the worker's identity.
+        Flags { flags }.task(mode, uid)
+    }
+}
+
+fn bad(why: String) -> Error {
+    Error::invalid("worker", why)
+}
+
+/// The flags of one worker invocation, consumed as they are read. Strict:
+/// unknown, missing or repeated arguments are errors.
+struct Flags<'a> {
+    flags: std::collections::BTreeMap<&'a str, &'a str>,
+}
+
+impl<'a> Flags<'a> {
+    fn take(&mut self, flag: &str) -> Result<&'a str> {
+        self.flags
+            .remove(flag)
+            .ok_or_else(|| bad(format!("'{flag}' is missing")))
+    }
+
+    fn number(&mut self, flag: &str) -> Result<u64> {
+        self.take(flag)?
+            .parse::<u64>()
+            .map_err(|_| bad(format!("'{flag}' must be a number")))
+    }
+
+    /// Never root: the archiver must not run with the worker's identity.
+    fn id(flag: &str, v: &str) -> Result<u32> {
+        match v.parse::<u32>() {
             Ok(n) if n != 0 => Ok(n),
             _ => Err(bad(format!("'{flag}' must be a non-root numeric id"))),
+        }
+    }
+
+    fn path(&mut self, flag: &str) -> Result<PathBuf> {
+        let v = self.take(flag)?;
+        absolute(v, flag)
+    }
+
+    fn sha256(&mut self) -> Result<String> {
+        let v = self.take("--sha256")?;
+        if v.len() != 64 || !v.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(bad("'--sha256' must be 64 hexadecimal digits".into()));
+        }
+        Ok(v.to_ascii_lowercase())
+    }
+
+    /// A comma-separated list ("-" = none), each item checked by `check`.
+    fn list(&mut self, flag: &str, check: impl Fn(&str) -> Result<String>) -> Result<Vec<String>> {
+        match self.take(flag)? {
+            "-" => Ok(Vec::new()),
+            list => list.split(',').map(check).collect(),
+        }
+    }
+
+    fn task(mut self, mode: &str, uid: Option<&str>) -> Result<Task> {
+        let database = |v: &str| {
+            crate::validate::DbName::parse(v, "--databases").map(|n| n.as_str().to_owned())
         };
-        let uid = id("uid", uid)?;
-        let gid = id("--gid", take("--gid")?)?;
-        let home = absolute(take("--home")?, "--home")?;
-        let task = match mode.as_str() {
-            "backup" => Self::Backup {
-                uid,
-                gid,
-                home,
-                output: absolute(take("--output")?, "--output")?,
-                max_bytes: number("--max-bytes", take("--max-bytes")?)?,
-                venvs: match take("--venvs")? {
-                    "-" => Vec::new(),
-                    list => list
-                        .split(',')
-                        .map(|v| RelPath::parse_field(v, "--venvs").map(|p| p.as_str().to_owned()))
-                        .collect::<Result<_>>()?,
+        let task = match (mode, uid) {
+            ("backup", Some(uid)) => Task::Backup {
+                uid: Self::id("uid", uid)?,
+                gid: Self::id("--gid", self.take("--gid")?)?,
+                home: self.path("--home")?,
+                output: self.path("--output")?,
+                max_bytes: self.number("--max-bytes")?,
+                venvs: self.list("--venvs", |v| {
+                    RelPath::parse_field(v, "--venvs").map(|p| p.as_str().to_owned())
+                })?,
+                databases: self.list("--databases", database)?,
+                socket: self.path("--socket")?,
+            },
+            ("restore", Some(uid)) => Task::Restore {
+                uid: Self::id("uid", uid)?,
+                gid: Self::id("--gid", self.take("--gid")?)?,
+                home: self.path("--home")?,
+                input: self.path("--input")?,
+                sha256: self.sha256()?,
+                size: self.number("--size")?,
+                on_existing: match self.take("--existing")? {
+                    "overwrite" => OnExisting::Overwrite,
+                    "keep" => OnExisting::Keep,
+                    _ => return Err(bad("'--existing' must be overwrite or keep".into())),
                 },
             },
-            "restore" => {
-                let sha256 = take("--sha256")?;
-                if sha256.len() != 64 || !sha256.bytes().all(|b| b.is_ascii_hexdigit()) {
-                    return Err(bad("'--sha256' must be 64 hexadecimal digits".into()));
-                }
-                Self::Restore {
-                    uid,
-                    gid,
-                    home,
-                    input: absolute(take("--input")?, "--input")?,
-                    sha256: sha256.to_ascii_lowercase(),
-                    size: number("--size", take("--size")?)?,
-                    on_existing: match take("--existing")? {
-                        "overwrite" => OnExisting::Overwrite,
-                        "keep" => OnExisting::Keep,
-                        _ => return Err(bad("'--existing' must be overwrite or keep".into())),
-                    },
-                }
-            }
-            other => return Err(bad(format!("unknown mode '{other}'"))),
+            ("restore-db", None) => Task::RestoreDb {
+                input: self.path("--input")?,
+                sha256: self.sha256()?,
+                size: self.number("--size")?,
+                socket: self.path("--socket")?,
+                database: database(self.take("--database")?)?,
+            },
+            (other, _) => return Err(bad(format!("unknown mode '{other}'"))),
         };
-        if let Some(extra) = flags.keys().next() {
+        if let Some(extra) = self.flags.keys().next() {
             return Err(bad(format!("unknown argument '{extra}'")));
         }
         Ok(task)
+    }
+}
+
+/// `a,b,c`, or `-` for none.
+fn list_arg(items: &[String]) -> String {
+    if items.is_empty() {
+        "-".to_owned()
+    } else {
+        items.join(",")
     }
 }
 
@@ -443,7 +537,22 @@ pub fn run(task: &Task) -> std::result::Result<(), Failure> {
             output,
             max_bytes,
             venvs,
-        } => backup(&tar_create(*uid, *gid, home, venvs), output, *max_bytes),
+            databases,
+            socket,
+        } => {
+            let mut used = backup(&tar_create(*uid, *gid, home, venvs), output, *max_bytes)?;
+            // The dumps share the budget the daemon allowed for the archive.
+            let dir = output.parent().unwrap_or(Path::new("/"));
+            for database in databases {
+                used += dump(
+                    socket,
+                    database,
+                    &dir.join(dump_member(database)),
+                    max_bytes.saturating_sub(used),
+                )?;
+            }
+            Ok(())
+        }
         Task::Restore {
             uid,
             gid,
@@ -458,10 +567,198 @@ pub fn run(task: &Task) -> std::result::Result<(), Failure> {
             sha256,
             *size,
         ),
+        Task::RestoreDb {
+            input,
+            sha256,
+            size,
+            socket,
+            database,
+        } => restore_db(input, sha256, *size, socket, database),
     }
 }
 
-fn backup(tar: &CommandSpec, output: &Path, max_bytes: u64) -> std::result::Result<(), Failure> {
+/// `mariadb-dump` of one database, as root over the UNIX socket (the
+/// `unix_socket` plugin authenticates root by being root: there is no
+/// password anywhere): tables, data and views, consistent for InnoDB tables
+/// (`--single-transaction`), binary columns as hex. Triggers, routines and
+/// events are left out on purpose: their bodies are replayed verbatim by a
+/// restore, which a tenant can abuse (see `db::objects`); the daemon keeps
+/// their definitions in a member of its own.
+pub fn mariadb_dump(socket: &Path, database: &str) -> CommandSpec {
+    CommandSpec::new(bin::MARIADB_DUMP, Duration::ZERO)
+        .args(["--no-defaults", "--protocol=socket"])
+        .arg(format!("--socket={}", socket.display()))
+        .args([
+            "--user=root",
+            "--single-transaction",
+            "--quick",
+            "--skip-triggers",
+            "--hex-blob",
+            "--skip-comments",
+            "--skip-dump-date",
+            "--default-character-set=utf8mb4",
+            "--",
+        ])
+        .arg(database)
+}
+
+/// Loading a dump into the new database, as root over the UNIX socket,
+/// with the client's backslash commands and file access turned off.
+pub fn mariadb_load(socket: &Path, database: &str) -> CommandSpec {
+    CommandSpec::new(bin::MARIADB, Duration::ZERO)
+        .args(["--no-defaults", "--protocol=socket"])
+        .arg(format!("--socket={}", socket.display()))
+        .args([
+            "--user=root",
+            "--batch",
+            "--binary-mode",
+            "--sandbox",
+            "--default-character-set=utf8mb4",
+            "--connect-timeout=10",
+            "--",
+        ])
+        .arg(database)
+}
+
+fn gzip(decompress: bool) -> CommandSpec {
+    let spec = CommandSpec::new(bin::GZIP, Duration::ZERO);
+    if decompress {
+        spec.args(["--decompress", "--stdout"])
+    } else {
+        spec.arg("--stdout")
+    }
+}
+
+/// Dump `database` through `gzip` into the new file `output`, at most
+/// `max_bytes` long, and write its result file. Returns its size.
+fn dump(
+    socket: &Path,
+    database: &str,
+    output: &Path,
+    max_bytes: u64,
+) -> std::result::Result<u64, Failure> {
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(ARCHIVE_MODE)
+        .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits())
+        .open(output)
+        .map_err(|e| Failure::internal(Error::io("create", output, e)))?;
+    let discard = |why: Failure| {
+        let _ = std::fs::remove_file(output);
+        why
+    };
+    let failed = |what: String| Failure::new(EXIT_DUMP, format!("the dump of database {database} failed: {what}"));
+    let mut dumper = spawn_streaming(
+        &mariadb_dump(socket, database),
+        Stdio::null(),
+        Stdio::piped(),
+        Stdio::inherit(),
+    )
+    .map_err(|e| discard(failed(e.to_string())))?;
+    let Some(dumped) = dumper.stdout.take() else {
+        return Err(discard(failed("no pipe".into())));
+    };
+    let mut gz = spawn_streaming(&gzip(false), Stdio::from(dumped), Stdio::piped(), Stdio::inherit())
+        .map_err(|e| discard(failed(e.to_string())))?;
+    let copied = match gz.stdout.take() {
+        Some(stream) => copy_hashed(stream, &mut file, max_bytes),
+        None => Err(CopyError::Io(std::io::Error::other("no pipe"))),
+    };
+    let gz_status = gz.wait();
+    let dump_status = dumper.wait();
+    let (size_bytes, sha256) = match copied {
+        Ok(done) => done,
+        Err(CopyError::TooLarge) => {
+            return Err(discard(Failure::new(
+                EXIT_TOO_LARGE,
+                format!("the archive and the dumps would exceed the {max_bytes} bytes available"),
+            )))
+        }
+        Err(CopyError::Io(e)) => return Err(discard(Failure::internal(Error::io("write", output, e)))),
+    };
+    for (program, status) in [(bin::MARIADB_DUMP, dump_status), (bin::GZIP, gz_status)] {
+        match status {
+            Ok(s) if s.success() => {}
+            Ok(s) => return Err(discard(failed(format!("{program} {s}")))),
+            Err(e) => return Err(discard(failed(format!("{program}: {e}")))),
+        }
+    }
+    file.sync_all()
+        .map_err(|e| discard(Failure::internal(Error::io("fsync", output, e))))?;
+    write_result(
+        output,
+        &MemberResult {
+            kind: KIND_MARIADB.to_owned(),
+            size_bytes,
+            sha256,
+        },
+    )
+    .map_err(|e| discard(Failure::internal(e)))?;
+    Ok(size_bytes)
+}
+
+/// Open an archive member and verify it completely against what was
+/// recorded, before anything reads it for real.
+fn open_verified(input: &Path, sha256: &str, size: u64) -> std::result::Result<File, Failure> {
+    let mut archive = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits())
+        .open(input)
+        .map_err(|e| Failure::new(EXIT_INTEGRITY, Error::io("open", input, e).to_string()))?;
+    let (found_size, found_sha256) = copy_hashed(&mut archive, std::io::sink(), u64::MAX)
+        .map_err(|e| Failure::internal(format!("read {}: {e:?}", input.display())))?;
+    if found_size != size || found_sha256 != sha256 {
+        return Err(Failure::new(
+            EXIT_INTEGRITY,
+            format!(
+                "the archive is damaged: expected {size} bytes with SHA-256 {sha256}, found {found_size} bytes with {found_sha256}"
+            ),
+        ));
+    }
+    archive
+        .seek(SeekFrom::Start(0))
+        .map_err(|e| Failure::internal(Error::io("seek", input, e)))?;
+    Ok(archive)
+}
+
+/// Load a verified dump into `database` (new and empty, created by the daemon).
+fn restore_db(
+    input: &Path,
+    sha256: &str,
+    size: u64,
+    socket: &Path,
+    database: &str,
+) -> std::result::Result<(), Failure> {
+    let archive = open_verified(input, sha256, size)?;
+    let failed = |what: String| {
+        Failure::new(EXIT_LOAD, format!("loading the dump into {database} failed: {what}"))
+    };
+    let mut gz = spawn_streaming(&gzip(true), Stdio::from(archive), Stdio::piped(), Stdio::inherit())
+        .map_err(|e| failed(e.to_string()))?;
+    let Some(sql) = gz.stdout.take() else {
+        return Err(failed("no pipe".into()));
+    };
+    let mut loader = spawn_streaming(
+        &mariadb_load(socket, database),
+        Stdio::from(sql),
+        Stdio::null(),
+        Stdio::inherit(),
+    )
+    .map_err(|e| failed(e.to_string()))?;
+    let load_status = loader.wait();
+    let gz_status = gz.wait();
+    for (program, status) in [(bin::MARIADB, load_status), (bin::GZIP, gz_status)] {
+        match status {
+            Ok(s) if s.success() => {}
+            Ok(s) => return Err(failed(format!("{program} {s}"))),
+            Err(e) => return Err(failed(format!("{program}: {e}"))),
+        }
+    }
+    Ok(())
+}
+
+fn backup(tar: &CommandSpec, output: &Path, max_bytes: u64) -> std::result::Result<u64, Failure> {
     // create_new: a member is written once; an existing file is not ours to reuse.
     let mut archive = OpenOptions::new()
         .write(true)
@@ -515,7 +812,8 @@ fn backup(tar: &CommandSpec, output: &Path, max_bytes: u64) -> std::result::Resu
             sha256,
         },
     )
-    .map_err(|e| discard(Failure::internal(e)))
+    .map_err(|e| discard(Failure::internal(e)))?;
+    Ok(size_bytes)
 }
 
 fn restore(
@@ -524,25 +822,8 @@ fn restore(
     sha256: &str,
     size: u64,
 ) -> std::result::Result<(), Failure> {
-    let mut archive = OpenOptions::new()
-        .read(true)
-        .custom_flags(nix::fcntl::OFlag::O_NOFOLLOW.bits())
-        .open(input)
-        .map_err(|e| Failure::new(EXIT_INTEGRITY, Error::io("open", input, e).to_string()))?;
     // Verified in full before the archiver sees a single byte.
-    let (found_size, found_sha256) = copy_hashed(&mut archive, std::io::sink(), u64::MAX)
-        .map_err(|e| Failure::internal(format!("read {}: {e:?}", input.display())))?;
-    if found_size != size || found_sha256 != sha256 {
-        return Err(Failure::new(
-            EXIT_INTEGRITY,
-            format!(
-                "the archive is damaged: expected {size} bytes with SHA-256 {sha256}, found {found_size} bytes with {found_sha256}"
-            ),
-        ));
-    }
-    archive
-        .seek(SeekFrom::Start(0))
-        .map_err(|e| Failure::internal(Error::io("seek", input, e)))?;
+    let archive = open_verified(input, sha256, size)?;
     let mut child = spawn_streaming(tar, Stdio::from(archive), Stdio::piped(), Stdio::piped())
         .map_err(Failure::internal)?;
     // Standard output names every member; it is only counted (in a thread,
@@ -603,6 +884,11 @@ pub fn parse_restore_result(output: &str) -> Option<(u64, u64)> {
 /// What the in-memory fake OS leaves behind for a backup worker: a small
 /// placeholder archive with a truthful result file.
 pub fn write_fake_archive(output: &Path) -> Result<()> {
+    write_fake_member(output, KIND_HOME)
+}
+
+/// A placeholder member of `kind` with a truthful result file (fake OS).
+pub fn write_fake_member(output: &Path, kind: &str) -> Result<()> {
     const CONTENT: &[u8] = b"oxpanel dry-run archive\n";
     let mut file = File::create(output).map_err(|e| Error::io("create", output, e))?;
     let (size_bytes, sha256) = copy_hashed(CONTENT, &mut file, u64::MAX)
@@ -610,7 +896,7 @@ pub fn write_fake_archive(output: &Path) -> Result<()> {
     write_result(
         output,
         &MemberResult {
-            kind: KIND_HOME.to_owned(),
+            kind: kind.to_owned(),
             size_bytes,
             sha256,
         },
@@ -773,6 +1059,8 @@ mod tests {
             output: "/var/lib/oxpanel-backups/alice/b1731500000123/home.tar.gz".into(),
             max_bytes: 1 << 40,
             venvs: vec!["apps/api/.venv".into(), "apps/b/.venv".into()],
+            databases: vec!["alice_wp".into(), "alice_shop".into()],
+            socket: "/var/lib/mysql/mysql.sock".into(),
         };
         let restore = Task::Restore {
             uid: 20000,
@@ -799,6 +1087,10 @@ mod tests {
                 "1099511627776",
                 "--venvs",
                 "apps/api/.venv,apps/b/.venv",
+                "--databases",
+                "alice_wp,alice_shop",
+                "--socket",
+                "/var/lib/mysql/mysql.sock",
             ]
         );
         assert!(
@@ -811,9 +1103,42 @@ mod tests {
             output: "/b/home.tar.gz".into(),
             max_bytes: 1,
             venvs: Vec::new(),
+            databases: Vec::new(),
+            socket: "/s.sock".into(),
         };
-        assert!(strings(&no_venvs.to_args()).ends_with(&["--venvs".to_owned(), "-".to_owned()]));
-        for task in [backup, restore, no_venvs] {
+        assert!(strings(&no_venvs.to_args()).ends_with(&[
+            "--venvs".to_owned(),
+            "-".to_owned(),
+            "--databases".to_owned(),
+            "-".to_owned(),
+            "--socket".to_owned(),
+            "/s.sock".to_owned()
+        ]));
+        let restore_db = Task::RestoreDb {
+            input: "/var/lib/oxpanel-backups/alice/b1731500000123/db-alice_wp.sql.gz".into(),
+            sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad".into(),
+            size: 42,
+            socket: "/var/lib/mysql/mysql.sock".into(),
+            database: "alice_old".into(),
+        };
+        assert_eq!(
+            strings(&restore_db.to_args()),
+            vec![
+                "worker",
+                "restore-db",
+                "--input",
+                "/var/lib/oxpanel-backups/alice/b1731500000123/db-alice_wp.sql.gz",
+                "--sha256",
+                "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+                "--size",
+                "42",
+                "--socket",
+                "/var/lib/mysql/mysql.sock",
+                "--database",
+                "alice_old",
+            ]
+        );
+        for task in [backup, restore, no_venvs, restore_db] {
             assert_eq!(Task::parse(&strings(&task.to_args()))?, task);
         }
         Ok(())
@@ -835,6 +1160,10 @@ mod tests {
             "10",
             "--venvs",
             "apps/a/.venv",
+            "--databases",
+            "abc_wp,abc_shop",
+            "--socket",
+            "/var/lib/mysql/mysql.sock",
         ];
         let parse =
             |args: &[&str]| Task::parse(&args.iter().map(|a| (*a).to_owned()).collect::<Vec<_>>());
@@ -861,6 +1190,13 @@ mod tests {
             with(12, "/etc"),
             with(12, "a,,b"),
             with(12, "apps/a/.venv,x y"),
+            // Only valid database names, only an absolute socket path.
+            with(14, "abc_wp;DROP"),
+            with(14, "mysql"),
+            with(14, "abc_wp,,abc_x"),
+            with(14, "`abc_wp`"),
+            with(16, "mysql.sock"),
+            with(16, "/var/lib/../mysql.sock"),
         ] {
             assert!(parse(&bad).is_err(), "{bad:?}");
         }
@@ -910,6 +1246,75 @@ mod tests {
         for bad in ["", "merge", "KEEP"] {
             assert!(restore(bad).is_err(), "{bad:?}");
         }
+        let restore_db = |uid: Option<&'static str>, database: &'static str| {
+            let mut a = vec!["worker", "restore-db"];
+            a.extend(uid);
+            a.extend([
+                "--input",
+                "/b/db-abc_wp.sql.gz",
+                "--sha256",
+                "ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12ab12",
+                "--size",
+                "9",
+                "--socket",
+                "/var/lib/mysql/mysql.sock",
+                "--database",
+                database,
+            ]);
+            parse(&a)
+        };
+        assert!(restore_db(None, "abc_old").is_ok());
+        assert!(restore_db(Some("20000"), "abc_old").is_err(), "no uid in this mode");
+        for bad in ["mysql", "abc_old;DROP", "", "abc_old`"] {
+            assert!(restore_db(None, bad).is_err(), "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn dumps_and_loads_run_the_exact_programs_as_root_without_passwords() {
+        let socket = Path::new("/var/lib/mysql/mysql.sock");
+        let dump = mariadb_dump(socket, "alice_wp");
+        assert_eq!(dump.program, bin::MARIADB_DUMP);
+        assert_eq!(dump.run_as, None, "unix_socket authenticates root by being root");
+        assert_eq!(
+            strings(&dump.args),
+            vec![
+                "--no-defaults",
+                "--protocol=socket",
+                "--socket=/var/lib/mysql/mysql.sock",
+                "--user=root",
+                "--single-transaction",
+                "--quick",
+                "--skip-triggers",
+                "--hex-blob",
+                "--skip-comments",
+                "--skip-dump-date",
+                "--default-character-set=utf8mb4",
+                "--",
+                "alice_wp",
+            ]
+        );
+        assert!(!strings(&dump.args).iter().any(|a| a.contains("routines") || a.contains("events") || a.contains("password")));
+        let load = mariadb_load(socket, "alice_old");
+        assert_eq!((load.program, load.run_as), (bin::MARIADB, None));
+        assert_eq!(
+            strings(&load.args),
+            vec![
+                "--no-defaults",
+                "--protocol=socket",
+                "--socket=/var/lib/mysql/mysql.sock",
+                "--user=root",
+                "--batch",
+                "--binary-mode",
+                "--sandbox",
+                "--default-character-set=utf8mb4",
+                "--connect-timeout=10",
+                "--",
+                "alice_old",
+            ]
+        );
+        assert_eq!(strings(&gzip(false).args), vec!["--stdout"]);
+        assert_eq!(strings(&gzip(true).args), vec!["--decompress", "--stdout"]);
     }
 
     #[test]
@@ -1008,6 +1413,8 @@ mod tests {
                 output: archive.clone(),
                 max_bytes: max,
                 venvs: Vec::new(),
+                databases: Vec::new(),
+                socket: "/nonexistent.sock".into(),
             })
         };
         assert_eq!(run_backup(10).map_err(|f| f.code), Err(EXIT_TOO_LARGE));

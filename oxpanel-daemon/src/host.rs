@@ -53,6 +53,8 @@ pub enum DriftKind {
     BackupArchiveModified,
     OrphanBackupArchive,
     BackupIncomplete,
+    DatabaseTrashDrift,
+    OrphanDatabaseTrash,
 }
 
 /// One difference between a record and the operating system.
@@ -115,6 +117,8 @@ pub struct HostInfo {
     pub backup_disk_free_bytes: u64,
     /// Backups kept per tenant.
     pub backup_keep: u32,
+    /// Days a deleted database stays in the trash.
+    pub db_trash_days: u32,
     /// Per database engine: availability, version, databases and users.
     pub databases: Vec<crate::db::EngineFacts>,
     pub tls: TlsSupport,
@@ -161,6 +165,7 @@ impl HostService {
             backup_disk_total_bytes: backup_disk.disk_total_bytes,
             backup_disk_free_bytes: backup_disk.disk_free_bytes,
             backup_keep: cfg.backup_keep,
+            db_trash_days: cfg.db_trash_days,
             selinux: self.ctx.selinux,
             dry_run: cfg.dry_run,
             tenant_count: count(self.ctx.store.count_tenants()?),
@@ -725,7 +730,11 @@ fn check_backups(ctx: &Ctx, out: &mut Vec<Drift>) -> Result<()> {
         }
         check_backup_files(b, &dir, out)?;
     }
-    for j in jobs.iter().filter(|j| j.state == JobState::Running) {
+    // A tenant deletion without a final backup names no backup.
+    for j in jobs
+        .iter()
+        .filter(|j| j.state == JobState::Running && !j.backup_id.is_empty())
+    {
         if !backups.iter().any(|b| b.id == j.backup_id) {
             out.push(Drift::new(
                 DriftKind::BackupIncomplete,
@@ -1187,7 +1196,7 @@ mod tests {
         let cfg = &h.ctx.config;
         let backups = BackupService::new(h.ctx.clone())
             .with_poll_interval(std::time::Duration::from_secs(3600));
-        let (job, _) = backups.create("alice", 0).await?;
+        let (job, _) = backups.create("alice", 0, 0).await?;
         assert_eq!(
             h.host.reconcile().await?,
             vec![],
@@ -1212,7 +1221,7 @@ mod tests {
         let records = dir.join("records.json");
         std::fs::remove_file(&records).map_err(|e| Error::io("rm", &records, e))?;
         // A backup whose job record vanished while it was being written.
-        let (lost, _) = backups.create("foo-bar", 0).await?;
+        let (lost, _) = backups.create("foo-bar", 0, 0).await?;
         h.ctx.store.delete_job(&JobId::parse(&lost.id)?)?;
         // Directories nobody recorded.
         let stray_a = cfg.backup_dir.join("alice").join("b0000000000001");

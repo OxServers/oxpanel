@@ -420,6 +420,7 @@ impl From<LimitArgs> for pb::ResourceLimits {
             tasks_max: l.tasks_max,
             disk_max_bytes: l.disk,
             inodes_max: l.inodes,
+            db_trash_max_bytes: 0,
         }
     }
 }
@@ -753,6 +754,7 @@ async fn run_tenant(
                 .delete_tenant(pb::DeleteTenantRequest {
                     username,
                     remove_home,
+                    ..Default::default()
                 })
                 .await?
                 .into_inner();
@@ -1480,6 +1482,7 @@ async fn run_retained(
                     tenant,
                     backup_id,
                     retain_months: months,
+                    retain_days: 0,
                 })
                 .await?
                 .into_inner();
@@ -1532,6 +1535,7 @@ async fn run_backup(
                 .create_backup(pb::CreateBackupRequest {
                     tenant,
                     retain_months,
+                    retain_days: 0,
                 })
                 .await?
                 .into_inner();

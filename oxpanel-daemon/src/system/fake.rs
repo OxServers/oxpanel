@@ -325,6 +325,21 @@ impl FakeSystem {
         }
     }
 
+    /// The tables and objects of a schema on the emulated server (`None`
+    /// when it does not exist): `(tables, [(KIND, name, definer)])`.
+    pub fn mariadb_schema(&self, name: &str) -> Option<(Vec<String>, Vec<(String, String, String)>)> {
+        let i = self.inner.lock().ok()?;
+        let schema = i.mariadb.as_ref()?.schema(name)?;
+        Some((
+            schema.tables.into_iter().collect(),
+            schema
+                .objects
+                .into_iter()
+                .map(|((kind, name), o)| (kind, name, o.definer))
+                .collect(),
+        ))
+    }
+
     /// Every script the daemon sent to the MariaDB client, in order.
     pub fn mariadb_scripts(&self) -> Vec<String> {
         self.calls_to(bin::MARIADB)
@@ -662,9 +677,25 @@ fn emulate_job(i: &mut Inner, spec: &CommandSpec) -> Option<CommandOutput> {
         bin::SYSTEMD_RUN if has_flag(args, "worker") => {
             if has_flag(args, "backup") && !i.faults.worker_writes_nothing {
                 if let Some(path) = arg_value(args, "--output") {
-                    if let Err(e) = crate::worker::write_fake_archive(Path::new(&path)) {
+                    let path = Path::new(&path);
+                    let mut written = crate::worker::write_fake_archive(path);
+                    // One dump member per database, next to the archive.
+                    let databases = arg_value(args, "--databases").unwrap_or_default();
+                    for db in databases.split(',').filter(|d| !d.is_empty() && *d != "-") {
+                        let member = path.with_file_name(crate::worker::dump_member(db));
+                        written = written.and_then(|()| {
+                            crate::worker::write_fake_member(&member, crate::worker::KIND_MARIADB)
+                        });
+                    }
+                    if let Err(e) = written {
                         return Some(output(program, 1, "", &e.to_string()));
                     }
+                }
+            }
+            // A database restore "loads" one table into the new database.
+            if has_flag(args, "restore-db") {
+                if let (Some(db), Some(server)) = (arg_value(args, "--database"), i.mariadb.as_mut()) {
+                    let _ = server.execute(&format!("CREATE TABLE `{db}`.`from_dump` (a INT);\n"));
                 }
             }
             Some(output(program, 0, "", ""))

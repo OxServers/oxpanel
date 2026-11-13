@@ -44,11 +44,13 @@
 //! a state, so every request can be repeated after a crash.
 
 pub mod mariadb;
+pub mod objects;
+pub mod trash;
 
 use std::collections::{BTreeMap, BTreeSet};
 
 use mariadb::{sql, ServerState};
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::ctx::Ctx;
 use crate::error::{Error, Result};
@@ -253,40 +255,9 @@ impl DbService {
         let mut rec = if let Some(rec) = existing {
             rec
         } else {
-            // Never adopt a database OxPanel did not create.
-            if server.schemata.contains(name.as_str()) {
-                return Err(Error::DbNotManaged {
-                    kind: DATABASE,
-                    name: name.to_string(),
-                });
-            }
-            // Nor create one that someone else could already reach: a
-            // database-level grant is a pattern, and one written by hand
-            // (`test\_%`, `%`) would cover the new name the moment it exists.
-            let managed = managed_accounts(&self.ctx.store.list_db_users()?);
-            if let Some((grantee, pattern)) = foreign_reach(&server, &managed, name.as_str()) {
-                warn!(database = %name, %grantee, %pattern, "database refused: an unmanaged account's grant covers the name");
-                return Err(unusable(
-                    DATABASE,
-                    &name,
-                    "would be reachable by an account OxPanel does not manage (a database-level grant whose pattern covers the name; see the journal); remove that grant or choose another name",
-                ));
-            }
-            let max = self.ctx.config.db_max_databases;
-            let owned = self
-                .ctx
-                .store
-                .list_databases()?
-                .iter()
-                .filter(|d| d.tenant == tenant.as_str())
-                .count();
-            if owned >= usize::try_from(max).unwrap_or(usize::MAX) {
-                return Err(Error::DbLimitReached {
-                    tenant: tenant.to_string(),
-                    kind: DATABASE,
-                    max,
-                });
-            }
+            // Never adopt a database OxPanel did not create, nor create one
+            // that someone else could already reach (see `claimable`).
+            trash::claimable(&self.ctx, &server, &tenant, &name)?;
             let rec = DatabaseRecord {
                 version: RECORD_VERSION,
                 name: name.to_string(),
@@ -335,42 +306,6 @@ impl DbService {
                 (d, size)
             })
             .collect())
-    }
-
-    /// Drop a database OxPanel created, after taking it away from the users
-    /// that were granted it. Returns `false` if OxPanel has no such database.
-    pub async fn delete_database(&self, name: &str) -> Result<bool> {
-        let name = DbName::parse(name, "name")?;
-        let _guard = self.ctx.lock.lock().await;
-        let Some(mut rec) = self.ctx.store.load_database(&name)? else {
-            return Ok(false);
-        };
-        let server = mariadb::snapshot(&self.ctx).await?;
-        if rec.state != DbState::Deleting {
-            rec.state = DbState::Deleting;
-            self.ctx.store.save_database(&rec)?;
-        }
-        let mut holders = Vec::new();
-        let mut script = String::new();
-        for user in self.ctx.store.list_db_users()? {
-            if user.tenant != rec.tenant {
-                continue;
-            }
-            let user_name = DbName::parse(&user.name, "name")?;
-            script.push_str(&revoke_script(&server, &user_name, &name));
-            if user.grants.contains(&rec.name) {
-                holders.push(user);
-            }
-        }
-        script.push_str(&sql::drop_database(&name));
-        mariadb::execute(&self.ctx, script).await?;
-        for mut user in holders {
-            user.grants.retain(|g| g != &rec.name);
-            self.ctx.store.save_db_user(&user)?;
-        }
-        self.ctx.store.delete_database(&name)?;
-        info!(tenant = %rec.tenant, database = %name, "database dropped");
-        Ok(true)
     }
 
     /// Create a database user for a tenant. For a user that already exists
@@ -602,10 +537,11 @@ impl DbService {
     }
 }
 
-/// Whether the tenant still owns a database or a database user
-/// (`DeleteTenant` refuses while it does).
+/// Whether the tenant still owns a database, a database user or a deleted
+/// database in its trash (`DeleteTenant` refuses while it does).
 pub fn tenant_has_objects(ctx: &Ctx, tenant: &Username) -> Result<bool> {
-    Ok(ctx
+    Ok(trash::tenant_has_trash(ctx, tenant)?
+        || ctx
         .store
         .list_databases()?
         .iter()
@@ -674,11 +610,12 @@ pub async fn facts(ctx: &Ctx) -> Result<Vec<EngineFacts>> {
 pub async fn drifts(ctx: &Ctx, tenants: &[TenantRecord]) -> Result<Vec<Drift>> {
     let databases = ctx.store.list_databases()?;
     let users = ctx.store.list_db_users()?;
+    let trashed = ctx.store.list_trash()?;
     let server = match mariadb::snapshot(ctx).await {
         Ok(server) => server,
         Err(Error::DbUnavailable(why)) => {
             // A host without MariaDB and without database records is consistent.
-            if databases.is_empty() && users.is_empty() {
+            if databases.is_empty() && users.is_empty() && trashed.is_empty() {
                 return Ok(Vec::new());
             }
             return Ok(vec![Drift::new(
@@ -709,7 +646,29 @@ pub async fn drifts(ctx: &Ctx, tenants: &[TenantRecord]) -> Result<Vec<Drift>> {
         check_user(u, &server, &by_name, &mut out)?;
     }
     check_unrecorded(&databases, &users, &server, tenants, &mut out);
+    trash::drifts(&trashed, &server, tenants, &mut out);
+    check_trash_reach(&users, &server, &mut out);
     Ok(out)
+}
+
+/// Trash schemas are reachable by nobody but the server's administrators:
+/// an account OxPanel does not manage whose pattern grant covers one is
+/// reported (OxPanel's own accounts only hold exact, escaped names).
+fn check_trash_reach(users: &[DbUserRecord], server: &ServerState, out: &mut Vec<Drift>) {
+    let managed = managed_accounts(users);
+    for schema in server
+        .schemata
+        .iter()
+        .filter(|s| s.starts_with(crate::validate::TRASH_SCHEMA_PREFIX))
+    {
+        if let Some((grantee, pattern)) = foreign_reach(server, &managed, schema) {
+            out.push(Drift::new(
+                DriftKind::DatabasePrivilegeDrift,
+                schema.as_str(),
+                format!("{grantee}, an account OxPanel does not manage, can reach this deleted database (`{pattern}`)"),
+            ));
+        }
+    }
 }
 
 fn interrupted(state: DbState, create: &str, delete: &str) -> Option<String> {
@@ -999,12 +958,17 @@ mod tests {
             .collect()
     }
 
-    /// The scripts that changed something (everything but the state query).
+    /// The scripts that changed something (everything but the read-only
+    /// queries: state, sizes, object listings).
     fn mutations(h: &Harness) -> Vec<String> {
         h.sys
             .mariadb_scripts()
             .into_iter()
-            .filter(|s| s != mariadb::SNAPSHOT_SQL)
+            .filter(|s| {
+                s != mariadb::SNAPSHOT_SQL
+                    && !s.starts_with(mariadb::SIZES_SQL_PREFIX)
+                    && !s.starts_with(mariadb::OBJECTS_SQL_PREFIX)
+            })
             .collect()
     }
 
@@ -1148,7 +1112,7 @@ mod tests {
             Err(Error::DbNotManaged { .. })
         ));
         // No record, so "delete" finds nothing and touches nothing.
-        assert!(!h.db.delete_database("alice_legacy").await?);
+        assert_eq!(h.db.delete_database("alice_legacy").await?, trash::Deleted::NotFound);
         assert!(!h.db.delete_user("alice_legacy").await?);
         assert!(mutations(&h).is_empty());
         assert!(h.ctx.store.list_databases()?.is_empty());
@@ -1427,10 +1391,16 @@ mod tests {
         h.db.grant("alice_app", "alice_wp").await?;
         h.db.grant("alice_app", "alice_shop").await?;
         h.sys.clear_calls();
-        assert!(h.db.delete_database("alice_wp").await?);
+        let trash::Deleted::Trashed(t) = h.db.delete_database("alice_wp").await? else {
+            panic!("not trashed");
+        };
         assert_eq!(
             mutations(&h),
-            vec!["REVOKE ALL PRIVILEGES ON `alice\\_wp`.* FROM 'alice_app'@'localhost';\nDROP DATABASE IF EXISTS `alice_wp`;\n".to_owned()]
+            vec![
+                // The grant goes, and the sessions of its holder end with it.
+                "REVOKE ALL PRIVILEGES ON `alice\\_wp`.* FROM 'alice_app'@'localhost';\nKILL USER 'alice_app'@'localhost';\n".to_owned(),
+                format!("CREATE DATABASE IF NOT EXISTS `oxpanel_trash_{}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\nDROP DATABASE IF EXISTS `alice_wp`;\n", t.id),
+            ]
         );
         assert_eq!(
             h.db.list_users("alice")
@@ -1439,7 +1409,7 @@ mod tests {
                 .map(|u| u.grants.clone()),
             Some(vec!["alice_shop".to_owned()])
         );
-        assert!(!h.db.delete_database("alice_wp").await?);
+        assert_eq!(h.db.delete_database("alice_wp").await?, trash::Deleted::NotFound);
         assert_eq!(h.host.reconcile().await?, vec![]);
         Ok(())
     }
@@ -1529,7 +1499,10 @@ mod tests {
             h.db.create_database("alice", "alice_wp", MARIADB).await,
             Err(Error::DbObjectUnusable { .. })
         ));
-        assert!(h.db.delete_database("alice_wp").await?);
+        assert!(matches!(
+            h.db.delete_database("alice_wp").await?,
+            trash::Deleted::Trashed(_)
+        ));
         h.ctx.store.save_db_user(&DbUserRecord {
             state: DbState::Deleting,
             ..user
@@ -1598,6 +1571,12 @@ mod tests {
         ));
         h.db.delete_user("alice_app").await?;
         h.db.delete_user("alice_two").await?;
+        // The deleted database is in the trash: the tenant still owns it.
+        assert!(matches!(
+            h.tenants.delete("alice", true).await,
+            Err(Error::TenantHasDatabases(_))
+        ));
+        assert_eq!(h.db.purge_trash("alice", "").await?, 1);
         assert!(h.tenants.delete("alice", true).await?);
         // A tenant without database users never contacts MariaDB when suspended.
         h.sys.clear_calls();

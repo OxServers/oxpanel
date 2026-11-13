@@ -97,6 +97,14 @@ fn scope_table() -> BTreeMap<&'static str, Scope> {
         ("RetainBackup", Scope::Tenant),
         ("ListRetainedBackups", Scope::Read),
         ("RestoreRetainedBackup", Scope::Delete),
+        // Lifecycle: the database trash is the customer's (like deleting a
+        // database); restoring a database from a backup is like restoring
+        // files; from a deleted tenant's retained backup, the strongest scope.
+        ("ListDatabaseTrash", Scope::Read),
+        ("RestoreDatabaseTrash", Scope::VHost),
+        ("PurgeDatabaseTrash", Scope::VHost),
+        ("RestoreBackupDatabase", Scope::Tenant),
+        ("RestoreRetainedBackupDatabase", Scope::Delete),
     ]
     .into_iter()
     .collect()
@@ -471,6 +479,7 @@ async fn random_requests_never_panic_or_corrupt_state() {
                     tasks_max: u32::MAX,
                     disk_max_bytes: u64::MAX - (i as u64),
                     inodes_max: i as u64,
+                    ..Default::default()
                 }),
             }
             .encode_to_vec(),
@@ -499,6 +508,7 @@ async fn random_requests_never_panic_or_corrupt_state() {
             3 => pb::DeleteTenantRequest {
                 username: s(),
                 remove_home: true,
+                ..Default::default()
             }
             .encode_to_vec(),
             4 => pb::UpdateTenantOwnerRequest {
@@ -575,6 +585,7 @@ fn limits(memory_mib: u64) -> Option<pb::ResourceLimits> {
         tasks_max: 0,
         disk_max_bytes: 0,
         inodes_max: 0,
+        ..Default::default()
     })
 }
 
@@ -727,6 +738,7 @@ async fn concurrent_clients_neither_deadlock_nor_corrupt_state() {
                         .delete_tenant(pb::DeleteTenantRequest {
                             username: tenant,
                             remove_home: true,
+                            ..Default::default()
                         })
                         .await;
                 }

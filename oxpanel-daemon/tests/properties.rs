@@ -105,6 +105,7 @@ fn limits() -> impl Strategy<Value = Limits> {
                     tasks_max,
                     disk_max_bytes,
                     inodes_max,
+                    db_trash_max_bytes: None,
                 }
             },
         )

@@ -487,13 +487,28 @@ impl TenantService {
         }
         // Retained backups outlive the tenant, detached from its name.
         crate::backup::detach_retained(&self.ctx, &name)?;
+        self.remove_account(&rec, remove_home, None).await?;
+        Ok(true)
+    }
 
+    /// The end of every deletion: SFTP access, the uid's disk quota, the
+    /// account (and, with `remove_home`, its home), the slice units, the job
+    /// history (except `keep_job`, the deletion's own job) and the record.
+    /// The caller holds the mutation lock and has marked the record
+    /// `deleting`. Idempotent.
+    async fn remove_account(
+        &self,
+        rec: &TenantRecord,
+        remove_home: bool,
+        keep_job: Option<&crate::validate::JobId>,
+    ) -> Result<()> {
+        let name = Username::parse(&rec.username)?;
         let timeout = self.ctx.config.command_timeout;
         // SFTP first: the home must not be removed while it is still mounted
         // into the chroot directory, and userdel refuses an account that has
         // running sessions (`remove_access` ends them). The password and the
         // group memberships go with the account.
-        sftp::remove_access(&self.ctx, &rec, true).await?;
+        sftp::remove_access(&self.ctx, rec, true).await?;
         // The uid will be given to another tenant one day; not its limits.
         quota::clear(&self.ctx, rec.uid).await?;
         if self.ctx.sys.user_by_name(name.as_str()).await?.is_some() {
@@ -514,9 +529,48 @@ impl TenantService {
             timeout,
         )
         .await?;
-        crate::backup::forget_tenant_jobs(&self.ctx, &name)?;
+        crate::backup::forget_tenant_jobs(&self.ctx, &name, keep_job)?;
         self.ctx.store.delete_tenant(&name)?;
-        Ok(true)
+        Ok(())
+    }
+
+    /// Delete a tenant with everything it has, in this order: PHP and
+    /// applications stopped, every site removed (with its certificate,
+    /// Automatic HTTPS state, logs, PHP pool and application unit), SFTP
+    /// access, every database user, database and the database trash
+    /// (dropped at once), the backups that are not retained, then the
+    /// account with its home. Retained backups (a final one among them)
+    /// outlive it, detached from the name. Every step is idempotent and
+    /// driven by records, so repeating this after a crash completes it.
+    /// The caller (`lifecycle`) holds the mutation lock.
+    pub(crate) async fn remove_everything(
+        &self,
+        name: &Username,
+        job: &crate::validate::JobId,
+    ) -> Result<()> {
+        let Some(mut rec) = self.ctx.store.load_tenant(name)? else {
+            return Ok(());
+        };
+        if rec.state != TenantState::Deleting {
+            rec.state = TenantState::Deleting;
+            self.ctx.store.save_tenant(&rec)?;
+            info!(tenant = %name, "deleting the tenant with everything it has");
+        }
+        crate::backup::detach_retained(&self.ctx, name)?;
+        crate::php::set_running(&self.ctx, &rec, false).await?;
+        crate::app::set_running_all(&self.ctx, &rec, false).await?;
+        let vhosts = vhost::VHostService::new(self.ctx.clone());
+        for v in self.ctx.store.list_vhosts()? {
+            if v.tenant == rec.username {
+                vhosts
+                    .remove_locked(&crate::validate::Domain::parse(&v.domain)?)
+                    .await?;
+            }
+        }
+        sftp::remove_access(&self.ctx, &rec, true).await?;
+        crate::db::trash::drop_everything(&self.ctx, &rec).await?;
+        crate::backup::remove_unretained(&self.ctx, name)?;
+        self.remove_account(&rec, true, Some(job)).await
     }
 }
 
@@ -1165,7 +1219,7 @@ mod tests {
         db.create_user("alice", "alice_app", "db-password-123", DbEngine::Mariadb)
             .await?;
         db.grant("alice_app", "alice_wp").await?;
-        let (job, started) = backups.create("alice", 0).await?;
+        let (job, started) = backups.create("alice", 0, 0).await?;
         assert!(started);
         assert!(
             backups
@@ -1309,9 +1363,13 @@ mod tests {
                 .await?;
             self.db.delete_user("alice_app").await?;
             self.db.delete_database("alice_wp").await?;
+            // The deleted database waits in the trash: still refused.
+            self.refused(|e| matches!(e, Error::TenantHasDatabases(_)))
+                .await?;
+            assert_eq!(self.db.purge_trash("alice", "").await?, 1);
             self.refused(|e| matches!(e, Error::TenantHasBackups(_)))
                 .await?;
-            self.backups.retain("alice", &self.backup_id, 1).await?;
+            self.backups.retain("alice", &self.backup_id, 1, 0).await?;
             self.sys.clear_calls();
             assert!(self.tenants.delete("alice", true).await?);
             let calls = argvs(&self.sys);

@@ -359,7 +359,7 @@ impl ServerState {
 }
 
 /// Undo the escaping of the client's `--batch` output.
-fn unescape(field: &str) -> String {
+pub(crate) fn unescape(field: &str) -> String {
     let mut out = String::with_capacity(field.len());
     let mut chars = field.chars();
     while let Some(c) = chars.next() {
@@ -461,6 +461,11 @@ pub async fn execute_secret(ctx: &Ctx, script: String) -> Result<()> {
     run(ctx, script, true).await.map(|_| ())
 }
 
+/// The tables and stored objects of `schema` (read-only).
+pub async fn objects(ctx: &Ctx, schema: &Schema) -> Result<SchemaObjects> {
+    parse_objects(&run(ctx, objects_sql(schema), false).await?)
+}
+
 /// Read the server state. Fails with [`Error::DbUnavailable`] — before the
 /// caller has changed anything — when MariaDB cannot be used.
 pub async fn snapshot(ctx: &Ctx) -> Result<ServerState> {
@@ -482,12 +487,262 @@ pub async fn snapshot(ctx: &Ctx) -> Result<ServerState> {
     Ok(state)
 }
 
+/// The hardened client for scripts that carry names or text a tenant chose
+/// (table and object names, object definitions): `--binary-mode` turns off
+/// the client's backslash commands (`\g`, `\!`, `\.` …) and `--sandbox`
+/// every command that touches the file system. See `db::objects` for why.
+fn hardened_client(ctx: &Ctx) -> Result<CommandSpec> {
+    Ok(client(ctx)?.args(["--binary-mode", "--sandbox"]))
+}
+
+/// Run a script through the hardened client; returns standard output.
+pub async fn run_hardened(ctx: &Ctx, script: String) -> Result<String> {
+    if !ctx.sys.is_installed(bin::MARIADB).await {
+        return Err(Error::DbUnavailable(
+            "MariaDB is not installed (dnf install mariadb-server)".into(),
+        ));
+    }
+    let out = ctx
+        .sys
+        .run(hardened_client(ctx)?.stdin(script.into_bytes()))
+        .await?;
+    if out.success() {
+        return Ok(String::from_utf8_lossy(&out.stdout).into_owned());
+    }
+    let stderr = out.stderr_lossy();
+    if stderr.contains("ERROR 2002") {
+        return Err(Error::DbUnavailable(format!(
+            "MariaDB is not running or does not listen on {}",
+            ctx.config.mariadb_socket.display()
+        )));
+    }
+    Err(Error::CommandFailed {
+        program: bin::MARIADB.to_owned(),
+        status: out
+            .code
+            .map_or_else(|| "signal".to_owned(), |c| format!("status {c}")),
+        stderr: server_errors(&stderr, false),
+    })
+}
+
+/// A schema the daemon may name in a statement: a tenant database or a
+/// trash schema. Both consist of `a-z 0-9 _ -` only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Schema(String);
+
+impl Schema {
+    pub fn of_db(name: &DbName) -> Self {
+        Self(name.as_str().to_owned())
+    }
+
+    pub fn of_trash(id: &crate::validate::TrashId) -> Self {
+        Self(id.schema())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// `` `name` `` for a name a tenant chose (a table, a trigger …): back-quoted
+/// with back-quotes doubled, which is all the grammar asks inside an
+/// identifier. Only ever sent through the hardened client.
+pub fn quote(name: &str) -> String {
+    format!("`{}`", name.replace('`', "``"))
+}
+
+/// `CONVERT(X'…' USING utf8mb4)`: text a tenant wrote, as a hex literal the
+/// client never tokenises.
+pub fn hex_text(text: &str) -> String {
+    let mut s = String::with_capacity(text.len() * 2 + 26);
+    s.push_str("CONVERT(X'");
+    for b in text.bytes() {
+        let _ = write!(s, "{b:02X}");
+    }
+    s.push_str("' USING utf8mb4)");
+    s
+}
+
+/// Start of the query that lists a schema's tables and stored objects.
+pub const OBJECTS_SQL_PREFIX: &str = "SELECT 'table', HEX(TABLE_NAME), HEX(TABLE_TYPE) FROM information_schema.TABLES WHERE TABLE_SCHEMA = '";
+
+/// Tables (anything but views) and views, triggers, routines and events of
+/// `schema`, with names and definers in hexadecimal so that no name can
+/// disturb the output.
+pub fn objects_sql(schema: &Schema) -> String {
+    let s = schema.as_str();
+    format!(
+        "{OBJECTS_SQL_PREFIX}{s}' AND TABLE_TYPE <> 'VIEW' ORDER BY TABLE_NAME;
+SELECT 'view', HEX(TABLE_NAME), HEX(DEFINER) FROM information_schema.VIEWS WHERE TABLE_SCHEMA = '{s}' ORDER BY TABLE_NAME;
+SELECT 'trigger', HEX(TRIGGER_NAME), HEX(DEFINER) FROM information_schema.TRIGGERS WHERE TRIGGER_SCHEMA = '{s}' ORDER BY TRIGGER_NAME;
+SELECT LOWER(ROUTINE_TYPE), HEX(ROUTINE_NAME), HEX(DEFINER) FROM information_schema.ROUTINES WHERE ROUTINE_SCHEMA = '{s}' ORDER BY ROUTINE_TYPE, ROUTINE_NAME;
+SELECT 'event', HEX(EVENT_NAME), HEX(DEFINER) FROM information_schema.EVENTS WHERE EVENT_SCHEMA = '{s}' ORDER BY EVENT_NAME;
+"
+    )
+}
+
+/// One object of a schema as listed by [`objects_sql`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Listed {
+    pub kind: crate::records::DbObjectKind,
+    pub name: String,
+    /// `user@host`.
+    pub definer: String,
+}
+
+/// What a schema holds.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SchemaObjects {
+    /// Base tables (and sequences, system-versioned tables …), by name.
+    pub tables: Vec<String>,
+    /// Views, triggers, routines and events.
+    pub objects: Vec<Listed>,
+}
+
+impl SchemaObjects {
+    pub fn of_kind(&self, kind: crate::records::DbObjectKind) -> impl Iterator<Item = &Listed> {
+        self.objects.iter().filter(move |o| o.kind == kind)
+    }
+}
+
+fn unhex(field: &str) -> Result<String> {
+    let bytes = field.as_bytes();
+    if bytes.len() % 2 != 0 {
+        return Err(Error::Internal(format!("not hexadecimal: '{field}'")));
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    for pair in bytes.chunks(2) {
+        let text = std::str::from_utf8(pair).unwrap_or("zz");
+        out.push(
+            u8::from_str_radix(text, 16)
+                .map_err(|_| Error::Internal(format!("not hexadecimal: '{field}'")))?,
+        );
+    }
+    let text = String::from_utf8(out)
+        .map_err(|_| Error::Internal("a name on the server is not UTF-8".into()))?;
+    if text.contains('\0') {
+        return Err(Error::Internal("a name on the server contains NUL".into()));
+    }
+    Ok(text)
+}
+
+/// Parse the output of [`objects_sql`]. A kind of object OxPanel cannot keep
+/// (Oracle-mode packages) is an error: nothing may be lost silently.
+pub fn parse_objects(text: &str) -> Result<SchemaObjects> {
+    use crate::records::DbObjectKind as K;
+    let mut out = SchemaObjects::default();
+    for line in text.lines().filter(|l| !l.is_empty()) {
+        let cols: Vec<&str> = line.split('\t').collect();
+        let (Some(tag), Some(name), Some(third)) = (cols.first(), cols.get(1), cols.get(2)) else {
+            return Err(Error::Internal(format!("unexpected object row '{line}'")));
+        };
+        let name = unhex(name)?;
+        let kind = match *tag {
+            "table" => {
+                out.tables.push(name);
+                continue;
+            }
+            "view" => K::View,
+            "trigger" => K::Trigger,
+            "procedure" => K::Procedure,
+            "function" => K::Function,
+            "event" => K::Event,
+            other => {
+                return Err(Error::Internal(format!(
+                    "the database holds a {other} ('{name}'), which OxPanel cannot keep; drop it first"
+                )))
+            }
+        };
+        out.objects.push(Listed {
+            kind,
+            name,
+            definer: unhex(third)?,
+        });
+    }
+    Ok(out)
+}
+
+/// The statements that move, restore and re-create a database's content.
+/// Every one of them names tenant-chosen things and is only ever sent
+/// through [`run_hardened`].
+pub mod content {
+    use super::{hex_text, quote, Schema};
+    use crate::records::DbObjectKind;
+
+    /// `SHOW CREATE …` of each object, after `USE`: views come out without
+    /// the database name, so they can be re-created under another one.
+    pub fn show_create(schema: &Schema, objects: &[(DbObjectKind, String)]) -> String {
+        let mut s = format!("USE `{}`;\n", schema.as_str());
+        for (kind, name) in objects {
+            s.push_str(&format!("SHOW CREATE {} {};\n", kind.keyword(), quote(name)));
+        }
+        s
+    }
+
+    pub fn create_schema(schema: &Schema) -> String {
+        format!(
+            "CREATE DATABASE IF NOT EXISTS `{}` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;\n",
+            schema.as_str()
+        )
+    }
+
+    pub fn drop_schema(schema: &Schema) -> String {
+        format!("DROP DATABASE IF EXISTS `{}`;\n", schema.as_str())
+    }
+
+    pub fn drop_object(schema: &Schema, kind: DbObjectKind, name: &str) -> String {
+        format!(
+            "DROP {} IF EXISTS `{}`.{};\n",
+            kind.keyword(),
+            schema.as_str(),
+            quote(name)
+        )
+    }
+
+    /// All tables from one schema to another in **one** statement (atomic).
+    /// Empty when there are none.
+    pub fn rename_tables(from: &Schema, to: &Schema, tables: &[String]) -> String {
+        if tables.is_empty() {
+            return String::new();
+        }
+        let pairs: Vec<String> = tables
+            .iter()
+            .map(|t| {
+                format!(
+                    "`{}`.{} TO `{}`.{}",
+                    from.as_str(),
+                    quote(t),
+                    to.as_str(),
+                    quote(t)
+                )
+            })
+            .collect();
+        format!("RENAME TABLE {};\n", pairs.join(", "))
+    }
+
+    /// A view is re-created from a hex literal through a prepared statement:
+    /// its text never meets the client's parser.
+    pub fn create_view(schema: &Schema, definition: &str) -> String {
+        format!(
+            "USE `{}`;\nEXECUTE IMMEDIATE {};\n",
+            schema.as_str(),
+            hex_text(definition)
+        )
+    }
+}
+
 /// Data plus index bytes of each of `names` that has tables.
 pub async fn sizes(ctx: &Ctx, names: &[DbName]) -> Result<BTreeMap<String, u64>> {
-    if names.is_empty() {
+    let schemas: Vec<Schema> = names.iter().map(Schema::of_db).collect();
+    schema_sizes(ctx, &schemas).await
+}
+
+/// Data plus index bytes of each of `schemas` that has tables.
+pub async fn schema_sizes(ctx: &Ctx, schemas: &[Schema]) -> Result<BTreeMap<String, u64>> {
+    if schemas.is_empty() {
         return Ok(BTreeMap::new());
     }
-    let list: Vec<String> = names
+    let list: Vec<String> = schemas
         .iter()
         .map(|n| format!("'{}'", n.as_str().replace('\'', "''")))
         .collect();
