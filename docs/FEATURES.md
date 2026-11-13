@@ -123,7 +123,7 @@ Port 443 (and 80, for HTTP-01) must be opened in the firewall by the operator; O
 
 - Rust, `#![forbid(unsafe_code)]`, clippy pedantic with warnings as errors, no `unwrap`/`expect`/`panic` in production paths.
 - No shell anywhere: every external program is an absolute path with an argv array; the only module that spawns processes is `system/real.rs`.
-- Tests: 130 unit tests of the daemon (exact argv assertions against a fake OS) and 9 of the ACME client, 8 end-to-end gRPC tests over a real UNIX socket, a 327-check root integration suite in an AlmaLinux 9 systemd container (including HTTPS with OpenSSL-made certificates, and ACME, Automatic HTTPS and External Account Binding end to end against a local Pebble test CA), and `make acceptance`: ≈455 checks on a real AlmaLinux 9 VM with SELinux enforcing (install from git or RPM, SELinux labels and zero AVC denials, sandbox namespaces, restart/kill/resume, reboot, soak). `cargo-deny` for advisories/licences/bans.
+- Tests: 130 unit tests of the daemon (exact argv assertions against a fake OS) and 9 of the ACME client, 8 end-to-end gRPC tests over a real UNIX socket, a 327-check root integration suite in an AlmaLinux 9 systemd container (including HTTPS with OpenSSL-made certificates, and ACME, Automatic HTTPS and External Account Binding end to end against a local Pebble test CA), and `make acceptance`: ≈483 checks on a real AlmaLinux 9 VM with SELinux enforcing (install from git or RPM, SELinux labels and zero AVC denials, sandbox namespaces, restart/kill/resume, reboot, soak). `cargo-deny` for advisories/licences/bans.
 - Builds without a system `protoc` (pure-Rust `protox`) and without a host toolchain (everything runs in the AlmaLinux 9 container).
 
 ## Not yet included
