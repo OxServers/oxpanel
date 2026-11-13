@@ -29,6 +29,12 @@ struct Inner {
     missing: Vec<&'static str>,
     /// What `node --version` prints; `None` = a supported version.
     node_version: Option<String>,
+    /// Scripted standard output, consumed in order per program.
+    scripted_stdout: BTreeMap<&'static str, VecDeque<String>>,
+    /// Free space reported by `host_stats`; `None` = 80 GiB.
+    disk_free_bytes: Option<u64>,
+    /// Backup workers leave no archive behind (as if they had failed).
+    worker_writes_nothing: bool,
 }
 
 #[derive(Debug, Default)]
@@ -98,6 +104,31 @@ impl FakeSystem {
         }
     }
 
+    /// Make the next invocation of `program` succeed and print `stdout`.
+    pub fn script_stdout(&self, program: &'static str, stdout: &str) {
+        if let Ok(mut i) = self.inner.lock() {
+            i.scripted_stdout
+                .entry(program)
+                .or_default()
+                .push_back(stdout.to_owned());
+        }
+    }
+
+    /// Free space `host_stats` reports for every file system.
+    pub fn set_disk_free(&self, bytes: u64) {
+        if let Ok(mut i) = self.inner.lock() {
+            i.disk_free_bytes = Some(bytes);
+        }
+    }
+
+    /// Whether the fake backup worker writes its archive (default) or leaves
+    /// nothing behind, as a worker that failed or was killed would.
+    pub fn set_worker_writes_nothing(&self, on: bool) {
+        if let Ok(mut i) = self.inner.lock() {
+            i.worker_writes_nothing = on;
+        }
+    }
+
     /// Forget recorded commands (tests call this after harness setup).
     pub fn clear_calls(&self) {
         if let Ok(mut i) = self.inner.lock() {
@@ -154,6 +185,39 @@ fn output(program: &'static str, code: i32, stdout: &str, stderr: &str) -> Comma
     }
 }
 
+/// Scripted standard output, and the transient units of backup and restore
+/// jobs: the worker "runs" at once, a backup leaves a small archive with its
+/// result file like the real one, and the unit reports success afterwards.
+fn emulate_job(i: &mut Inner, spec: &CommandSpec) -> Option<CommandOutput> {
+    let (program, args) = (spec.program, &spec.args);
+    if let Some(stdout) = i
+        .scripted_stdout
+        .get_mut(program)
+        .and_then(VecDeque::pop_front)
+    {
+        return Some(output(program, 0, &stdout, ""));
+    }
+    match program {
+        bin::SYSTEMD_RUN if has_flag(args, "worker") => {
+            if has_flag(args, "backup") && !i.worker_writes_nothing {
+                if let Some(path) = arg_value(args, "--output") {
+                    if let Err(e) = crate::worker::write_fake_archive(Path::new(&path)) {
+                        return Some(output(program, 1, "", &e.to_string()));
+                    }
+                }
+            }
+            Some(output(program, 0, "", ""))
+        }
+        bin::SYSTEMCTL if has_flag(args, "--property=ActiveState") => Some(output(
+            program,
+            0,
+            "LoadState=loaded\nActiveState=active\nSubState=exited\nResult=success\nExecMainStatus=0\n",
+            "",
+        )),
+        _ => None,
+    }
+}
+
 fn create_private_dir(path: &Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(path)?;
@@ -171,6 +235,9 @@ impl System for FakeSystem {
             .and_then(VecDeque::pop_front)
         {
             return Ok(output(spec.program, code, "", &stderr));
+        }
+        if let Some(out) = emulate_job(&mut i, &spec) {
+            return Ok(out);
         }
         let args = &spec.args;
         let program = spec.program;
@@ -316,13 +383,14 @@ impl System for FakeSystem {
     }
 
     async fn host_stats(&self, _path: &Path) -> Result<HostStats> {
+        let free = self.lock()?.disk_free_bytes.unwrap_or(80 << 30);
         Ok(HostStats {
             load: (0.25, 0.5, 0.75),
             memory_total_bytes: 8 << 30,
             memory_free_bytes: 6 << 30,
             uptime_secs: 3600,
             disk_total_bytes: 100 << 30,
-            disk_free_bytes: 80 << 30,
+            disk_free_bytes: free,
         })
     }
 }

@@ -10,15 +10,16 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use crate::app;
+use crate::backup;
 use crate::config::Config;
 use crate::ctx::Ctx;
 use crate::error::Result;
 use crate::fsutil;
 use crate::php::{self, PoolFiles};
-use crate::records::{TenantRecord, TenantState, VHostRecord};
+use crate::records::{BackupRecord, BackupState, JobState, TenantRecord, TenantState, VHostRecord};
 use crate::system::{bin, HostStats};
 use crate::systemd::{self, TenantUnits};
-use crate::validate::{Domain, Username};
+use crate::validate::{BackupId, Domain, Username};
 use crate::vhost;
 
 /// What kind of difference a [`Drift`] describes.
@@ -37,6 +38,10 @@ pub enum DriftKind {
     OrphanPhpPool,
     AppUnitDrift,
     OrphanAppUnit,
+    BackupArchiveMissing,
+    BackupArchiveModified,
+    OrphanBackupArchive,
+    BackupIncomplete,
 }
 
 /// One difference between a record and the operating system.
@@ -79,6 +84,12 @@ pub struct HostInfo {
     /// Installed Node.js version; empty if none.
     pub node_version: String,
     pub stats: HostStats,
+    /// Size and free space of the file system holding backups (0 if the
+    /// backup directory does not exist yet).
+    pub backup_disk_total_bytes: u64,
+    pub backup_disk_free_bytes: u64,
+    /// Backups kept per tenant.
+    pub backup_keep: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -97,7 +108,16 @@ impl HostService {
         let node_version = app::node_version(&self.ctx).await?.unwrap_or_default();
         let node_usable =
             app::major_of(&node_version).is_some_and(|major| major >= app::MIN_NODE_MAJOR);
+        let backup_disk = self
+            .ctx
+            .sys
+            .host_stats(&cfg.backup_dir)
+            .await
+            .unwrap_or_default();
         Ok(HostInfo {
+            backup_disk_total_bytes: backup_disk.disk_total_bytes,
+            backup_disk_free_bytes: backup_disk.disk_free_bytes,
+            backup_keep: cfg.backup_keep,
             selinux: self.ctx.selinux,
             dry_run: cfg.dry_run,
             tenant_count: count(self.ctx.store.list_tenants()?.len()),
@@ -161,6 +181,7 @@ impl HostService {
         }
         check_php_pools(cfg, &tenants, &vhosts, &mut out)?;
         check_apps(cfg, self.ctx.selinux, &by_name, &vhosts, &mut out)?;
+        check_backups(&self.ctx, &mut out)?;
         Ok(out)
     }
 
@@ -354,6 +375,119 @@ fn check_apps(
     Ok(())
 }
 
+/// Backups: every record has its directory, manifest and members (at their
+/// recorded sizes — checksums are verified when a backup is restored, not on
+/// every reconciliation), and every directory in the store has a record.
+fn check_backups(ctx: &Ctx, out: &mut Vec<Drift>) -> Result<()> {
+    let backup_dir = &ctx.config.backup_dir;
+    let backups = ctx.store.list_backups()?;
+    let jobs = ctx.store.list_jobs()?;
+    let in_flight: BTreeSet<&str> = jobs
+        .iter()
+        .filter(|j| j.state == JobState::Running)
+        .map(|j| j.backup_id.as_str())
+        .collect();
+    let mut known: BTreeSet<PathBuf> = BTreeSet::new();
+    for b in &backups {
+        let dir = backup::backup_path(
+            backup_dir,
+            &Username::parse_field(&b.tenant, "tenant")?,
+            &BackupId::parse(&b.id)?,
+        );
+        known.insert(dir.clone());
+        if b.state != BackupState::Ready {
+            if !in_flight.contains(b.id.as_str()) {
+                out.push(Drift::new(
+                    DriftKind::BackupIncomplete,
+                    b.id.as_str(),
+                    format!(
+                        "backup of tenant '{}' was never completed and no job is writing it; delete it",
+                        b.tenant
+                    ),
+                ));
+            }
+            continue;
+        }
+        check_backup_files(b, &dir, out)?;
+    }
+    for j in jobs.iter().filter(|j| j.state == JobState::Running) {
+        if !backups.iter().any(|b| b.id == j.backup_id) {
+            out.push(Drift::new(
+                DriftKind::BackupIncomplete,
+                j.id.as_str(),
+                format!(
+                    "job is recorded as running for tenant '{}' but backup {} has no record",
+                    j.tenant, j.backup_id
+                ),
+            ));
+        }
+    }
+    for tenant in fsutil::list_dirs(backup_dir)? {
+        let tenant_dir = backup_dir.join(&tenant);
+        for id in fsutil::list_dirs(&tenant_dir)? {
+            let dir = tenant_dir.join(&id);
+            if !known.contains(&dir) {
+                out.push(Drift::new(
+                    DriftKind::OrphanBackupArchive,
+                    dir.to_string_lossy(),
+                    "no backup record refers to this directory",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The files of one sealed backup against its record.
+fn check_backup_files(b: &BackupRecord, dir: &Path, out: &mut Vec<Drift>) -> Result<()> {
+    let subject = b.id.as_str();
+    if !dir.is_dir() {
+        out.push(Drift::new(
+            DriftKind::BackupArchiveMissing,
+            subject,
+            format!("{} is missing", dir.display()),
+        ));
+        return Ok(());
+    }
+    let manifest = dir.join(backup::MANIFEST);
+    match fsutil::read_optional(&manifest)? {
+        None => out.push(Drift::new(
+            DriftKind::BackupArchiveMissing,
+            subject,
+            format!("{} is missing", manifest.display()),
+        )),
+        Some(bytes) if bytes != backup::render_manifest(b)? => out.push(Drift::new(
+            DriftKind::BackupArchiveModified,
+            subject,
+            format!("{} differs from the record", manifest.display()),
+        )),
+        Some(_) => {}
+    }
+    for m in &b.members {
+        let path = dir.join(&m.name);
+        match std::fs::symlink_metadata(&path) {
+            Ok(md) if md.is_file() && md.len() == m.size_bytes => {}
+            Ok(md) => out.push(Drift::new(
+                DriftKind::BackupArchiveModified,
+                subject,
+                format!(
+                    "{} is {} bytes, the record says {}",
+                    path.display(),
+                    md.len(),
+                    m.size_bytes
+                ),
+            )),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => out.push(Drift::new(
+                DriftKind::BackupArchiveMissing,
+                subject,
+                format!("{} is missing", path.display()),
+            )),
+            Err(e) => return Err(crate::Error::io("lstat", &path, e)),
+        }
+    }
+    Ok(())
+}
+
 /// `None` when the file holds exactly `expected`.
 fn compare_file(path: &Path, expected: &str) -> Result<Option<&'static str>> {
     Ok(match fsutil::read_optional(path)? {
@@ -389,6 +523,7 @@ mod tests {
         let mut cfg = Config::default();
         cfg.state_dir = dir.path().join("state");
         cfg.home_base = dir.path().join("home");
+        cfg.backup_dir = dir.path().join("backups");
         cfg.systemd_unit_dir = dir.path().join("systemd");
         cfg.nginx_log_dir = dir.path().join("log");
         cfg.php_conf_dir = dir.path().join("php");
@@ -688,6 +823,77 @@ mod tests {
             vec![(DriftKind::OrphanAppUnit, stray.as_str())],
             "repeating the request rewrites the unit"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn reports_backup_drift_and_orphans() -> Result<()> {
+        use crate::backup::BackupService;
+        use crate::validate::JobId;
+        let h = harness().await;
+        let cfg = &h.ctx.config;
+        let backups = BackupService::new(h.ctx.clone())
+            .with_poll_interval(std::time::Duration::from_secs(3600));
+        let (job, _) = backups.create("alice").await?;
+        assert_eq!(
+            h.host.reconcile().await?,
+            vec![],
+            "a backup in flight is not drift"
+        );
+        assert!(backups.step(&JobId::parse(&job.id)?).await?);
+        assert_eq!(
+            h.host.reconcile().await?,
+            vec![],
+            "a sealed backup is not drift"
+        );
+        let info = h.host.info().await?;
+        assert_eq!(info.backup_keep, 7);
+        assert!(info.backup_disk_free_bytes > 0);
+
+        // The archive grew behind the daemon's back; a member disappeared.
+        let dir = cfg.backup_dir.join("alice").join(&job.backup_id);
+        let archive = dir.join("home.tar.gz");
+        let mut grown = std::fs::read(&archive).map_err(|e| Error::io("read", &archive, e))?;
+        grown.extend_from_slice(b"appended");
+        std::fs::write(&archive, grown).map_err(|e| Error::io("write", &archive, e))?;
+        let records = dir.join("records.json");
+        std::fs::remove_file(&records).map_err(|e| Error::io("rm", &records, e))?;
+        // A backup whose job record vanished while it was being written.
+        let (lost, _) = backups.create("foo-bar").await?;
+        h.ctx.store.delete_job(&JobId::parse(&lost.id)?)?;
+        // Directories nobody recorded.
+        let stray_a = cfg.backup_dir.join("alice").join("b0000000000001");
+        let stray_b = cfg.backup_dir.join("ghost").join("b0000000000002");
+        for d in [&stray_a, &stray_b] {
+            std::fs::create_dir_all(d).map_err(|e| Error::io("mkdir", d, e))?;
+        }
+        let (stray_a, stray_b) = (
+            stray_a.to_string_lossy().into_owned(),
+            stray_b.to_string_lossy().into_owned(),
+        );
+        let drifts = h.host.reconcile().await?;
+        assert_eq!(
+            kinds(&drifts),
+            vec![
+                (DriftKind::BackupArchiveModified, job.backup_id.as_str()),
+                (DriftKind::BackupArchiveMissing, job.backup_id.as_str()),
+                (DriftKind::BackupIncomplete, lost.backup_id.as_str()),
+                (DriftKind::OrphanBackupArchive, stray_a.as_str()),
+                (DriftKind::OrphanBackupArchive, stray_b.as_str()),
+            ]
+        );
+        // Deleting through the API heals what belongs to records; orphans
+        // are reported, never removed.
+        assert!(backups.delete("alice", &job.backup_id).await?);
+        assert!(backups.delete("foo-bar", &lost.backup_id).await?);
+        assert_eq!(
+            kinds(&h.host.reconcile().await?),
+            vec![
+                (DriftKind::OrphanBackupArchive, stray_a.as_str()),
+                (DriftKind::OrphanBackupArchive, stray_b.as_str()),
+            ]
+        );
+        assert!(std::path::Path::new(&stray_a).is_dir());
         Ok(())
     }
 

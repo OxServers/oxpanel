@@ -53,6 +53,22 @@ service OxPanelEngine {
   // Compare every record with the operating system and report differences.
   // Read-only: nothing is repaired.
   rpc Reconcile(ReconcileRequest) returns (ReconcileResponse);
+
+  // Start a backup of a tenant (its home, plus the engine's records of the
+  // tenant and its virtual hosts). Returns at once with a job; the work runs
+  // outside the request and survives a restart of the engine. While a backup
+  // of the tenant is already running, that job is returned instead of a
+  // second one being started.
+  rpc CreateBackup(CreateBackupRequest) returns (StartJobResponse);
+  rpc ListBackups(ListBackupsRequest) returns (ListBackupsResponse);
+  rpc DeleteBackup(DeleteBackupRequest) returns (DeleteBackupResponse);
+  // Restore a tenant's files from one of that tenant's own backups, over the
+  // current content of its home: what is in the backup replaces what is
+  // there, files that are not in the backup are kept. PHP and applications of
+  // the tenant are stopped for the duration. Returns at once with a job.
+  rpc RestoreBackup(RestoreBackupRequest) returns (StartJobResponse);
+  // State of a backup or restore job.
+  rpc GetJob(GetJobRequest) returns (Job);
 }
 
 // Per-tenant resource limits, applied through systemd (cgroups v2).
@@ -286,6 +302,11 @@ message HostInfo {
   // Installed Node.js version, e.g. "22.11.0"; empty if none. A version
   // older than 22 is reported here while `node_available` stays false.
   string node_version = 19;
+  // The file system that holds backups (0 if the directory does not exist).
+  uint64 backup_disk_total_bytes = 32;
+  uint64 backup_disk_free_bytes = 33;
+  // Backups kept per tenant; older ones are removed when a new one completes.
+  uint32 backup_keep = 34;
 }
 
 message ReconcileRequest {}
@@ -319,6 +340,16 @@ enum DriftKind {
   DRIFT_KIND_APP_UNIT_DRIFT = 12;
   // An oxpanel-app-*.service unit that no virtual host accounts for.
   DRIFT_KIND_ORPHAN_APP_UNIT = 13;
+  // A backup record whose directory, manifest or a member is missing.
+  DRIFT_KIND_BACKUP_ARCHIVE_MISSING = 26;
+  // A member of a backup no longer has its recorded size, or the manifest
+  // differs from the record. (Checksums are verified at restore, not here.)
+  DRIFT_KIND_BACKUP_ARCHIVE_MODIFIED = 27;
+  // A directory in the backup store that no backup record accounts for.
+  DRIFT_KIND_ORPHAN_BACKUP_ARCHIVE = 28;
+  // A backup that was never completed and has no running job, or a job
+  // recorded as running whose backup or tenant is gone.
+  DRIFT_KIND_BACKUP_INCOMPLETE = 29;
 }
 
 message Drift {
@@ -372,4 +403,111 @@ message InstallAppDependenciesResponse {
   bool succeeded = 1;
   // The end of the installer's output.
   string output = 2;
+}
+
+enum BackupState {
+  BACKUP_STATE_UNSPECIFIED = 0;
+  // The job writing it is still running. Not restorable yet.
+  BACKUP_STATE_CREATING = 1;
+  // Complete: every member is stored with its size and checksum.
+  BACKUP_STATE_READY = 2;
+}
+
+// One file of a backup.
+message BackupMember {
+  // File name inside the backup, e.g. "home.tar.gz".
+  string name = 1;
+  // What it holds: "home" (the tenant's home directory as a gzip-compressed
+  // tar archive) or "records" (the engine's records of the tenant and its
+  // virtual hosts, JSON). Clients must tolerate kinds they do not know.
+  string kind = 2;
+  uint64 size_bytes = 3;
+  // Lower-case hexadecimal SHA-256, verified before a restore.
+  string sha256 = 4;
+}
+
+message Backup {
+  // Assigned by the engine: "b" followed by digits; sorts by creation time.
+  string id = 1;
+  string tenant = 2;
+  google.protobuf.Timestamp created_at = 3;
+  BackupState state = 4;
+  // Total size on disk; 0 while CREATING.
+  uint64 size_bytes = 5;
+  repeated BackupMember members = 6;
+  // The tenant's virtual hosts when the backup was made.
+  repeated string domains = 7;
+}
+
+enum JobKind {
+  JOB_KIND_UNSPECIFIED = 0;
+  JOB_KIND_BACKUP = 1;
+  JOB_KIND_RESTORE = 2;
+}
+
+enum JobState {
+  JOB_STATE_UNSPECIFIED = 0;
+  JOB_STATE_RUNNING = 1;
+  JOB_STATE_SUCCEEDED = 2;
+  // A failed backup leaves no backup behind. A failed restore may have
+  // restored part of the files; `message` and `output` say what happened.
+  JOB_STATE_FAILED = 3;
+}
+
+message Job {
+  // Assigned by the engine: "j" followed by digits.
+  string id = 1;
+  JobKind kind = 2;
+  string tenant = 3;
+  // The backup being written or restored from.
+  string backup_id = 4;
+  JobState state = 5;
+  // One line from the engine about the outcome; empty while RUNNING.
+  string message = 6;
+  // The end of what the worker printed: files that were skipped, the reason
+  // of a failure. May contain file names chosen by the tenant.
+  string output = 7;
+  google.protobuf.Timestamp started_at = 8;
+  // Unset while RUNNING.
+  google.protobuf.Timestamp finished_at = 9;
+}
+
+message CreateBackupRequest {
+  string tenant = 1;
+}
+
+message StartJobResponse {
+  Job job = 1;
+  // false when an identical job was already running and is returned instead.
+  bool started = 2;
+}
+
+message ListBackupsRequest {
+  string tenant = 1;
+}
+
+message ListBackupsResponse {
+  // Oldest first.
+  repeated Backup backups = 1;
+}
+
+message DeleteBackupRequest {
+  string tenant = 1;
+  string backup_id = 2;
+}
+
+message DeleteBackupResponse {
+  // false when the tenant has no such backup.
+  bool deleted = 1;
+}
+
+message RestoreBackupRequest {
+  // The tenant to restore. The backup must be one of this tenant's own:
+  // another tenant's backup is NOT_FOUND here.
+  string tenant = 1;
+  string backup_id = 2;
+}
+
+message GetJobRequest {
+  string job_id = 1;
 }

@@ -11,10 +11,14 @@ use tracing::{error, info, warn};
 use std::sync::Arc;
 
 use crate::auth::{PeerInfo, Scope, ScopePolicy};
+use crate::backup::BackupService;
 use crate::ctx::Ctx;
 use crate::error::Error;
 use crate::host::{Drift, DriftKind, HostService};
-use crate::records::{AppRuntime, TenantRecord, TenantState, VHostRecord};
+use crate::records::{
+    AppRuntime, BackupRecord, BackupState, JobKind, JobRecord, JobState, TenantRecord, TenantState,
+    VHostRecord,
+};
 use crate::tenant::TenantService;
 use crate::validate::Limits;
 use crate::vhost::{AppRequest, LogKind, VHostRequest, VHostService};
@@ -28,6 +32,7 @@ pub struct Engine {
     vhosts: VHostService,
     host: HostService,
     scopes: Arc<ScopePolicy>,
+    backups: BackupService,
 }
 
 /// Interceptor type used by [`Engine::into_service`].
@@ -39,8 +44,15 @@ impl Engine {
             scopes: Arc::new(ScopePolicy::new(ctx.config.peer_scopes.clone())),
             tenants: TenantService::new(ctx.clone()),
             vhosts: VHostService::new(ctx.clone()),
+            backups: BackupService::new(ctx.clone()),
             host: HostService::new(ctx),
         }
+    }
+
+    /// The backup service behind this engine (the daemon resumes jobs
+    /// through it at start-up).
+    pub fn backups(&self) -> &BackupService {
+        &self.backups
     }
 
     /// The tonic service, wrapped so every request must carry a verified peer.
@@ -109,6 +121,10 @@ fn drift_to(d: &Drift) -> pb::Drift {
         DriftKind::OrphanPhpPool => pb::DriftKind::OrphanPhpPool,
         DriftKind::AppUnitDrift => pb::DriftKind::AppUnitDrift,
         DriftKind::OrphanAppUnit => pb::DriftKind::OrphanAppUnit,
+        DriftKind::BackupArchiveMissing => pb::DriftKind::BackupArchiveMissing,
+        DriftKind::BackupArchiveModified => pb::DriftKind::BackupArchiveModified,
+        DriftKind::OrphanBackupArchive => pb::DriftKind::OrphanBackupArchive,
+        DriftKind::BackupIncomplete => pb::DriftKind::BackupIncomplete,
     };
     pb::Drift {
         kind: kind.into(),
@@ -142,6 +158,13 @@ fn fail(rpc: &'static str, peer: &str, err: Error) -> Status {
         | Error::NoApp(_)
         | Error::RuntimeTooOld { .. }
         | Error::AppPolicyMissing
+        | Error::BackupNotFound { .. }
+        | Error::BackupNotReady(_)
+        | Error::JobNotFound(_)
+        | Error::JobRunning { .. }
+        | Error::TooManyJobs
+        | Error::BackupNoSpace { .. }
+        | Error::TenantHasBackups(_)
         | Error::NginxInvalid(_) => {
             warn!(rpc, peer, error = %err, "request refused");
             err.into()
@@ -520,6 +543,9 @@ impl OxPanelEngine for Engine {
             node_available: i.runtimes.node,
             python_available: i.runtimes.python,
             node_version: i.node_version,
+            backup_disk_total_bytes: i.backup_disk_total_bytes,
+            backup_disk_free_bytes: i.backup_disk_free_bytes,
+            backup_keep: i.backup_keep,
         }))
     }
 
@@ -538,6 +564,137 @@ impl OxPanelEngine for Engine {
         Ok(Response::new(pb::ReconcileResponse {
             drifts: drifts.iter().map(drift_to).collect(),
         }))
+    }
+
+    async fn create_backup(
+        &self,
+        req: Request<pb::CreateBackupRequest>,
+    ) -> Result<Response<pb::StartJobResponse>, Status> {
+        const RPC: &str = "CreateBackup";
+        let peer = self.authorise(&req, RPC, Scope::Tenant)?;
+        let r = req.into_inner();
+        info!(rpc = RPC, peer, tenant = %r.tenant, "request");
+        let (job, started) = self
+            .backups
+            .create(&r.tenant)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(pb::StartJobResponse {
+            job: Some(job_to(&job)),
+            started,
+        }))
+    }
+
+    async fn list_backups(
+        &self,
+        req: Request<pb::ListBackupsRequest>,
+    ) -> Result<Response<pb::ListBackupsResponse>, Status> {
+        const RPC: &str = "ListBackups";
+        let peer = self.authorise(&req, RPC, Scope::Read)?;
+        let r = req.into_inner();
+        let recs = self
+            .backups
+            .list(&r.tenant)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(pb::ListBackupsResponse {
+            backups: recs.iter().map(backup_to).collect(),
+        }))
+    }
+
+    async fn delete_backup(
+        &self,
+        req: Request<pb::DeleteBackupRequest>,
+    ) -> Result<Response<pb::DeleteBackupResponse>, Status> {
+        const RPC: &str = "DeleteBackup";
+        let peer = self.authorise(&req, RPC, Scope::Delete)?;
+        let r = req.into_inner();
+        info!(rpc = RPC, peer, tenant = %r.tenant, backup = %r.backup_id, "request");
+        let deleted = self
+            .backups
+            .delete(&r.tenant, &r.backup_id)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(pb::DeleteBackupResponse { deleted }))
+    }
+
+    async fn restore_backup(
+        &self,
+        req: Request<pb::RestoreBackupRequest>,
+    ) -> Result<Response<pb::StartJobResponse>, Status> {
+        const RPC: &str = "RestoreBackup";
+        let peer = self.authorise(&req, RPC, Scope::Tenant)?;
+        let r = req.into_inner();
+        info!(rpc = RPC, peer, tenant = %r.tenant, backup = %r.backup_id, "request");
+        let (job, started) = self
+            .backups
+            .restore(&r.tenant, &r.backup_id)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(pb::StartJobResponse {
+            job: Some(job_to(&job)),
+            started,
+        }))
+    }
+
+    async fn get_job(&self, req: Request<pb::GetJobRequest>) -> Result<Response<pb::Job>, Status> {
+        const RPC: &str = "GetJob";
+        let peer = self.authorise(&req, RPC, Scope::Read)?;
+        let r = req.into_inner();
+        let job = self
+            .backups
+            .job(&r.job_id)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(job_to(&job)))
+    }
+}
+
+fn backup_to(rec: &BackupRecord) -> pb::Backup {
+    pb::Backup {
+        id: rec.id.clone(),
+        tenant: rec.tenant.clone(),
+        created_at: Some(timestamp(rec.created_at_unix)),
+        state: match rec.state {
+            BackupState::Creating => pb::BackupState::Creating,
+            BackupState::Ready => pb::BackupState::Ready,
+        }
+        .into(),
+        size_bytes: rec.size_bytes,
+        members: rec
+            .members
+            .iter()
+            .map(|m| pb::BackupMember {
+                name: m.name.clone(),
+                kind: m.kind.clone(),
+                size_bytes: m.size_bytes,
+                sha256: m.sha256.clone(),
+            })
+            .collect(),
+        domains: rec.domains.clone(),
+    }
+}
+
+fn job_to(rec: &JobRecord) -> pb::Job {
+    pb::Job {
+        id: rec.id.clone(),
+        kind: match rec.kind {
+            JobKind::Backup => pb::JobKind::Backup,
+            JobKind::Restore => pb::JobKind::Restore,
+        }
+        .into(),
+        tenant: rec.tenant.clone(),
+        backup_id: rec.backup_id.clone(),
+        state: match rec.state {
+            JobState::Running => pb::JobState::Running,
+            JobState::Succeeded => pb::JobState::Succeeded,
+            JobState::Failed => pb::JobState::Failed,
+        }
+        .into(),
+        message: rec.message.clone(),
+        output: rec.output.clone(),
+        started_at: Some(timestamp(rec.started_at_unix)),
+        finished_at: (rec.finished_at_unix != 0).then(|| timestamp(rec.finished_at_unix)),
     }
 }
 

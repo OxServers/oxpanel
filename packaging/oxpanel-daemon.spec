@@ -16,6 +16,9 @@ Requires:       util-linux
 Requires:       acl
 Requires:       coreutils
 Requires:       logrotate
+# Backups: the archiver and its compressor (run as the tenant).
+Requires:       tar
+Requires:       gzip
 # PHP is optional: without php-fpm, virtual hosts are static only.
 Recommends:     php-fpm
 # Likewise optional: Node.js applications need Node.js 22 or newer. AlmaLinux 9

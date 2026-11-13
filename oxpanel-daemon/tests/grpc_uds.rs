@@ -535,6 +535,22 @@ async fn a_scoped_peer_can_only_call_its_scopes() {
         .reconcile(pb::ReconcileRequest {})
         .await
         .expect("reconcile");
+    // Listing backups and reading a job are reads: past the gate, then
+    // NOT_FOUND for what does not exist.
+    let e = client
+        .list_backups(pb::ListBackupsRequest {
+            tenant: "alice".into(),
+        })
+        .await
+        .expect_err("no such tenant");
+    assert_eq!(e.code(), Code::NotFound);
+    let e = client
+        .get_job(pb::GetJobRequest {
+            job_id: "j1731500000123".into(),
+        })
+        .await
+        .expect_err("no such job");
+    assert_eq!(e.code(), Code::NotFound);
 
     // (Host information asks the installed Node.js for its version.)
     srv.sys.clear_calls();
@@ -579,6 +595,27 @@ async fn a_scoped_peer_can_only_call_its_scopes() {
             .delete_tenant(pb::DeleteTenantRequest {
                 username: "alice".into(),
                 remove_home: true,
+            })
+            .await
+            .map(|_| ()),
+        // Backups: taking and restoring need `tenant`, deleting `delete`.
+        client
+            .create_backup(pb::CreateBackupRequest {
+                tenant: "alice".into(),
+            })
+            .await
+            .map(|_| ()),
+        client
+            .restore_backup(pb::RestoreBackupRequest {
+                tenant: "alice".into(),
+                backup_id: "b1731500000123".into(),
+            })
+            .await
+            .map(|_| ()),
+        client
+            .delete_backup(pb::DeleteBackupRequest {
+                tenant: "alice".into(),
+                backup_id: "b1731500000123".into(),
             })
             .await
             .map(|_| ()),

@@ -59,6 +59,18 @@ pub struct Config {
     pub dry_run: bool,
     /// `tracing` filter directive, e.g. `info` or `oxpanel_daemon=debug`.
     pub log_filter: String,
+    /// Where backups are stored: `<backup_dir>/<tenant>/<backup id>/`. Root
+    /// only; never inside a tenant home.
+    pub backup_dir: PathBuf,
+    /// Backups kept per tenant; older ones are removed when a new one completes.
+    pub backup_keep: u32,
+    /// Space that must stay free on the backup file system. A backup that
+    /// could eat into it is refused, and no archive may grow into it.
+    pub backup_min_free_bytes: u64,
+    /// Upper bound for one backup or restore job.
+    pub backup_timeout: Duration,
+    /// The program a job's transient unit runs: this daemon, in worker mode.
+    pub worker_exe: PathBuf,
 }
 
 impl Default for Config {
@@ -84,6 +96,11 @@ impl Default for Config {
             command_timeout: Duration::from_secs(60),
             dry_run: false,
             log_filter: "info".to_owned(),
+            backup_dir: PathBuf::from("/var/lib/oxpanel-backups"),
+            backup_keep: 7,
+            backup_min_free_bytes: 1 << 30,
+            backup_timeout: Duration::from_secs(6 * 3600),
+            worker_exe: PathBuf::from("/usr/sbin/oxpanel-daemon"),
         }
     }
 }
@@ -178,6 +195,22 @@ impl Config {
         if let Some(v) = get("OXPANEL_LOG") {
             c.log_filter = v;
         }
+        path("OXPANEL_BACKUP_DIR", &mut c.backup_dir)?;
+        if let Some(v) = get("OXPANEL_BACKUP_KEEP") {
+            c.backup_keep = parse_u32("OXPANEL_BACKUP_KEEP", &v)?;
+        }
+        if let Some(v) = get("OXPANEL_BACKUP_MIN_FREE_BYTES") {
+            c.backup_min_free_bytes = v.trim().parse::<u64>().map_err(|_| {
+                Error::invalid(
+                    "config",
+                    format!("OXPANEL_BACKUP_MIN_FREE_BYTES: '{v}' is not a number of bytes"),
+                )
+            })?;
+        }
+        if let Some(v) = get("OXPANEL_BACKUP_TIMEOUT_SECS") {
+            c.backup_timeout =
+                Duration::from_secs(u64::from(parse_u32("OXPANEL_BACKUP_TIMEOUT_SECS", &v)?));
+        }
         c.validate()?;
         Ok(c)
     }
@@ -193,8 +226,29 @@ impl Config {
             ("OXPANEL_SYSTEMD_UNIT_DIR", &self.systemd_unit_dir),
             ("OXPANEL_NGINX_LOG_DIR", &self.nginx_log_dir),
             ("OXPANEL_PHP_CONF_DIR", &self.php_conf_dir),
+            ("OXPANEL_BACKUP_DIR", &self.backup_dir),
         ] {
             check_path(key, p)?;
+        }
+        // A backup directory a tenant could reach would hand every archive
+        // to that tenant, and let it plant files for the root-side worker.
+        if self.backup_dir.starts_with(&self.home_base) {
+            return Err(Error::invalid(
+                "config",
+                "OXPANEL_BACKUP_DIR must not be inside OXPANEL_HOME_BASE",
+            ));
+        }
+        if !(1..=365).contains(&self.backup_keep) {
+            return Err(Error::invalid(
+                "config",
+                "OXPANEL_BACKUP_KEEP must be between 1 and 365",
+            ));
+        }
+        if self.backup_timeout < Duration::from_secs(60) {
+            return Err(Error::invalid(
+                "config",
+                "OXPANEL_BACKUP_TIMEOUT_SECS must be at least 60",
+            ));
         }
         if self.uid_min < 1000 {
             return Err(Error::invalid(
@@ -236,6 +290,16 @@ impl Config {
     /// `state_dir/vhosts`.
     pub fn vhosts_dir(&self) -> PathBuf {
         self.state_dir.join("vhosts")
+    }
+
+    /// `state_dir/backups`: one record per backup.
+    pub fn backup_records_dir(&self) -> PathBuf {
+        self.state_dir.join("backups")
+    }
+
+    /// `state_dir/jobs`: one record per backup or restore job.
+    pub fn jobs_dir(&self) -> PathBuf {
+        self.state_dir.join("jobs")
     }
 }
 
@@ -413,6 +477,21 @@ mod tests {
         assert!(from(&[("OXPANEL_NGINX_CONF_DIR", "/etc/nginx/ox;panel.d")]).is_err());
         assert!(from(&[("OXPANEL_HOME_BASE", "/srv/web-homes_v2")]).is_ok());
         assert!(from(&[("OXPANEL_WEB_USER", "nginx;rm")]).is_err());
+        assert!(from(&[("OXPANEL_BACKUP_DIR", "/home/backups")]).is_err());
+        assert!(from(&[("OXPANEL_BACKUP_DIR", "backups")]).is_err());
+        assert!(from(&[("OXPANEL_BACKUP_KEEP", "0")]).is_err());
+        assert!(from(&[("OXPANEL_BACKUP_TIMEOUT_SECS", "5")]).is_err());
+        assert!(from(&[("OXPANEL_BACKUP_MIN_FREE_BYTES", "1G")]).is_err());
+        let c = from(&[
+            ("OXPANEL_BACKUP_DIR", "/srv/backups"),
+            ("OXPANEL_BACKUP_KEEP", "3"),
+            ("OXPANEL_BACKUP_MIN_FREE_BYTES", "0"),
+            ("OXPANEL_BACKUP_TIMEOUT_SECS", "600"),
+        ])
+        .unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(c.backup_dir, PathBuf::from("/srv/backups"));
+        assert_eq!((c.backup_keep, c.backup_min_free_bytes), (3, 0));
+        assert_eq!(c.backup_timeout, Duration::from_secs(600));
         assert!(from(&[
             ("OXPANEL_NGINX_CONF_DIR", "/etc/nginx/conf.d"),
             ("OXPANEL_NGINX_INCLUDE_FILE", "/etc/nginx/conf.d/x.conf")

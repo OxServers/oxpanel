@@ -14,6 +14,8 @@
 //! - [`tenant`], [`vhost`] — the provisioning workflows.
 //! - [`php`]      — per-tenant PHP-FPM instances.
 //! - [`app`]      — Node.js and Python applications behind virtual hosts.
+//! - [`backup`]   — per-tenant backups and restores, run as jobs; [`worker`]
+//!   is the half of a job that runs outside the daemon.
 //! - [`host`]     — host information and record ↔ OS reconciliation.
 //! - [`auth`]     — peer-credential gate for the UNIX socket.
 //! - [`server`]   — gRPC ↔ domain mapping.
@@ -31,6 +33,7 @@
 
 pub mod app;
 pub mod auth;
+pub mod backup;
 pub mod config;
 pub mod ctx;
 pub mod error;
@@ -45,6 +48,7 @@ pub mod systemd;
 pub mod tenant;
 pub mod validate;
 pub mod vhost;
+pub mod worker;
 
 pub use error::{Error, Result};
 /// Generated API types (re-exported from `oxpanel-proto`).

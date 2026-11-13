@@ -19,7 +19,7 @@ use oxpanel_daemon::config::Config;
 use oxpanel_daemon::ctx::Ctx;
 use oxpanel_daemon::server::Engine;
 use oxpanel_daemon::system::{bin, CommandSpec, FakeSystem, OsUser, RealSystem, System};
-use oxpanel_daemon::{fsutil, nginx, vhost};
+use oxpanel_daemon::{fsutil, nginx, vhost, worker};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const USAGE: &str = "\
@@ -117,8 +117,45 @@ fn init_tracing() {
     }
 }
 
-#[tokio::main]
-async fn main() -> ExitCode {
+fn main() -> ExitCode {
+    // `oxpanel-daemon worker …` is the half of a backup or restore job that
+    // runs in its own transient unit; it never becomes a server.
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|a| a == worker::SUBCOMMAND) {
+        init_tracing();
+        return run_worker(&args);
+    }
+    match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime.block_on(daemon()),
+        Err(e) => {
+            init_tracing();
+            error!("cannot start the async runtime: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run_worker(args: &[String]) -> ExitCode {
+    let task = match worker::Task::parse(args) {
+        Ok(task) => task,
+        Err(e) => {
+            error!("{e}");
+            return ExitCode::from(worker::EXIT_USAGE);
+        }
+    };
+    match worker::run(&task) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(failure) => {
+            error!("{}", failure.message);
+            ExitCode::from(failure.code)
+        }
+    }
+}
+
+async fn daemon() -> ExitCode {
     let cli = match parse_cli() {
         Ok(Some(cli)) => cli,
         Ok(None) => return ExitCode::SUCCESS,
@@ -138,6 +175,39 @@ async fn main() -> ExitCode {
     }
 }
 
+/// Job workers run this very binary, wherever it was installed. (After an
+/// upgrade the kernel reports the old path as "… (deleted)"; the default
+/// location is used then.)
+fn locate_worker(config: &mut Config) {
+    if let Ok(exe) = std::env::current_exe() {
+        let plain = exe.to_str().is_some_and(|s| {
+            s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'/' | b'.' | b'_' | b'-'))
+        });
+        if plain && is_executable(&exe) {
+            config.worker_exe = exe;
+        }
+    }
+}
+
+/// Make sure the backup store exists (root-only from the first moment), then
+/// pick up the backups and restores that were running when the daemon last
+/// stopped: they went on without it; find out how they ended.
+async fn resume_jobs(ctx: &Ctx, engine: &Engine) {
+    if !ctx.config.dry_run {
+        if let Err(e) = fsutil::ensure_dir(&ctx.config.backup_dir, 0o700) {
+            warn!(error = %e, dir = %ctx.config.backup_dir.display(), "backup directory is not usable; backups will fail until it is (does the unit's ReadWritePaths cover it?)");
+        }
+    }
+    match engine.backups().resume_all().await {
+        Ok(0) => {}
+        Ok(n) => info!(jobs = n, "resumed watching running jobs"),
+        Err(e) => {
+            warn!(error = %e, "could not resume running jobs; see `oxpanel-ctl host reconcile`");
+        }
+    }
+}
+
 async fn run(cli: Cli) -> Result<(), Fatal> {
     let mut config = Config::from_env().map_err(|e| Fatal::Config(e.to_string()))?;
     if cli.dry_run {
@@ -146,6 +216,7 @@ async fn run(cli: Cli) -> Result<(), Fatal> {
     info!(version = VERSION, dry_run = config.dry_run, socket = %config.socket_path.display(), "starting oxpanel-daemon");
 
     let sys = make_system(&mut config)?;
+    locate_worker(&mut config);
 
     let selinux = preflight(&config, sys.as_ref()).await?;
     let socket_gid = match &config.socket_group {
@@ -199,6 +270,8 @@ async fn run(cli: Cli) -> Result<(), Fatal> {
     let listener = bind_socket(&ctx.config.socket_path, socket_gid)?;
     let incoming = auth::gate(listener, policy, ctx.sys.clone());
     let engine = Engine::new(ctx.clone());
+
+    resume_jobs(&ctx, &engine).await;
 
     let shutdown = async {
         let mut term =

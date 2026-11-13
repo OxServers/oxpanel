@@ -446,6 +446,31 @@ impl VHostService {
         Ok(all)
     }
 
+    /// After a restore replaced files in the tenant's home: give every
+    /// document root of the tenant what `configure` gives it — it exists and
+    /// is the tenant's own directory, the web server may traverse to it and
+    /// read it, and on SELinux hosts it carries the web-content label.
+    /// The caller holds the mutation lock.
+    pub(crate) async fn restore_web_access(&self, tenant: &TenantRecord) -> Result<()> {
+        for v in self
+            .ctx
+            .store
+            .list_vhosts()?
+            .iter()
+            .filter(|v| v.tenant == tenant.username)
+        {
+            let docroot = RelPath::parse(&v.document_root)?;
+            let abs_root = tenant.home.join(docroot.as_str());
+            self.create_document_root(tenant, &abs_root).await?;
+            self.grant_web_access(&tenant.home, &docroot, &abs_root)
+                .await?;
+            if self.ctx.selinux {
+                self.label_docroot(&abs_root).await?;
+            }
+        }
+        Ok(())
+    }
+
     /// Persistent SELinux label for the document root, then apply it.
     async fn label_docroot(&self, root: &Path) -> Result<()> {
         let timeout = self.ctx.config.command_timeout;

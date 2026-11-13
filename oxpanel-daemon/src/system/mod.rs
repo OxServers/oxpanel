@@ -50,6 +50,9 @@ pub mod bin {
     /// Runs dependency installation outside the daemon's network-less sandbox.
     pub const SYSTEMD_RUN: &str = "/usr/bin/systemd-run";
     pub const JOURNALCTL: &str = "/usr/bin/journalctl";
+    /// Backups: the archiver and its compressor, both run as the tenant.
+    pub const TAR: &str = "/usr/bin/tar";
+    pub const GZIP: &str = "/usr/bin/gzip";
     /// Login shell given to every tenant account.
     pub const NOLOGIN: &str = "/sbin/nologin";
 }

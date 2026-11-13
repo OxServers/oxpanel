@@ -380,6 +380,215 @@ check "removing the sites removes the remaining unit" bash -c 'oxpanel-ctl vhost
 check "no runtime directories left behind" bash -c '! ls /run/oxpanel-app/*/app.sock >/dev/null 2>&1'
 check "no drift after application teardown" grep -q '^drifts=0$' <(oxpanel-ctl host reconcile)
 
+echo "== backups and restores"
+BK=/var/lib/oxpanel-backups
+# The backup id and job id of the job a `backup create|restore|job` printed.
+backup_of() { sed -n 's/^job=[^ ]* .* backup=\([^ ]*\) .*/\1/p' <<<"$1" | tail -1; }
+job_of() { sed -n 's/^job=\([^ ]*\) .*/\1/p' <<<"$1" | tail -1; }
+backup_ids() { oxpanel-ctl backup list "$1" | sed -n 's/^backup=\([^ ]*\) .*/\1/p'; }
+# Size and SHA-256 of a member as the engine recorded them.
+recorded() { python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); m=[m for m in r["members"] if m["kind"]=="home"][0]; print(m["size_bytes"], m["sha256"])' "/var/lib/oxpanel/backups/$1.json"; }
+on_disk() { echo "$(stat -c %s "$1") $(sha256sum "$1" | cut -d' ' -f1)"; }
+check "backup store is root-only" test "$(stat -c '%U:%G %a' "$BK")" = "root:root 700"
+check "host info reports the backup store" grep -q ' backup_keep=7' <(oxpanel-ctl host info)
+check_not "a backup of an unknown tenant is refused" oxpanel-ctl backup create nosuchtenant
+check_not "a malformed backup id is refused" oxpanel-ctl backup restore alice '../b1731500000123'
+
+echo "-- reading the home happens as the tenant"
+as_user alice sh -c 'mkfifo /home/alice/fifo; truncate -s 10G /home/alice/sparse.img; mkdir -p /home/alice/.cache; echo cached > /home/alice/.cache/junk'
+# What a tenant cannot plant itself, root plants: a file it may not read, a
+# hard link to /etc/shadow, a device node.
+echo root-only-secret-marker > /home/alice/root-secret; chmod 600 /home/alice/root-secret
+hardlinked=0; if ln /etc/shadow /home/alice/shadow-hardlink 2>/dev/null; then hardlinked=1; fi
+# (Containers without CAP_MKNOD cannot plant the node; the VM can.)
+noded=0; if mknod /home/alice/null-dev c 1 3 2>/dev/null; then noded=1; fi
+rc=0; out="$(timeout 300 oxpanel-ctl backup create alice --wait)" || rc=$?
+echo "$out" | tail -3
+check "a backup over a FIFO, a device node and unreadable files completes" test "$rc" -eq 0
+HOSTILE="$(backup_of "$out")"
+A="$BK/alice/$HOSTILE/home.tar.gz"
+tar -tvzf "$A" > /root/listing.txt
+check "a symlink to /etc/shadow is stored as a symlink" grep -q '^l.* \./public_html/shadow -> /etc/shadow$' /root/listing.txt
+check "a FIFO is stored as a FIFO, never opened" grep -q '^p.* \./fifo$' /root/listing.txt
+if [ "$noded" = 1 ]; then
+  check "a device node is stored as a node, never read" grep -q '^c.* \./null-dev$' /root/listing.txt
+fi
+check "a file the tenant cannot read is not archived" bash -c '! grep -q " \./root-secret$" /root/listing.txt'
+if [ "$hardlinked" = 1 ]; then
+  check "a hard link to /etc/shadow is not archived" bash -c '! grep -q "shadow-hardlink" /root/listing.txt'
+fi
+check "no content of /etc/shadow or the root-only file in the archive" bash -c '! tar -xzOf "$1" --exclude=./sparse.img --exclude=./fifo --exclude=./null-dev 2>/dev/null | grep -aqE "^root:|root-only-secret-marker"' _ "$A"
+check "a 10 GiB sparse file costs almost nothing" test "$(stat -c %s "$A")" -lt 10485760
+check "download caches are left out" bash -c '! grep -q "\./\.cache" /root/listing.txt'
+check "the tenant's skipped files are reported in the job output" grep -q 'root-secret' <<<"$out"
+rm -f /home/alice/fifo /home/alice/sparse.img /home/alice/root-secret /home/alice/shadow-hardlink /home/alice/null-dev
+rm -rf /home/alice/.cache
+check "the hostile-home backup can be deleted" grep -q '^deleted=true' <(oxpanel-ctl backup delete alice "$HOSTILE")
+check "and its directory is gone" test ! -e "$BK/alice/$HOSTILE"
+
+echo "-- round trip: a static site and a PHP site"
+as_user alice sh -c 'echo original-static > /home/alice/public_html/backup.html; printf nl > "/home/alice/public_html/new
+line.txt"'
+check "PHP site for bob" grep -q '^changed=true' <(oxpanel-ctl vhost set bkphp.test --tenant bob --php)
+as_user bob sh -c 'echo "<?php echo \"php-\" . \"original\";" > /home/bob/public_html/index.php'
+check "the PHP site serves" body_eventually bkphp.test / php-original
+out="$(timeout 300 oxpanel-ctl backup create alice --wait)" || true; echo "$out" | tail -1
+check "backup of alice succeeds" grep -q 'state=JOB_STATE_SUCCEEDED' <<<"$out"
+A1="$(backup_of "$out")"
+out="$(timeout 300 oxpanel-ctl backup create bob --wait)" || true; echo "$out" | tail -1
+check "backup of bob succeeds" grep -q 'state=JOB_STATE_SUCCEEDED' <<<"$out"
+B1="$(backup_of "$out")"
+check "listed READY with its members and sites" grep -q "^backup=$A1 tenant=alice state=BACKUP_STATE_READY .* domains=[^ ]*example.test[^ ]* members=home:home.tar.gz:[0-9]*,records:records.json:[0-9]*$" <(oxpanel-ctl backup list alice)
+check "archive, manifest and records are root-only" bash -c 'test "$(stat -c "%U %a" "$1"/home.tar.gz "$1"/manifest.json "$1"/records.json | sort -u)" = "root 600" && test "$(stat -c "%U %a" "$1")" = "root 700"' _ "$BK/alice/$A1"
+check "no worker leftovers in the backup" test "$(ls "$BK/alice/$A1" | tr '\n' ' ')" = "home.tar.gz manifest.json records.json "
+check "the checksum on record is the archive's" test "$(recorded "$A1")" = "$(on_disk "$BK/alice/$A1/home.tar.gz")"
+check "the manifest lists the checksum" grep -q "$(recorded "$A1" | cut -d' ' -f2)" "$BK/alice/$A1/manifest.json"
+check "the records member describes the tenant and its sites" bash -c 'grep -q "\"username\": \"alice\"" "$1" && grep -q example.test "$1"' _ "$BK/alice/$A1/records.json"
+check_not "the tenant cannot list the backup store" as_user alice ls "$BK"
+check_not "the tenant cannot read its own archive" as_user alice cat "$BK/alice/$A1/home.tar.gz"
+check_not "another tenant cannot read it either" as_user bob cat "$BK/alice/$A1/home.tar.gz"
+check "backups are not drift" grep -q '^drifts=0$' <(oxpanel-ctl host reconcile)
+
+as_user alice sh -c 'echo changed > /home/alice/public_html/backup.html; rm -f "/home/alice/public_html/new
+line.txt"; echo extra > /home/alice/public_html/added-later.html'
+as_user bob sh -c 'echo "<?php echo \"php-modified\";" > /home/bob/public_html/index.php'
+check "the static change is live" body_eventually example.test /backup.html changed
+check "the PHP change is live" body_eventually bkphp.test / php-modified
+out="$(timeout 300 oxpanel-ctl backup restore alice "$A1" --wait)" || true; echo "$out" | tail -1
+check "restore of alice succeeds" grep -q 'kind=JOB_KIND_RESTORE .* state=JOB_STATE_SUCCEEDED' <<<"$out"
+check "the static site serves the original again" body_eventually example.test /backup.html original-static
+check "a file with a newline in its name came back" test -f "/home/alice/public_html/new
+line.txt"
+check "restore merges: files newer than the backup stay" test -f /home/alice/public_html/added-later.html
+check "restored files belong to the tenant" test "$(stat -c %U /home/alice/public_html/backup.html)" = alice
+check "the home is still private" test "$(stat -c '%U:%G' /home/alice)" = "alice:alice"
+check "the home still admits only the web server" grep -q '^user:nginx:--x' <(getfacl -p /home/alice 2>/dev/null)
+if selinuxenabled 2>/dev/null; then
+  check "SELinux: restored site files carry the web-content label" grep -q 'httpd_sys_content_t' <(ls -Z /home/alice/public_html/backup.html)
+fi
+out="$(timeout 300 oxpanel-ctl backup restore bob "$B1" --wait)" || true; echo "$out" | tail -1
+check "restore of bob succeeds" grep -q 'state=JOB_STATE_SUCCEEDED' <<<"$out"
+check "the PHP site serves the original again" body_eventually bkphp.test / php-original
+check "bob's PHP pool runs again" systemctl -q is-active oxpanel-php-bob.service
+
+echo "-- one tenant's backup is not another's"
+check_not "bob cannot be restored from alice's backup" oxpanel-ctl backup restore bob "$A1"
+check "the refusal is NOT_FOUND" grep -q 'NotFound' <(oxpanel-ctl backup restore bob "$A1" 2>&1 || true)
+check "bob cannot delete alice's backup" grep -q '^deleted=false' <(oxpanel-ctl backup delete bob "$A1")
+check "alice's backup is still there" test -f "$BK/alice/$A1/manifest.json"
+check "bob's listing shows only bob's backup" test "$(backup_ids bob)" = "$B1"
+
+echo "-- integrity"
+cp -p "$BK/alice/$A1/home.tar.gz" /root/good.tar.gz
+as_user alice sh -c 'echo after-damage > /home/alice/public_html/backup.html'
+printf x >> "$BK/alice/$A1/home.tar.gz"
+check "a grown archive is drift" grep -q 'BACKUP_ARCHIVE_MODIFIED' <(oxpanel-ctl host reconcile || true)
+rc=0; out="$(timeout 300 oxpanel-ctl backup restore alice "$A1" --wait)" || rc=$?
+check "a corrupted archive is refused (exit 5)" test "$rc" -eq 5
+check "and says so" grep -q 'archive is damaged' <<<"$out"
+truncate -s 100 "$BK/alice/$A1/home.tar.gz"
+rc=0; out="$(timeout 300 oxpanel-ctl backup restore alice "$A1" --wait)" || rc=$?
+check "a truncated archive is refused" bash -c 'test "$1" -eq 5 && grep -q "archive is damaged" <<<"$2"' _ "$rc" "$out"
+check "nothing was restored from a damaged archive" test "$(cat /home/alice/public_html/backup.html)" = after-damage
+check "the site is back in service after a refused restore" body_eventually example.test /backup.html after-damage
+cp -p /root/good.tar.gz "$BK/alice/$A1/home.tar.gz"
+
+echo "-- restoring a hostile archive (as if made from a compromised site)"
+python3 - "$BK/alice/$A1/home.tar.gz" <<'PY'
+import io, sys, tarfile
+def add(t, name, data=b"pwned\n", **kw):
+    i = tarfile.TarInfo(name); i.size = len(data)
+    for k, v in kw.items(): setattr(i, k, v)
+    t.addfile(i, io.BytesIO(data) if i.isreg() else None)
+with tarfile.open(sys.argv[1], "w:gz", format=tarfile.GNU_FORMAT) as t:
+    add(t, "./hostile-ok.txt", b"extracted\n", mode=0o644)
+    add(t, "/etc/oxpanel-evil-abs", mode=0o644)
+    add(t, "../../../etc/oxpanel-evil-dotdot", mode=0o644)
+    add(t, "./esc", type=tarfile.SYMTYPE, linkname="/etc", size=0)
+    add(t, "./esc/oxpanel-evil-link", mode=0o644)
+    add(t, "./tobob", type=tarfile.SYMTYPE, linkname="/home/bob", size=0)
+    add(t, "./tobob/pwned", mode=0o644)
+    add(t, "./suid", b"#!/bin/sh\n", mode=0o4755)
+    add(t, "./sgid", b"#!/bin/sh\n", mode=0o2755)
+    add(t, "./dev-null", type=tarfile.CHRTYPE, devmajor=1, devminor=3, size=0, mode=0o666)
+    add(t, "./hl", type=tarfile.LNKTYPE, linkname="/etc/shadow", size=0)
+    add(t, "./rootowned", b"root\n", uid=0, gid=0, uname="root", gname="root", mode=0o644)
+PY
+python3 - "/var/lib/oxpanel/backups/$A1.json" "$BK/alice/$A1/home.tar.gz" <<'PY'
+import hashlib, json, os, sys
+rec, archive = sys.argv[1], sys.argv[2]
+r = json.load(open(rec))
+for m in r["members"]:
+    if m["kind"] == "home":
+        m["size_bytes"] = os.path.getsize(archive)
+        m["sha256"] = hashlib.sha256(open(archive, "rb").read()).hexdigest()
+json.dump(r, open(rec, "w"), indent=2)
+PY
+rc=0; out="$(timeout 300 oxpanel-ctl backup restore alice "$A1" --wait)" || rc=$?
+echo "$out" | tail -4
+check "the restore reports the refused members (exit 5)" test "$rc" -eq 5
+check "the harmless member was restored, as the tenant" test "$(stat -c '%U' /home/alice/hostile-ok.txt)" = alice
+check "an absolute path stays inside the home" bash -c 'test ! -e /etc/oxpanel-evil-abs && test -f /home/alice/etc/oxpanel-evil-abs'
+check "a '..' path is not extracted" test ! -e /etc/oxpanel-evil-dotdot
+check "nothing is written through a symlink to /etc" test ! -e /etc/oxpanel-evil-link
+check "nothing is written through a symlink into another home" test ! -e /home/bob/pwned
+check "no set-uid file" bash -c 'test ! -u /home/alice/suid'
+check "no set-gid file" bash -c 'test ! -g /home/alice/sgid'
+check "no device node" bash -c 'test ! -c /home/alice/dev-null'
+check "no hard link to /etc/shadow" bash -c '! test /home/alice/hl -ef /etc/shadow'
+check "/etc/shadow is untouched" test "$(stat -c '%U:%G %a' /etc/shadow)" = "root:root 0"
+check "a member owned by root is owned by the tenant" test "$(stat -c '%U' /home/alice/rootowned)" = alice
+check "the site is back in service after a hostile restore" body_eventually example.test /backup.html after-damage
+rm -rf /home/alice/hostile-ok.txt /home/alice/etc /home/alice/esc /home/alice/tobob /home/alice/suid /home/alice/sgid /home/alice/dev-null /home/alice/hl /home/alice/rootowned
+check "the tampered backup is drift" grep -q "BACKUP_ARCHIVE_MODIFIED.*$A1\|subject=$A1" <(oxpanel-ctl host reconcile || true)
+check "and can be deleted" grep -q '^deleted=true' <(oxpanel-ctl backup delete alice "$A1")
+
+echo "-- the daemon killed during a backup; the worker killed during a backup"
+as_user alice sh -c 'head -c 400M /dev/urandom > /home/alice/big.bin'
+out="$(oxpanel-ctl backup create alice)" || true; J="$(job_of "$out")"; K="$(backup_of "$out")"
+check "the job runs in its own unit" systemctl -q is-active "oxpanel-job-$J.service"
+check "the job is charged to the tenant's slice" test "$(systemctl show -p Slice --value "oxpanel-job-$J.service")" = oxpanel-tenant-alice.slice
+check "the archiver runs as the tenant, not root" bash -c 'for i in $(seq 1 50); do u="$(ps -o user= -C tar | sort -u | tr -d " ")"; [ -n "$u" ] && { [ "$u" = alice ]; exit; }; sleep 0.1; done; exit 1'
+check "a repeated request returns the running job" grep -q "^started=false" <(oxpanel-ctl backup create alice)
+check_not "a backup in flight cannot be restored yet" oxpanel-ctl backup restore alice "$K"
+check "listed as CREATING while it runs" grep -q "^backup=$K .*state=BACKUP_STATE_CREATING" <(oxpanel-ctl backup list alice)
+systemctl kill -s SIGKILL oxpanel-daemon
+check "the worker outlives the daemon" systemctl -q is-active "oxpanel-job-$J.service"
+for i in $(seq 1 60); do systemctl -q is-active oxpanel-daemon && break; sleep 0.5; done
+out="$(timeout 600 oxpanel-ctl backup job "$J" --wait)" || true; echo "$out" | tail -1
+check "the restarted daemon finishes the backup" grep -q 'state=JOB_STATE_SUCCEEDED' <<<"$out"
+check "it is complete and listed" grep -q "^backup=$K .*state=BACKUP_STATE_READY" <(oxpanel-ctl backup list alice)
+check "and its checksum is right" test "$(recorded "$K")" = "$(on_disk "$BK/alice/$K/home.tar.gz")"
+out="$(oxpanel-ctl backup create alice)" || true; J="$(job_of "$out")"; K2="$(backup_of "$out")"
+sleep 1
+systemctl kill -s SIGKILL "oxpanel-job-$J.service"
+rc=0; out="$(timeout 300 oxpanel-ctl backup job "$J" --wait)" || rc=$?
+echo "$out" | tail -1
+check "a killed worker fails the job (exit 5)" test "$rc" -eq 5
+check "and leaves no backup behind" bash -c '! oxpanel-ctl backup list alice | grep -q "^backup=$1 " && test ! -e "$2"' _ "$K2" "$BK/alice/$K2"
+rm -f /home/alice/big.bin
+check "delete the big backup" grep -q '^deleted=true' <(oxpanel-ctl backup delete alice "$K")
+
+echo "-- retention, suspended tenants, deletion"
+oxpanel-ctl tenant suspend foo-bar >/dev/null
+out="$(timeout 300 oxpanel-ctl backup create foo-bar --wait)" || true
+check "a suspended tenant can be backed up" grep -q 'state=JOB_STATE_SUCCEEDED' <<<"$out"
+first="$(backup_of "$out")"
+oxpanel-ctl tenant resume foo-bar >/dev/null
+for i in $(seq 1 7); do timeout 300 oxpanel-ctl backup create foo-bar --wait >/dev/null; done
+check "retention keeps the newest 7" test "$(backup_ids foo-bar | wc -l)" -eq 7
+check "the oldest is gone, with its files" bash -c '! oxpanel-ctl backup list foo-bar | grep -q "^backup=$1 " && test ! -e "$2"' _ "$first" "$BK/foo-bar/$first"
+check_not "a tenant with backups cannot be deleted" oxpanel-ctl tenant delete foo-bar --remove-home
+check "the refusal says why" grep -q 'still has backups' <(oxpanel-ctl tenant delete foo-bar --remove-home 2>&1 || true)
+mkdir -p "$BK/ghost/b0000000000001"
+check "a directory without a record is drift" grep -q "ORPHAN_BACKUP_ARCHIVE subject=$BK/ghost/b0000000000001" <(oxpanel-ctl host reconcile || true)
+rm -r "$BK/ghost"
+for t in alice bob foo-bar; do for id in $(backup_ids "$t"); do oxpanel-ctl backup delete "$t" "$id" >/dev/null; done; done
+check "every backup deleted" test -z "$(ls "$BK")"
+check "remove the PHP backup site" grep -q '^removed=true' <(oxpanel-ctl vhost remove bkphp.test)
+check "no drift after backups" grep -q '^drifts=0$' <(oxpanel-ctl host reconcile)
+check "no job unit left behind" bash -c '! systemctl list-units --all --no-legend "oxpanel-job-*" | grep -q .'
+
 echo "== teardown"
 check "vhost removed" grep -q '^removed=true' <(oxpanel-ctl vhost remove example.test)
 check "config gone" test ! -e /etc/nginx/oxpanel.d/example.test.conf

@@ -2,7 +2,8 @@
 //!
 //! Exit status: 0 on success, 1 on an API error (message on stderr),
 //! 2 on usage errors, 3 when `host reconcile` found drift, 4 when
-//! `vhost install-deps` ran and the installer failed.
+//! `vhost install-deps` ran and the installer failed, 5 when a backup or
+//! restore waited for with `--wait` failed.
 // A CLI's whole job is to print.
 #![allow(clippy::print_stdout, clippy::print_stderr)]
 
@@ -60,6 +61,9 @@ enum Cmd {
     /// The engine and the host it runs on.
     #[command(subcommand)]
     Host(HostCmd),
+    /// Per-tenant backups and restores (run as jobs).
+    #[command(subcommand)]
+    Backup(BackupCmd),
 }
 
 #[derive(Subcommand, Debug)]
@@ -303,6 +307,7 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
         Cmd::Tenant(cmd) => run_tenant(&mut c, cmd).await?,
         Cmd::Vhost(cmd) => run_vhost(&mut c, cmd).await?,
         Cmd::Host(cmd) => run_host(&mut c, cmd).await?,
+        Cmd::Backup(cmd) => run_backup(&mut c, cmd).await?,
     })
 }
 
@@ -534,7 +539,7 @@ async fn run_host(
                 .await?
                 .into_inner();
             say!(
-                "version={} selinux={} php={} node={} node_version={} python={} dry_run={} tenants={} vhosts={} uid_range={}-{} load={:.2},{:.2},{:.2} memory_total={} memory_free={} home_disk_total={} home_disk_free={} uptime={}",
+                "version={} selinux={} php={} node={} node_version={} python={} dry_run={} tenants={} vhosts={} uid_range={}-{} load={:.2},{:.2},{:.2} memory_total={} memory_free={} home_disk_total={} home_disk_free={} uptime={} backup_disk_total={} backup_disk_free={} backup_keep={}",
                 i.daemon_version,
                 i.selinux_enabled,
                 i.php_available,
@@ -558,6 +563,9 @@ async fn run_host(
                 i.home_disk_total_bytes,
                 i.home_disk_free_bytes,
                 i.uptime_seconds,
+                i.backup_disk_total_bytes,
+                i.backup_disk_free_bytes,
+                i.backup_keep,
             );
         }
         HostCmd::Reconcile => {
@@ -570,6 +578,172 @@ async fn run_host(
             if !r.drifts.is_empty() {
                 return Ok(ExitCode::from(EXIT_DRIFT));
             }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+#[derive(Subcommand, Debug)]
+enum BackupCmd {
+    /// Start a backup of a tenant; prints the job.
+    Create {
+        tenant: String,
+        /// Wait for the job to finish; exits with status 5 if it failed.
+        #[arg(long)]
+        wait: bool,
+    },
+    /// The tenant's backups, oldest first.
+    List { tenant: String },
+    /// Delete one of the tenant's backups.
+    Delete { tenant: String, backup_id: String },
+    /// Restore the tenant's home from one of its own backups (merges over
+    /// the current files); prints the job.
+    Restore {
+        tenant: String,
+        backup_id: String,
+        /// Wait for the job to finish; exits with status 5 if it failed.
+        #[arg(long)]
+        wait: bool,
+    },
+    /// State of a backup or restore job.
+    Job {
+        job_id: String,
+        /// Wait for the job to finish; exits with status 5 if it failed.
+        #[arg(long)]
+        wait: bool,
+    },
+}
+
+/// Exit status of `backup … --wait` when the job failed.
+const EXIT_JOB_FAILED: u8 = 5;
+
+fn print_job(j: &pb::Job) {
+    let kind = pb::JobKind::try_from(j.kind).map_or("unknown", |k| k.as_str_name());
+    let state = pb::JobState::try_from(j.state).map_or("unknown", |s| s.as_str_name());
+    say!(
+        "job={} kind={} tenant={} backup={} state={} started_at={} finished_at={} message={}",
+        j.id,
+        kind,
+        j.tenant,
+        j.backup_id,
+        state,
+        j.started_at.as_ref().map_or(0, |ts| ts.seconds),
+        j.finished_at.as_ref().map_or(0, |ts| ts.seconds),
+        if j.message.is_empty() {
+            "-"
+        } else {
+            j.message.as_str()
+        },
+    );
+}
+
+fn print_backup(b: &pb::Backup) {
+    let state = pb::BackupState::try_from(b.state).map_or("unknown", |s| s.as_str_name());
+    let members: Vec<String> = b
+        .members
+        .iter()
+        .map(|m| format!("{}:{}:{}", m.kind, m.name, m.size_bytes))
+        .collect();
+    say!(
+        "backup={} tenant={} state={} created_at={} size={} domains={} members={}",
+        b.id,
+        b.tenant,
+        state,
+        b.created_at.as_ref().map_or(0, |ts| ts.seconds),
+        b.size_bytes,
+        if b.domains.is_empty() {
+            "-".to_owned()
+        } else {
+            b.domains.join(",")
+        },
+        if members.is_empty() {
+            "-".to_owned()
+        } else {
+            members.join(",")
+        },
+    );
+}
+
+/// Print the job; with `wait`, poll it until it has ended, then print its
+/// output and the final state.
+async fn follow_job(
+    c: &mut OxPanelEngineClient<Channel>,
+    mut job: pb::Job,
+    wait: bool,
+) -> Result<ExitCode, tonic::Status> {
+    let running = |j: &pb::Job| j.state == i32::from(pb::JobState::Running);
+    if wait {
+        while running(&job) {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            job = c
+                .get_job(pb::GetJobRequest {
+                    job_id: job.id.clone(),
+                })
+                .await?
+                .into_inner();
+        }
+    }
+    for line in job.output.lines() {
+        say!("{line}");
+    }
+    print_job(&job);
+    if job.state == i32::from(pb::JobState::Failed) {
+        return Ok(ExitCode::from(EXIT_JOB_FAILED));
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+async fn run_backup(
+    c: &mut OxPanelEngineClient<Channel>,
+    cmd: BackupCmd,
+) -> Result<ExitCode, tonic::Status> {
+    match cmd {
+        BackupCmd::Create { tenant, wait } => {
+            let r = c
+                .create_backup(pb::CreateBackupRequest { tenant })
+                .await?
+                .into_inner();
+            say!("started={}", r.started);
+            match r.job {
+                Some(job) => return follow_job(c, job, wait).await,
+                None => return Err(tonic::Status::internal("no job in the response")),
+            }
+        }
+        BackupCmd::Restore {
+            tenant,
+            backup_id,
+            wait,
+        } => {
+            let r = c
+                .restore_backup(pb::RestoreBackupRequest { tenant, backup_id })
+                .await?
+                .into_inner();
+            say!("started={}", r.started);
+            match r.job {
+                Some(job) => return follow_job(c, job, wait).await,
+                None => return Err(tonic::Status::internal("no job in the response")),
+            }
+        }
+        BackupCmd::Job { job_id, wait } => {
+            let job = c.get_job(pb::GetJobRequest { job_id }).await?.into_inner();
+            return follow_job(c, job, wait).await;
+        }
+        BackupCmd::List { tenant } => {
+            for b in &c
+                .list_backups(pb::ListBackupsRequest { tenant })
+                .await?
+                .into_inner()
+                .backups
+            {
+                print_backup(b);
+            }
+        }
+        BackupCmd::Delete { tenant, backup_id } => {
+            let r = c
+                .delete_backup(pb::DeleteBackupRequest { tenant, backup_id })
+                .await?
+                .into_inner();
+            say!("deleted={}", r.deleted);
         }
     }
     Ok(ExitCode::SUCCESS)

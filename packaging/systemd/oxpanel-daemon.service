@@ -44,7 +44,9 @@ ProtectSystem=strict
 # /etc:      useradd/userdel rewrite passwd/shadow/group via rename; nginx and systemd unit files
 # /home:     tenant homes
 # /var/lib:  nginx -t temp dirs (/var/lib/nginx), the semanage policy store (/var/lib/selinux),
-#            the sssd cache (/var/lib/sss). Listed as the parent on purpose: /var/lib/selinux is
+#            the sssd cache (/var/lib/sss), the backup store (/var/lib/oxpanel-backups: the daemon
+#            creates backup directories and writes manifests; archives are written by job units,
+#            each allowed only its own backup directory). Listed as the parent on purpose: /var/lib/selinux is
 #            labelled semanage_store_t, a SELinux *security* file type, and the targeted policy
 #            forbids init_t from mounting on it, so naming it directly makes the unit fail with
 #            "Failed at step NAMESPACE" on every enforcing host (found by make acceptance).

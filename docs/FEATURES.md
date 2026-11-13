@@ -73,6 +73,23 @@ see "Not yet included" at the end so nobody assumes otherwise.
 | SELinux | Works enforcing with zero denials. Applications run in their own domain, `oxpanel_app_t` (a small CIL module shipped with the package), so the web server is allowed to connect to application sockets and to nothing else; socket directories are labelled `httpd_var_run_t`. If the module is missing, enabling an application is refused with the command that installs it. |
 | Reconciliation | An edited or missing application unit is `APP_UNIT_DRIFT`, a stray one `ORPHAN_APP_UNIT`. |
 
+## Backups and restores
+
+| Feature | Detail |
+|---|---|
+| Jobs | `CreateBackup` and `RestoreBackup` return a job at once; `GetJob` reports `RUNNING`, `SUCCEEDED` or `FAILED` with a message and the end of the worker's output. The work runs in a transient systemd unit (`oxpanel-job-<id>.service`), so it is not bound by the 300 s request limit and survives a restart or crash of the daemon, which re-attaches to running jobs at start. One job per tenant, at most 4 on the host. |
+| Contents | The tenant's home as a gzip'd tar (`home.tar.gz`; package-manager caches `.cache` and `.npm` left out, virtualenvs and `node_modules` included) and the engine's records of the tenant and its virtual hosts (`records.json`), listed in a `manifest.json` with size and SHA-256 of each member. Further members (database dumps) can be added without changing the format. |
+| Read as the tenant | `tar` runs with the tenant's uid (never root), stores symlinks as symlinks, skips what the tenant cannot read, records FIFOs and device nodes without opening them, handles sparse files, stays on one file system. It writes into a pipe; only a root worker without `CAP_DAC_OVERRIDE` writes the archive file. |
+| Charged to the tenant | The job runs in the tenant's slice at the lowest CPU and I/O priority, sandboxed (`ProtectSystem=strict` with one writable path, no network), with a time limit (6 h by default). |
+| Root-only storage, bounded | `/var/lib/oxpanel-backups/<tenant>/<id>/`, directories `0700`, files `0600`; tenants cannot list or read it. A backup is refused unless the home fits with a reserve to spare (1 GiB by default), and the archive may not grow into it. The newest 7 complete backups per tenant are kept (configurable). |
+| Never half-written | A backup is listed `READY` only after the worker has written and synced the archive and the daemon has written the manifest; a failed, killed or interrupted backup leaves nothing behind. |
+| Integrity | Size and SHA-256 are verified in full before a restore starts; a damaged or truncated archive is refused and nothing is restored. |
+| Restore as the tenant | Merges over the home (files in the backup replace current ones, newer files stay), extracted by `tar` running as the tenant in a sandbox where only the home is writable: absolute paths, `..`, writes through symlinks, hard links out of the home, set-uid/set-gid files and device nodes are all refused, and every file belongs to the tenant. PHP and applications are stopped during the restore; afterwards the home is made private again, relabelled, and every document root gets its web-server ACLs and SELinux label back, so the site is served without manual steps. |
+| Tenant isolation | A backup is only found for the tenant it belongs to (and the uid it was taken from): restoring or deleting another tenant's backup is `NOT_FOUND`. |
+| Lifecycle | Suspended tenants can be backed up and restored (their services stay stopped). `DeleteTenant` is refused while the tenant has backups or a running job. |
+| Reconciliation | `BACKUP_ARCHIVE_MISSING`, `BACKUP_ARCHIVE_MODIFIED` (size or manifest differs from the record), `ORPHAN_BACKUP_ARCHIVE`, `BACKUP_INCOMPLETE`. |
+| Scheduling | Left to the panel (call `CreateBackup` on its own timetable); retention is enforced by the engine. |
+
 ## API, transport and authentication
 
 | Feature | Detail |
@@ -90,7 +107,7 @@ see "Not yet included" at the end so nobody assumes otherwise.
 
 | Feature | Detail |
 |---|---|
-| `oxpanel-ctl` | Command-line client: `tenant create|get|list|set-limits|set-owner|suspend|resume|usage|delete`, `vhost set|log|restart-app|install-deps|remove|list`, `host info|reconcile`, human-readable sizes (`512M`, `2G`). |
+| `oxpanel-ctl` | Command-line client: `tenant create|get|list|set-limits|set-owner|suspend|resume|usage|delete`, `vhost set|log|restart-app|install-deps|remove|list`, `host info|reconcile`, `backup create|list|delete|restore|job` (with `--wait`), human-readable sizes (`512M`, `2G`). |
 | Host information | `GetHostInfo`: engine version, SELinux and dry-run state, tenant and virtual-host counts, the tenant uid range (capacity), load averages, memory, uptime, and size/free space of the file system holding tenant homes. |
 | Reconciliation | `Reconcile` compares every record with the operating system and reports differences: interrupted tenants, missing or mismatched accounts, invalid homes, edited or missing unit files, missing or edited Nginx files, virtual hosts without a tenant, and orphan files in OxPanel's own directories. Strictly read-only — most findings are healed by repeating the original request. `oxpanel-ctl host reconcile` exits `3` when drift is found. |
 | Configuration | Environment variables `OXPANEL_*` (from `/etc/oxpanel/daemon.env`); every value has a production default. `--check-config` validates configuration and host prerequisites without starting. |
@@ -99,7 +116,7 @@ see "Not yet included" at the end so nobody assumes otherwise.
 | Hardened unit | `ProtectSystem=strict` with an explicit `ReadWritePaths` list, `PrivateNetwork` + `IPAddressDeny=any`, `NoNewPrivileges`, `PrivateDevices`, `ProtectKernel*`, `RestrictNamespaces`, `MemoryDenyWriteExecute`, capability deny-list, seccomp allow-list. |
 | Packaging | RPM spec (`packaging/oxpanel-daemon.spec`), `sysusers.d` (creates the `oxpanel` group), `tmpfiles.d`, environment file. |
 | Dry-run mode | `--dry-run` runs the full daemon against an in-memory fake OS as an unprivileged user — for developing the panel without root. |
-| Records | Everything the daemon owns is recorded in `/var/lib/oxpanel/{tenants,vhosts}/*.json` (root-only). A corrupt record blocks operations on that one object only. |
+| Records | Everything the daemon owns is recorded in `/var/lib/oxpanel/{tenants,vhosts,backups,jobs}/*.json` (root-only). A corrupt record blocks operations on that one object only. |
 
 ## Engineering guarantees
 
@@ -110,4 +127,4 @@ see "Not yet included" at the end so nobody assumes otherwise.
 
 ## Not yet included
 
-To be explicit, v0.1.0 does **not** provide: TLS/ACME certificates, a choice of PHP version or per-tenant PHP settings (the host's `php-fpm` package is used as installed), a choice of Node.js/Python version per application (the host's packages are used; Node.js must be 22 or newer), other runtimes, custom start commands or environment variables for applications, a confining SELinux policy for applications, DNS, mail, databases, FTP/SFTP/SSH access for tenants, disk quotas, backups, automatic repair of drift found by `Reconcile`, a confined SELinux domain for the daemon itself, or historical metrics. These are on the roadmap in `oxpanel-daemon/PROJECT_DETAILS.md`.
+To be explicit, v0.1.0 does **not** provide: TLS/ACME certificates, a choice of PHP version or per-tenant PHP settings (the host's `php-fpm` package is used as installed), a choice of Node.js/Python version per application (the host's packages are used; Node.js must be 22 or newer), other runtimes, custom start commands or environment variables for applications, a confining SELinux policy for applications, DNS, mail, databases, FTP/SFTP/SSH access for tenants, disk quotas, off-host or encrypted backups, automatic repair of drift found by `Reconcile`, a confined SELinux domain for the daemon itself, or historical metrics. These are on the roadmap in `oxpanel-daemon/PROJECT_DETAILS.md`.
