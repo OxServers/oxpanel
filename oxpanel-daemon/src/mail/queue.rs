@@ -5,9 +5,10 @@
 //!
 //! Postfix's tools list the host's network interfaces when they start and
 //! stop if there are none; the daemon has no network (`PrivateNetwork=yes`),
-//! so they run in a transient unit, and their output is read back from the
-//! journal (a file systemd opened for a confined Postfix tool would be
-//! refused by SELinux, as for rndc).
+//! so they run in a transient unit, started through the daemon's own binary
+//! (`oxpanel-daemon mail-tool`: systemd itself may not run Postfix's
+//! programs under SELinux, found on the enforcing VM), and their output is
+//! read back from the journal.
 
 use super::store::MailStore;
 use crate::ctx::Ctx;
@@ -77,6 +78,49 @@ pub fn parse(text: &str) -> Vec<QueueEntry> {
     out
 }
 
+/// `oxpanel-daemon mail-tool <program> <args…>` (see [`tool_main`]).
+pub const TOOL_SUBCOMMAND: &str = "mail-tool";
+
+/// `oxpanel-daemon mail-tool …`, in the transient unit: run exactly one of
+/// `postqueue -j`, `postqueue -f`, `postsuper -d <queue id>` and pass its
+/// output on. Anything else is refused.
+pub fn tool_main(args: &[String]) -> u8 {
+    use std::io::Write as _;
+    let argv: Vec<&str> = args.iter().skip(1).map(String::as_str).collect();
+    let spec = match argv.as_slice() {
+        [p, "-j"] if *p == bin::POSTQUEUE => (bin::POSTQUEUE, vec!["-j".to_owned()]),
+        [p, "-f"] if *p == bin::POSTQUEUE => (bin::POSTQUEUE, vec!["-f".to_owned()]),
+        [p, "-d", id] if *p == bin::POSTSUPER && QueueId::parse(id).is_ok() => {
+            (bin::POSTSUPER, vec!["-d".to_owned(), (*id).to_owned()])
+        }
+        _ => {
+            let _ = writeln!(std::io::stderr(), "mail-tool: refused");
+            return 64;
+        }
+    };
+    let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    else {
+        return 70;
+    };
+    let cmd = CommandSpec::new(spec.0, std::time::Duration::from_secs(120)).args(&spec.1);
+    match rt.block_on(crate::system::System::run(
+        &crate::system::RealSystem::new(),
+        cmd,
+    )) {
+        Ok(out) => {
+            let _ = std::io::stdout().write_all(&out.stdout);
+            let _ = std::io::stderr().write_all(&out.stderr);
+            u8::try_from(out.code.unwrap_or(1)).unwrap_or(1)
+        }
+        Err(e) => {
+            let _ = writeln!(std::io::stderr(), "mail-tool: {e}");
+            70
+        }
+    }
+}
+
 static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Run a Postfix tool in a transient unit and return what it printed.
@@ -95,6 +139,8 @@ pub(super) async fn tool(ctx: &Ctx, program: &'static str, args: &[&str]) -> Res
                 .args(["--wait", "--collect", "--quiet"])
                 .arg(format!("--unit={unit}"))
                 .arg("--")
+                .arg(&ctx.config.worker_exe)
+                .arg(TOOL_SUBCOMMAND)
                 .arg(program)
                 .args(args),
         )

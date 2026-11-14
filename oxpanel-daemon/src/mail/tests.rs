@@ -1223,7 +1223,7 @@ async fn the_queue_is_read_attributed_and_managed() {
         h.argvs(bin::SYSTEMD_RUN)
             .into_iter()
             .filter(|a| a.iter().any(|x| x.starts_with("--unit=oxpanel-mailq-")))
-            .map(|a| a.into_iter().skip_while(|x| x != "--").skip(1).collect())
+            .map(|a| a.into_iter().skip_while(|x| x != "--").skip(3).collect())
             .collect()
     };
     h.sys.clear_calls();
@@ -1248,6 +1248,17 @@ async fn the_queue_is_read_attributed_and_managed() {
     );
     let run = h.argvs(bin::SYSTEMD_RUN);
     assert_eq!(&run[0][..3], ["--wait", "--collect", "--quiet"]);
+    let tail: Vec<&String> = run[0]
+        .iter()
+        .skip_while(|x| *x != "--")
+        .skip(1)
+        .take(2)
+        .collect();
+    assert_eq!(
+        tail[1],
+        crate::mail::queue::TOOL_SUBCOMMAND,
+        "through the daemon's own binary"
+    );
     assert!(
         h.argvs(bin::POSTQUEUE).is_empty(),
         "never run in the daemon's own unit"

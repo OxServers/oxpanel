@@ -150,6 +150,14 @@ fn main() -> ExitCode {
     {
         return ExitCode::from(oxpanel_daemon::dns::probe::main(&args));
     }
+    // `oxpanel-daemon mail-tool …`: one of Postfix's queue tools, in the
+    // transient unit the daemon starts for it.
+    if args
+        .first()
+        .is_some_and(|a| a == oxpanel_daemon::mail::queue::TOOL_SUBCOMMAND)
+    {
+        return ExitCode::from(oxpanel_daemon::mail::queue::tool_main(&args));
+    }
     // `oxpanel-daemon mail-policy`: the mail policy service (its own unit,
     // as the account oxpanel-mail).
     if args
