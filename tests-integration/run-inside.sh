@@ -121,7 +121,8 @@ check_not "bob cannot take alice's alias" oxpanel-ctl vhost set www.example.test
 check_not "bob cannot take alice's domain" oxpanel-ctl vhost set example.test --tenant bob
 check_not "unauthorised peer (bob, a tenant) is refused" as_user bob oxpanel-ctl tenant list
 # The panel-api service account: a system user whose *account* is in the oxpanel group.
-useradd -r -G oxpanel -s /sbin/nologin panelapi
+# (On a host with the panel installed, INSTALL=product, its package made it already.)
+getent passwd panelapi >/dev/null || useradd -r -G oxpanel -s /sbin/nologin panelapi
 check "authorised peer via oxpanel group membership works" bash -c 'setpriv --reuid=panelapi --regid=panelapi --init-groups --no-new-privs -- oxpanel-ctl tenant list | grep -q tenant=alice'
 check "process groups alone do not grant access (account DB is authoritative)" bash -c '! setpriv --reuid=bob --regid=bob --groups="$(getent group oxpanel | cut -d: -f3)" --no-new-privs -- oxpanel-ctl tenant list >/dev/null 2>&1'
 check "nginx -t output has no warnings" bash -c '! nginx -t 2>&1 | grep -q warn'

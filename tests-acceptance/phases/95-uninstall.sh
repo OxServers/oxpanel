@@ -40,6 +40,14 @@ check "the fail2ban jail OxPanel added is gone" bash -c '! test -e /etc/fail2ban
 check "the uninstaller said what it left" bash -c 'grep -q "LEFT IN PLACE" uninstall.log && grep -q "homes" uninstall.log && grep -q "databases" uninstall.log && grep -q "backups" uninstall.log'
 check "RESULT line" grep -q '^RESULT: uninstalled' uninstall.log
 
+if ls release/oxpanel-panel-[0-9]*.rpm >/dev/null 2>&1; then
+  check "the panel package is gone" bash -c '! rpm -q oxpanel-panel'
+  check "the panel is off Nginx (server block and secret include removed)" bash -c '! test -e /etc/nginx/conf.d/00-oxpanel-panel.conf && ! test -e /etc/nginx/oxpanel-panel-proxy.inc'
+  check "nothing listens on the panel's port any more" bash -c '! ss -H -ltn | grep -q ":8443 "'
+  check "the panel's SELinux module went with it" bash -c '! semodule -l | grep -qx oxpanel-panel'
+  check "the panel's database was kept, and the uninstaller said so" bash -c 'test -s /var/lib/oxpanel-panel/panel.db && grep -q "kept: the panel.s database" uninstall.log'
+  check "the panel's port was closed in firewalld" bash -c '! systemctl -q is-active firewalld || ! firewall-cmd --query-port=8443/tcp'
+fi
 check "the tenant account is still there" getent passwd $T
 check "its home and page are still there" test "$(cat /home/$T/public_html/index.html)" = kept-page
 check "its database and data are still there" bash -c "[ \"\$(mariadb --no-defaults -u root -N -B -e 'SELECT v FROM ${T}_data.t')\" = 42 ]"
@@ -69,6 +77,11 @@ check "its file-manager job history is still listed" bash -c "oxpanel-ctl files 
 check "the fail2ban jail is back" bash -c 'fail2ban-client status sshd >/dev/null'
 eventually "its zone is served again, with the tenant's own record" 30 1 bash -c "dig +short +norec @127.0.0.1 unin.test TXT | grep -q kept-dns-record"
 check "reconcile is clean" bash -c 'oxpanel-ctl host reconcile | grep -qx "drifts=0"'
+if ls release/oxpanel-panel-[0-9]*.rpm >/dev/null 2>&1; then
+  check "the reinstalled panel answers over HTTPS" oxpanel-panel-setup status
+  check "the reinstall found the kept administrator (no new one-time password)" bash -c 'grep -q "already has an administrator" reinstall.log && ! grep -q "one-time password" reinstall.log'
+  check "the panel database survived the round trip" bash -c 'test -s /var/lib/oxpanel-panel/panel.db'
+fi
 
 oxpanel-ctl db delete ${T}_data >/dev/null 2>&1
 oxpanel-ctl db trash-purge $T >/dev/null 2>&1

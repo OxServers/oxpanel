@@ -11,7 +11,7 @@ INSTALL="${INSTALL:-git}"; PHASES="${PHASES:-10 15 20 30 40 50 60 70 80 90}"; SO
 ACCEL="${ACCEL:-kvm}"; CONTINUE="${CONTINUE:-0}"; KEEP="${KEEP:-0}"; REFRESH_IMAGE="${REFRESH_IMAGE:-0}"
 GIT_URL="${GIT_URL:-}"; GIT_REF="${GIT_REF:-}"; RPM_DIR="${RPM_DIR:-/work/dist/rpms}"
 TARGET="${TARGET:-}"; TARGET_PORT="${TARGET_PORT:-22}"; TARGET_KEY="${TARGET_KEY:-}"; I_UNDERSTAND="${I_UNDERSTAND:-0}"
-SSH_PORT="${SSH_PORT:-2222}"; HTTP_PORT="${HTTP_PORT:-8080}"
+SSH_PORT="${SSH_PORT:-2222}"; HTTP_PORT="${HTTP_PORT:-8080}"; PANEL_HTTPS_PORT="${PANEL_HTTPS_PORT:-8443}"
 PHASE_TIMEOUT="${PHASE_TIMEOUT:-900}"; INSTALL_TIMEOUT="${INSTALL_TIMEOUT:-2400}"
 IMAGE_BASE=https://repo.almalinux.org/almalinux/9/cloud/x86_64/images
 IMAGE_NAME=AlmaLinux-9-GenericCloud-latest.x86_64.qcow2
@@ -81,10 +81,10 @@ provision() {
   local accel_args net_args
   if [ "$ACCEL" = kvm ]; then accel_args="-accel kvm -cpu host"; else accel_args="-accel tcg -cpu max"; fi
   if "$QEMU" -netdev help 2>/dev/null | grep -qx user; then
-    net_args="-netdev user,id=n0,hostfwd=tcp:0.0.0.0:$SSH_PORT-:22,hostfwd=tcp:0.0.0.0:$HTTP_PORT-:80"
+    net_args="-netdev user,id=n0,hostfwd=tcp:0.0.0.0:$SSH_PORT-:22,hostfwd=tcp:0.0.0.0:$HTTP_PORT-:80,hostfwd=tcp:0.0.0.0:$PANEL_HTTPS_PORT-:8443"
     VM_DESC="qemu $("$QEMU" --version | head -1 | awk '{print $4}') · $ACCEL · ${cpus} vCPU · ${mem} MB · slirp"
   else
-    passt -f -s "$RUN/passt.sock" -t "$SSH_PORT:22" -t "$HTTP_PORT:80" > "$OUT/passt.log" 2>&1 &
+    passt -f -s "$RUN/passt.sock" -t "$SSH_PORT:22" -t "$HTTP_PORT:80" -t "$PANEL_HTTPS_PORT:8443" > "$OUT/passt.log" 2>&1 &
     PASST_PID=$!
     for _ in $(seq 1 50); do [ -S "$RUN/passt.sock" ] && break; sleep 0.1; done
     net_args="-netdev stream,id=n0,server=off,addr.type=unix,addr.path=$RUN/passt.sock"
@@ -147,6 +147,7 @@ run_phase() { # <NN> → script name
           if vm_wait_ssh 300; then run_remote 15-quota-post "$PHASE_TIMEOUT" "cd /root/acc && $(phase_env) bash phases/15-quota-post.sh" || rc=$?
           else P_NUM+=(15); P_NAME+=(quota-post); P_STATUS+=(NO-SSH); P_SECS+=(300); P_OK+=(0); P_FAIL+=("VM did not come back after reboot"); rc=1; fi
         fi;;
+    25) run_remote 25-product "$PHASE_TIMEOUT" "cd /root/acc && $(phase_env) bash phases/25-product.sh" || rc=$?;;
     20) run_remote 20-integration "$PHASE_TIMEOUT" "cd /root/acc && $(phase_env) bash phases/20-integration.sh" || rc=$?;;
     30) run_remote 30-selinux "$PHASE_TIMEOUT" "cd /root/acc && $(phase_env) bash phases/30-selinux.sh" || rc=$?;;
     40) run_remote 40-sandbox "$PHASE_TIMEOUT" "cd /root/acc && $(phase_env) bash phases/40-sandbox.sh" || rc=$?;;
@@ -171,6 +172,7 @@ collect() {
   log "collecting artifacts"
   vm_ssh 'journalctl -u oxpanel-daemon --no-pager -o short-precise' > "$OUT/host/journal-oxpanel-daemon.txt" 2>/dev/null || true
   vm_ssh 'journalctl -u nginx --no-pager -o short-precise' > "$OUT/host/journal-nginx.txt" 2>/dev/null || true
+  vm_ssh 'journalctl -u oxpanel-panel --no-pager -o short-precise' > "$OUT/host/journal-oxpanel-panel.txt" 2>/dev/null || true
   vm_ssh 'journalctl --list-boots --no-pager; echo; journalctl -p warning --no-pager -o short-precise | tail -300' > "$OUT/host/journal-warnings.txt" 2>/dev/null || true
   vm_ssh 'tar czf - --ignore-failed-read /var/log/audit /var/log/nginx /etc/nginx/oxpanel.d /etc/nginx/conf.d/00-oxpanel.conf /var/lib/oxpanel /etc/oxpanel /usr/lib/systemd/system/oxpanel-daemon.service /etc/systemd/system/oxpanel-daemon.service /root/acc/*.log /root/acc/*.sh /root/acc/*.pre 2>/dev/null' 2>/dev/null | tar xzf - -C "$OUT/host" 2>/dev/null || true
   vm_ssh 'echo "release: $(cat /etc/almalinux-release)"; echo "kernel: $(uname -r)"; echo "selinux: $(getenforce)"; echo "package: $(rpm -q oxpanel-daemon 2>/dev/null || echo "(source install)")"; echo "binary: $(oxpanel-daemon --version 2>/dev/null)"; echo "nginx: $(nginx -v 2>&1)"; echo; systemd-analyze security oxpanel-daemon --no-pager 2>/dev/null | tail -2' > "$OUT/host/system.txt" 2>/dev/null || true
@@ -232,12 +234,13 @@ log "copying test payload"
 vm_ssh 'mkdir -p /root/acc/phases /root/acc/rpms'
 vm_scp "$HERE"/phases/*.sh /root/acc/phases/
 vm_scp "$HERE"/phases/attack /root/acc/phases/
+vm_scp "$HERE"/phases/product /root/acc/phases/
 vm_scp "$WORK/tests-integration/run-inside.sh" "$WORK/docs/HANDBOOK.md" /root/acc/
 if [ "$INSTALL" = rpm ]; then
   ls "$RPM_DIR"/oxpanel-daemon-*.rpm >/dev/null 2>&1 || die "no RPMs in $RPM_DIR (run make rpm)"
   vm_scp "$RPM_DIR"/oxpanel-daemon-*.rpm /root/acc/rpms/
 fi
-if [ "$INSTALL" = installer ] || [ "$INSTALL" = upgrade ]; then
+if [ "$INSTALL" = installer ] || [ "$INSTALL" = upgrade ] || [ "$INSTALL" = product ]; then
   [ -f "$WORK/dist/release/install.sh" ] || die "no dist/release (run make dist)"
   vm_ssh 'mkdir -p /root/acc/release'
   vm_scp "$WORK"/dist/release/. /root/acc/release/

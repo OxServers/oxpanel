@@ -17,6 +17,7 @@ export INSTALL="${INSTALL:-git}" KEEP="${KEEP:-0}" ACCEL="${ACCEL:-kvm}" TARGET=
 case "${INSTALL:-git}" in
   installer) DEFAULT_PHASES="10 15 16 17 20 30 40 50 60 70 80 90 95";;
   upgrade) DEFAULT_PHASES="10 12 20 30";;
+  product) DEFAULT_PHASES="10 25 20 30 60 95";;
   *) DEFAULT_PHASES="10 15 20 30 40 50 60 70 80 90";;
 esac
 export PHASES="${PHASES:-$DEFAULT_PHASES}" SOAK_N="${SOAK_N:-20}" I_UNDERSTAND="${I_UNDERSTAND:-0}" REFRESH_IMAGE="${REFRESH_IMAGE:-0}"
@@ -45,6 +46,15 @@ case "$INSTALL" in
     (cd "$ROOT" && ./scripts/dev.sh ./scripts/build-rpm.sh >/dev/null && ./scripts/make-dist.sh >/dev/null)
     if [ "$INSTALL" = upgrade ]; then say "building the old RPM (${OLD_REF:-d38bae2})"; (cd "$ROOT" && ./scripts/build-old-rpm.sh "${OLD_REF:-d38bae2}" >/dev/null); fi
     say "release: $(cd "$ROOT/dist/release" && ls | tr '\n' ' ')";;
+  product)
+    # The whole product: the engine release plus the (proprietary) panel RPM,
+    # built in the panel's own repository and named here; nothing of it is kept
+    # in this repository.
+    [ -n "${PANEL_RPM:-}" ] && [ -f "$PANEL_RPM" ] || die "INSTALL=product needs PANEL_RPM=/path/to/oxpanel-panel-<version>.rpm (make rpm in the panel's repository)"
+    podman image exists "$DEV" || { say "building dev image $DEV"; podman build -t "$DEV" -f "$ROOT/tests-integration/Containerfile" "$ROOT/tests-integration" >/dev/null; }
+    say "building the release with the panel (make dist PANEL_RPM=...) from the working tree"
+    (cd "$ROOT" && ./scripts/dev.sh ./scripts/build-rpm.sh >/dev/null && PANEL_RPM="$PANEL_RPM" ./scripts/make-dist.sh >/dev/null)
+    say "release: $(cd "$ROOT/dist/release" && ls | tr '\n' ' ')";;
   git)
     if [ -z "$GIT_REF" ]; then
       branch="$(git -C "$ROOT" rev-parse --abbrev-ref HEAD 2>/dev/null || echo main)"
@@ -58,7 +68,7 @@ case "$INSTALL" in
       say "WARNING: local HEAD is not pushed to origin/$ref; the VM will test $(git -C "$ROOT" rev-parse --short "origin/$ref")"
     fi
     say "git install: ${GIT_URL:-https://github.com/OxServers/oxpanel.git} @ ${GIT_REF:-main}";;
-  *) die "INSTALL must be git, rpm, installer or upgrade";;
+  *) die "INSTALL must be git, rpm, installer, upgrade or product";;
 esac
 
 STAMP="$(date -u +%Y%m%dT%H%M%SZ)"; OUT="$ROOT/dist/acceptance/$STAMP"; mkdir -p "$OUT"; ln -sfn "$STAMP" "$ROOT/dist/acceptance/latest"
@@ -70,7 +80,8 @@ if [ -n "${TARGET_KEY:-}" ]; then ARGS+=(-v "$TARGET_KEY:/target-key:ro" -e TARG
 say "run directory: dist/acceptance/$STAMP"
 if [ "$KEEP" = 1 ] && [ -z "$TARGET" ]; then
   podman rm -f oxpanel-acceptance-vm >/dev/null 2>&1 || true
-  cid="$(podman run -d --name oxpanel-acceptance-vm -p 127.0.0.1:2222:2222 -p 127.0.0.1:8080:8080 "${ARGS[@]}" "$RIG" /work/tests-acceptance/acceptance.sh)"
+  # 8443: the panel's HTTPS port (INSTALL=product), for a browser on this machine.
+  cid="$(podman run -d --name oxpanel-acceptance-vm -p 127.0.0.1:2222:2222 -p 127.0.0.1:8080:8080 -p 127.0.0.1:8443:8443 "${ARGS[@]}" "$RIG" /work/tests-acceptance/acceptance.sh)"
   podman logs -f "$cid" 2>&1 | sed '/^ACCEPTANCE_DONE/q'
   rc="$(cat "$OUT/exit-code" 2>/dev/null || echo 2)"
 else

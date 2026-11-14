@@ -21,9 +21,11 @@ help:
 	@echo "make rpm          build the engine RPM (with oxpanel-acme) from the working tree into dist/rpms/"
 	@echo "make rpmlint      rpmlint + rpm -qpR of the built RPM"
 	@echo "make dist         collect RPM, install.sh, SHA256SUMS and the handbook in dist/release/ (no tag, no upload)"
+	@echo "                  PANEL_RPM=path adds the (proprietary) panel RPM to the bundle; install.sh then installs it"
 	@echo "make rpm-old      build the RPM of an older commit for the upgrade test (OLD_REF=d38bae2)"
 	@echo "make acceptance   real AlmaLinux 9 VM (KVM, SELinux enforcing): install RPM, run all phases"
-	@echo "                  INSTALL=git|rpm|installer|upgrade (installer = dist/release + install.sh; upgrade = old RPM, then current)"
+	@echo "                  INSTALL=git|rpm|installer|upgrade|product (installer = dist/release + install.sh; upgrade = old RPM,"
+	@echo "                  then current; product = release + panel RPM (PANEL_RPM=path), driven through the panel's HTTPS API)"
 	@echo "                  KEEP=1 keep the VM · PHASES=\"30 60\" subset · SOAK_N=50 · RPM=path · TARGET=user@host"
 	@echo "make acceptance-destroy  stop a kept VM"
 
@@ -85,7 +87,7 @@ rpm-old:
 	./scripts/build-old-rpm.sh $(OLD_REF)
 
 dist: rpm
-	./scripts/make-dist.sh
+	PANEL_RPM="$(PANEL_RPM)" ./scripts/make-dist.sh
 
 acceptance:
 	./scripts/acceptance.sh

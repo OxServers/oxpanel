@@ -38,7 +38,7 @@ case "$INSTALL" in
     [ "$rc" = 0 ] || fail "install.sh exited $rc (see above)"
     ok "install.sh --yes ran clean ($(( $(date +%s) - start ))s)"
     check "the run reports success and that a reboot is needed for quotas" bash -c 'grep -q "^RESULT: ok changes=[1-9][0-9]* .*reboot_required=yes" install-1.log'
-    check "every stage ran" bash -c 'for s in preflight nodejs engine selinux nginx mariadb php panel daemon dns firewall fail2ban quota verify; do grep -q "^\[$s\]" install-1.log || { echo "stage $s missing"; exit 1; }; done'
+    check "every stage ran" bash -c 'for s in preflight nodejs engine selinux nginx mariadb php panel daemon dns panelweb firewall fail2ban quota verify; do grep -q "^\[$s\]" install-1.log || { echo "stage $s missing"; exit 1; }; done'
     check "the status file records the result" bash -c 'grep -qx "reboot_required=yes" /var/lib/oxpanel-installer/status && grep -qx "result=ok" /var/lib/oxpanel-installer/status'
     check "the log file exists, root-only" test "$(stat -c %a /var/log/oxpanel-install.log)" = 600
     # Idempotence: the second run changes nothing.
@@ -47,6 +47,33 @@ case "$INSTALL" in
     [ "$rc" = 0 ] || fail "second install.sh run exited $rc"
     check "the second run changes nothing" bash -c 'grep -q "^RESULT: ok changes=0 " install-2.log'
     check "the second run says so in every stage" bash -c '! grep -q "changed:" install-2.log'
+    ;;
+  product)
+    # The release bundle includes the panel RPM (make dist PANEL_RPM=...): install.sh
+    # installs both, puts the panel on HTTPS and prints the first administrator's
+    # one-time password, which phase 25 uses to sign in like the operator would.
+    check "the release directory is intact (SHA256SUMS)" bash -c 'cd release && sha256sum -c --quiet SHA256SUMS'
+    check "the bundle includes the panel RPM" bash -c 'ls release/oxpanel-panel-[0-9]*.rpm'
+    check "install firewalld and start it (a host that has a firewall)" bash -c 'dnf -y -q install firewalld && systemctl enable --now firewalld'
+    start=$(date +%s)
+    bash release/install.sh --yes --fail2ban --enable-epel > install-1.log 2>&1; rc=$?
+    # The log printed here must not show the password: keep it out of the phase log too.
+    echo "--- install-1.log (password line masked) ---"; sed 's/\(one-time password: *\).*/\1<masked>/' install-1.log; echo "---------------------"
+    [ "$rc" = 0 ] || fail "install.sh exited $rc (see above)"
+    ok "install.sh --yes with the bundled panel ran clean ($(( $(date +%s) - start ))s)"
+    check "every stage ran, the panel's included" bash -c 'for s in preflight nodejs engine selinux nginx mariadb php panel daemon dns panelweb firewall fail2ban quota verify; do grep -q "^\[$s\]" install-1.log || { echo "stage $s missing"; exit 1; }; done'
+    check "the run reports success" grep -q '^RESULT: ok changes=[1-9]' install-1.log
+    sed -n 's/^  administrator: *//p' install-1.log > panel-admin.once
+    sed -n 's/^  one-time password: *//p' install-1.log >> panel-admin.once
+    chmod 600 panel-admin.once
+    check "the installer printed the first administrator and a one-time password" bash -c 'test "$(wc -l < panel-admin.once)" = 2 && test "$(sed -n 2p panel-admin.once | wc -c)" -gt 12'
+    check "the one-time password is not in the installer's log file" bash -c '! grep -qF -- "$(sed -n 2p panel-admin.once)" /var/log/oxpanel-install.log'
+    check "the installer checked the panel over HTTPS" grep -q 'panel answers over HTTPS' install-1.log
+    bash release/install.sh --yes --fail2ban --enable-epel > install-2.log 2>&1; rc=$?
+    tail -25 install-2.log
+    [ "$rc" = 0 ] || fail "second install.sh run exited $rc"
+    check "the second run changes nothing" bash -c 'grep -q "^RESULT: ok changes=0 " install-2.log'
+    check "the second run creates no second administrator and prints no password" bash -c '! grep -q "one-time password" install-2.log && grep -q "already has an administrator" install-2.log'
     ;;
   upgrade)
     OLD=$(ls old-rpms/oxpanel-daemon-[0-9]*.el9.x86_64.rpm 2>/dev/null | grep -vE 'debuginfo|debugsource' | head -1)
@@ -95,7 +122,7 @@ check "DNS tools for the checks (dig, delv, dnssec-dsfromkey)" dnf -y -q install
 if [ "$INSTALL" = upgrade ]; then
   info "MariaDB comes with the upgrade (phase 12)"
 else
-  if [ "$INSTALL" != installer ]; then
+  if [ "$INSTALL" != installer ] && [ "$INSTALL" != product ]; then
     handbook_block "### 3.5 " > install-mariadb.sh
     [ -s install-mariadb.sh ] || fail "could not extract the §3.5 MariaDB block from HANDBOOK.md"
     if ! bash -e install-mariadb.sh > install-mariadb.log 2>&1; then tail -30 install-mariadb.log; fail "handbook §3.5 MariaDB block failed"; fi
