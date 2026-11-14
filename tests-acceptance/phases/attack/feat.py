@@ -355,34 +355,34 @@ def mail(victim_home, victim_domain, own_domain, sendmail):
     except OSError as e:
         emit('mail-forge-policy', False, 'blocked', e.strerror or type(e).__name__)
     # Postfix's own submission paths.
-    rc, out = run(['/usr/sbin/sendmail.postfix', '-f', f'x@{own_domain}', f'info@{victim_domain}'], stdin=b'Subject: x\n\nx\n')
+    rc, out = run(['/usr/sbin/sendmail.postfix', '-f', f'x@{own_domain}', f'info@{victim_domain}'], stdin=b'Subject: x\n\nx\n', timeout=8)
     emit('mail-postfix-sendmail', rc == 0, 'blocked', out.strip()[:80])
-    rc, out = run(['/usr/sbin/postdrop'], stdin=b'')
+    rc, out = run(['/usr/sbin/postdrop'], stdin=b'', timeout=8)
     emit('mail-postdrop', rc == 0, 'blocked', out.strip()[:80])
-    rc, out = run(['/usr/bin/doveadm', 'fetch', '-u', f'info@{victim_domain}', 'text', 'all'])
+    rc, out = run(['/usr/bin/doveadm', 'fetch', '-u', f'info@{victim_domain}', 'text', 'all'], timeout=8)
     emit('mail-doveadm-fetch', rc == 0 and 'VICTIM' in out, 'blocked', out.strip()[:80])
     # Relaying through the loopback, with and without a login.
-    r = smtp_dialog(('127.0.0.1', 25), ['EHLO attacker', f'MAIL FROM:<x@{own_domain}>', 'RCPT TO:<victim@relay.example>'])
+    r = smtp_dialog(('127.0.0.1', 25), timeout=5, lines=['EHLO attacker', f'MAIL FROM:<x@{own_domain}>', 'RCPT TO:<victim@relay.example>'])
     emit('mail-relay-25', r.startswith('250'), 'blocked', r[:80])
     try:
-        r = smtp_dialog(('127.0.0.1', 587), ['EHLO attacker', f'MAIL FROM:<x@{own_domain}>', 'RCPT TO:<victim@relay.example>'])
+        r = smtp_dialog(('127.0.0.1', 587), timeout=5, lines=['EHLO attacker', f'MAIL FROM:<x@{own_domain}>', 'RCPT TO:<victim@relay.example>'])
         emit('mail-relay-587-no-login', r.startswith('250'), 'blocked', r[:80])
     except OSError as e:
         emit('mail-relay-587-no-login', False, 'blocked', str(e))
-    r = smtp_dialog(('127.0.0.1', 25), ['EHLO attacker', 'VRFY info@' + victim_domain])
+    r = smtp_dialog(('127.0.0.1', 25), timeout=5, lines=['EHLO attacker', 'VRFY info@' + victim_domain])
     emit('mail-vrfy', r.startswith('25'), 'blocked', r[:80])
     # OxPanel's sendmail: as another customer (envelope, From:), as itself.
     msg = f'From: ceo@{victim_domain}\nTo: info@{victim_domain}\nSubject: forged\n\nx\n'.encode()
-    rc, out = run([sendmail, '-t', '-i'], stdin=msg)
+    rc, out = run([sendmail, '-t', '-i'], stdin=msg, timeout=8)
     emit('mail-sendmail-from-victim', rc == 0, 'blocked', out.strip()[:80])
     msg = f'From: shop@{own_domain}\nTo: info@{victim_domain}\nSubject: forged\n\nx\n'.encode()
-    rc, out = run([sendmail, '-t', '-i', '-f', f'ceo@{victim_domain}'], stdin=msg)
+    rc, out = run([sendmail, '-t', '-i', '-f', f'ceo@{victim_domain}'], stdin=msg, timeout=8)
     emit('mail-sendmail-envelope-victim', rc == 0, 'blocked', out.strip()[:80])
     msg = f'From: shop@{own_domain}\nTo: info@{victim_domain}\nSubject: header\r\nBcc: injected@relay.example\n\nx\n'.encode()
-    rc, out = run([sendmail, '-i', f'info@{victim_domain}\nRCPT TO:<x@relay.example>'], stdin=msg)
+    rc, out = run([sendmail, '-i', f'info@{victim_domain}\nRCPT TO:<x@relay.example>'], stdin=msg, timeout=8)
     emit('mail-sendmail-rcpt-injection', rc == 0, 'blocked', out.strip()[:80])
     msg = f'From: shop@{own_domain}\nTo: info@{victim_domain}\nSubject: control\n\nx\n'.encode()
-    rc, out = run([sendmail, '-t', '-i'], stdin=msg)
+    rc, out = run([sendmail, '-t', '-i'], stdin=msg, timeout=8)
     emit('mail-sendmail-own-domain', rc == 0, 'open', out.strip()[:80])
 
 

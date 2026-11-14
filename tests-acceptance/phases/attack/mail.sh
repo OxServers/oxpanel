@@ -31,7 +31,7 @@ features_mail() {
   check "attacker: generous limits for the controls" run_ok ctl mail limits-set attack3 --max-mailboxes 0 --max-mailbox-bytes 0 --per-hour-account 1000 --per-hour-mailbox 1000
 
   echo "-- 16a. from the attacker's code (PHP, Python, scheduled task)"
-  feat_everywhere mail 30 mail /home/victim1 "$VD" "$AD" /usr/sbin/oxpanel-daemon
+  feat_everywhere mail 30 mail /home/victim1 "$VD" "$AD" /usr/libexec/oxpanel/sendmail
 
   echo "-- 16b. claiming the victim's names"
   check "the victim's domain cannot become the attacker's mail domain" bash -c "oxpanel-ctl mail domain-set $VD --tenant attack3 2>&1 | grep -q mail_domain_not_owned"
@@ -54,7 +54,7 @@ features_mail() {
   echo "-- 16d. reading the victim's mail"
   check_not "IMAP login as the victim with the attacker's password" python3 "$MCL" imap-count "info@$VD" "$APW"
   check_not "IMAP login as the victim with the address as password" python3 "$MCL" imap-count "info@$VD" "info@$VD"
-  check "the file manager refuses paths outside the attacker's home" bash -c "oxpanel-ctl files list attack3 ../victim1/mail 2>&1 | grep -qiE 'invalid|outside|refused|not found'"
+  check "the file manager refuses paths outside the attacker's home" bash -c "! oxpanel-ctl files ls attack3 ../victim1/mail >/dev/null 2>&1 && ! oxpanel-ctl files cat attack3 ../victim1/mail/vphp.test/info/cur >/dev/null 2>&1"
   check "webmail's account cannot read the victim's mail" bash -c "! setpriv --reuid=oxpanel-webmail --regid=oxpanel-webmail --clear-groups -- ls /home/victim1/mail >/dev/null 2>&1"
   check "the mail policy service's account cannot either" bash -c "! setpriv --reuid=oxpanel-mail --regid=oxpanel-mail --clear-groups -- ls /home/victim1/mail >/dev/null 2>&1"
   check "webmail may reach only the loopback" bash -c "systemctl show oxpanel-webmail -p IPAddressDeny | grep -q 0.0.0.0/0"
@@ -69,7 +69,7 @@ features_mail() {
   check "an autoresponder subject with a line break is refused" bash -c "! oxpanel-ctl mail autoreply shop@$AD --tenant attack3 --subject \$'x\nBcc: a@b.example' --body x >/dev/null 2>&1"
   check "an external MX with a line break is refused" bash -c "! oxpanel-ctl mail domain-set $AD --tenant attack3 --mode external --mx \$'mx.example.org\nrelay' >/dev/null 2>&1"
   check "an autoresponder body that tries to end the Sieve string stays text" run_ok ctl mail autoreply "shop@$AD" --tenant attack3 --subject 'away "x"; redirect "a@b.example";' --body $'line\n.\n"; redirect "evil@relay.example"; keep;'
-  check "the script compiles, with exactly one action" bash -c "grep -c 'redirect' /var/lib/oxpanel-mail/sieve/$AD/shop.sieve | grep -qx 0 || sievec /var/lib/oxpanel-mail/sieve/$AD/shop.sieve /dev/null"
+  check "the script compiles and holds no redirect (the text stayed text)" bash -c "sievec /var/lib/oxpanel-mail/sieve/$AD/shop.sieve $FT/shop.svbin && ! sieve-dump $FT/shop.svbin | grep -qiE '^ *[0-9a-f]+: *redirect'"
   check "Postfix still accepts its maps" bash -c "postfix check >/dev/null 2>&1"
   check "Dovecot still accepts its configuration" bash -c "doveconf -n >/dev/null 2>&1"
   ctl mail autoreply "shop@$AD" --tenant attack3 --off >/dev/null
