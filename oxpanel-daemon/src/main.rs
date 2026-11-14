@@ -416,6 +416,21 @@ async fn converge_at_start(ctx: &Ctx) {
     }
     // SFTP: the sshd drop-in confines every tenant account, also those
     // without keys, so it is installed whenever sshd is.
+    // Application and scheduled-task units written by an older version.
+    match oxpanel_daemon::app::converge_units(ctx).await {
+        Ok(0) => {}
+        Ok(n) => info!(units = n, "application units brought up to date"),
+        Err(e) => {
+            warn!(error = %e, "could not bring application units up to date; see `oxpanel-ctl host reconcile`");
+        }
+    }
+    match oxpanel_daemon::task::converge_units(ctx).await {
+        Ok(0) => {}
+        Ok(n) => info!(tasks = n, "scheduled-task units brought up to date"),
+        Err(e) => {
+            warn!(error = %e, "could not bring scheduled-task units up to date; see `oxpanel-ctl host reconcile`");
+        }
+    }
     match sftp::converge_all(ctx).await {
         Ok(n) => info!(tenants_with_sftp = n, "sftp access converged"),
         Err(e) => {

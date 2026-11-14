@@ -283,6 +283,8 @@ out="$(oxpanel-ctl vhost set node.test --tenant bob --app node)"
 echo "$out"
 check "node app vhost changed=true with defaults" bash -c 'grep -q "^changed=true" <<<"$1" && grep -q " app=node:apps/node.test:app.js " <<<"$1"' _ "$out"
 NODEU=oxpanel-app-node.test.service
+# systemd writes the unit's description into the journal its owner reads in the panel.
+check "the application unit is described in the panel's words (account, not tenant)" bash -c "grep -qx 'Description=OxPanel node application for node.test (account bob)' /etc/systemd/system/$NODEU"
 check "application directory created for the tenant" test "$(stat -c '%U:%G' /home/bob/apps/node.test)" = "bob:bob"
 check "application directory is not opened to the web server" bash -c '! getfacl -p /home/bob/apps/node.test 2>/dev/null | grep -q "^user:nginx"'
 check "before any code exists the site answers 502" code_eventually node.test / 502

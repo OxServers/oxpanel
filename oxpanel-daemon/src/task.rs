@@ -696,7 +696,7 @@ pub fn render_service(rec: &TaskRecord, tenant: &TenantRecord, selinux: bool) ->
     let timeout = rec.timeout_secs;
     Ok(format!(
         "{HEADER}[Unit]
-Description=OxPanel scheduled task {task} of tenant {name}
+Description=OxPanel scheduled task {task} of account {name}
 Documentation=https://github.com/OxServers/oxpanel
 After=network.target
 
@@ -747,7 +747,7 @@ pub fn render_timer(rec: &TaskRecord) -> Result<String> {
     let delay = rec.schedule.randomized_delay_secs();
     Ok(format!(
         "{HEADER}[Unit]
-Description=Schedule of OxPanel task {task} of tenant {name}
+Description=Schedule of OxPanel task {task} of account {name}
 Documentation=https://github.com/OxServers/oxpanel
 
 [Timer]
@@ -1220,6 +1220,31 @@ pub async fn set_running_all(ctx: &Ctx, tenant: &TenantRecord, running: bool) ->
     Ok(())
 }
 
+/// Start-up: units an older daemon version rendered differently are written
+/// again from their records, and the timer applied as after a `Put` (so a
+/// changed schedule takes effect). Units that are missing are left to
+/// `Reconcile` and the next `Put`. Returns the number of tasks rewritten.
+pub async fn converge_units(ctx: &Ctx) -> Result<usize> {
+    let _guard = ctx.lock.lock().await;
+    let mut n = 0;
+    for tenant in ctx.store.list_tenants()? {
+        if tenant.state != TenantState::Ready {
+            continue;
+        }
+        for rec in list_for(&ctx.config, &tenant.username)? {
+            let units = TaskUnits::of(&ctx.config, &rec)?;
+            if !units.service.exists() || !units.timer.exists() {
+                continue;
+            }
+            if write_units(ctx, &rec, &tenant).await? {
+                apply_timer(ctx, &rec, &tenant, true).await?;
+                n += 1;
+            }
+        }
+    }
+    Ok(n)
+}
+
 /// Deleting a tenant: every task goes (configuration, not data). The
 /// caller holds the mutation lock.
 pub async fn remove_all(ctx: &Ctx, tenant: &str) -> Result<usize> {
@@ -1514,7 +1539,7 @@ pub(crate) mod tests {
             service,
             "# Managed by oxpanel-daemon. Manual edits will be overwritten.
 [Unit]
-Description=OxPanel scheduled task nightly-report of tenant foo-bar
+Description=OxPanel scheduled task nightly-report of account foo-bar
 Documentation=https://github.com/OxServers/oxpanel
 After=network.target
 
@@ -1561,7 +1586,7 @@ SystemCallArchitectures=native
             render_timer(&r)?,
             "# Managed by oxpanel-daemon. Manual edits will be overwritten.
 [Unit]
-Description=Schedule of OxPanel task nightly-report of tenant foo-bar
+Description=Schedule of OxPanel task nightly-report of account foo-bar
 Documentation=https://github.com/OxServers/oxpanel
 
 [Timer]
@@ -1906,6 +1931,34 @@ WantedBy=timers.target
             vec![v(&["disable", "--now", "--", timer])]
         );
         assert!(units.service.exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn units_of_an_older_version_are_rewritten_at_start_up() -> Result<()> {
+        let h = harness();
+        let (r, _) = h.svc.put("alice", &raw("job", TaskKind::Php)).await?;
+        let units = TaskUnits::of(&h.ctx.config, &r)?;
+        h.sys.clear_calls();
+        assert_eq!(converge_units(&h.ctx).await?, 0, "nothing to do");
+        assert!(systemctl_calls(&h.sys).is_empty());
+        // An older version's wording (it reached the account's journal).
+        let old = std::fs::read_to_string(&units.service)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .replace("of account alice", "of tenant alice");
+        std::fs::write(&units.service, old).unwrap_or_else(|e| panic!("{e}"));
+        assert_eq!(converge_units(&h.ctx).await?, 1);
+        let timer = "oxpanel-task-alice-job.timer";
+        assert_eq!(
+            systemctl_calls(&h.sys),
+            vec![
+                v(&["daemon-reload"]),
+                v(&["enable", "--", timer]),
+                v(&["restart", "--", timer]),
+            ]
+        );
+        let now = std::fs::read_to_string(&units.service).unwrap_or_else(|e| panic!("{e}"));
+        assert!(now.contains("Description=OxPanel scheduled task job of account alice\n"));
         Ok(())
     }
 

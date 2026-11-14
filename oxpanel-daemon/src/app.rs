@@ -29,7 +29,7 @@ use crate::ctx::Ctx;
 use crate::error::{Error, Result};
 use crate::fsutil;
 use crate::nginx::safe_path_str;
-use crate::records::{AppRecord, AppRuntime, TenantRecord, VHostRecord};
+use crate::records::{AppRecord, AppRuntime, TenantRecord, TenantState, VHostRecord};
 use crate::system::{bin, CommandSpec};
 use crate::systemd;
 use crate::validate::{Domain, RelPath, Username};
@@ -167,7 +167,7 @@ pub fn render_unit(
     };
     Ok(format!(
         "{HEADER}[Unit]
-Description=OxPanel {runtime} application for {domain} (tenant {name})
+Description=OxPanel {runtime} application for {domain} (account {name})
 Documentation=https://github.com/OxServers/oxpanel
 After=network.target
 
@@ -412,6 +412,50 @@ pub async fn set_running_all(ctx: &Ctx, tenant: &TenantRecord, running: bool) ->
     Ok(())
 }
 
+/// Start-up: application units an older daemon version rendered differently
+/// are written again from their records; a running application is restarted
+/// so the new unit applies (`try-restart`: a stopped one stays stopped, and a
+/// suspended tenant's are not touched). Units that are missing are left to
+/// `Reconcile` and the next `ConfigureVirtualHost`. Returns how many changed.
+pub async fn converge_units(ctx: &Ctx) -> Result<usize> {
+    let _guard = ctx.lock.lock().await;
+    let cfg = &ctx.config;
+    let mut changed: Vec<(String, bool)> = Vec::new();
+    for tenant in ctx.store.list_tenants()? {
+        if tenant.state != TenantState::Ready {
+            continue;
+        }
+        for v in ctx
+            .store
+            .list_vhosts()?
+            .iter()
+            .filter(|v| v.tenant == tenant.username && v.app.is_some())
+        {
+            let (domain, app) = parts(v)?;
+            let path = unit_path(&cfg.systemd_unit_dir, &domain);
+            if !path.exists() {
+                continue;
+            }
+            let unit = render_unit(&tenant, &domain, app, &cfg.web_user, ctx.selinux)?;
+            if fsutil::write_atomic(&path, unit.as_bytes(), FILE_MODE)? {
+                changed.push((unit_name(&domain), tenant.suspended));
+            }
+        }
+    }
+    if changed.is_empty() {
+        return Ok(0);
+    }
+    systemd::daemon_reload(ctx.sys.as_ref(), cfg.command_timeout).await?;
+    for (unit, suspended) in &changed {
+        if !suspended {
+            ctx.sys
+                .run_ok(systemctl(ctx).args(["try-restart", "--"]).arg(unit))
+                .await?;
+        }
+    }
+    Ok(changed.len())
+}
+
 /// Restart the application, clearing a start-limit left by earlier crashes.
 pub async fn restart(ctx: &Ctx, vhost: &VHostRecord) -> Result<()> {
     let (domain, _) = parts(vhost)?;
@@ -601,6 +645,9 @@ mod tests {
             .any(|l| l == "SELinuxContext=system_u:system_r:oxpanel_app_t:s0"));
         assert_eq!(unit_name(&d), "oxpanel-app-my\\x2dapp.example.com.service");
         for line in [
+            // systemd writes this into the application's journal, which its
+            // owner reads in the panel: in the panel's words, not the engine's.
+            "Description=OxPanel node application for my-app.example.com (account foo-bar)",
             "User=foo-bar",
             "Group=foo-bar",
             "Slice=oxpanel-tenant-foo\\x2dbar.slice",

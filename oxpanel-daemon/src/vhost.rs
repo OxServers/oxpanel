@@ -2098,6 +2098,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn application_units_of_an_older_version_are_rewritten_at_start_up() -> Result<()> {
+        let h = harness(false).await;
+        h.vhosts
+            .configure(app_req("example.com", "alice", AppRuntime::Node))
+            .await?;
+        h.vhosts
+            .configure(app_req("example.net", "bob", AppRuntime::Node))
+            .await?;
+        h.sys.clear_calls();
+        assert_eq!(crate::app::converge_units(&h.vhosts.ctx).await?, 0);
+        assert!(systemctl_calls(&h).is_empty(), "nothing to do");
+        // An older version's wording, which reached the account's journal.
+        let path = app_unit(&h, "example.com");
+        let old = std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .replace("(account alice)", "(tenant alice)");
+        std::fs::write(&path, old).unwrap_or_else(|e| panic!("{e}"));
+        // A suspended tenant's unit is rewritten but its application not started.
+        h.tenants.set_suspended("bob", true).await?;
+        let path_b = app_unit(&h, "example.net");
+        std::fs::write(
+            &path_b,
+            std::fs::read_to_string(&path_b)
+                .unwrap_or_else(|e| panic!("{e}"))
+                .replace("(account bob)", "(tenant bob)"),
+        )
+        .unwrap_or_else(|e| panic!("{e}"));
+        h.sys.clear_calls();
+        assert_eq!(crate::app::converge_units(&h.vhosts.ctx).await?, 2);
+        assert_eq!(
+            systemctl_calls(&h),
+            vec![
+                vec!["daemon-reload".to_owned()],
+                vec![
+                    "try-restart".to_owned(),
+                    "--".into(),
+                    "oxpanel-app-example.com.service".into()
+                ],
+            ]
+        );
+        assert!(std::fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .contains("Description=OxPanel node application for example.com (account alice)\n"));
+        assert!(std::fs::read_to_string(&path_b)
+            .unwrap_or_else(|e| panic!("{e}"))
+            .contains("(account bob)"));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn restart_and_dependency_installation_run_exact_commands() -> Result<()> {
         let h = harness(false).await;
         h.vhosts
