@@ -91,7 +91,7 @@ pub struct TlsBlock<'a> {
 /// cache and no session tickets (their keys would otherwise have to be
 /// rotated). No OCSP stapling: it needs a resolver and outbound requests from
 /// the web server, and Let's Encrypt no longer runs OCSP responders.
-const TLS_SETTINGS: &str = "    ssl_protocols TLSv1.2 TLSv1.3;
+pub(crate) const TLS_SETTINGS: &str = "    ssl_protocols TLSv1.2 TLSv1.3;
     ssl_ciphers ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
     ssl_prefer_server_ciphers off;
     ssl_session_cache shared:oxpanel_tls:10m;
@@ -101,7 +101,8 @@ const TLS_SETTINGS: &str = "    ssl_protocols TLSv1.2 TLSv1.3;
 
 /// What browsers are told with `hsts`: HTTPS only, for one year, for this
 /// name alone (no `includeSubDomains`, no `preload`).
-const HSTS_HEADER: &str = "    add_header Strict-Transport-Security \"max-age=31536000\" always;\n";
+pub(crate) const HSTS_HEADER: &str =
+    "    add_header Strict-Transport-Security \"max-age=31536000\" always;\n";
 
 /// What goes into one server block.
 #[derive(Debug, Clone, PartialEq, Eq)]

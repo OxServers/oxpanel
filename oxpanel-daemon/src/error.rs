@@ -14,6 +14,16 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
+    /// The tenant still has mail domains (removed explicitly, or by a
+    /// cascading deletion).
+    #[error("tenant '{0}' still has mail domains; switch their email off or delete the tenant with everything it has")]
+    TenantHasMailDomains(String),
+
+    /// An email request that cannot be done; the message starts with the
+    /// code (see [`MailCode`]), which clients rely on.
+    #[error("{}: {detail}", code.as_str())]
+    Mail { code: MailCode, detail: String },
+
     /// A request field failed validation. Safe to return verbatim.
     #[error("invalid {field}: {reason}")]
     InvalidInput { field: &'static str, reason: String },
@@ -347,6 +357,8 @@ impl Error {
                 | Self::DnsLimitReached(_)
                 | Self::DnsZoneRejected(_)
                 | Self::TenantHasDnsZones(_)
+                | Self::Mail { .. }
+                | Self::TenantHasMailDomains(_)
         )
     }
 }
@@ -401,7 +413,8 @@ impl From<Error> for Status {
             | Error::NginxInvalid(_)
             | Error::DnsUnavailable(_)
             | Error::DnsConflict(_)
-            | Error::TenantHasDnsZones(_) => Status::failed_precondition(message),
+            | Error::TenantHasDnsZones(_)
+            | Error::TenantHasMailDomains(_) => Status::failed_precondition(message),
             Error::DnsZoneNotFound(_) | Error::DnsRecordNotFound { .. } => {
                 Status::not_found(message)
             }
@@ -414,6 +427,7 @@ impl From<Error> for Status {
             | Error::TooManyUploads(_)
             | Error::TaskLimitReached { .. }
             | Error::BackupNoSpace { .. } => Status::resource_exhausted(message),
+            Error::Mail { code, .. } => code.status(message),
             Error::Unauthorised => Status::permission_denied(message),
             Error::FileRefused { fault, .. } => file_status(fault, message),
             Error::CommandTimeout { .. } => Status::deadline_exceeded(message),
@@ -422,6 +436,80 @@ impl From<Error> for Status {
             | Error::Sys { .. }
             | Error::CorruptRecord { .. }
             | Error::Internal(_) => Status::internal(message),
+        }
+    }
+}
+
+/// The stable codes of email refusals: the first word of the message.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MailCode {
+    /// The mail component is not installed or not switched on.
+    Unavailable,
+    /// The domain is not a local mail domain (its mode is external or off).
+    DomainNotLocal,
+    /// The account has no mail domain of this name.
+    DomainNotFound,
+    /// The account does not hold this name (no site, no DNS zone), or another account does.
+    DomainNotOwned,
+    MailboxExists,
+    MailboxNotFound,
+    ForwarderNotFound,
+    MailboxLimitReached,
+    MailboxQuotaAboveLimit,
+    /// A mailbox and a forwarder (without `keep_copy`) would share the address.
+    AddressInUse,
+    ForwardLoop,
+    TooManyDestinations,
+    WeakPassword,
+    /// A message in the queue that is not there (any more).
+    QueuedMailNotFound,
+}
+
+impl MailCode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unavailable => "mail_unavailable",
+            Self::DomainNotLocal => "mail_domain_not_local",
+            Self::DomainNotFound => "mail_domain_not_found",
+            Self::DomainNotOwned => "mail_domain_not_owned",
+            Self::MailboxExists => "mailbox_exists",
+            Self::MailboxNotFound => "mailbox_not_found",
+            Self::ForwarderNotFound => "forwarder_not_found",
+            Self::MailboxLimitReached => "mailbox_limit_reached",
+            Self::MailboxQuotaAboveLimit => "mailbox_quota_above_limit",
+            Self::AddressInUse => "address_in_use",
+            Self::ForwardLoop => "forward_loop",
+            Self::TooManyDestinations => "too_many_destinations",
+            Self::WeakPassword => "weak_password",
+            Self::QueuedMailNotFound => "queued_mail_not_found",
+        }
+    }
+
+    fn status(self, message: String) -> Status {
+        match self {
+            Self::Unavailable | Self::DomainNotLocal | Self::DomainNotOwned => {
+                Status::failed_precondition(message)
+            }
+            Self::DomainNotFound
+            | Self::MailboxNotFound
+            | Self::ForwarderNotFound
+            | Self::QueuedMailNotFound => Status::not_found(message),
+            Self::MailboxExists | Self::AddressInUse => Status::already_exists(message),
+            Self::MailboxLimitReached => Status::resource_exhausted(message),
+            Self::MailboxQuotaAboveLimit
+            | Self::ForwardLoop
+            | Self::TooManyDestinations
+            | Self::WeakPassword => Status::invalid_argument(message),
+        }
+    }
+}
+
+impl Error {
+    /// An email refusal with its stable code.
+    pub fn mail(code: MailCode, detail: impl Into<String>) -> Self {
+        Self::Mail {
+            code,
+            detail: detail.into(),
         }
     }
 }

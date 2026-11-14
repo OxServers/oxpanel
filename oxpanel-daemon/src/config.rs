@@ -124,6 +124,8 @@ pub struct Config {
     pub essentials: Essentials,
     /// DNS hosting (`OXPANEL_DNS_*`), see [`crate::dns::DnsConfig`].
     pub dns: crate::dns::DnsConfig,
+    /// Email (`OXPANEL_MAIL_*`), see [`crate::mail::MailConfig`].
+    pub mail: crate::mail::MailConfig,
 }
 
 /// Settings of scheduled tasks, per-site PHP settings and scheduled backups.
@@ -318,6 +320,7 @@ impl Default for Config {
             files_job_timeout: Duration::from_secs(2 * 3600),
             essentials: Essentials::default(),
             dns: crate::dns::DnsConfig::default(),
+            mail: crate::mail::MailConfig::default(),
         }
     }
 }
@@ -421,6 +424,7 @@ impl Config {
         c.files_from_lookup(&get)?;
         c.essentials.read_env(&get)?;
         c.dns = crate::dns::DnsConfig::from_lookup(&get)?;
+        c.mail = crate::mail::MailConfig::from_lookup(&get)?;
         c.validate()?;
         Ok(c)
     }
@@ -913,6 +917,18 @@ pub(crate) fn sandbox_feature_paths(cfg: &mut Config, dir: &Path) {
     cfg.dns.conf_dir = dir.join("named-oxpanel");
     cfg.dns.data_dir = dir.join("oxpanel-dns");
     cfg.dns.suffix_list = dir.join("public_suffix_list.dat");
+    let mail = dir.join("mail");
+    cfg.mail.postfix_dir = mail.join("postfix");
+    cfg.mail.dovecot_dir = mail.join("dovecot");
+    cfg.mail.rspamd_dir = mail.join("rspamd");
+    cfg.mail.state_dir = mail.join("state");
+    cfg.mail.webmail_dir = mail.join("webmail");
+    cfg.mail.webmail_data_dir = mail.join("webmail-data");
+    cfg.mail.nginx_file = mail.join("nginx-mail.conf");
+    cfg.mail.run_dir = mail.join("run");
+    cfg.mail.milter_dir = mail.join("milter");
+    cfg.mail.selfsigned_dir = mail.join("pki");
+    cfg.mail.roundcube_index = mail.join("roundcube").join("index.php");
     for d in [dir.join("sshd_config.d"), dir.join("run")] {
         std::fs::create_dir_all(&d).unwrap_or_else(|e| panic!("{}: {e}", d.display()));
     }

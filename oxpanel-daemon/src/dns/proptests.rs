@@ -173,7 +173,7 @@ proptest! {
             ipv4: Some("203.0.113.10".parse().unwrap()),
             ..DnsConfig::default()
         };
-        let input = ZoneInput { zone: &zone, cfg: &cfg, sites: &sites, records: &records };
+        let input = ZoneInput { zone: &zone, cfg: &cfg, sites: &sites, records: &records, mail: &[] };
         let text = zone::render(&input, 42);
         let lines: Vec<&str> = text.lines().collect();
         prop_assert_eq!(lines.len(), 2 + 2 + sites.len() + records.len());

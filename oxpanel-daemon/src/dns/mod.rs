@@ -172,11 +172,13 @@ fn view(ctx: &Ctx, rec: ZoneRecord, with_records: bool) -> Result<ZoneView> {
     sites.dedup();
     let mut records = Vec::new();
     if with_records {
+        let mail = mail_records_for(ctx, &rec, &sites_in, &plain);
         let input = ZoneInput {
             zone: &zone,
             cfg: &ctx.config.dns,
             sites: &sites_in,
             records: &plain,
+            mail: &mail,
         };
         for (rr, origin) in zone::engine_records(&input) {
             records.push(RecordView {
@@ -229,6 +231,113 @@ pub fn zone_of_site(ctx: &Ctx, site: &VHostRecord) -> String {
             _ => return String::new(),
         }
     }
+}
+
+// ---- email -------------------------------------------------------------------
+
+/// The mail records of `rec`'s zone, except those at a name a site serves
+/// (the site's address records win) or at or below a delegated name.
+pub(crate) fn mail_records_for(
+    ctx: &Ctx,
+    rec: &ZoneRecord,
+    sites: &[zone::SiteName],
+    rrs: &[Rr],
+) -> Vec<(Rr, zone::Origin)> {
+    let Ok(zone) = rec.domain() else {
+        return Vec::new();
+    };
+    let delegated: Vec<&RelName> = rrs
+        .iter()
+        .filter(|r| r.data.rtype() == RrType::Ns)
+        .map(|r| &r.name)
+        .collect();
+    crate::mail::zone_records(ctx, &zone, &rec.tenant)
+        .into_iter()
+        .filter(|(r, _)| {
+            !sites.iter().any(|s| s.name == r.name)
+                && !delegated.iter().any(|d| r.name.is_at_or_below(d))
+        })
+        .collect()
+}
+
+/// Whether the tenant record `r` takes a place the engine keeps for email:
+/// the same name and type as a mail record (for TXT: an SPF record where
+/// the engine keeps SPF, any TXT at a DKIM or DMARC name), or any record
+/// at a name the engine keeps a CNAME at.
+fn mail_conflict(r: &Rr, mail: &[(Rr, zone::Origin)]) -> bool {
+    mail.iter().any(|(m, _)| {
+        if m.name != r.name {
+            return false;
+        }
+        let (mt, rt) = (m.data.rtype(), r.data.rtype());
+        if mt == RrType::Cname || rt == RrType::Cname {
+            return true;
+        }
+        if mt != rt {
+            return false;
+        }
+        if mt != RrType::Txt {
+            return true;
+        }
+        let text = |x: &Rr| match &x.data {
+            RData::Txt(t) => t.as_str().to_owned(),
+            _ => String::new(),
+        };
+        let (mtxt, rtxt) = (text(m), text(r));
+        mtxt.starts_with("v=DKIM1")
+            || mtxt.starts_with("v=DMARC1")
+            || (mtxt.starts_with("v=spf1") && rtxt.to_ascii_lowercase().starts_with("v=spf1"))
+    })
+}
+
+/// Tenant records must leave the engine's mail records alone.
+pub fn check_mail_rules(zone: &Domain, rrs: &[Rr], mail: &[(Rr, zone::Origin)]) -> Result<()> {
+    if let Some(r) = rrs.iter().find(|r| mail_conflict(r, mail)) {
+        return Err(Error::invalid(
+            "record",
+            format!(
+                "{} {} is kept by the engine for the domain's email (switch the domain's email off or to EXTERNAL to set it yourself)",
+                r.name.fqdn(zone),
+                r.data.rtype().as_str()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// A mail domain changed (created, mode switched, key rotated, removed):
+/// bring the tenant's zone that holds it up to date. The tenant's records
+/// that take a place email now needs make way (each removal is logged), as
+/// for sites. Called with the mutation lock held; a no-op while DNS hosting
+/// is not available.
+pub async fn mail_changed(ctx: &Ctx, domain: &Domain) -> Result<()> {
+    if unavailable_reason(ctx).await?.is_some() {
+        return Ok(());
+    }
+    let vhosts = ctx.store.list_vhosts()?;
+    for z in ZoneStore::new(&ctx.config)
+        .list()?
+        .into_iter()
+        .filter(|z| z.state == ZoneState::Ready && is_within(domain.as_str(), &z.zone))
+    {
+        let mut next = z.clone();
+        let zone = next.domain()?;
+        let rrs = next.rrs()?;
+        let plain: Vec<Rr> = rrs.iter().map(|(_, r)| r.clone()).collect();
+        let sites = ops::site_names(&next, &plain, &vhosts)?;
+        let mail = mail_records_for(ctx, &next, &sites, &plain);
+        let drop: Vec<u64> = rrs
+            .iter()
+            .filter(|(_, r)| mail_conflict(r, &mail))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in &drop {
+            info!(%zone, id, "a record at a place the domain's email needs was replaced by the engine's mail record");
+        }
+        next.records.retain(|s| !drop.contains(&s.id));
+        ops::apply_zone(ctx, Some(&z), next, None).await?;
+    }
+    Ok(())
 }
 
 // ---- zone-level rules ------------------------------------------------------
@@ -620,6 +729,7 @@ pub async fn site_changed(
             && rec.records.is_empty()
             && ops::site_names(&rec, &plain, &vhosts)?.is_empty()
             && claimed_names(&rec, &vhosts)?.is_empty()
+            && crate::mail::zone_records(ctx, &rec.domain()?, &rec.tenant).is_empty()
         {
             delete_locked(ctx, rec).await?;
         }
@@ -882,10 +992,13 @@ impl DnsService {
                 "zone '{zone}' already has the maximum of {max} records"
             )));
         }
-        check_rules(
+        let vhosts = self.ctx.store.list_vhosts()?;
+        check_rules(&zone, &plain, &claimed_names(&next, &vhosts)?)?;
+        let sites = ops::site_names(&next, &plain, &vhosts)?;
+        check_mail_rules(
             &zone,
             &plain,
-            &claimed_names(&next, &self.ctx.store.list_vhosts()?)?,
+            &mail_records_for(&self.ctx, &next, &sites, &plain),
         )?;
         ops::apply_zone(&self.ctx, Some(rec), next, None).await
     }
@@ -1373,11 +1486,13 @@ fn check_zone_files(
     let zone = z.domain()?;
     let rrs: Vec<Rr> = z.rrs()?.into_iter().map(|(_, r)| r).collect();
     let sites = ops::site_names(z, &rrs, vhosts)?;
+    let mail = mail_records_for(ctx, z, &sites, &rrs);
     let input = ZoneInput {
         zone: &zone,
         cfg: &ctx.config.dns,
         sites: &sites,
         records: &rrs,
+        mail: &mail,
     };
     let want = zone::render(&input, z.serial);
     match crate::fsutil::read_optional(&l.zone_file(&zone))? {

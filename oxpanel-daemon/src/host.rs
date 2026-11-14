@@ -63,6 +63,9 @@ pub enum DriftKind {
     DnsServerDrift,
     DnsSecondaryDrift,
     DnssecDrift,
+    MailConfigDrift,
+    MailDomainDrift,
+    OrphanMailFile,
 }
 
 /// One difference between a record and the operating system.
@@ -263,6 +266,7 @@ impl HostService {
         out.extend(crate::task::drifts(&self.ctx, &tenants)?);
         out.extend(crate::backup_schedule::drifts(cfg, &tenants)?);
         out.extend(crate::dns::drifts(&self.ctx).await?);
+        out.extend(crate::mail::drifts(&self.ctx).await?);
         Ok(out)
     }
 

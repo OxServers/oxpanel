@@ -11,6 +11,12 @@ pub const TYPE_NS: u16 = 2;
 pub const TYPE_SOA: u16 = 6;
 pub const TYPE_DS: u16 = 43;
 pub const TYPE_DNSKEY: u16 = 48;
+/// Email's deliverability checks ask for these too.
+pub const TYPE_A: u16 = 1;
+pub const TYPE_PTR: u16 = 12;
+pub const TYPE_MX: u16 = 15;
+pub const TYPE_TXT: u16 = 16;
+pub const TYPE_AAAA: u16 = 28;
 const CLASS_IN: u16 = 1;
 const HEADER: usize = 12;
 const MAX_NAME: usize = 255;
@@ -58,6 +64,13 @@ pub enum Data {
     Ds(u16, u8, u8, String),
     /// Flags, protocol, algorithm, public key.
     Dnskey(u16, u8, u8, Vec<u8>),
+    /// Preference and exchange.
+    Mx(u16, String),
+    /// The character-strings, joined.
+    Txt(Vec<u8>),
+    A(std::net::Ipv4Addr),
+    Aaaa(std::net::Ipv6Addr),
+    Ptr(String),
     Other(u16),
 }
 
@@ -226,6 +239,37 @@ pub fn decode(buf: &[u8]) -> R<Response> {
                     let proto = r.u8()?;
                     let alg = r.u8()?;
                     Data::Dnskey(flags, proto, alg, r.bytes(len - 4)?.to_vec())
+                }
+                TYPE_MX => {
+                    let pref = r.u16()?;
+                    Data::Mx(pref, r.name()?)
+                }
+                TYPE_PTR => Data::Ptr(r.name()?),
+                TYPE_A if len == 4 => {
+                    let b = r.bytes(4)?;
+                    Data::A(std::net::Ipv4Addr::new(
+                        *b.first().unwrap_or(&0),
+                        *b.get(1).unwrap_or(&0),
+                        *b.get(2).unwrap_or(&0),
+                        *b.get(3).unwrap_or(&0),
+                    ))
+                }
+                TYPE_AAAA if len == 16 => {
+                    let mut a = [0u8; 16];
+                    a.copy_from_slice(r.bytes(16)?);
+                    Data::Aaaa(std::net::Ipv6Addr::from(a))
+                }
+                TYPE_TXT => {
+                    let mut text = Vec::new();
+                    let end = start.checked_add(len).ok_or(WireError("length overflow"))?;
+                    while r.pos < end {
+                        let n = usize::from(r.u8()?);
+                        text.extend_from_slice(r.bytes(n)?);
+                    }
+                    if r.pos != end {
+                        return Err(WireError("TXT strings overrun the record"));
+                    }
+                    Data::Txt(text)
                 }
                 other => Data::Other(other),
             };

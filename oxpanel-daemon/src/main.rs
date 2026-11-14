@@ -142,6 +142,25 @@ fn main() -> ExitCode {
     {
         return ExitCode::from(oxpanel_daemon::dns::probe::main(&args));
     }
+    // `oxpanel-daemon mail-policy`: the mail policy service (its own unit,
+    // as the account oxpanel-mail).
+    if args
+        .first()
+        .is_some_and(|a| a == oxpanel_daemon::mail::policy::SUBCOMMAND)
+    {
+        init_tracing();
+        return ExitCode::from(oxpanel_daemon::mail::policy::main(&args));
+    }
+    // `oxpanel-daemon sendmail …`: OxPanel's sendmail, run by sites (PHP's
+    // sendmail_path) as their account.
+    if args
+        .first()
+        .is_some_and(|a| a == oxpanel_daemon::mail::sendmail::SUBCOMMAND)
+    {
+        return ExitCode::from(oxpanel_daemon::mail::sendmail::main(
+            args.get(1..).unwrap_or_default(),
+        ));
+    }
     match tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
@@ -319,6 +338,7 @@ async fn run(cli: Cli) -> Result<(), Fatal> {
     let engine = Engine::new(ctx.clone());
     tokio::spawn(renew_certificates_periodically(engine.tls()));
     tokio::spawn(auto_https_periodically(engine.tls()));
+    tokio::spawn(mail_certificates_periodically(ctx.clone()));
 
     resume_jobs(&ctx, &engine).await;
     // Scheduled backups: due ones (after downtime: once) now, then periodically.
@@ -403,6 +423,19 @@ async fn auto_https_periodically(tls: TlsService) {
     }
 }
 
+/// Certificates of the mail host name and the webmail names, on the same
+/// cadence as Automatic HTTPS.
+async fn mail_certificates_periodically(ctx: Ctx) {
+    if !ctx.config.mail.enabled || !ctx.config.auto_https.is_on() {
+        return;
+    }
+    tokio::time::sleep(oxpanel_daemon::auto_https::FIRST_SWEEP_AFTER).await;
+    loop {
+        oxpanel_daemon::mail::certificates_sweep(&ctx).await;
+        tokio::time::sleep(oxpanel_daemon::auto_https::SWEEP_EVERY).await;
+    }
+}
+
 /// Bring what the records describe up to date with this version of the
 /// daemon. Failures are logged and left to `Reconcile`; they never stop it.
 async fn converge_at_start(ctx: &Ctx) {
@@ -444,6 +477,9 @@ async fn converge_at_start(ctx: &Ctx) {
     // DNS hosting: interrupted zone work, zones for sites that have none,
     // every zone and the server configuration re-rendered.
     oxpanel_daemon::dns::converge(ctx).await;
+    // Email: interrupted work finished, every file re-rendered, the servers
+    // started.
+    oxpanel_daemon::mail::converge(ctx).await;
 }
 
 /// The real OS, or the in-memory fake for `--dry-run`.

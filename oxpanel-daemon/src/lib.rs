@@ -32,6 +32,9 @@
 //!   backups the engine starts by itself.
 //! - [`dns`]      — DNS hosting: zones of tenants on OxPanel's own BIND
 //!   instance, records, secondaries, DNSSEC.
+//! - [`mail`]     — email: mail domains, mailboxes, forwarders and
+//!   autoresponders on Postfix, Dovecot and Rspamd, the policy service that
+//!   counts and limits sending, and the webmail.
 //! - [`host`]     — host information and record ↔ OS reconciliation.
 //! - [`auth`]     — peer-credential gate for the UNIX socket.
 //! - [`server`]   — gRPC ↔ domain mapping.
@@ -65,6 +68,7 @@ pub mod files_worker;
 pub mod fsutil;
 pub mod host;
 pub mod lifecycle;
+pub mod mail;
 pub mod nginx;
 pub mod php;
 pub mod php_settings;

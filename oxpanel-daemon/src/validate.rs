@@ -993,6 +993,336 @@ pub fn retention(months: u32, days: u32) -> Result<u64> {
     }
 }
 
+// ---- Email ----------------------------------------------------------------
+
+/// Longest local part of an address (RFC 5321).
+pub const MAIL_LOCAL_MAX: usize = 64;
+/// Mailbox passwords: shortest accepted, and longest (bcrypt reads 72 bytes;
+/// a longer password would be cut silently).
+pub const MAIL_PASSWORD_MIN: usize = 10;
+pub const MAIL_PASSWORD_MAX_BYTES: usize = 72;
+/// Most destinations a forwarder may have.
+pub const MAX_FORWARD_DESTINATIONS: usize = 10;
+pub const AUTOREPLY_SUBJECT_MAX: usize = 200;
+pub const AUTOREPLY_BODY_MAX: usize = 8000;
+
+/// The local part of an address OxPanel hosts (a mailbox or a forwarder):
+/// `^[a-z0-9]([a-z0-9._-]*[a-z0-9])?$`, at most 64 characters, no `..`.
+/// No `+` (it separates the address from a tag: `info+news@` reaches
+/// `info@`), nothing a mail map, a Sieve script, a path or an argument
+/// could read as syntax.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct MailLocalPart(String);
+
+impl MailLocalPart {
+    pub fn parse(raw: &str) -> Result<Self> {
+        Self::parse_field(raw, "local_part")
+    }
+
+    pub fn parse_field(raw: &str, field: &'static str) -> Result<Self> {
+        if raw.is_empty() || raw.len() > MAIL_LOCAL_MAX {
+            return Err(Error::invalid(
+                field,
+                format!("must be 1..={MAIL_LOCAL_MAX} characters"),
+            ));
+        }
+        if raw != raw.to_ascii_lowercase() {
+            return Err(Error::invalid(field, "must be lower-case"));
+        }
+        if !raw.bytes().all(|b| {
+            b.is_ascii_lowercase() || b.is_ascii_digit() || matches!(b, b'.' | b'_' | b'-')
+        }) {
+            return Err(Error::invalid(
+                field,
+                "may only contain a-z, 0-9, '.', '_' and '-'",
+            ));
+        }
+        let edge_ok = |b: Option<&u8>| b.is_some_and(u8::is_ascii_alphanumeric);
+        if !edge_ok(raw.as_bytes().first()) || !edge_ok(raw.as_bytes().last()) {
+            return Err(Error::invalid(
+                field,
+                "must start and end with a letter or digit",
+            ));
+        }
+        if raw.contains("..") {
+            return Err(Error::invalid(field, "must not contain '..'"));
+        }
+        Ok(Self(raw.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for MailLocalPart {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// An address OxPanel hosts: a [`MailLocalPart`] at a [`Domain`].
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct MailAddress {
+    pub local: MailLocalPart,
+    pub domain: Domain,
+}
+
+impl MailAddress {
+    pub fn new(local: MailLocalPart, domain: Domain) -> Self {
+        Self { local, domain }
+    }
+
+    pub fn parse(raw: &str) -> Result<Self> {
+        Self::parse_field(raw, "address")
+    }
+
+    pub fn parse_field(raw: &str, field: &'static str) -> Result<Self> {
+        let (local, domain) = raw
+            .split_once('@')
+            .ok_or_else(|| Error::invalid(field, "must be local-part@domain"))?;
+        Ok(Self {
+            local: MailLocalPart::parse_field(local, field)?,
+            domain: Domain::parse_field(domain, field)?,
+        })
+    }
+}
+
+impl fmt::Display for MailAddress {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}@{}", self.local, self.domain)
+    }
+}
+
+/// Where a forwarder sends mail: any address, here or elsewhere. The local
+/// part may also hold `+` and `=` (tags, SRS); letters are lowered (no
+/// provider tells upper- from lower-case). Nothing else is accepted.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct MailDestination(String);
+
+impl MailDestination {
+    pub fn parse(raw: &str) -> Result<Self> {
+        let field = "destinations";
+        let lowered = raw.trim().to_ascii_lowercase();
+        let (local, domain) = lowered.rsplit_once('@').ok_or_else(|| {
+            Error::invalid(
+                field,
+                format!("'{}' is not local-part@domain", printable(raw)),
+            )
+        })?;
+        if local.is_empty() || local.len() > MAIL_LOCAL_MAX {
+            return Err(Error::invalid(
+                field,
+                format!("the local part must be 1..={MAIL_LOCAL_MAX} characters"),
+            ));
+        }
+        if !local.bytes().all(|b| {
+            b.is_ascii_lowercase()
+                || b.is_ascii_digit()
+                || matches!(b, b'.' | b'_' | b'-' | b'+' | b'=')
+        }) {
+            return Err(Error::invalid(
+                field,
+                "the local part may only contain a-z, 0-9, '.', '_', '-', '+' and '='",
+            ));
+        }
+        if local.starts_with(['.', '-', '+', '=']) || local.ends_with('.') || local.contains("..") {
+            return Err(Error::invalid(
+                field,
+                "the local part must not start with '.', '-', '+' or '=', end with '.' or contain '..'",
+            ));
+        }
+        let domain = Domain::parse_field(domain, field)?;
+        Ok(Self(format!("{local}@{domain}")))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// The domain part.
+    pub fn domain(&self) -> &str {
+        self.0.rsplit_once('@').map_or("", |(_, d)| d)
+    }
+}
+
+impl fmt::Display for MailDestination {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// At most 60 characters of `raw`, control characters as `?`, for messages.
+fn printable(raw: &str) -> String {
+    raw.chars()
+        .take(60)
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
+}
+
+/// Passwords nobody should use, whatever their length.
+const COMMON_PASSWORDS: &[&str] = &[
+    "1234567890",
+    "12345678910",
+    "0123456789",
+    "1q2w3e4r5t",
+    "qwertyuiop",
+    "password12",
+    "password123",
+    "password1234",
+    "passw0rd123",
+    "iloveyou12",
+    "letmein123",
+    "welcome123",
+    "administrator",
+    "changeme123",
+    "qwerty12345",
+    "abcdefghij",
+    "abc1234567",
+    "zaq12wsxcde",
+];
+
+/// A mailbox password. Never logged (`Debug` hides it), never stored: only
+/// its hash is ([`crate::mail::password`]).
+#[derive(Clone)]
+pub struct MailPassword(String);
+
+impl MailPassword {
+    /// Check `raw` for the mailbox `local`@`domain`. Too short, too
+    /// simple, a well-known password or one containing the address is
+    /// refused as `weak_password`; one the hash cannot take whole is invalid.
+    pub fn parse(raw: &str, local: &MailLocalPart, domain: &Domain) -> Result<Self> {
+        use crate::error::MailCode;
+        if raw.len() > MAIL_PASSWORD_MAX_BYTES {
+            return Err(Error::invalid(
+                "password",
+                format!("must be at most {MAIL_PASSWORD_MAX_BYTES} bytes"),
+            ));
+        }
+        if raw.chars().any(char::is_control) {
+            return Err(Error::invalid(
+                "password",
+                "must not contain control characters (newlines, tabs, NUL, …)",
+            ));
+        }
+        let weak = |why: &str| Err(Error::mail(MailCode::WeakPassword, why.to_owned()));
+        if raw.chars().count() < MAIL_PASSWORD_MIN {
+            return weak(&format!(
+                "a password needs at least {MAIL_PASSWORD_MIN} characters"
+            ));
+        }
+        let lower = raw.to_lowercase();
+        let distinct: std::collections::BTreeSet<char> = lower.chars().collect();
+        if distinct.len() < 4 {
+            return weak("a password needs more than three different characters");
+        }
+        if raw.chars().all(|c| c.is_ascii_digit()) {
+            return weak("a password of digits only is too easy to guess");
+        }
+        if COMMON_PASSWORDS.contains(&lower.as_str()) {
+            return weak("this is one of the most common passwords");
+        }
+        let first_label = domain.as_str().split('.').next().unwrap_or_default();
+        for part in [local.as_str(), first_label] {
+            if part.len() >= 3 && lower.contains(part) {
+                return weak("a password must not contain the address");
+            }
+        }
+        Ok(Self(raw.to_owned()))
+    }
+
+    /// The password, for the one place that hashes it.
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Debug for MailPassword {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("MailPassword([redacted])")
+    }
+}
+
+/// An autoresponder's subject: 1..=200 characters, none of them a control
+/// character, so it cannot start a header of its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoreplySubject(String);
+
+impl AutoreplySubject {
+    pub fn parse(raw: &str) -> Result<Self> {
+        let n = raw.chars().count();
+        if n == 0 || n > AUTOREPLY_SUBJECT_MAX {
+            return Err(Error::invalid(
+                "subject",
+                format!("must be 1..={AUTOREPLY_SUBJECT_MAX} characters"),
+            ));
+        }
+        if raw.chars().any(char::is_control) {
+            return Err(Error::invalid(
+                "subject",
+                "must be one line without control characters",
+            ));
+        }
+        Ok(Self(raw.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// An autoresponder's text: at most 8000 characters; line breaks and tabs
+/// are the only control characters (CR LF and CR become LF).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AutoreplyBody(String);
+
+impl AutoreplyBody {
+    pub fn parse(raw: &str) -> Result<Self> {
+        let text = raw.replace("\r\n", "\n").replace('\r', "\n");
+        let n = text.chars().count();
+        if n == 0 || n > AUTOREPLY_BODY_MAX {
+            return Err(Error::invalid(
+                "body",
+                format!("must be 1..={AUTOREPLY_BODY_MAX} characters"),
+            ));
+        }
+        if text
+            .chars()
+            .any(|c| c.is_control() && c != '\n' && c != '\t')
+        {
+            return Err(Error::invalid(
+                "body",
+                "must not contain control characters other than line breaks and tabs",
+            ));
+        }
+        Ok(Self(text))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+/// A Postfix queue id (short or long form): 5..=20 ASCII letters and digits.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueId(String);
+
+impl QueueId {
+    pub fn parse(raw: &str) -> Result<Self> {
+        if !(5..=20).contains(&raw.len()) || !raw.bytes().all(|b| b.is_ascii_alphanumeric()) {
+            return Err(Error::invalid(
+                "queue_id",
+                "must be 5..=20 letters and digits",
+            ));
+        }
+        Ok(Self(raw.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 #[cfg(test)]
 mod id_tests {
     use super::*;

@@ -61,6 +61,12 @@ pub struct Answer {
     pub ns: Vec<String>,
     /// `tag/alg/type/HEX`.
     pub ds: Vec<String>,
+    /// Email's checks: MX (preference, exchange), TXT (as text, non-printable
+    /// bytes as `?`), A/AAAA addresses and PTR names.
+    pub mx: Vec<(u16, String)>,
+    pub txt: Vec<String>,
+    pub addrs: Vec<String>,
+    pub ptr: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,6 +80,11 @@ fn type_name(t: u16) -> &'static str {
         wire::TYPE_NS => "NS",
         wire::TYPE_SOA => "SOA",
         wire::TYPE_DS => "DS",
+        wire::TYPE_MX => "MX",
+        wire::TYPE_TXT => "TXT",
+        wire::TYPE_A => "A",
+        wire::TYPE_AAAA => "AAAA",
+        wire::TYPE_PTR => "PTR",
         _ => "?",
     }
 }
@@ -83,6 +94,11 @@ fn type_from(s: &str) -> Option<u16> {
         "NS" => Some(wire::TYPE_NS),
         "SOA" => Some(wire::TYPE_SOA),
         "DS" => Some(wire::TYPE_DS),
+        "MX" => Some(wire::TYPE_MX),
+        "TXT" => Some(wire::TYPE_TXT),
+        "A" => Some(wire::TYPE_A),
+        "AAAA" => Some(wire::TYPE_AAAA),
+        "PTR" => Some(wire::TYPE_PTR),
         _ => None,
     }
 }
@@ -178,6 +194,18 @@ pub fn parse_output(text: &str, n: usize) -> Vec<Outcome> {
                         a.ns.push(v.to_owned());
                     } else if let Some(v) = item.strip_prefix("ds=") {
                         a.ds.push(v.to_owned());
+                    } else if let Some((p, n)) =
+                        item.strip_prefix("mx=").and_then(|v| v.split_once('/'))
+                    {
+                        if let Ok(p) = p.parse() {
+                            a.mx.push((p, n.to_owned()));
+                        }
+                    } else if let Some(v) = item.strip_prefix("txt=") {
+                        a.txt.push(from_hex_text(v));
+                    } else if let Some(v) = item.strip_prefix("a=") {
+                        a.addrs.push(v.to_owned());
+                    } else if let Some(v) = item.strip_prefix("ptr=") {
+                        a.ptr.push(v.to_owned());
                     }
                 }
                 *slot = Outcome::Answer(a);
@@ -186,6 +214,22 @@ pub fn parse_output(text: &str, n: usize) -> Vec<Outcome> {
         }
     }
     out
+}
+
+/// A TXT value from the probe's hex, printable ASCII kept, the rest `?`.
+fn from_hex_text(hex: &str) -> String {
+    hex.as_bytes()
+        .chunks(2)
+        .filter_map(|c| std::str::from_utf8(c).ok())
+        .filter_map(|c| u8::from_str_radix(c, 16).ok())
+        .map(|b| {
+            if (0x20..0x7f).contains(&b) {
+                char::from(b)
+            } else {
+                '?'
+            }
+        })
+        .collect()
 }
 
 // ---- the probe process ---------------------------------------------------
@@ -330,6 +374,22 @@ fn ask(q: &Question, resolver: Option<SocketAddr>, id: u16) -> String {
             Data::Ds(tag, alg, dt, hex) if q.qtype == wire::TYPE_DS => {
                 let _ = write!(line, " ds={tag}/{alg}/{dt}/{hex}");
             }
+            Data::Mx(p, n) if q.qtype == wire::TYPE_MX => {
+                let _ = write!(line, " mx={p}/{n}");
+            }
+            // Hex: a TXT value may hold spaces.
+            Data::Txt(t) if q.qtype == wire::TYPE_TXT => {
+                let _ = write!(line, " txt={}", wire::hex_upper(t));
+            }
+            Data::A(a) if q.qtype == wire::TYPE_A => {
+                let _ = write!(line, " a={a}");
+            }
+            Data::Aaaa(a) if q.qtype == wire::TYPE_AAAA => {
+                let _ = write!(line, " a={a}");
+            }
+            Data::Ptr(n) if q.qtype == wire::TYPE_PTR => {
+                let _ = write!(line, " ptr={n}");
+            }
             _ => {}
         }
     }
@@ -416,6 +476,7 @@ mod tests {
                 soa_serial: None,
                 ns: vec!["ns1.example.net".into(), "ns2.example.net".into()],
                 ds: vec![],
+                ..Answer::default()
             })
         );
         assert!(matches!(&out[1], Outcome::Failed(m) if m.contains("timed out")));

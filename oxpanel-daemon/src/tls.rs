@@ -773,7 +773,12 @@ impl TlsService {
 
 /// Have OpenSSL examine the material in a staging area and check what the
 /// daemon itself is responsible for: the name and the validity period.
-async fn verify_material(ctx: &Ctx, domain: &Domain, chain: &str, key: &str) -> Result<CertInfo> {
+pub(crate) async fn verify_material(
+    ctx: &Ctx,
+    domain: &Domain,
+    chain: &str,
+    key: &str,
+) -> Result<CertInfo> {
     let (cert_file, key_file) = staged_paths(&ctx.config.tls_dir, domain);
     fsutil::write_atomic(&cert_file, chain.as_bytes(), KEY_MODE)?;
     fsutil::write_atomic(&key_file, key.as_bytes(), KEY_MODE)?;

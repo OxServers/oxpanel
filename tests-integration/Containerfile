@@ -84,3 +84,13 @@ RUN dnf -y install --setopt=install_weak_deps=False php-cli && dnf clean all && 
 # host's public suffix list, which decides the apex of automatic zones.
 RUN dnf -y install --setopt=install_weak_deps=False bind bind-utils bind-dnssec-utils publicsuffix-list \
     && dnf clean all && rm -rf /var/cache/dnf
+# Email (the optional mail component): Postfix and Dovecot (with Sieve) from
+# AppStream; Rspamd (spam filter and DKIM signer) from rspamd's own signed
+# repository, whose libraries (jemalloc, hyperscan, libsodium) come from
+# EPEL; Roundcube webmail and its SQLite driver from EPEL; swaks and the
+# Python standard library (imaplib, smtplib) drive the integration test.
+RUN dnf -y install epel-release \
+    && printf '[rspamd]\nname=Rspamd stable\nbaseurl=https://rspamd.com/rpm-stable/centos-9/$basearch\nenabled=1\ngpgcheck=1\nrepo_gpgcheck=1\ngpgkey=https://rspamd.com/rpm/rspamd.asc\n' > /etc/yum.repos.d/rspamd.repo \
+    && dnf -y install --setopt=install_weak_deps=False postfix dovecot dovecot-pigeonhole rspamd roundcubemail php-pdo swaks \
+    && dnf -y remove epel-release && rm -f /etc/yum.repos.d/rspamd.repo \
+    && dnf clean all && rm -rf /var/cache/dnf

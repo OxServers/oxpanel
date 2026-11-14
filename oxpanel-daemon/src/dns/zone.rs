@@ -2,8 +2,8 @@
 //!
 //! A zone file is: one header comment, the SOA record, the apex NS records
 //! of the configured name servers, the address records of the tenant's
-//! sites in the zone, (later: the engine's mail records,
-//! [`mail_records`]), then the tenant's own records — one line each, in the
+//! sites in the zone, the engine's mail records (when the host keeps a
+//! domain's mail), then the tenant's own records — one line each, in the
 //! order they were added. Every line comes from [`Rr::render`] or from the
 //! SOA renderer below; nothing is copied from a request.
 //!
@@ -36,7 +36,7 @@ pub enum Origin {
     Zone,
     /// The address records of a site's name.
     Site(String),
-    /// Mail records (none yet; see [`mail_records`]).
+    /// OxPanel's mail records of a mail domain in the zone.
     Mail,
 }
 
@@ -66,15 +66,10 @@ pub struct ZoneInput<'a> {
     pub sites: &'a [SiteName],
     /// The tenant's records, in id order.
     pub records: &'a [Rr],
-}
-
-/// The hook for OxPanel's own mail records (MX, SPF, DKIM, DMARC) once the
-/// engine hosts mail: engine-maintained, protected like the site records,
-/// rendered between them and the tenant's records. There is no mail server
-/// on the host today, so there are none; tenants who use an external mail
-/// provider add that provider's records themselves.
-pub fn mail_records(_zone: &Domain) -> Vec<(Rr, Origin)> {
-    Vec::new()
+    /// OxPanel's own mail records of the zone (see [`crate::mail::records`]):
+    /// engine-maintained, protected like the site records, rendered between
+    /// them and the tenant's records.
+    pub mail: &'a [(Rr, Origin)],
 }
 
 /// The records the engine maintains, except the SOA: apex NS, then the
@@ -113,7 +108,7 @@ pub fn engine_records(input: &ZoneInput<'_>) -> Vec<(Rr, Origin)> {
             ));
         }
     }
-    out.extend(mail_records(input.zone));
+    out.extend(input.mail.iter().cloned());
     out
 }
 
@@ -263,6 +258,7 @@ mod tests {
             cfg: &cfg,
             sites: &sites,
             records: &records,
+            mail: &[],
         };
         assert_eq!(
             render(&input, 1_763_100_000),
@@ -282,10 +278,10 @@ example.com. 3600 IN MX 10 mx1.mail.example.org.
         assert_eq!(h, content_hash(&input));
         let no_mx = ZoneInput {
             records: &[],
+            mail: &[],
             ..input
         };
         assert_ne!(h, content_hash(&no_mx));
-        assert!(mail_records(&zone).is_empty(), "no mail records by default");
     }
 
     #[test]

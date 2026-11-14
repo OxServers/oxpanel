@@ -288,6 +288,46 @@ service OxPanelEngine {
   // would stop resolving for validating resolvers) and, unless `force` is
   // set, when that cannot be checked.
   rpc SetDnssec(SetDnssecRequest) returns (DnsZone);
+
+  // --- Email --------------------------------------------------------------
+  // Every email RPC answers FAILED_PRECONDITION "mail_unavailable: ..." while
+  // the mail component is not installed or not switched on (OXPANEL_MAIL).
+  // Refusals specific to email start their message with a stable code
+  // ("mailbox_limit_reached: ..."); see docs/HANDBOOK.md "Email".
+  // Host-level calls: GetMailHost, GetMailQueue and CheckDeliverability need
+  // `read`, DeleteQueuedMail, FlushMailQueue and SetMailLimits need `tenant`
+  // (staff). Per-account calls need `read` to look and `vhost` to change,
+  // like DNS zones.
+  rpc GetMailHost(GetMailHostRequest) returns (MailHost);
+  rpc GetMailQueue(GetMailQueueRequest) returns (MailQueue);
+  rpc DeleteQueuedMail(DeleteQueuedMailRequest) returns (DeleteQueuedMailResponse);
+  rpc FlushMailQueue(FlushMailQueueRequest) returns (FlushMailQueueResponse);
+  // Look at a mail domain from outside (through the unprivileged DNS probe):
+  // reverse DNS of the host, SPF, DKIM, DMARC, MX. Takes a few seconds.
+  rpc CheckDeliverability(CheckDeliverabilityRequest) returns (Deliverability);
+  // Create a mail domain or change its mode. A domain must be one of the
+  // account's site names or the apex of one of its DNS zones.
+  rpc SetMailDomain(SetMailDomainRequest) returns (SetMailDomainResponse);
+  rpc GetMailDomain(GetMailDomainRequest) returns (MailDomain);
+  rpc ListMailDomains(ListMailDomainsRequest) returns (ListMailDomainsResponse);
+  // A new 2048-bit DKIM key with a new selector; signing switches to it at
+  // once. The previous key stays published (hosted DNS) for 7 days.
+  rpc RotateDkimKey(RotateDkimKeyRequest) returns (MailDomain);
+  // Create or update a mailbox (create-or-update: `created` says which).
+  rpc PutMailbox(PutMailboxRequest) returns (PutMailboxResponse);
+  rpc ListMailboxes(ListMailboxesRequest) returns (ListMailboxesResponse);
+  // Remove a mailbox. Its mail is moved out at once and removed in the
+  // background (resumed after a restart).
+  rpc DeleteMailbox(DeleteMailboxRequest) returns (DeleteMailboxResponse);
+  rpc SetMailboxPassword(SetMailboxPasswordRequest) returns (SetMailboxPasswordResponse);
+  rpc PutForwarder(PutForwarderRequest) returns (PutForwarderResponse);
+  rpc ListForwarders(ListForwardersRequest) returns (ListForwardersResponse);
+  rpc DeleteForwarder(DeleteForwarderRequest) returns (DeleteForwarderResponse);
+  rpc SetAutoresponder(SetAutoresponderRequest) returns (Autoresponder);
+  rpc GetAutoresponder(GetAutoresponderRequest) returns (Autoresponder);
+  rpc GetMailLimits(GetMailLimitsRequest) returns (MailLimits);
+  rpc SetMailLimits(SetMailLimitsRequest) returns (MailLimits);
+  rpc GetMailUsage(GetMailUsageRequest) returns (MailUsage);
 }
 
 // Per-tenant resource limits, applied through systemd (cgroups v2).
@@ -768,6 +808,17 @@ enum DriftKind {
   // DNSSEC: a signed zone without signing keys, or keys left behind for a
   // zone that is not signed.
   DRIFT_KIND_DNSSEC_DRIFT = 39;
+  // Email: a configuration file of Postfix, Dovecot, Rspamd, the webmail or
+  // the mail policy service is missing or differs from what the records
+  // render, or one of those services is not running while email is on.
+  DRIFT_KIND_MAIL_CONFIG_DRIFT = 40;
+  // Email: a mail domain or mailbox record in an interrupted state, of an
+  // account that no longer exists, or a mailbox directory that is missing,
+  // not a directory or not owned by the account.
+  DRIFT_KIND_MAIL_DOMAIN_DRIFT = 41;
+  // Email: a DKIM key, autoresponder script or mail left to remove that no
+  // record accounts for.
+  DRIFT_KIND_ORPHAN_MAIL_FILE = 42;
 }
 
 message Drift {
@@ -2241,4 +2292,289 @@ message SetDnssecRequest {
   // Switch off although the parent could not be checked for a DS record.
   // (A DS record that IS published still refuses.)
   bool force = 4;
+}
+
+// ============================================================== email
+// Limits: 0 = unlimited.
+
+message GetMailHostRequest {}
+
+message MailComponents {
+  bool postfix = 1;
+  bool dovecot = 2;
+  // Spam filtering and DKIM signing (Rspamd).
+  bool filter = 3;
+  // ClamAV, through the filter (off by default).
+  bool antivirus = 4;
+  // Roundcube.
+  bool webmail = 5;
+}
+
+enum MailWarningKind {
+  MAIL_WARNING_KIND_UNSPECIFIED = 0;
+  MAIL_WARNING_KIND_REVERSE_DNS_MISMATCH = 1;
+  MAIL_WARNING_KIND_PORT_25_BLOCKED = 2;
+  MAIL_WARNING_KIND_NO_CERTIFICATE = 3;
+  // A component is installed but its service is not running.
+  MAIL_WARNING_KIND_SERVICE_NOT_RUNNING = 4;
+}
+
+message MailWarning {
+  MailWarningKind kind = 1;
+  // The engine's words (administrators only).
+  string detail = 2;
+}
+
+message MailHost {
+  // The mail component is installed and switched on (OXPANEL_MAIL).
+  bool enabled = 1;
+  // The host name mail clients connect to (IMAPS, POP3S, submission).
+  string host_name = 2;
+  MailComponents components = 3;
+  repeated MailWarning warnings = 4;
+  // Webmail address of a domain, "{domain}" standing for it:
+  // "https://webmail.{domain}/". Empty: no webmail.
+  string webmail_url_pattern = 5;
+}
+
+message GetMailQueueRequest {
+  // 0-based page of `page_size` entries (0: 100 entries).
+  uint32 page = 1;
+  uint32 page_size = 2;
+}
+
+message MailQueueEntry {
+  string queue_id = 1;
+  // The account the sender's domain belongs to (empty: none of ours, e.g. a bounce).
+  string tenant = 2;
+  string sender = 3;
+  uint32 recipients_count = 4;
+  uint64 size_bytes = 5;
+  google.protobuf.Timestamp arrived_at = 6;
+  // Why it is still queued (the last delivery error).
+  string reason = 7;
+}
+
+message MailQueue {
+  repeated MailQueueEntry entries = 1;
+  uint32 total = 2;
+}
+
+message DeleteQueuedMailRequest { string queue_id = 1; }
+message DeleteQueuedMailResponse { bool deleted = 1; }
+message FlushMailQueueRequest {}
+message FlushMailQueueResponse { uint32 attempted = 1; }
+
+message CheckDeliverabilityRequest { string domain = 1; }
+
+enum CheckStatus {
+  CHECK_STATUS_UNSPECIFIED = 0;
+  CHECK_STATUS_OK = 1;
+  CHECK_STATUS_WARN = 2;
+  CHECK_STATUS_FAIL = 3;
+  CHECK_STATUS_UNKNOWN = 4;
+}
+
+message DeliverabilityCheck {
+  // "mx", "spf", "dkim", "dmarc", "reverse_dns".
+  string name = 1;
+  CheckStatus status = 2;
+  string detail = 3;
+}
+
+message Deliverability {
+  string domain = 1;
+  repeated DeliverabilityCheck checks = 2;
+}
+
+enum MailMode {
+  // In a request: LOCAL.
+  MAIL_MODE_UNSPECIFIED = 0;
+  MAIL_MODE_LOCAL = 1;
+  MAIL_MODE_EXTERNAL = 2;
+  MAIL_MODE_OFF = 3;
+}
+
+enum DkimPublished {
+  DKIM_PUBLISHED_UNKNOWN = 0;
+  DKIM_PUBLISHED_YES = 1;
+  DKIM_PUBLISHED_NO = 2;
+}
+
+message Dkim {
+  string selector = 1;
+  // The TXT value of <selector>._domainkey.<domain> ("v=DKIM1; k=rsa; p=...").
+  string public_key_record = 2;
+  // YES: the hosted zone carries it. UNKNOWN: the DNS is elsewhere
+  // (CheckDeliverability looks).
+  DkimPublished published = 3;
+}
+
+message MailDnsRecord {
+  // Relative to the zone the record belongs in ("@", "_dmarc", ...); for a
+  // domain whose DNS is elsewhere, relative to the mail domain.
+  string name = 1;
+  // "MX", "TXT", "SRV", "CNAME", "A", "AAAA".
+  string type = 2;
+  string value = 3;
+  uint32 priority = 4;
+}
+
+message MailDomain {
+  string domain = 1;
+  string tenant = 2;
+  MailMode mode = 3;
+  repeated string external_mx = 4;
+  // The mailbox that gets mail for unknown addresses of the domain; empty: none.
+  string catch_all = 5;
+  // Unset when the mode is OFF or EXTERNAL.
+  Dkim dkim = 6;
+  // This host serves the domain's DNS zone and keeps the records there.
+  bool dns_hosted = 7;
+  // When it does not: what must be created at the DNS provider.
+  repeated MailDnsRecord required_records = 8;
+  uint32 mailbox_count = 9;
+  uint32 forwarder_count = 10;
+}
+
+message SetMailDomainRequest {
+  string tenant = 1;
+  string domain = 2;
+  MailMode mode = 3;
+  // EXTERNAL only: the provider's mail servers, most preferred first.
+  repeated string external_mx = 4;
+  // Local part or address of a mailbox of the domain; empty: none.
+  string catch_all = 5;
+}
+
+message SetMailDomainResponse {
+  MailDomain domain = 1;
+  bool created = 2;
+}
+
+message GetMailDomainRequest { string tenant = 1; string domain = 2; }
+message ListMailDomainsRequest { string tenant = 1; }
+message ListMailDomainsResponse { repeated MailDomain domains = 1; }
+message RotateDkimKeyRequest { string tenant = 1; string domain = 2; }
+
+message Mailbox {
+  string address = 1;
+  string local_part = 2;
+  string domain = 3;
+  // 0: no limit of its own (only the account's disk limit).
+  uint64 quota_bytes = 4;
+  uint64 used_bytes = 5;
+  uint64 messages = 6;
+  bool enabled = 7;
+  // Unset: unknown (never, or not recorded).
+  google.protobuf.Timestamp last_login = 8;
+}
+
+message PutMailboxRequest {
+  string tenant = 1;
+  string domain = 2;
+  string local_part = 3;
+  uint64 quota_bytes = 4;
+  // Required when the mailbox is created; empty on an update keeps it.
+  // Never logged, never returned.
+  string password = 5;
+  // A disabled mailbox cannot log in or send; mail for it is still delivered.
+  bool enabled = 6;
+}
+
+message PutMailboxResponse {
+  Mailbox mailbox = 1;
+  bool created = 2;
+}
+
+message ListMailboxesRequest { string tenant = 1; string domain = 2; }
+message ListMailboxesResponse { repeated Mailbox mailboxes = 1; }
+message DeleteMailboxRequest { string tenant = 1; string domain = 2; string local_part = 3; }
+message DeleteMailboxResponse { bool deleted = 1; }
+
+message SetMailboxPasswordRequest {
+  string tenant = 1;
+  string domain = 2;
+  string local_part = 3;
+  string password = 4;
+}
+message SetMailboxPasswordResponse {}
+
+message Forwarder {
+  string address = 1;
+  string local_part = 2;
+  string domain = 3;
+  repeated string destinations = 4;
+  // Also deliver to the mailbox of the same address.
+  bool keep_copy = 5;
+}
+
+message PutForwarderRequest {
+  string tenant = 1;
+  string domain = 2;
+  string local_part = 3;
+  repeated string destinations = 4;
+  bool keep_copy = 5;
+}
+
+message PutForwarderResponse {
+  Forwarder forwarder = 1;
+  bool created = 2;
+}
+
+message ListForwardersRequest { string tenant = 1; string domain = 2; }
+message ListForwardersResponse { repeated Forwarder forwarders = 1; }
+message DeleteForwarderRequest { string tenant = 1; string domain = 2; string local_part = 3; }
+message DeleteForwarderResponse { bool deleted = 1; }
+
+message Autoresponder {
+  string address = 1;
+  bool enabled = 2;
+  string subject = 3;
+  string body = 4;
+  // Unset: from now on / with no end.
+  google.protobuf.Timestamp starts_at = 5;
+  google.protobuf.Timestamp ends_at = 6;
+}
+
+message SetAutoresponderRequest {
+  string tenant = 1;
+  // The address of a mailbox.
+  string address = 2;
+  bool enabled = 3;
+  string subject = 4;
+  string body = 5;
+  google.protobuf.Timestamp starts_at = 6;
+  google.protobuf.Timestamp ends_at = 7;
+}
+
+message GetAutoresponderRequest { string tenant = 1; string address = 2; }
+
+message GetMailLimitsRequest { string tenant = 1; }
+
+message SetMailLimitsRequest {
+  string tenant = 1;
+  uint32 max_mailboxes = 2;
+  uint64 max_mailbox_bytes = 3;
+  uint32 max_messages_per_hour_account = 4;
+  uint32 max_messages_per_hour_mailbox = 5;
+}
+
+message MailLimits {
+  string tenant = 1;
+  uint32 max_mailboxes = 2;
+  uint64 max_mailbox_bytes = 3;
+  uint32 max_messages_per_hour_account = 4;
+  uint32 max_messages_per_hour_mailbox = 5;
+}
+
+message GetMailUsageRequest { string tenant = 1; }
+
+message MailUsage {
+  string tenant = 1;
+  uint32 mailboxes = 2;
+  uint64 bytes_used = 3;
+  // Recipients of mail the account sent in the current clock hour (UTC),
+  // through every mailbox and its sites.
+  uint32 messages_sent_this_hour = 4;
 }

@@ -101,14 +101,45 @@ pub(super) fn openssl(args: &[OsString], generated: &mut u32) -> (i32, String, S
         .map(|a| a.to_string_lossy().into_owned())
         .collect();
     let has = |flag: &str| args.iter().any(|a| a == flag);
-    let public_key =
-        |f: &BTreeMap<String, String>| format!("FAKE PUBLIC KEY {}\n", field(f, "key"));
+    // A PEM block, as the real one prints (DKIM keys are read from it).
+    let public_key = |f: &BTreeMap<String, String>| {
+        pem(
+            "PUBLIC KEY",
+            &format!("fake-public-key {}", field(f, "key")),
+        )
+    };
     let answer = match args.first().map(String::as_str) {
         Some("genpkey") => {
             *generated += 1;
             Some(fake_private_key(&format!("generated-{generated}")))
         }
         Some("pkey") => decode(value(&args, "-in"), "fake-key").map(|f| public_key(&f)),
+        // A self-signed certificate with a new key, both written to files.
+        Some("req") if has("-x509") => {
+            *generated += 1;
+            let id = format!("generated-{generated}");
+            let (Some(key), Some(crt)) = (value(&args, "-keyout"), value(&args, "-out")) else {
+                return (1, String::new(), "missing -keyout or -out".to_owned());
+            };
+            let names = value(&args, "-subj")
+                .and_then(|s| s.strip_prefix("/CN="))
+                .unwrap_or_default()
+                .to_owned();
+            let now = crate::records::now_unix();
+            let cert = fake_certificate(
+                &id,
+                &format!("CN={names}"),
+                now,
+                now + 3650 * 86_400,
+                &[&names],
+            );
+            if std::fs::write(key, fake_private_key(&id)).is_err()
+                || std::fs::write(crt, cert).is_err()
+            {
+                return (1, String::new(), "cannot write".to_owned());
+            }
+            Some(String::new())
+        }
         Some("req") => decode(value(&args, "-key"), "fake-key").map(|f| {
             let names = value(&args, "-addext")
                 .and_then(|v| v.strip_prefix("subjectAltName="))

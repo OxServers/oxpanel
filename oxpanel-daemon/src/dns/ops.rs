@@ -178,11 +178,13 @@ async fn write_zone(
     let rrs: Vec<super::rr::Rr> = rec.rrs()?.into_iter().map(|(_, r)| r).collect();
     let vhosts = ctx.store.list_vhosts()?;
     let sites = site_names(&rec, &rrs, &vhosts)?;
+    let mail = super::mail_records_for(ctx, &rec, &sites, &rrs);
     let input = ZoneInput {
         zone: &zone,
         cfg: &ctx.config.dns,
         sites: &sites,
         records: &rrs,
+        mail: &mail,
     };
     let hash = zone::content_hash(&input);
     if hash != rec.content_sha256 || rec.serial == 0 || floor.is_some() {

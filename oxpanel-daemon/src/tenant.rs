@@ -375,6 +375,10 @@ impl TenantService {
             self.ctx.store.save_tenant(&rec)?;
             info!(tenant = %name, suspended, "suspension changed");
         }
+        // Email reads the saved record: logins and sending stop (or come
+        // back), mail for the domains is deferred. Repeated on every call,
+        // so a retry finishes what an interrupted one began.
+        crate::mail::tenant_changed(&self.ctx, &name, rec.suspended).await?;
         Ok((rec, changed))
     }
 
@@ -415,6 +419,9 @@ impl TenantService {
         // DNS zones hold the tenant's records: deleted explicitly
         // (`crate::dns::remove_tenant_zones` for a cascade).
         crate::dns::refuse_tenant_deletion(&self.ctx, name)?;
+        // Mail domains hold mailboxes: switched off explicitly
+        // (`crate::mail::remove_tenant_mail` for a cascade).
+        crate::mail::refuse_tenant_deletion(&self.ctx, name)?;
         // Backups are the tenant's data too: they are deleted explicitly,
         // never as a side effect, and no job may be in flight.
         crate::backup::refuse_tenant_deletion(&self.ctx, name)
@@ -553,6 +560,7 @@ impl TenantService {
         crate::backup::forget_tenant_jobs(&self.ctx, &name, keep_job)?;
         crate::files::forget_tenant(&self.ctx, &name)?;
         crate::backup_schedule::forget(&self.ctx.config, &name)?;
+        crate::mail::store::MailStore::new(&self.ctx.config).delete_limits(&name)?;
         self.ctx.store.delete_tenant(&name)?;
         Ok(())
     }
@@ -596,6 +604,9 @@ impl TenantService {
                     .await?;
             }
         }
+        // Email: mail domains, DKIM keys, autoresponders (the mail itself
+        // goes with the home), before the zones that carry their records.
+        crate::mail::remove_tenant_mail(&self.ctx, name).await?;
         // DNS zones: the sites' automatic ones went with the sites; what is
         // left holds the tenant's own records (and DNSSEC keys) and goes now.
         crate::dns::remove_tenant_zones(&self.ctx, name).await?;

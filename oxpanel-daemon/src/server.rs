@@ -3,6 +3,7 @@
 use tonic::service::interceptor::InterceptedService;
 
 mod essentials;
+mod mail;
 
 /// Largest request the daemon will decode. Every message is a handful of
 /// short strings; anything bigger is a mistake or an attack.
@@ -57,6 +58,7 @@ pub struct Engine {
     schedules: crate::backup_schedule::ScheduleService,
     ctx: Ctx,
     dns: crate::dns::DnsService,
+    mail: crate::mail::MailService,
 }
 
 /// Interceptor type used by [`Engine::into_service`].
@@ -81,6 +83,7 @@ impl Engine {
                 BackupService::new(ctx.clone()),
             ),
             dns: crate::dns::DnsService::new(ctx.clone()),
+            mail: crate::mail::MailService::new(ctx.clone()),
             host: HostService::new(ctx.clone()),
             ctx,
         }
@@ -210,6 +213,9 @@ fn drift_to(d: &Drift) -> pb::Drift {
         DriftKind::DnsServerDrift => pb::DriftKind::DnsServerDrift,
         DriftKind::DnsSecondaryDrift => pb::DriftKind::DnsSecondaryDrift,
         DriftKind::DnssecDrift => pb::DriftKind::DnssecDrift,
+        DriftKind::MailConfigDrift => pb::DriftKind::MailConfigDrift,
+        DriftKind::MailDomainDrift => pb::DriftKind::MailDomainDrift,
+        DriftKind::OrphanMailFile => pb::DriftKind::OrphanMailFile,
     };
     pb::Drift {
         kind: kind.into(),
@@ -281,6 +287,8 @@ fn fail(rpc: &'static str, peer: &str, err: Error) -> Status {
         | Error::DnsLimitReached(_)
         | Error::DnsZoneRejected(_)
         | Error::TenantHasDnsZones(_)
+        | Error::TenantHasMailDomains(_)
+        | Error::Mail { .. }
         | Error::NginxInvalid(_) => {
             warn!(rpc, peer, error = %err, "request refused");
             err.into()
@@ -2078,6 +2086,155 @@ impl OxPanelEngine for Engine {
                 .await
                 .map_err(|e| fail(RPC, &peer, e))?;
         Ok(Response::new(dns_zone_to(&z)))
+    }
+
+    // --- Email (server/mail.rs)
+
+    async fn get_mail_host(
+        &self,
+        req: Request<pb::GetMailHostRequest>,
+    ) -> Result<Response<pb::MailHost>, Status> {
+        self.get_mail_host_rpc(req).await
+    }
+
+    async fn get_mail_queue(
+        &self,
+        req: Request<pb::GetMailQueueRequest>,
+    ) -> Result<Response<pb::MailQueue>, Status> {
+        self.get_mail_queue_rpc(req).await
+    }
+
+    async fn delete_queued_mail(
+        &self,
+        req: Request<pb::DeleteQueuedMailRequest>,
+    ) -> Result<Response<pb::DeleteQueuedMailResponse>, Status> {
+        self.delete_queued_mail_rpc(req).await
+    }
+
+    async fn flush_mail_queue(
+        &self,
+        req: Request<pb::FlushMailQueueRequest>,
+    ) -> Result<Response<pb::FlushMailQueueResponse>, Status> {
+        self.flush_mail_queue_rpc(req).await
+    }
+
+    async fn check_deliverability(
+        &self,
+        req: Request<pb::CheckDeliverabilityRequest>,
+    ) -> Result<Response<pb::Deliverability>, Status> {
+        self.check_deliverability_rpc(req).await
+    }
+
+    async fn set_mail_domain(
+        &self,
+        req: Request<pb::SetMailDomainRequest>,
+    ) -> Result<Response<pb::SetMailDomainResponse>, Status> {
+        self.set_mail_domain_rpc(req).await
+    }
+
+    async fn get_mail_domain(
+        &self,
+        req: Request<pb::GetMailDomainRequest>,
+    ) -> Result<Response<pb::MailDomain>, Status> {
+        self.get_mail_domain_rpc(req).await
+    }
+
+    async fn list_mail_domains(
+        &self,
+        req: Request<pb::ListMailDomainsRequest>,
+    ) -> Result<Response<pb::ListMailDomainsResponse>, Status> {
+        self.list_mail_domains_rpc(req).await
+    }
+
+    async fn rotate_dkim_key(
+        &self,
+        req: Request<pb::RotateDkimKeyRequest>,
+    ) -> Result<Response<pb::MailDomain>, Status> {
+        self.rotate_dkim_key_rpc(req).await
+    }
+
+    async fn put_mailbox(
+        &self,
+        req: Request<pb::PutMailboxRequest>,
+    ) -> Result<Response<pb::PutMailboxResponse>, Status> {
+        self.put_mailbox_rpc(req).await
+    }
+
+    async fn list_mailboxes(
+        &self,
+        req: Request<pb::ListMailboxesRequest>,
+    ) -> Result<Response<pb::ListMailboxesResponse>, Status> {
+        self.list_mailboxes_rpc(req).await
+    }
+
+    async fn delete_mailbox(
+        &self,
+        req: Request<pb::DeleteMailboxRequest>,
+    ) -> Result<Response<pb::DeleteMailboxResponse>, Status> {
+        self.delete_mailbox_rpc(req).await
+    }
+
+    async fn set_mailbox_password(
+        &self,
+        req: Request<pb::SetMailboxPasswordRequest>,
+    ) -> Result<Response<pb::SetMailboxPasswordResponse>, Status> {
+        self.set_mailbox_password_rpc(req).await
+    }
+
+    async fn put_forwarder(
+        &self,
+        req: Request<pb::PutForwarderRequest>,
+    ) -> Result<Response<pb::PutForwarderResponse>, Status> {
+        self.put_forwarder_rpc(req).await
+    }
+
+    async fn list_forwarders(
+        &self,
+        req: Request<pb::ListForwardersRequest>,
+    ) -> Result<Response<pb::ListForwardersResponse>, Status> {
+        self.list_forwarders_rpc(req).await
+    }
+
+    async fn delete_forwarder(
+        &self,
+        req: Request<pb::DeleteForwarderRequest>,
+    ) -> Result<Response<pb::DeleteForwarderResponse>, Status> {
+        self.delete_forwarder_rpc(req).await
+    }
+
+    async fn set_autoresponder(
+        &self,
+        req: Request<pb::SetAutoresponderRequest>,
+    ) -> Result<Response<pb::Autoresponder>, Status> {
+        self.set_autoresponder_rpc(req).await
+    }
+
+    async fn get_autoresponder(
+        &self,
+        req: Request<pb::GetAutoresponderRequest>,
+    ) -> Result<Response<pb::Autoresponder>, Status> {
+        self.get_autoresponder_rpc(req).await
+    }
+
+    async fn get_mail_limits(
+        &self,
+        req: Request<pb::GetMailLimitsRequest>,
+    ) -> Result<Response<pb::MailLimits>, Status> {
+        self.get_mail_limits_rpc(req).await
+    }
+
+    async fn set_mail_limits(
+        &self,
+        req: Request<pb::SetMailLimitsRequest>,
+    ) -> Result<Response<pb::MailLimits>, Status> {
+        self.set_mail_limits_rpc(req).await
+    }
+
+    async fn get_mail_usage(
+        &self,
+        req: Request<pb::GetMailUsageRequest>,
+    ) -> Result<Response<pb::MailUsage>, Status> {
+        self.get_mail_usage_rpc(req).await
     }
 }
 

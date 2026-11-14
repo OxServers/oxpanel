@@ -98,6 +98,26 @@ pub mod bin {
     pub const NAMED_CHECKCONF: &str = "/usr/sbin/named-checkconf";
     pub const NAMED_CHECKZONE: &str = "/usr/sbin/named-checkzone";
     pub const RNDC: &str = "/usr/sbin/rndc";
+    /// Optional: email (the mail component). Postfix's tools: reload is
+    /// through systemctl; the queue is read with postqueue -j, a message
+    /// removed with postsuper -d, the queue flushed with postqueue -f.
+    pub const POSTFIX: &str = "/usr/sbin/postfix";
+    pub const POSTQUEUE: &str = "/usr/sbin/postqueue";
+    pub const POSTSUPER: &str = "/usr/sbin/postsuper";
+    /// Dovecot: its configuration checker, and doveadm for quota usage,
+    /// ending sessions and flushing the authentication cache.
+    pub const DOVECOT: &str = "/usr/sbin/dovecot";
+    pub const DOVECONF: &str = "/usr/bin/doveconf";
+    pub const DOVEADM: &str = "/usr/bin/doveadm";
+    /// Compiles autoresponder scripts (dovecot-pigeonhole).
+    pub const SIEVEC: &str = "/usr/bin/sievec";
+    /// The filter and DKIM signer.
+    pub const RSPAMD: &str = "/usr/bin/rspamd";
+    /// Removes a deleted mailbox's mail, as the account.
+    pub const RM: &str = "/usr/bin/rm";
+    /// Postfix's sendmail, to which OxPanel's sendmail hands mail of
+    /// callers that are not hosting accounts (never run by the daemon).
+    pub const SENDMAIL: &str = "/usr/sbin/sendmail";
 }
 
 /// A resolved account from the system user database.
