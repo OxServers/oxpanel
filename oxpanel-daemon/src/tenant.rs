@@ -562,7 +562,9 @@ impl TenantService {
         crate::backup::forget_tenant_jobs(&self.ctx, &name, keep_job)?;
         crate::files::forget_tenant(&self.ctx, &name)?;
         crate::backup_schedule::forget(&self.ctx.config, &name)?;
-        crate::mail::store::MailStore::new(&self.ctx.config).delete_limits(&name)?;
+        // Mail domains left without mailboxes or forwarders, their DKIM keys
+        // and the account's mail limits.
+        crate::mail::remove_tenant_mail(&self.ctx, &name).await?;
         self.ctx.store.delete_tenant(&name)?;
         crate::mail::accounts_changed(&self.ctx).await;
         Ok(())

@@ -15,14 +15,13 @@ use crate::host::{Drift, DriftKind};
 use crate::records::now_unix;
 use crate::validate::{Domain, MailLocalPart, Username};
 
-/// Deleting an account is refused while it has mail domains; a cascading
-/// deletion removes them with [`remove_tenant_mail`].
+/// Deleting an account is refused while it has mailboxes or forwarders
+/// (mail is data: removed explicitly, or by a cascading deletion with
+/// [`remove_tenant_mail`]). Mail domains without either go with the account.
 pub fn refuse_tenant_deletion(ctx: &Ctx, tenant: &Username) -> Result<()> {
-    if MailStore::new(&ctx.config)
-        .list()?
-        .iter()
-        .any(|d| d.tenant == tenant.as_str())
-    {
+    if MailStore::new(&ctx.config).list()?.iter().any(|d| {
+        d.tenant == tenant.as_str() && (d.live_mailboxes().next().is_some() || !d.forwarders.is_empty())
+    }) {
         return Err(Error::TenantHasMailDomains(tenant.to_string()));
     }
     Ok(())

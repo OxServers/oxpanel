@@ -16,7 +16,7 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 pub enum Error {
     /// The tenant still has mail domains (removed explicitly, or by a
     /// cascading deletion).
-    #[error("tenant '{0}' still has mail domains; switch their email off or delete the tenant with everything it has")]
+    #[error("tenant '{0}' still has mailboxes or forwarders; delete them first, or delete the tenant with everything it has")]
     TenantHasMailDomains(String),
 
     /// An email request that cannot be done; the message starts with the

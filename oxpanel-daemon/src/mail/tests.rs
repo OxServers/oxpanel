@@ -1106,6 +1106,21 @@ async fn an_account_with_mail_is_deleted_only_with_everything() {
 }
 
 #[tokio::test]
+async fn a_mail_domain_without_mailboxes_goes_with_its_account() {
+    let h = harness().await;
+    h.domain().await;
+    let key = render::dkim_key_path(
+        h.cfg(),
+        "example.test",
+        &h.record("example.test").dkim.unwrap().selector,
+    );
+    h.vhosts.remove("example.test").await.unwrap();
+    h.tenants.delete("alice", true).await.unwrap();
+    assert!(MailStore::new(&h.ctx.config).list().unwrap().is_empty());
+    assert!(!key.exists());
+}
+
+#[tokio::test]
 async fn limits_and_usage() {
     let h = harness().await;
     h.domain().await;
