@@ -146,6 +146,8 @@ message_size_limit = {size}
 mailbox_size_limit = 0
 biff = no
 append_dot_mydomain = no
+# Sites' mail often lacks Date: and Message-ID:; receivers penalise that.
+always_add_missing_headers = yes
 
 # Only root may use sendmail(1) directly. Sites send through OxPanel's
 # sendmail, which attributes, checks and limits their mail (the policy
@@ -188,8 +190,8 @@ smtpd_tls_cert_file = {cert}
 smtpd_tls_key_file = {key}
 smtpd_tls_security_level = may
 smtpd_tls_auth_only = yes
-smtpd_tls_protocols = >=TLSv1.2
-smtpd_tls_mandatory_protocols = >=TLSv1.2
+smtpd_tls_protocols = !SSLv2, !SSLv3, !TLSv1, !TLSv1.1
+smtpd_tls_mandatory_protocols = !SSLv2, !SSLv3, !TLSv1, !TLSv1.1
 smtpd_tls_ciphers = medium
 smtpd_tls_mandatory_ciphers = high
 smtpd_tls_exclude_ciphers = aNULL, eNULL, MD5, RC4, 3DES
@@ -198,7 +200,7 @@ smtpd_tls_loglevel = 1
 smtpd_tls_session_cache_database = btree:${{data_directory}}/smtpd_scache
 smtp_tls_security_level = may
 smtp_tls_CAfile = /etc/pki/tls/certs/ca-bundle.crt
-smtp_tls_protocols = >=TLSv1.2
+smtp_tls_protocols = !SSLv2, !SSLv3, !TLSv1, !TLSv1.1
 smtp_tls_loglevel = 1
 smtp_tls_session_cache_database = btree:${{data_directory}}/smtp_scache
 "
@@ -227,9 +229,10 @@ pub fn postfix_master(cfg: &MailConfig) -> Result<String> {
         "{HEADER}# service type  private unpriv  chroot  wakeup  maxproc command + args
 smtp      inet  n       -       n       -       -       smtpd
   -o smtpd_sasl_auth_enable=no
-submission inet n       -       n       -       -       smtpd
+# Ports by number: AlmaLinux's /etc/services has no name for 465.
+587       inet  n       -       n       -       -       smtpd
   -o syslog_name=postfix/submission
-{client}submissions inet n      -       n       -       -       smtpd
+{client}465       inet  n       -       n       -       -       smtpd
   -o syslog_name=postfix/submissions
   -o smtpd_tls_wrappermode=yes
 {client}# Site mail from OxPanel's policy service only: the socket is in public/,
@@ -239,6 +242,7 @@ oxinject  unix  n       -       n       -       -       smtpd
   -o syslog_name=postfix/oxinject
   -o smtpd_authorized_xclient_hosts=static:all
   -o smtpd_sasl_auth_enable=yes
+  -o smtpd_tls_auth_only=no
   -o smtpd_tls_security_level=none
   -o smtpd_client_restrictions=
   -o smtpd_sender_restrictions=

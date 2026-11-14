@@ -344,11 +344,23 @@ pub async fn ensure_layout(ctx: &Ctx) -> Result<()> {
         (cfg.postfix_dir.join("oxpanel"), 0o750, Some(POSTFIX_GROUP)),
         (cfg.dovecot_dir.join("oxpanel"), 0o750, Some(DOVECOT_GROUP)),
         (cfg.rspamd_dir.join("local.d"), 0o755, None),
+        (cfg.webmail_dir.clone(), 0o755, None),
+        (webmail::roundcube_conf_dir(cfg), 0o750, Some(WEBMAIL_USER)),
     ] {
         created |= !dir.exists();
         fsutil::ensure_dir(&dir, mode)?;
         if let Some(g) = group {
             own_group(ctx, &dir, g).await?;
+        }
+    }
+    // The filter's milter socket: Rspamd creates it, only Postfix may reach it.
+    fsutil::ensure_dir(&cfg.milter_dir, 0o750)?;
+    if !ctx.config.dry_run {
+        if let (Some(u), Some(g)) = (
+            ctx.sys.user_by_name(RSPAMD_USER).await?,
+            ctx.sys.group_by_name(POSTFIX_GROUP).await?,
+        ) {
+            fsutil::set_owner(&cfg.milter_dir, u.uid, g)?;
         }
     }
     // The policy service writes its counters here.

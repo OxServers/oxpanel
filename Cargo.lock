@@ -959,6 +959,7 @@ dependencies = [
  "clap",
  "hyper-util",
  "oxpanel-proto",
+ "prost-types",
  "sha2",
  "tokio",
  "tonic",

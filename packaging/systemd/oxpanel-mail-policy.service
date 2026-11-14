@@ -1,0 +1,60 @@
+# OxPanel's mail policy service: counts and limits what accounts send, and
+# hands in the mail of sites (PHP mail(), sendmail) as their account after
+# checking the sender. See oxpanel-daemon/src/mail/policy.rs.
+#
+# Started by oxpanel-daemon once email is switched on (OXPANEL_MAIL=true);
+# it only reads the map the daemon renders and keeps its counters.
+
+[Unit]
+Description=OxPanel mail policy service (sending limits, mail of sites)
+Documentation=https://github.com/OxServers/oxpanel
+After=network.target
+ConditionPathExists=/var/lib/oxpanel-mail/policy.json
+
+[Service]
+Type=notify
+ExecStart=/usr/sbin/oxpanel-daemon mail-policy
+# The map is re-read whenever it changes; a reload has nothing more to do.
+ExecReload=/bin/true
+Restart=on-failure
+RestartSec=2s
+User=oxpanel-mail
+Group=oxpanel-mail
+# postfix: owns the policy socket's group (only Postfix may ask);
+# postdrop: may enter /var/spool/postfix/public to hand mail in.
+SupplementaryGroups=postfix postdrop
+RuntimeDirectory=oxpanel-mail
+RuntimeDirectoryMode=0755
+UMask=0027
+
+# --- Isolation ---------------------------------------------------------------
+# Only UNIX sockets (Postfix's, its own); no network at all.
+PrivateNetwork=yes
+IPAddressDeny=any
+RestrictAddressFamilies=AF_UNIX
+ProtectSystem=strict
+ReadWritePaths=/var/lib/oxpanel-mail/usage
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

@@ -635,11 +635,19 @@ impl Service {
     }
 }
 
-/// Bind a socket, replacing a stale one, with `mode`.
-fn bind(path: &Path, mode: u32) -> std::io::Result<UnixListener> {
+/// Bind a socket, replacing a stale one, with `mode` and (if given) the
+/// group `group`, of which the service must be a member.
+fn bind(path: &Path, mode: u32, group: Option<&str>) -> std::io::Result<UnixListener> {
     use std::os::unix::fs::PermissionsExt;
     let _ = std::fs::remove_file(path);
     let l = UnixListener::bind(path)?;
+    if let Some(g) = group {
+        let gid = nix::unistd::Group::from_name(g)
+            .map_err(std::io::Error::other)?
+            .ok_or_else(|| std::io::Error::other(format!("no group {g}")))?
+            .gid;
+        nix::unistd::chown(path, None, Some(gid)).map_err(std::io::Error::other)?;
+    }
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
     Ok(l)
 }
@@ -651,6 +659,8 @@ pub fn main(args: &[String]) -> u8 {
     let mut run_dir = cfg.run_dir.clone();
     let mut inject_socket = PathBuf::from(INJECT_SOCKET);
     let mut max_message = cfg.message_max_bytes;
+    // Postfix's group may ask; tests run without it.
+    let mut policy_group = Some("postfix".to_owned());
     let mut it = args.iter().skip(1);
     while let Some(a) = it.next() {
         let v = it.next().cloned().unwrap_or_default();
@@ -659,6 +669,7 @@ pub fn main(args: &[String]) -> u8 {
             "--run-dir" => run_dir = PathBuf::from(v),
             "--inject-socket" => inject_socket = PathBuf::from(v),
             "--max-message" => max_message = v.parse().unwrap_or(max_message),
+            "--policy-group" => policy_group = (!v.is_empty()).then_some(v),
             _ => {
                 tracing::error!(argument = %a, "unknown argument");
                 return 64;
@@ -696,14 +707,14 @@ pub fn main(args: &[String]) -> u8 {
         }
     };
     rt.block_on(async move {
-        let postfix = match bind(&run_dir.join("policy.sock"), 0o660) {
+        let postfix = match bind(&run_dir.join("policy.sock"), 0o660, policy_group.as_deref()) {
             Ok(l) => l,
             Err(e) => {
                 tracing::error!(error = %e, "cannot listen for Postfix");
                 return 1;
             }
         };
-        let sites = match bind(&run_dir.join("sendmail.sock"), 0o666) {
+        let sites = match bind(&run_dir.join("sendmail.sock"), 0o666, None) {
             Ok(l) => l,
             Err(e) => {
                 tracing::error!(error = %e, "cannot listen for sites");

@@ -1,0 +1,62 @@
+# OxPanel's webmail: Roundcube (the roundcubemail package from EPEL) run by
+# its own PHP-FPM master as its own account, with OxPanel's configuration
+# (/etc/oxpanel-webmail, rendered by oxpanel-daemon) and its own SQLite
+# database (/var/lib/oxpanel-webmail). Nginx serves it as webmail.<domain>.
+# Roundcube talks to Dovecot and Postfix on the loopback like any mail client.
+
+[Unit]
+Description=OxPanel webmail (Roundcube)
+Documentation=https://github.com/OxServers/oxpanel
+After=network.target
+ConditionPathExists=/etc/oxpanel-webmail/php-fpm.conf
+
+[Service]
+Type=notify
+User=oxpanel-webmail
+Group=oxpanel-webmail
+# The package's files (/etc/roundcubemail/defaults.inc.php) belong to the
+# group apache; nothing else on an OxPanel host runs as apache (the shared
+# PHP-FPM pool is masked, httpd is not installed).
+SupplementaryGroups=apache
+Environment=RCUBE_CONFIG_PATH=/etc/oxpanel-webmail/roundcube
+# The database: created on the first start (an existing one makes initdb
+# fail harmlessly), brought up to the installed version on every start.
+ExecStartPre=-/usr/bin/php /usr/share/roundcubemail/bin/initdb.sh --dir=/usr/share/roundcubemail/SQL
+ExecStartPre=/usr/bin/php /usr/share/roundcubemail/bin/updatedb.sh --package=roundcube --dir=/usr/share/roundcubemail/SQL
+ExecStart=/usr/sbin/php-fpm --nodaemonize --fpm-config /etc/oxpanel-webmail/php-fpm.conf
+ExecReload=/bin/kill -USR2 $MAINPID
+Restart=on-failure
+RestartSec=2s
+RuntimeDirectory=oxpanel-webmail
+RuntimeDirectoryMode=0711
+StateDirectory=oxpanel-webmail oxpanel-webmail/temp
+StateDirectoryMode=0700
+UMask=0077
+
+# --- Isolation ---------------------------------------------------------------
+ProtectSystem=strict
+ReadWritePaths=/var/lib/oxpanel-webmail
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+# IMAP and SMTP on the loopback; DNS for nothing.
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+IPAddressAllow=localhost
+IPAddressDeny=any
+SystemCallArchitectures=native
+
+[Install]
+WantedBy=multi-user.target

@@ -52,7 +52,8 @@ pub struct MailConfig {
     /// Sockets of the policy service (the sendmail socket and Postfix's
     /// policy socket).
     pub run_dir: PathBuf,
-    /// The filter's milter socket directory (only Postfix may enter it).
+    /// The filter's milter socket directory: `_rspamd:postfix 0750`, so no
+    /// local process other than Postfix (and the filter) can reach it.
     pub milter_dir: PathBuf,
     /// The self-signed certificate used until the mail host name has a real one.
     pub selfsigned_dir: PathBuf,
@@ -80,7 +81,7 @@ impl Default for MailConfig {
             webmail_data_dir: PathBuf::from("/var/lib/oxpanel-webmail"),
             nginx_file: PathBuf::from("/etc/nginx/conf.d/oxpanel-mail.conf"),
             run_dir: PathBuf::from("/run/oxpanel-mail"),
-            milter_dir: PathBuf::from("/run/oxpanel-milter"),
+            milter_dir: PathBuf::from("/var/spool/postfix/oxpanel-milter"),
             selfsigned_dir: PathBuf::from("/etc/pki/oxpanel-mail"),
             roundcube_index: PathBuf::from("/usr/share/roundcubemail/public_html/index.php"),
         }

@@ -96,9 +96,14 @@ enum Cmd {
     /// DNS hosting: zones and records of tenants' domains.
     #[command(subcommand)]
     Dns(dns::DnsCmd),
+    /// Email: mail domains, mailboxes, forwarders, autoresponders, limits,
+    /// the queue.
+    #[command(subcommand)]
+    Mail(mail::MailCmd),
 }
 
 mod dns;
+mod mail;
 
 #[derive(Subcommand, Debug)]
 enum SftpCmd {
@@ -569,12 +574,13 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
         Cmd::Php(cmd) => essentials::run_php(&mut c, cmd).await?,
         Cmd::BackupSchedule(cmd) => essentials::run_schedule(&mut c, cmd).await?,
         Cmd::Dns(cmd) => dns::run_dns(&mut c, cmd).await?,
+        Cmd::Mail(cmd) => mail::run_mail(&mut c, cmd).await?,
     })
 }
 
 /// One line from standard input, without its line ending. A password given
 /// as an argument would be visible to every user of the host in `ps`.
-fn read_password() -> Result<String, tonic::Status> {
+pub(crate) fn read_password() -> Result<String, tonic::Status> {
     let mut line = String::new();
     std::io::stdin()
         .read_line(&mut line)
