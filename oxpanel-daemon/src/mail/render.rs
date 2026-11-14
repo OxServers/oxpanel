@@ -523,9 +523,8 @@ fn sieve_str(s: &str) -> String {
 }
 
 fn iso(unix: u64) -> String {
-    let t = crate::tls::format_utc(unix);
-    // "2026-11-15 10:00:00 UTC" -> "2026-11-15T10:00:00Z"
-    t.trim_end_matches(" UTC").replacen(' ', "T", 1) + "Z"
+    // "2026-11-15 10:00:00Z" -> "2026-11-15T10:00:00Z"
+    crate::tls::format_utc(unix).replacen(' ', "T", 1)
 }
 
 /// A mailbox's autoresponder as a Sieve script: never to lists, bulk or

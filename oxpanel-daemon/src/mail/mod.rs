@@ -664,7 +664,8 @@ impl MailService {
 mod lifecycle;
 mod mailboxes;
 pub use lifecycle::{
-    converge, drifts, refuse_tenant_deletion, remove_tenant_mail, tenant_changed, zone_records,
+    accounts_changed, converge, drifts, refuse_tenant_deletion, remove_tenant_mail, tenant_changed,
+    zone_records,
 };
 
 /// Mailboxes, forwarders and autoresponders as they are listed.

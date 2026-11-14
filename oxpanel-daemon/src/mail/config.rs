@@ -59,6 +59,10 @@ pub struct MailConfig {
     pub selfsigned_dir: PathBuf,
     /// Roundcube's front page as packaged: webmail is offered when it exists.
     pub roundcube_index: PathBuf,
+    /// bcrypt cost of mailbox password hashes. Not configurable from the
+    /// environment: always [`super::password::COST`] in production; tests
+    /// lower it to keep debug builds fast.
+    pub password_cost: u32,
 }
 
 impl Default for MailConfig {
@@ -84,6 +88,7 @@ impl Default for MailConfig {
             milter_dir: PathBuf::from("/var/spool/postfix/oxpanel-milter"),
             selfsigned_dir: PathBuf::from("/etc/pki/oxpanel-mail"),
             roundcube_index: PathBuf::from("/usr/share/roundcubemail/public_html/index.php"),
+            password_cost: super::password::COST,
         }
     }
 }

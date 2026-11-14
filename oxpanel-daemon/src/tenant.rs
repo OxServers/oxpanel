@@ -215,6 +215,8 @@ impl TenantService {
         rec.state = TenantState::Ready;
         self.ctx.store.save_tenant(&rec)?;
         info!(tenant = %name, "tenant ready");
+        // Its sites may send mail (the mail policy service learns its uid).
+        crate::mail::accounts_changed(&self.ctx).await;
         Ok(rec)
     }
 
@@ -562,6 +564,7 @@ impl TenantService {
         crate::backup_schedule::forget(&self.ctx.config, &name)?;
         crate::mail::store::MailStore::new(&self.ctx.config).delete_limits(&name)?;
         self.ctx.store.delete_tenant(&name)?;
+        crate::mail::accounts_changed(&self.ctx).await;
         Ok(())
     }
 

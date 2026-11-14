@@ -235,8 +235,9 @@ pub fn zone_of_site(ctx: &Ctx, site: &VHostRecord) -> String {
 
 // ---- email -------------------------------------------------------------------
 
-/// The mail records of `rec`'s zone, except those at a name a site serves
-/// (the site's address records win) or at or below a delegated name.
+/// The mail records of `rec`'s zone, except a CNAME at a name a site serves
+/// (the site's address records win) and anything at or below a delegated
+/// name.
 pub(crate) fn mail_records_for(
     ctx: &Ctx,
     rec: &ZoneRecord,
@@ -254,7 +255,9 @@ pub(crate) fn mail_records_for(
     crate::mail::zone_records(ctx, &zone, &rec.tenant)
         .into_iter()
         .filter(|(r, _)| {
-            !sites.iter().any(|s| s.name == r.name)
+            // A site's address records and a CNAME cannot share a name;
+            // MX, TXT and SRV records can (the apex is usually both).
+            (r.data.rtype() != RrType::Cname || !sites.iter().any(|s| s.name == r.name))
                 && !delegated.iter().any(|d| r.name.is_at_or_below(d))
         })
         .collect()

@@ -46,6 +46,20 @@ pub async fn tenant_changed(ctx: &Ctx, tenant: &Username, suspended: bool) -> Re
     Ok(())
 }
 
+/// An account was created or deleted, or a site's names changed: the
+/// policy service's map (which accounts exist, their uids and the domains
+/// their sites may send from) and the servers' files follow. Best effort
+/// (the site or account is done whatever email does; `Reconcile` shows a
+/// file left behind). The caller holds the mutation lock.
+pub async fn accounts_changed(ctx: &Ctx) {
+    if !ctx.config.mail.enabled || super::unavailable_reason(ctx).await.is_some() {
+        return;
+    }
+    if let Err(e) = ops::apply(ctx).await {
+        warn!(error = %e, "email could not follow the change of an account or site; see `oxpanel-ctl host reconcile`");
+    }
+}
+
 /// Remove every mail domain of `tenant` (a cascading deletion): servers
 /// first, then DKIM keys, autoresponder scripts, records and limits. The
 /// mail itself goes with the home. The caller holds the mutation lock.
@@ -103,13 +117,20 @@ async fn converge_inner(ctx: &Ctx) -> Result<()> {
                 continue;
             };
             match rec.state {
-                RecordState::Provisioning => {
+                // Also for ready domains: a mailbox directory that went
+                // missing is made again (as the account).
+                RecordState::Provisioning | RecordState::Ready => {
                     svc.finish_domain(rec.clone(), &t).await?;
                 }
+                // An interrupted removal: its keys and scripts go too.
                 RecordState::Deleting => {
+                    ops::prune_dkim_keys(ctx, None, &rec.domain)?;
+                    fsutil::remove_dir_tree(
+                        &ctx.config.mail.state_dir.join("sieve").join(&rec.domain),
+                    )?;
                     store.delete(&rec.domain()?)?;
+                    continue;
                 }
-                RecordState::Ready => {}
             }
             for local in ops::deleting(&rec) {
                 removals.push((t.clone(), rec.domain()?, local));
@@ -224,13 +245,13 @@ pub async fn drifts(ctx: &Ctx) -> Result<Vec<Drift>> {
         }
     }
     for d in &domains {
-        domain_drifts(ctx, d, &mut out)?;
+        domain_drifts(ctx, d, &mut out).await?;
     }
     orphan_drifts(ctx, &domains, &mut out)?;
     Ok(out)
 }
 
-fn domain_drifts(
+async fn domain_drifts(
     ctx: &Ctx,
     d: &super::store::MailDomainRecord,
     out: &mut Vec<Drift>,
@@ -267,27 +288,20 @@ fn domain_drifts(
             continue;
         }
         let dir = render::maildir(&t.home, &d.domain, local);
-        match std::fs::symlink_metadata(&dir) {
-            Err(_) => out.push(Drift::new(
+        if std::fs::symlink_metadata(&dir).is_err() {
+            out.push(Drift::new(
                 DriftKind::MailDomainDrift,
                 &addr,
                 "its mail directory is missing",
-            )),
-            Ok(md) if !md.is_dir() => out.push(Drift::new(
+            ));
+        } else if ctx.sys.verify_owned_dir(&dir, t.uid).await.is_err() {
+            // Through the System trait: the fake OS of the tests and dry
+            // runs cannot give files to other accounts.
+            out.push(Drift::new(
                 DriftKind::MailDomainDrift,
                 &addr,
-                "its mail directory is not a directory (a symlink?); mail cannot be delivered",
-            )),
-            Ok(md) => {
-                use std::os::unix::fs::MetadataExt;
-                if md.uid() != t.uid && !ctx.config.dry_run {
-                    out.push(Drift::new(
-                        DriftKind::MailDomainDrift,
-                        &addr,
-                        "its mail directory is not owned by the account",
-                    ));
-                }
-            }
+                "its mail directory is not a directory owned by the account (a symlink?); mail cannot be delivered",
+            ));
         }
         let _ = MailLocalPart::parse(local)?;
     }

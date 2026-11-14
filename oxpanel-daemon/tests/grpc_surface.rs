@@ -151,6 +151,30 @@ fn scope_table() -> BTreeMap<&'static str, Scope> {
         ("ResetDnsZone", Scope::VHost),
         ("CheckDnsZone", Scope::Read),
         ("SetDnssec", Scope::VHost),
+        // Email: the host's view and checks are reads; removing or retrying
+        // queued mail and setting an account's limits are staff decisions;
+        // a customer manages its own mail domains like its DNS zones.
+        ("GetMailHost", Scope::Read),
+        ("GetMailQueue", Scope::Read),
+        ("DeleteQueuedMail", Scope::Tenant),
+        ("FlushMailQueue", Scope::Tenant),
+        ("CheckDeliverability", Scope::Read),
+        ("SetMailDomain", Scope::VHost),
+        ("GetMailDomain", Scope::Read),
+        ("ListMailDomains", Scope::Read),
+        ("RotateDkimKey", Scope::VHost),
+        ("PutMailbox", Scope::VHost),
+        ("ListMailboxes", Scope::Read),
+        ("DeleteMailbox", Scope::VHost),
+        ("SetMailboxPassword", Scope::VHost),
+        ("PutForwarder", Scope::VHost),
+        ("ListForwarders", Scope::Read),
+        ("DeleteForwarder", Scope::VHost),
+        ("SetAutoresponder", Scope::VHost),
+        ("GetAutoresponder", Scope::Read),
+        ("GetMailLimits", Scope::Read),
+        ("SetMailLimits", Scope::Tenant),
+        ("GetMailUsage", Scope::Read),
     ]
     .into_iter()
     .collect()
@@ -208,9 +232,13 @@ async fn every_rpc_is_refused_without_its_scope_and_passes_with_it() {
                     denied.grpc_message
                 );
                 // An empty request is either served (lists, host info) or
-                // fails validation: both prove the gate was passed.
+                // fails validation: both prove the gate was passed. (Email
+                // RPCs without any field — the queue — answer that email is
+                // not available on the test host: past the gate too.)
+                let mail_off = granted.grpc_status == Some(9)
+                    && granted.grpc_message.starts_with("mail_unavailable:");
                 assert!(
-                    matches!(granted.grpc_status, Some(0 | 3)),
+                    matches!(granted.grpc_status, Some(0 | 3)) || mail_off,
                     "{rpc} with only scope '{}': {granted:?}",
                     scope.as_str()
                 );

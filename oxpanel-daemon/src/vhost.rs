@@ -444,6 +444,8 @@ impl VHostService {
         if let Err(e) = crate::dns::site_changed(&self.ctx, Some(&rec), None).await {
             warn!(%domain, error = %e, "the site's DNS records could not be removed; see `oxpanel-ctl host reconcile`");
         }
+        // The account's sites may no longer send as this name.
+        crate::mail::accounts_changed(&self.ctx).await;
         info!(%domain, tenant = %rec.tenant, "virtual host removed");
         Ok(true)
     }
@@ -772,6 +774,8 @@ async fn dns_follows(
     if let Err(e) = crate::dns::site_changed(ctx, before, after).await {
         warn!(%domain, error = %e, "the site's DNS records could not be brought up to date; see `oxpanel-ctl host reconcile`");
     }
+    // The names the account's sites may send mail as.
+    crate::mail::accounts_changed(ctx).await;
 }
 
 /// Validate, de-duplicate and sort the aliases of `domain`.

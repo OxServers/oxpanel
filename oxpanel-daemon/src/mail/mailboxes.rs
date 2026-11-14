@@ -21,6 +21,10 @@ use crate::validate::{
     MailPassword, Username, MAX_FORWARD_DESTINATIONS,
 };
 
+/// Autoresponder dates end with the year 9999: the script compares ISO 8601
+/// text, which only orders correctly with four-digit years.
+const LAST_AUTOREPLY_TIME: u64 = 253_402_300_799;
+
 /// Space used and messages of a mailbox, from Dovecot's quota (`doveadm -f
 /// tab quota get`; STORAGE is in KiB). Zero when Dovecot cannot tell.
 pub(super) async fn quota_usage(ctx: &Ctx, address: &str) -> (u64, u64) {
@@ -148,9 +152,10 @@ impl MailService {
             None
         } else {
             // Hashing is slow on purpose: done before the lock is taken.
-            Some(password::hash(&MailPassword::parse(
-                password, &local, &domain,
-            )?)?)
+            Some(password::hash_with_cost(
+                &MailPassword::parse(password, &local, &domain)?,
+                self.ctx.config.mail.password_cost,
+            )?)
         };
         require_available(&self.ctx).await?;
         let _guard = self.ctx.lock.lock().await;
@@ -249,7 +254,10 @@ impl MailService {
         let tenant = Username::parse_field(tenant, "tenant")?;
         let domain = Domain::parse(domain.trim_end_matches('.'))?;
         let local = MailLocalPart::parse(local)?;
-        let hash = password::hash(&MailPassword::parse(password, &local, &domain)?)?;
+        let hash = password::hash_with_cost(
+            &MailPassword::parse(password, &local, &domain)?,
+            self.ctx.config.mail.password_cost,
+        )?;
         require_available(&self.ctx).await?;
         let _guard = self.ctx.lock.lock().await;
         self.tenant(&tenant, true)?;
@@ -425,6 +433,11 @@ impl MailService {
     ) -> Result<AutoreplyView> {
         let tenant = Username::parse_field(tenant, "tenant")?;
         let address = MailAddress::parse(address)?;
+        if starts_at_unix.is_some_and(|t| t > LAST_AUTOREPLY_TIME)
+            || ends_at_unix.is_some_and(|t| t > LAST_AUTOREPLY_TIME)
+        {
+            return Err(Error::invalid("starts_at", "must be before the year 10000"));
+        }
         if let (Some(s), Some(e)) = (starts_at_unix, ends_at_unix) {
             if e <= s {
                 return Err(Error::invalid("ends_at", "must be after starts_at"));

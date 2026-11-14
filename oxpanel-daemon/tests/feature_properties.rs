@@ -261,3 +261,269 @@ proptest! {
         }
     }
 }
+
+// ---- Email ------------------------------------------------------------------------
+
+mod mail {
+    use std::collections::BTreeMap;
+    use std::path::PathBuf;
+
+    use proptest::prelude::*;
+
+    use oxpanel_daemon::mail::policy::{self, SubmitRequest};
+    use oxpanel_daemon::mail::render::{self, Account, Model};
+    use oxpanel_daemon::mail::store::{
+        AutoreplyRecord, ForwarderRecord, MailDomainRecord, MailMode, MailboxRecord, RecordState,
+    };
+    use oxpanel_daemon::validate::{
+        AutoreplyBody, AutoreplySubject, Domain, MailAddress, MailDestination, MailLocalPart,
+        MailPassword, QueueId,
+    };
+
+    use super::any_text;
+
+    fn local_like() -> impl Strategy<Value = String> {
+        prop_oneof![
+            "[a-z0-9._+=-]{0,70}",
+            "[A-Za-z0-9._+=\"@ <>\\-\n\r]{0,20}",
+            any_text()
+        ]
+    }
+
+    const HASH: &str = "{BLF-CRYPT}$2y$04$abcdefghijklmnopqrstuvABCDEFGHIJKLMNOPQRSTUVWXYZ01234";
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(512))]
+
+        /// An accepted local part is plain text a map, a path, a Sieve
+        /// string and an argument can all carry.
+        #[test]
+        fn local_parts_are_plain(s in local_like()) {
+            if let Ok(l) = MailLocalPart::parse(&s) {
+                let t = l.as_str();
+                prop_assert!((1..=64).contains(&t.len()));
+                prop_assert!(t.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b"._-".contains(&b)));
+                prop_assert!(!t.starts_with(['.', '-', '_']) && !t.ends_with(['.', '-', '_']));
+                prop_assert!(!t.contains(".."));
+            }
+        }
+
+        /// Addresses and destinations: one `@`, no space, no line break, no
+        /// quote, no angle bracket — nothing that could end a map field or
+        /// an SMTP command.
+        #[test]
+        fn addresses_and_destinations_are_single_tokens(l in local_like(), d in prop_oneof!["[a-z0-9.-]{1,30}", any_text()]) {
+            let raw = format!("{l}@{d}");
+            if let Ok(a) = MailAddress::parse(&raw) {
+                prop_assert_eq!(a.to_string(), raw.clone());
+            }
+            if let Ok(dest) = MailDestination::parse(&raw) {
+                let t = dest.as_str();
+                prop_assert_eq!(t.matches('@').count(), 1);
+                prop_assert!(t.bytes().all(|b| b.is_ascii_graphic() && !b"<>\",;\\()".contains(&b)));
+                prop_assert!(policy::plain_address(t));
+                let again = MailDestination::parse(t).unwrap();
+                prop_assert_eq!(again.as_str(), t);
+            }
+        }
+
+        /// A password is never shorter than 10 characters, never longer
+        /// than 72 bytes and never holds a control character.
+        #[test]
+        fn passwords_are_bounded(p in any_text()) {
+            let local = MailLocalPart::parse("info").unwrap();
+            let domain = Domain::parse("example.com").unwrap();
+            if let Ok(pw) = MailPassword::parse(&p, &local, &domain) {
+                prop_assert!(p.chars().count() >= 10 && p.len() <= 72);
+                prop_assert!(!p.chars().any(char::is_control));
+                let shown = format!("{pw:?}");
+                prop_assert!(!shown.contains(&p));
+            }
+        }
+
+        #[test]
+        fn queue_ids_are_letters_and_digits(s in prop_oneof!["[A-Za-z0-9]{3,24}", any_text()]) {
+            if let Ok(q) = QueueId::parse(&s) {
+                prop_assert!(q.as_str().bytes().all(|b| b.is_ascii_alphanumeric()));
+                prop_assert!(!q.as_str().starts_with('-'));
+            }
+        }
+
+        /// Whatever text an autoresponder is given, its script has exactly
+        /// one vacation command and the text comes back from the Sieve
+        /// string unchanged (no early end of string, no injected command).
+        #[test]
+        fn sieve_scripts_hold_the_text_and_nothing_else(subject in any_text(), body in any_text()) {
+            let (Ok(s), Ok(b)) = (AutoreplySubject::parse(&subject), AutoreplyBody::parse(&body)) else {
+                return Ok(());
+            };
+            prop_assert!(!s.as_str().contains(['\n', '\r']));
+            let r = AutoreplyRecord {
+                enabled: true,
+                subject: s.as_str().to_owned(),
+                body: b.as_str().to_owned(),
+                starts_at_unix: Some(1_800_000_000),
+                ends_at_unix: None,
+            };
+            let script = render::sieve_script("info@example.com", &r);
+            let parsed = sieve_strings(&script);
+            prop_assert!(parsed.contains(&r.subject), "subject lost: {script}");
+            prop_assert!(parsed.contains(&r.body), "body lost: {script}");
+            // Outside the strings, the script is always the same.
+            let skeleton = strip_strings(&script);
+            prop_assert_eq!(skeleton.matches("vacation").count(), 1, "{}", skeleton);
+            prop_assert_eq!(skeleton.matches(';').count(), 3, "{}", skeleton);
+        }
+
+        /// The maps and password files have exactly one line per entry,
+        /// whatever (valid) names the records hold.
+        #[test]
+        fn maps_have_one_line_per_entry(
+            locals in proptest::collection::btree_set("[a-z][a-z0-9._-]{0,10}[a-z0-9]", 1..6),
+            dests in proptest::collection::vec("[a-z][a-z0-9+=._-]{0,8}@[a-z]{1,8}\\.org", 1..4),
+            suspended in any::<bool>(),
+        ) {
+            let locals: Vec<String> = locals.into_iter().filter(|l| MailLocalPart::parse(l).is_ok()).collect();
+            prop_assume!(!locals.is_empty());
+            let dests: Vec<String> = dests.into_iter().filter_map(|d| MailDestination::parse(&d).ok()).map(|d| d.to_string()).collect();
+            prop_assume!(!dests.is_empty());
+            let mut rec = MailDomainRecord {
+                version: 1,
+                domain: "example.com".into(),
+                tenant: "alice".into(),
+                created_at_unix: 0,
+                state: RecordState::Ready,
+                mode: MailMode::Local,
+                external_mx: vec![],
+                catch_all: None,
+                dkim: None,
+                dkim_retired: vec![],
+                mailboxes: BTreeMap::new(),
+                forwarders: BTreeMap::new(),
+            };
+            for l in &locals {
+                rec.mailboxes.insert(l.clone(), MailboxRecord {
+                    state: RecordState::Ready,
+                    quota_bytes: 0,
+                    password_hash: HASH.into(),
+                    enabled: true,
+                    created_at_unix: 0,
+                    autoreply: None,
+                });
+            }
+            rec.forwarders.insert("fwd-x".into(), ForwarderRecord { destinations: dests.clone(), keep_copy: false });
+            rec.validate().unwrap();
+            let m = Model {
+                hostname: Domain::parse("mail.host.net").unwrap(),
+                accounts: BTreeMap::from([("alice".to_owned(), Account {
+                    name: "alice".into(),
+                    uid: 20000,
+                    gid: 20000,
+                    home: PathBuf::from("/home/alice"),
+                    suspended,
+                    rate_account: 1,
+                    rate_mailbox: 1,
+                    sender_domains: std::collections::BTreeSet::default(),
+                })]),
+                domains: vec![rec],
+                cert: PathBuf::from("/c"),
+                key: PathBuf::from("/k"),
+                uid_min: 20000,
+                uid_max: 29999,
+            };
+            let maps = render::postfix_maps(&m);
+            let body = |s: &str| s.lines().filter(|l| !l.starts_with('#')).count();
+            prop_assert_eq!(body(&maps["mailboxes"]), locals.len());
+            prop_assert_eq!(body(&maps["aliases"]), locals.len() + 1);
+            prop_assert_eq!(body(&maps["senders"]), if suspended { 0 } else { locals.len() });
+            prop_assert_eq!(body(&maps["recipient_access"]), usize::from(suspended));
+            for (name, text) in maps.iter().filter(|(n, _)| **n != "recipient_access") {
+                for l in text.lines().filter(|l| !l.starts_with('#')) {
+                    let _ = name;
+                    prop_assert_eq!(l.split(' ').count(), 2, "{}", l);
+                }
+            }
+            let files = render::dovecot_files(&m).unwrap();
+            prop_assert_eq!(files["passwd"].lines().count(), locals.len());
+            prop_assert_eq!(files["users"].lines().count(), locals.len());
+            for l in files["users"].lines() {
+                prop_assert_eq!(l.split(':').count(), 9, "{}", l);
+            }
+        }
+
+        /// The policy service's parsers never panic, and what they make of
+        /// any message is either refused or plain addresses and CRLF lines.
+        #[test]
+        fn site_messages_never_smuggle_commands(
+            msg in prop_oneof![any::<Vec<u8>>(), "(([A-Za-z-]{1,8}: [ -~]{0,30}|[ \t][ -~]{0,10})\r?\n){0,6}\r?\n[ -~\r\n.]{0,60}".prop_map(String::into_bytes)],
+            sender in proptest::option::of(local_like()),
+            extract in any::<bool>(),
+            rcpt in proptest::collection::vec(local_like(), 0..3),
+        ) {
+            let _ = policy::addresses(&String::from_utf8_lossy(&msg));
+            let req = SubmitRequest { sender, recipients: rcpt, extract };
+            if let Ok(m) = policy::prepare(&req, &msg) {
+                prop_assert!(policy::plain_address(&m.sender));
+                for r in &m.recipients {
+                    prop_assert!(policy::plain_address(r));
+                }
+                prop_assert!(!(1..=policy::MAX_SITE_RECIPIENTS).contains(&0));
+                prop_assert!(m.recipients.len() <= policy::MAX_SITE_RECIPIENTS);
+                let data = policy::smtp_data(&m.message);
+                prop_assert!(data.ends_with(b"\r\n.\r\n"));
+                // Every line of the data ends with CRLF and no line is a lone dot
+                // before the end.
+                let body = &data[..data.len() - 3];
+                for line in body.split(|b| *b == b'\n') {
+                    if !line.is_empty() {
+                        prop_assert!(line.ends_with(b"\r") || line.is_empty());
+                    }
+                    prop_assert_ne!(line, b".\r");
+                }
+            }
+        }
+    }
+
+    /// The contents of the Sieve strings of a script.
+    fn sieve_strings(script: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut cur: Option<String> = None;
+        let mut esc = false;
+        for c in script.chars() {
+            match (&mut cur, c) {
+                (Some(s), _) if esc => {
+                    s.push(c);
+                    esc = false;
+                }
+                (Some(_), '\\') => esc = true,
+                (Some(_), '"') => out.push(cur.take().unwrap_or_default()),
+                (Some(s), _) => s.push(c),
+                (None, '"') => cur = Some(String::new()),
+                (None, _) => {}
+            }
+        }
+        out
+    }
+
+    fn strip_strings(script: &str) -> String {
+        let mut out = String::new();
+        let (mut inside, mut esc) = (false, false);
+        for c in script.chars() {
+            if inside {
+                if esc {
+                    esc = false;
+                } else if c == '\\' {
+                    esc = true;
+                } else if c == '"' {
+                    inside = false;
+                    out.push_str("\"\"");
+                }
+            } else if c == '"' {
+                inside = true;
+            } else if c != '#' || !out.ends_with('\n') && !out.is_empty() {
+                out.push(c);
+            }
+        }
+        out
+    }
+}
