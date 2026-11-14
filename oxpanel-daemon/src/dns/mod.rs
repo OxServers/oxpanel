@@ -972,11 +972,15 @@ impl DnsService {
         let rec = {
             let _guard = self.ctx.lock.lock().await;
             require_available(&self.ctx).await?;
-            self.mutable(&tenant, &zone)?
+            let rec = self.mutable(&tenant, &zone)?;
+            if rec.dnssec == enabled {
+                // The record says so, but an earlier request may have been
+                // interrupted after saving it: finish what it left undone.
+                let rec = self.finish_switch(rec, &zone).await?;
+                return view(&self.ctx, rec, true);
+            }
+            rec
         };
-        if rec.dnssec == enabled {
-            return view(&self.ctx, rec, true);
-        }
         // Switching off: look at the parent first (no lock held: it takes a
         // few seconds), then decide under the lock.
         let checked = if enabled {
@@ -987,6 +991,7 @@ impl DnsService {
         let _guard = self.ctx.lock.lock().await;
         let rec = self.mutable(&tenant, &zone)?;
         if rec.dnssec == enabled {
+            let rec = self.finish_switch(rec, &zone).await?;
             return view(&self.ctx, rec, true);
         }
         let floor = match &checked {
@@ -1024,6 +1029,31 @@ impl DnsService {
         }
         info!(%zone, %tenant, dnssec = enabled, "DNSSEC switched");
         view(&self.ctx, saved, true)
+    }
+
+    /// The tail of a DNSSEC switch whose record was already saved: the
+    /// server loads the zone with its new configuration (`loaded_serial` 0
+    /// says it has not yet), and switching off leaves no signing state. A
+    /// switch interrupted there (daemon killed, the server's reload failed)
+    /// is completed by repeating the request. The caller holds the lock.
+    async fn finish_switch(&self, mut rec: ZoneRecord, zone: &Domain) -> Result<ZoneRecord> {
+        let keys_left = !rec.dnssec && Layout::new(&self.ctx.config.dns).key_dir(zone).exists();
+        if rec.loaded_serial != 0 && !keys_left {
+            return Ok(rec);
+        }
+        if !rec.dnssec {
+            ops::remove_raw_journal(&self.ctx, zone)?;
+        }
+        ops::apply_server(&self.ctx).await?;
+        if rec.loaded_serial == 0 {
+            rec.loaded_serial = rec.serial;
+            self.store().save(&rec)?;
+        }
+        if !rec.dnssec {
+            ops::remove_signing_state(&self.ctx, zone)?;
+        }
+        info!(%zone, tenant = %rec.tenant, dnssec = rec.dnssec, "interrupted DNSSEC switch completed");
+        Ok(rec)
     }
 }
 

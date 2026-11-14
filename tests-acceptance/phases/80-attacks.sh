@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # Phase 80 — tenant-isolation attacks, from inside the tenant's own PHP, Node.js and
-# Python code, and from the network. Every attempt must fail.
+# Python code, and from the network. Every attempt must fail. Sections 7-15
+# (phases/attack/features.sh) attack the features added since: SFTP, the file
+# manager, certificates, databases, backups, scheduled tasks and PHP settings,
+# DNS hosting and cascade deletion.
 #
 # How the phase tells "denied" from "a hole":
 #   * Every probe has an expected result. A probe that is OPEN where BLOCKED is
@@ -64,6 +67,11 @@ as_user susp1 sh -c "echo SUSPENDED-SECRET > /home/susp1/public_html/index.html"
 eventually "susp.test serves before suspension" 30 0.2 http_body_is susp.test / SUSPENDED-SECRET
 check "suspend susp1" bash -c "oxpanel-ctl tenant suspend susp1 | grep -q 'suspended=true'"
 
+# The features added since this phase was written (sections 7-15 and the battery's extra probes).
+source "$A/features.sh"
+echo "-- setup: the victim gets one of every feature"
+features_setup
+
 # probes.tsv: op<TAB>name<TAB>argument<TAB>expectation (blocked | open | info)
 P=/root/acc/probes.tsv
 {
@@ -111,6 +119,7 @@ P=/root/acc/probes.tsv
   p read victim-node-cmdline /proc/$VNODE/cmdline info
   p list run-oxpanel-app /run/oxpanel-app info
   p list run-oxpanel-php /run/oxpanel-php info
+  feature_probes
 } > "$P"
 NPROBES=$(grep -c . "$P"); NEXPECT=$(awk -F'\t' '{n+=1+($1=="read")+($1=="write")} END{print n+1}' "$P")
 check "probe list written ($NPROBES probes, $NEXPECT result lines per runtime)" test "$NPROBES" -gt 60
@@ -392,6 +401,20 @@ check "the removed sites answer nothing (connection closed)" bash -c "[ \"\$(cur
 check "delete attack1" bash -c "oxpanel-ctl tenant delete attack1 --remove-home | grep -q '^deleted=true'"
 check "no file owned by the deleted tenant's uid is left on the root file system" bash -c "! find / -xdev -uid $AUID 2>/dev/null | grep -q ."
 check "no process of the deleted uid remains" bash -c "! pgrep -u $AUID >/dev/null"
+
+# ------------------------------------------------------------------ 7-15. the newer features
+features_attacker
+features_sftp
+features_files
+features_certs
+features_db
+features_backups
+features_tasks
+features_dns
+features_listeners
+features_cascade
+check "the attacks on the features changed nothing outside the tenants (permissions, ACLs, labels)" test "$(snap)" = "$SNAP7"
+features_teardown
 
 # ------------------------------------------------------------------ wrap up
 echo "-- wrap up"

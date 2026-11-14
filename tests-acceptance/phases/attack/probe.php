@@ -17,6 +17,45 @@ function one($op, $arg) {
   return [false, 'unknown op'];
 }
 $do = $_GET['do'] ?? 'probe';
+if ($do === 'feat') { // feature attacks (feat.py) as a child of PHP-FPM; arguments separated by tabs
+  $args = array_map('escapeshellarg', explode("\t", $_GET['args'] ?? ''));
+  echo shell_exec('/usr/bin/python3 /home/ATTACKER/feat.py ' . implode(' ', $args) . ' 2>&1'); exit;
+}
+if ($do === 'ini') { // the settings this site's scripts run with (and whether .user.ini lifted any)
+  foreach (['memory_limit', 'upload_max_filesize', 'post_max_size', 'open_basedir', 'allow_url_include', 'auto_prepend_file', 'disable_functions', 'max_execution_time'] as $k) echo "$k=" . ini_get($k) . "\n";
+  exit;
+}
+if ($do === 'db') { // database attacks through PHP's own client (mysqli), the language API
+  mysqli_report(MYSQLI_REPORT_OFF);
+  $u = $_GET['u']; $pw = $_GET['p']; $own = $_GET['own']; $victim = $_GET['victim'];
+  $q = function ($name, $sql, $want, $db = null, $check = null) use ($u, $pw) {
+    $c = @mysqli_connect('localhost', $u, $pw, $db ?? '', 0, '/var/lib/mysql/mysql.sock');
+    if (!$c) { echo "$name\tBLOCKED\t$want\tconnect: " . mysqli_connect_errno() . "\n"; return; }
+    $r = @mysqli_query($c, $sql);
+    $ok = $r !== false; $detail = $ok ? 'ok' : mysqli_errno($c) . ' ' . substr(mysqli_error($c), 0, 60);
+    if ($ok && $check !== null && $r instanceof mysqli_result) { $row = mysqli_fetch_row($r); $ok = $check($row ? $row[0] : null); $detail = 'value ' . substr((string)($row[0] ?? 'NULL'), 0, 40); }
+    echo "$name\t" . ($ok ? 'OPEN' : 'BLOCKED') . "\t$want\t" . str_replace(["\t", "\n"], ' ', $detail) . "\n";
+    mysqli_close($c);
+  };
+  $q('php-db-own', 'SELECT 41+1', 'open', $own, fn($v) => $v == 42);
+  $q('php-db-victim', 'SELECT 1', 'blocked', $victim);
+  $q('php-db-victim-table', "SELECT COUNT(*) FROM `$victim`.secrets", 'blocked');
+  $q('php-db-load-file', "SELECT LOAD_FILE('/etc/passwd')", 'blocked', null, fn($v) => $v !== null && str_contains($v, 'root:'));
+  $q('php-db-outfile', "SELECT 'x' INTO OUTFILE '/var/lib/mysql/oxprobe-php.txt'", 'blocked', $own);
+  $q('php-db-create-user', "CREATE USER 'oxprobe2'@'localhost'", 'blocked');
+  $q('php-db-grant', 'GRANT ALL ON *.* TO CURRENT_USER', 'blocked');
+  $q('php-db-global', 'SET GLOBAL max_connections = 2', 'blocked');
+  $q('php-db-accounts', 'SELECT COUNT(*) FROM mysql.global_priv', 'blocked');
+  $q('php-db-trash', "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name LIKE 'oxpanel%'", 'blocked', null, fn($v) => $v > 0);
+  $q('php-db-other-schemas', "SELECT COUNT(*) FROM information_schema.schemata WHERE schema_name NOT IN ('information_schema', '$own')", 'blocked', null, fn($v) => $v > 0);
+  $q('php-db-definer-root', "CREATE DEFINER=`root`@`localhost` PROCEDURE `$own`.pr() SELECT 1", 'blocked');
+  $q('php-db-create-db', 'CREATE DATABASE oxprobe_php', 'blocked');
+  $c = @mysqli_connect('localhost', 'root', '', '', 0, '/var/lib/mysql/mysql.sock');
+  echo "php-db-root-via-socket\t" . ($c ? 'OPEN' : 'BLOCKED') . "\tblocked\t" . mysqli_connect_errno() . "\n";
+  $c = @mysqli_connect('localhost', explode('_', $victim)[0] . '_app', '', '', 0, '/var/lib/mysql/mysql.sock');
+  echo "php-db-victim-user-no-password\t" . ($c ? 'OPEN' : 'BLOCKED') . "\tblocked\t" . mysqli_connect_errno() . "\n";
+  exit;
+}
 if ($do === 'echo') { echo json_encode(['url' => $_SERVER['REQUEST_URI'], 'host' => $_SERVER['HTTP_HOST'] ?? '', 'headers' => getallheaders()]); exit; }
 if ($do === 'spawn') { exec('/usr/bin/setsid /usr/bin/sleep 600 >/dev/null 2>&1 &'); echo 'spawned'; exit; }
 if ($do === 'tmpfill') { $f = fopen('/tmp/fill', 'w'); $c = str_repeat('x', 1 << 20); for ($i = 0; $i < 200; $i++) fwrite($f, $c); fclose($f); echo 'filled ' . filesize('/tmp/fill'); exit; }

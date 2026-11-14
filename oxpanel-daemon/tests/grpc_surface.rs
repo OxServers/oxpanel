@@ -988,3 +988,194 @@ async fn an_installation_cannot_revive_a_suspended_or_removed_application() {
         assert_consistent(&srv.world, &srv.services, "installation vs suspension").await;
     }
 }
+
+/// Every RPC (not only `CreateTenant`) refuses malformed frames and
+/// messages: nothing is created, no change reaches the OS, the server keeps
+/// answering. A message that happens to decode (an unknown field, a field
+/// of another type that protobuf accepts) is either refused by validation
+/// or, for a `read` RPC, answered — never acted on by a mutating one.
+#[tokio::test]
+async fn malformed_requests_to_every_rpc_are_refused_without_side_effects() {
+    let srv = serve(allow_me(), None).await;
+    let table = scope_table();
+    let mut truncated = frame(&create("alice").encode_to_vec());
+    truncated.truncate(truncated.len() - 3);
+    let cases: Vec<(&str, Vec<u8>)> = vec![
+        ("field 1 as a varint", frame(&[0x08, 0x01])),
+        ("length overrun", frame(&[0x0a, 0x7f, b'a', b'b'])),
+        (
+            "invalid UTF-8 in field 1",
+            frame(&[0x0a, 0x03, 0xff, 0xfe, 0xfd]),
+        ),
+        (
+            "invalid UTF-8 in field 2",
+            frame(&[0x12, 0x03, 0xff, 0xfe, 0xfd]),
+        ),
+        (
+            "endless varint",
+            frame(&[
+                0x08, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+            ]),
+        ),
+        ("group wire type", frame(&[0x0b, 0x0c])),
+        ("field number 0", frame(&[0x02, 0x01, b'x'])),
+        ("truncated frame", truncated),
+        ("no frame at all", Vec::new()),
+        (
+            "length prefix far larger than the body",
+            vec![0, 0x7f, 0xff, 0xff, 0xff, 1, 2, 3],
+        ),
+    ];
+    for rpc in rpcs_in_proto() {
+        // A request without any field is the baseline: an RPC that serves
+        // an empty request (host-wide renewals, listings) may serve one
+        // whose only fields it does not know, and do what it does anyway.
+        srv.fake().clear_calls();
+        let empty = raw_call(&srv.socket, &rpc, frame(&[]))
+            .await
+            .expect("transport");
+        let serves_empty = empty.grpc_status == Some(0);
+        let empty_calls = srv.fake().calls().len();
+        let read = table.get(rpc.as_str()) == Some(&Scope::Read) || serves_empty;
+        for (what, body) in &cases {
+            srv.fake().clear_calls();
+            let reply = raw_call(&srv.socket, &rpc, body.clone()).await;
+            if let Ok(r) = &reply {
+                assert!(
+                    r.grpc_status.is_some_and(|s| s != 0) || read,
+                    "{rpc}, {what}: a mutating RPC accepted it: {r:?}"
+                );
+            }
+            if !read
+                || (!serves_empty
+                    && empty_calls == 0
+                    && table.get(rpc.as_str()) != Some(&Scope::Read))
+            {
+                assert!(
+                    srv.fake().calls().is_empty(),
+                    "{rpc}, {what}: reached the OS: {:?}",
+                    srv.fake().calls()
+                );
+            }
+            assert!(
+                srv.services
+                    .ctx
+                    .store
+                    .list_tenants()
+                    .expect("list")
+                    .is_empty(),
+                "{rpc}, {what}: created a tenant"
+            );
+        }
+        assert_alive(&srv).await;
+    }
+    assert_consistent(&srv.world, &srv.services, "malformed requests to every RPC").await;
+}
+
+static FIELD_PANICS: AtomicUsize = AtomicUsize::new(0);
+
+/// A message built field by field with no knowledge of its type: random
+/// field numbers and wire types carrying hostile strings and extreme
+/// integers (and nested messages of them), sent to every RPC against a host
+/// with a tenant and a site. No handler may panic; whatever is accepted went
+/// through validation; the state stays consistent and the server answers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn structured_hostile_messages_to_every_rpc_never_panic_or_corrupt_state() {
+    use prost::encoding::{encode_key, encode_varint, WireType};
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        FIELD_PANICS.fetch_add(1, Ordering::SeqCst);
+        previous(info);
+    }));
+    let srv = serve(allow_me(), None).await;
+    let mut client = connect(&srv.socket).await.expect("connect");
+    client.create_tenant(create("alice")).await.expect("create");
+    client
+        .configure_virtual_host(vhost("site.example", "alice", 1))
+        .await
+        .expect("site");
+    let rpcs = rpcs_in_proto();
+    let mut runner = TestRunner::deterministic();
+    let hostile = prop_oneof![
+        Just("alice".to_owned()),
+        Just("site.example".to_owned()),
+        Just("public_html".to_owned()),
+        "[a-z][a-z0-9_-]{2,12}",
+        "alice_[a-z]{1,8}",
+        "(\\.\\./){1,6}etc/(passwd|shadow)",
+        "/(etc|root|var/lib/oxpanel)/[a-z]{1,8}",
+        "[a-z]{1,5}[;{}$\"'`\\\\\n\r\t\0 %*][a-z]{1,5}",
+        "\\$(INCLUDE|ORIGIN|GENERATE) [a-z/]{1,12}",
+        "ssh-ed25519 [A-Za-z0-9+/]{10,80}={0,2}( [a-z]{1,8})?",
+        "-----BEGIN [A-Z ]{3,20}-----\n[A-Za-z0-9+/\n]{0,80}",
+        ".{0,40}",
+        "[a-z]{300,400}",
+    ];
+    let put_str = |number: u32, s: &str, out: &mut Vec<u8>| {
+        encode_key(number, WireType::LengthDelimited, out);
+        encode_varint(s.len() as u64, out);
+        out.extend_from_slice(s.as_bytes());
+    };
+    let msg = proptest::collection::vec((1u32..=14, 0u8..3, any::<u64>()), 0..10);
+    for i in 0..(rpcs.len() * 12) {
+        let rpc = rpcs.get(i % rpcs.len()).expect("rpc");
+        let fields = msg.new_tree(&mut runner).expect("tree").current();
+        let mut body = Vec::new();
+        for (number, wire, int) in fields {
+            match wire {
+                0 => {
+                    encode_key(number, WireType::Varint, &mut body);
+                    encode_varint(
+                        match int % 4 {
+                            0 => 0,
+                            1 => 1,
+                            2 => u64::MAX,
+                            _ => int,
+                        },
+                        &mut body,
+                    );
+                }
+                1 => {
+                    let s = hostile.new_tree(&mut runner).expect("tree").current();
+                    put_str(number, &s, &mut body);
+                }
+                _ => {
+                    let mut inner = Vec::new();
+                    for n in 1..=3u32 {
+                        let s = hostile.new_tree(&mut runner).expect("tree").current();
+                        put_str(n, &s, &mut inner);
+                    }
+                    encode_key(number, WireType::LengthDelimited, &mut body);
+                    encode_varint(inner.len() as u64, &mut body);
+                    body.extend_from_slice(&inner);
+                }
+            }
+        }
+        let _ = raw_call(&srv.socket, rpc, frame(&body)).await;
+    }
+    assert_eq!(
+        FIELD_PANICS.load(Ordering::SeqCst),
+        0,
+        "a request handler panicked"
+    );
+    assert_alive(&srv).await;
+    assert_consistent(
+        &srv.world,
+        &srv.services,
+        "after structured hostile requests",
+    )
+    .await;
+    for call in srv.fake().calls() {
+        for arg in &call.args {
+            let arg = arg.to_string_lossy();
+            assert!(
+                !arg.contains("../")
+                    && !arg.contains('\n')
+                    && !arg.contains("$INCLUDE")
+                    && !arg.contains("/etc/shadow"),
+                "hostile argument reached the OS: {} {arg:?}",
+                call.program
+            );
+        }
+    }
+}

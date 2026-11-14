@@ -158,7 +158,8 @@ run_phase() { # <NN> → script name
           else P_NUM+=(60); P_NAME+=(reboot-post); P_STATUS+=(NO-SSH); P_SECS+=(300); P_OK+=(0); P_FAIL+=("VM did not come back after reboot"); rc=1; fi
         fi;;
     70) run_remote 70-soak "$PHASE_TIMEOUT" "cd /root/acc && $(phase_env) bash phases/70-soak.sh" || rc=$?;;
-    80) run_remote 80-attacks "$PHASE_TIMEOUT" "cd /root/acc && $(phase_env) bash phases/80-attacks.sh" || rc=$?;;
+    # Phase 80 attacks every feature from tenant code (sections 1-15): longer than the others.
+    80) run_remote 80-attacks "$(( PHASE_TIMEOUT * 3 ))" "cd /root/acc && $(phase_env) bash phases/80-attacks.sh" || rc=$?;;
     90) run_remote 90-performance "$PHASE_TIMEOUT" "cd /root/acc && $(phase_env) bash phases/90-performance.sh" || rc=$?;;
     *) die "unknown phase $n";;
   esac

@@ -304,14 +304,22 @@ pub(super) async fn apply_server(ctx: &Ctx) -> Result<()> {
             zones.push((d, z.dnssec));
         }
     }
-    let catalog_changed = apply_catalog(ctx, &store, &l, &zones).await?;
+    // Whether the server has seen the files is decided from a marker
+    // written before them and removed once the server has loaded them, not
+    // from whether they changed: a daemon that died (or a reload that
+    // failed) between writing and loading would otherwise never load them,
+    // and a zone would stay unserved, or a deleted one served.
+    let pending = reload_pending_marker(ctx);
+    let was_pending = pending.exists();
+    fsutil::write_atomic(&pending, b"", 0o600)?;
+    let catalog_changed = apply_catalog(ctx, &store, &l, &zones).await? || was_pending;
     let files = [
         (l.named_conf(), bind::render_named_conf(cfg, &l)?),
         (l.zones_conf(), bind::render_zones_conf(&zones, &l)?),
         (l.rndc_conf(), bind::render_rndc_conf(&l)?),
     ];
     let mut previous = Vec::new();
-    let mut changed = false;
+    let mut changed = was_pending;
     for (path, text) in &files {
         previous.push((path.clone(), fsutil::read_optional(path)?));
         changed |= fsutil::write_atomic(path, text.as_bytes(), bind::CONF_MODE)?;
@@ -339,7 +347,8 @@ pub(super) async fn apply_server(ctx: &Ctx) -> Result<()> {
         }
     }
     if !server_active(ctx).await? {
-        return start_server(ctx).await;
+        start_server(ctx).await?;
+        return fsutil::remove_if_exists(&pending).map(|_| ());
     }
     if changed {
         ctx.sys
@@ -353,7 +362,13 @@ pub(super) async fn apply_server(ctx: &Ctx) -> Result<()> {
     if catalog_changed {
         rndc(ctx, &["reload", zone::CATALOG_ZONE]).await?;
     }
-    Ok(())
+    fsutil::remove_if_exists(&pending).map(|_| ())
+}
+
+/// Present while the server's configuration files may be newer than what
+/// the server has loaded (see [`apply_server`]).
+fn reload_pending_marker(ctx: &Ctx) -> std::path::PathBuf {
+    ctx.config.state_dir.join("dns-server.reload-pending")
 }
 
 /// Render the catalog of `zones`; returns whether its file changed.
