@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Phase 17 — installer options that the main run does not use (installer mode):
-# the answers file, the panel account hook, DNS hosting, and the /etc/fstab variant of the disk
+# the answers file, the panel account hook, DNS hosting, email, and the /etc/fstab variant of the disk
 # quota change (on a loopback XFS image that stands in for a separate /home).
 cd "$(dirname "$0")/.."; source phases/lib.sh
 echo "== phase 17: installer options"
@@ -14,6 +14,10 @@ cleanup() {
   [ -f /root/acc/fstab.keep ] && cp -p /root/acc/fstab.keep /etc/fstab
   systemctl daemon-reload; systemctl restart oxpanel-daemon; rm -f /var/xt.img /etc/fstab.oxpanel-installer.bak
   systemctl stop oxpanel-dns >/dev/null 2>&1 || true
+  systemctl disable --now exim.service >/dev/null 2>&1; rm -f /etc/systemd/system/exim.service
+  rm -f /etc/fail2ban/jail.d/50-oxpanel-mail.local; systemctl -q is-active fail2ban && systemctl reload fail2ban >/dev/null 2>&1
+  for s in smtp smtps smtp-submission imaps pop3s; do firewall-cmd -q --remove-service=$s 2>/dev/null; firewall-cmd -q --permanent --remove-service=$s 2>/dev/null; done
+  systemctl daemon-reload
 }
 trap cleanup EXIT
 
@@ -60,6 +64,36 @@ check "the firewall stage opens 53 for it" bash -c "$INST --dns $DNSF --only fir
 check "a run that does not mention DNS keeps it" bash -c "$INST --only engine >/dev/null 2>&1; grep -qx OXPANEL_DNS=true $ENVF"
 check "--no-dns takes the lines out" bash -c "$INST --no-dns --only dns >/dev/null 2>&1; ! grep -q '^OXPANEL_DNS' $ENVF"
 firewall-cmd -q --remove-service=dns; firewall-cmd -q --permanent --remove-service=dns
+
+# --- email
+MAILF="--mail --mail-hostname mail.inst.example --enable-epel"
+check_not "--mail with a bad host name is refused" bash -c "$INST --mail --mail-hostname 'Not A Name' --enable-epel --only mail"
+check "and nothing was written" bash -c "! grep -q '^OXPANEL_MAIL' $ENVF"
+printf '[Unit]\nDescription=stand-in for another MTA\n[Service]\nExecStart=/bin/sleep infinity\n[Install]\nWantedBy=multi-user.target\n' > /etc/systemd/system/exim.service
+systemctl daemon-reload; systemctl enable exim.service >/dev/null 2>&1
+check_not "an enabled other mail server (exim) stops the run" bash -c "$INST $MAILF --only mail"
+check "it was left alone, and nothing was written" bash -c "systemctl -q is-enabled exim && ! grep -q '^OXPANEL_MAIL' $ENVF"
+systemctl disable exim.service >/dev/null 2>&1; rm -f /etc/systemd/system/exim.service; systemctl daemon-reload
+$INST $MAILF --only mail > opt-mail.log 2>&1; rc=$?
+tail -12 opt-mail.log
+check "--mail with a host name" test "$rc" = 0
+check "the email lines are in the installer's block" bash -c "grep -qx OXPANEL_MAIL=true $ENVF && grep -qx OXPANEL_MAIL_HOSTNAME=mail.inst.example $ENVF && grep -qx OXPANEL_MAIL_WEBMAIL=true $ENVF && grep -qx OXPANEL_MAIL_ANTIVIRUS=false $ENVF"
+check "rspamd's repository is used over HTTPS with signed packages and metadata" bash -c 'grep -qx "baseurl=https://rspamd.com/rpm-stable/centos-9/\$basearch" /etc/yum.repos.d/rspamd.repo && grep -qx gpgcheck=1 /etc/yum.repos.d/rspamd.repo && grep -qx repo_gpgcheck=1 /etc/yum.repos.d/rspamd.repo && grep -qx "gpgkey=https://rspamd.com/rpm/rspamd.asc" /etc/yum.repos.d/rspamd.repo'
+check "the mail packages are installed" rpm -q postfix dovecot dovecot-pigeonhole rspamd roundcubemail php-pdo
+check "ClamAV is not (off by default)" bash -c '! rpm -q clamd'
+check "the _rspamd account exists" getent passwd _rspamd
+check "Roundcube is not served from Nginx's default server" bash -c '! grep -q location /etc/nginx/default.d/roundcubemail.conf'
+for u in postfix dovecot rspamd oxpanel-mail-policy oxpanel-webmail; do check "$u runs" systemctl -q is-active $u; done
+check "the engine reports email on with that host name" bash -c 'oxpanel-ctl mail host | grep -q "^enabled=true host_name=mail.inst.example "'
+check "OxPanel took over Postfix and kept the original" bash -c 'head -1 /etc/postfix/main.cf | grep -q "Managed by oxpanel-daemon" && test -s /etc/postfix/main.cf.oxpanel-orig'
+check "a second run changes nothing" bash -c "$INST $MAILF --only mail 2>&1 | grep -q '^RESULT: ok changes=0 '"
+check "the firewall stage opens the mail ports" bash -c "$INST $MAILF --only firewall >/dev/null 2>&1 && for s in smtp smtps smtp-submission imaps pop3s; do firewall-cmd -q --query-service=\$s && firewall-cmd -q --permanent --query-service=\$s || exit 1; done"
+check "with login banning, the mail jails run" bash -c "$INST $MAILF --fail2ban --only fail2ban >/dev/null 2>&1 && fail2ban-client status dovecot >/dev/null && fail2ban-client status postfix-sasl >/dev/null && fail2ban-client status oxpanel-webmail >/dev/null"
+check "the mail jails never ban the loopback (webmail logs in from there)" bash -c 'grep -q "^ignoreip  = 127.0.0.1/8 ::1" /etc/fail2ban/jail.d/50-oxpanel-mail.local'
+check "a run that does not mention email keeps it" bash -c "$INST --only engine >/dev/null 2>&1; grep -qx OXPANEL_MAIL=true $ENVF"
+check "verification checks email too" bash -c "$INST --only verify 2>&1 | grep -q 'mail host: enabled=true'"
+check "--no-mail takes the lines out and stops OxPanel's mail services" bash -c "$INST --no-mail --only mail >/dev/null 2>&1; ! grep -q '^OXPANEL_MAIL' $ENVF && ! systemctl -q is-active oxpanel-mail-policy && ! systemctl -q is-active oxpanel-webmail"
+check "the engine reports email off again" bash -c 'oxpanel-ctl mail host | grep -q "^enabled=false "'
 
 # --- fstab variant: a separate XFS file system holding the homes
 cp -p /etc/fstab /root/acc/fstab.keep

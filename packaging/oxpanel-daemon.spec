@@ -1,5 +1,5 @@
 Name:           oxpanel-daemon
-Version:        0.2.0
+Version:        0.3.0
 Release:        1%{?dist}
 Summary:        OxPanel engine: tenants, Nginx sites, apps and databases over a local gRPC API
 License:        Apache-2.0
@@ -50,6 +50,14 @@ Suggests:       php-mysqlnd
 # automatic zones. Without them DNS hosting is reported unavailable.
 Recommends:     bind
 Recommends:     publicsuffix-list
+# Email (off until OXPANEL_MAIL=true): Postfix, Dovecot and its Sieve plugin
+# from AppStream. The filter and DKIM signer (rspamd, from rspamd's own signed
+# repository) and the webmail (roundcubemail, from EPEL) come from other
+# repositories, so they are not recommended here: install.sh --mail adds the
+# repositories (an operator's decision) and installs them.
+Recommends:     postfix
+Recommends:     dovecot
+Recommends:     dovecot-pigeonhole
 Requires:       policycoreutils
 Requires:       policycoreutils-python-utils
 Requires:       libselinux-utils
@@ -74,12 +82,17 @@ install -D -m 0755 target/release/oxpanel-ctl    %{buildroot}%{_bindir}/oxpanel-
 install -D -m 0755 target/release/oxpanel-acme   %{buildroot}%{_libexecdir}/oxpanel/oxpanel-acme
 install -D -m 0644 packaging/systemd/oxpanel-daemon.service %{buildroot}%{_unitdir}/oxpanel-daemon.service
 install -D -m 0644 packaging/systemd/oxpanel-dns.service %{buildroot}%{_unitdir}/oxpanel-dns.service
+install -D -m 0644 packaging/systemd/oxpanel-mail-policy.service %{buildroot}%{_unitdir}/oxpanel-mail-policy.service
+install -D -m 0644 packaging/systemd/oxpanel-webmail.service %{buildroot}%{_unitdir}/oxpanel-webmail.service
+install -D -m 0644 packaging/php.d/90-oxpanel-mail.ini %{buildroot}%{_sysconfdir}/php.d/90-oxpanel-mail.ini
 install -D -m 0644 packaging/sysusers.d/oxpanel.conf %{buildroot}%{_sysusersdir}/oxpanel.conf
 install -D -m 0644 packaging/tmpfiles.d/oxpanel.conf %{buildroot}%{_tmpfilesdir}/oxpanel.conf
 install -D -m 0640 packaging/daemon.env %{buildroot}%{_sysconfdir}/oxpanel/daemon.env
 install -D -m 0644 packaging/logrotate.d/oxpanel %{buildroot}%{_sysconfdir}/logrotate.d/oxpanel
 install -D -m 0644 packaging/selinux/oxpanel.cil %{buildroot}%{_datadir}/oxpanel/selinux/oxpanel.cil
 install -D -m 0644 packaging/fail2ban/oxpanel-sshd.local %{buildroot}%{_datadir}/oxpanel/fail2ban/oxpanel-sshd.local
+install -D -m 0644 packaging/fail2ban/oxpanel-mail.local %{buildroot}%{_datadir}/oxpanel/fail2ban/oxpanel-mail.local
+install -D -m 0644 packaging/fail2ban/filter.d/oxpanel-webmail.conf %{buildroot}%{_datadir}/oxpanel/fail2ban/filter.d/oxpanel-webmail.conf
 
 %pre
 %sysusers_create_compat packaging/sysusers.d/oxpanel.conf
@@ -100,10 +113,14 @@ if /usr/sbin/selinuxenabled 2>/dev/null; then /usr/sbin/restorecon -R /var/lib/o
 # DNS hosting directories exist only once DNS hosting was used (the daemon
 # creates and labels them); an upgrade relabels them with the current module.
 if /usr/sbin/selinuxenabled 2>/dev/null; then for d in /var/lib/oxpanel-dns /etc/named/oxpanel; do [ -d "$d" ] && /usr/sbin/restorecon -R "$d" || :; done; fi
+# Email directories likewise exist only once email was switched on.
+if /usr/sbin/selinuxenabled 2>/dev/null; then for d in /var/lib/oxpanel-mail /etc/oxpanel-webmail /var/lib/oxpanel-webmail; do [ -d "$d" ] && /usr/sbin/restorecon -R "$d" || :; done; fi
 
 %preun
 %systemd_preun oxpanel-daemon.service
 %systemd_preun oxpanel-dns.service
+%systemd_preun oxpanel-mail-policy.service
+%systemd_preun oxpanel-webmail.service
 
 %postun
 %systemd_postun_with_restart oxpanel-daemon.service
@@ -119,6 +136,10 @@ if [ "$1" -eq 0 ] && /usr/sbin/selinuxenabled 2>/dev/null; then /usr/sbin/semodu
 %{_libexecdir}/oxpanel/oxpanel-acme
 %{_unitdir}/oxpanel-daemon.service
 %{_unitdir}/oxpanel-dns.service
+%{_unitdir}/oxpanel-mail-policy.service
+%{_unitdir}/oxpanel-webmail.service
+# PHP's mail() through OxPanel's sendmail. The directory belongs to PHP.
+%config(noreplace) %{_sysconfdir}/php.d/90-oxpanel-mail.ini
 %{_sysusersdir}/oxpanel.conf
 %{_tmpfilesdir}/oxpanel.conf
 %dir %attr(0750,root,oxpanel) %{_sysconfdir}/oxpanel
@@ -129,8 +150,28 @@ if [ "$1" -eq 0 ] && /usr/sbin/selinuxenabled 2>/dev/null; then /usr/sbin/semodu
 %{_datadir}/oxpanel/selinux/oxpanel.cil
 %dir %{_datadir}/oxpanel/fail2ban
 %{_datadir}/oxpanel/fail2ban/oxpanel-sshd.local
+%{_datadir}/oxpanel/fail2ban/oxpanel-mail.local
+%dir %{_datadir}/oxpanel/fail2ban/filter.d
+%{_datadir}/oxpanel/fail2ban/filter.d/oxpanel-webmail.conf
 
 %changelog
+* Sat Nov 14 2026 OxPanel contributors - 0.3.0-1
+- Email, an optional component (install.sh --mail): Postfix, Dovecot and
+  Rspamd configured entirely by the engine; mail domains (local, external or
+  off), mailboxes stored in the account's home with their own size limits,
+  forwarders, catch-alls and autoresponders; passwords stored only as bcrypt
+  hashes; DKIM signing with a 2048-bit key per domain, rotatable; MX, SPF,
+  DKIM, DMARC and client-settings records kept in hosted DNS zones (or
+  listed for the customer to create); TLS-only client protocols.
+- A mail policy service (oxpanel-mail-policy.service): a mailbox sends only
+  as its own address; sites send through OxPanel's sendmail as an address at
+  one of their account's domains; hourly limits per account and per mailbox;
+  suspended accounts cannot log in or send and their mail is deferred.
+- Webmail: Roundcube (EPEL) as webmail.<domain>, its own account, PHP-FPM
+  master and SQLite database (oxpanel-webmail.service), HTTPS only.
+- Mail queue, deliverability checks, mail drift in Reconcile, mail in
+  backups (it lives in the home) and in the deletion of a customer.
+
 * Fri Nov 13 2026 OxPanel contributors - 0.2.0-1
 - HTTPS: certificates (uploaded, or from an ACME authority through the new
   oxpanel-acme client), Automatic HTTPS for every site, HTTP-to-HTTPS

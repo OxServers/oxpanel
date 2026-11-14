@@ -22,7 +22,7 @@ help:
 	@echo "make rpmlint      rpmlint + rpm -qpR of the built RPM"
 	@echo "make dist         collect RPM, install.sh, SHA256SUMS and the handbook in dist/release/ (no tag, no upload)"
 	@echo "                  PANEL_RPM=path adds the (proprietary) panel RPM to the bundle; install.sh then installs it"
-	@echo "make rpm-old      build the RPM of an older commit for the upgrade test (OLD_REF=d38bae2)"
+	@echo "make rpm-old      build the RPM of an older commit for the upgrade test (OLD_REF=v0.2.0)"
 	@echo "make acceptance   real AlmaLinux 9 VM (KVM, SELinux enforcing): install RPM, run all phases"
 	@echo "                  INSTALL=git|rpm|installer|upgrade|product (installer = dist/release + install.sh; upgrade = old RPM,"
 	@echo "                  then current; product = release + panel RPM (PANEL_RPM=path), driven through the panel's HTTPS API)"

@@ -5,7 +5,7 @@
 #   make acceptance                      install from git (handbook §3.2) at the current branch
 #   INSTALL=rpm make acceptance          build + install the RPM from the working tree
 #   INSTALL=installer make acceptance    build the release (make dist) and run its install.sh unattended
-#   INSTALL=upgrade make acceptance      hand-install the 0.1.0 RPM (OLD_REF, default d38bae2), create
+#   INSTALL=upgrade make acceptance      hand-install the 0.2.0 RPM (OLD_REF, default v0.2.0), create
 #                                        tenants and sites, then upgrade with the release's install.sh
 #   KEEP=1 make acceptance               leave the VM running afterwards
 #   PHASES="30 60" SOAK_N=50 GIT_REF=<branch|sha> TARGET=user@host I_UNDERSTAND=1 …
@@ -44,7 +44,7 @@ case "$INSTALL" in
     podman image exists "$DEV" || { say "building dev image $DEV"; podman build -t "$DEV" -f "$ROOT/tests-integration/Containerfile" "$ROOT/tests-integration" >/dev/null; }
     say "building the release (make dist) from the working tree"
     (cd "$ROOT" && ./scripts/dev.sh ./scripts/build-rpm.sh >/dev/null && ./scripts/make-dist.sh >/dev/null)
-    if [ "$INSTALL" = upgrade ]; then say "building the old RPM (${OLD_REF:-d38bae2})"; (cd "$ROOT" && ./scripts/build-old-rpm.sh "${OLD_REF:-d38bae2}" >/dev/null); fi
+    if [ "$INSTALL" = upgrade ]; then say "building the old RPM (${OLD_REF:-v0.2.0})"; (cd "$ROOT" && ./scripts/build-old-rpm.sh "${OLD_REF:-v0.2.0}" >/dev/null); fi
     say "release: $(cd "$ROOT/dist/release" && ls | tr '\n' ' ')";;
   product)
     # The whole product: the engine release plus the (proprietary) panel RPM,

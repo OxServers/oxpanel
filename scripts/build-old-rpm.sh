@@ -5,12 +5,12 @@
 # container with a build volume of its own, so the working tree and its build
 # volume are untouched.
 #
-#   scripts/build-old-rpm.sh [<git ref>]      default: d38bae2 (the 0.1.0 line, tag-less)
+#   scripts/build-old-rpm.sh [<git ref>]      default: v0.2.0 (the released 0.2.0 engine, without email)
 #
 # Output: dist/old-rpms/oxpanel-daemon-<version>-<release>.<dist>.x86_64.rpm
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-REF="${1:-${OLD_REF:-d38bae2}}"
+REF="${1:-${OLD_REF:-v0.2.0}}"
 IMAGE="${OXPANEL_DEV_IMAGE:-localhost/oxpanel-dev:alma9}"
 VOLUME="${OXPANEL_OLD_TARGET_VOLUME:-oxpanel-target-old-rpm}"
 SHA="$(git -C "$ROOT" rev-parse --verify "$REF^{commit}")"

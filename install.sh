@@ -19,7 +19,7 @@
 # /var/lib/oxpanel-installer/status. Licence: Apache-2.0.
 set -euo pipefail
 
-INSTALLER_VERSION="0.2.0"
+INSTALLER_VERSION="0.3.0"
 
 # ---------------------------------------------------------------------------
 # Where a real release would be fetched from. NOT SET: there is no published
@@ -50,6 +50,12 @@ OPT_IGNORE_IP="" OPT_PANEL_SCOPES="" OPT_PANEL_RPM="" OPT_REPO_URL="" OPT_ANSWER
 OPT_PANEL_PORT="" OPT_PANEL_HOSTNAME="" OPT_PANEL_ADMIN="" OPT_NO_PANEL="" OPT_PURGE_PANEL=""
 OPT_DNS="" OPT_DNS_NAMESERVERS="" OPT_DNS_CONTACT="" OPT_DNS_IPV4="" OPT_DNS_IPV6="" OPT_DISABLE_STOCK_NAMED=""
 DNS_KEYS='^OXPANEL_DNS(_NAMESERVERS|_SOA_CONTACT|_IPV4|_IPV6)?='
+OPT_MAIL="" OPT_MAIL_HOSTNAME="" OPT_MAIL_ANTIVIRUS="" OPT_MAIL_WEBMAIL="" OPT_PURGE_MAIL=""
+MAIL_KEYS='^OXPANEL_MAIL(_HOSTNAME|_WEBMAIL|_ANTIVIRUS)?='
+MAIL_JAIL_FILE=/etc/fail2ban/jail.d/50-oxpanel-mail.local
+MAIL_FILTER_FILE=/etc/fail2ban/filter.d/oxpanel-webmail.conf
+RSPAMD_REPO_FILE=/etc/yum.repos.d/rspamd.repo
+ROUNDCUBE_NGINX_FILE=/etc/nginx/default.d/roundcubemail.conf
 ENGINE_RPM=""
 INTERACTIVE=0
 CHANGE_FILE="" WARN_FILE="" FLAG_DIR=""
@@ -95,6 +101,7 @@ General
   --check               preflight checks only; changes nothing
   --only STAGE          run only this stage (after preflight); stages:
                         nodejs engine selinux nginx mariadb php panel daemon dns
+                        mail
                         panelweb firewall fail2ban quota verify
   --force               continue past a conflicting web server or port 80 owner
   --uninstall           remove the engine packages and OxPanel's own
@@ -136,6 +143,24 @@ DNS hosting (optional; this host as the name server of its customers' domains)
   --dns-ipv6 ADDR       NAT the interface's address is private); one or both
   --disable-stock-named stop and disable the distribution's named.service if it
                         runs (it would hold port 53); otherwise the installer stops
+
+Email (optional; mailboxes, forwarders, webmail for the customers' domains)
+  --mail                install Postfix, Dovecot, Rspamd (and Roundcube) and switch
+                        email on. Rspamd comes from rspamd's own signed repository
+                        (written as /etc/yum.repos.d/rspamd.repo) and needs EPEL,
+                        as does Roundcube: EPEL must be allowed (--enable-epel).
+                        OxPanel takes over Postfix's main.cf/master.cf and
+                        Dovecot's dovecot.conf (the originals are kept as *.oxpanel-orig)
+  --no-mail             switch it off (mail data and configuration stay on disk)
+  --mail-hostname NAME  the host name mail clients and servers reach this host by
+                        (default: this host's FQDN, if it has a dot); it should
+                        resolve here and be the reverse DNS name of the address
+  --mail-antivirus      also install ClamAV and scan mail with it (off by default:
+                        it needs about 1 GB of memory)
+  --no-webmail          no Roundcube (webmail is on by default with --mail)
+  --purge-mail          with --uninstall: also delete the mail configuration and
+                        state OxPanel wrote, and put the distribution's Postfix and
+                        Dovecot configuration back (mailboxes in the homes stay)
 
 Panel (optional; the panel is a separate product)
   --panel-rpm FILE      install (or upgrade) the panel RPM, make sure the
@@ -200,6 +225,14 @@ parse_args() {
       --dns-ipv4) [ $# -ge 2 ] || die "--dns-ipv4 needs an address"; OPT_DNS_IPV4="$2"; shift;;
       --dns-ipv6) [ $# -ge 2 ] || die "--dns-ipv6 needs an address"; OPT_DNS_IPV6="$2"; shift;;
       --disable-stock-named) OPT_DISABLE_STOCK_NAMED=yes;;
+      --mail) OPT_MAIL=yes;;
+      --no-mail) OPT_MAIL=no;;
+      --mail-hostname) [ $# -ge 2 ] || die "--mail-hostname needs a name"; OPT_MAIL_HOSTNAME="$2"; shift;;
+      --mail-antivirus) OPT_MAIL_ANTIVIRUS=yes;;
+      --no-mail-antivirus) OPT_MAIL_ANTIVIRUS=no;;
+      --no-webmail) OPT_MAIL_WEBMAIL=no;;
+      --webmail) OPT_MAIL_WEBMAIL=yes;;
+      --purge-mail) OPT_PURGE_MAIL=yes;;
       --panel-scopes) [ $# -ge 2 ] || die "--panel-scopes needs a value"; OPT_PANEL_SCOPES="$2"; shift;;
       -*) die "unknown option: $1 (see --help)";;
       *) ENGINE_RPM="$1";;
@@ -256,6 +289,10 @@ load_answers() {
       dns_ipv4) [ -n "$OPT_DNS_IPV4" ] || OPT_DNS_IPV4="$val";;
       dns_ipv6) [ -n "$OPT_DNS_IPV6" ] || OPT_DNS_IPV6="$val";;
       disable_stock_named) [ -n "$OPT_DISABLE_STOCK_NAMED" ] || OPT_DISABLE_STOCK_NAMED="$(yesno_value "$key" "$val")";;
+      mail) [ -n "$OPT_MAIL" ] || OPT_MAIL="$(yesno_value "$key" "$val")";;
+      mail_hostname) [ -n "$OPT_MAIL_HOSTNAME" ] || OPT_MAIL_HOSTNAME="$val";;
+      mail_antivirus) [ -n "$OPT_MAIL_ANTIVIRUS" ] || OPT_MAIL_ANTIVIRUS="$(yesno_value "$key" "$val")";;
+      webmail) [ -n "$OPT_MAIL_WEBMAIL" ] || OPT_MAIL_WEBMAIL="$(yesno_value "$key" "$val")";;
       *) die "$OPT_ANSWERS:$n: unknown key '$key'";;
     esac
   done <"$OPT_ANSWERS"
@@ -497,6 +534,7 @@ env_block_content() {
   fi
   if [ -n "$scopes" ]; then echo "$scopes"; fi
   dns_env_lines
+  mail_env_lines
 }
 
 # The DNS hosting lines of the installer's block: written once BIND is there
@@ -515,6 +553,36 @@ dns_env_lines() {
     no) ;;
     *) env_block_current | grep -E "$DNS_KEYS" || true;;
   esac
+}
+
+# The email lines of the installer's block: written once the mail servers are
+# installed (so the daemon never starts with email on and no server); kept as
+# they are by a run that does not mention email; removed only by --no-mail.
+mail_env_lines() {
+  case "$OPT_MAIL" in
+    yes)
+      mail_packages_present || return 0
+      echo "OXPANEL_MAIL=true"
+      echo "OXPANEL_MAIL_HOSTNAME=$OPT_MAIL_HOSTNAME"
+      if [ "$OPT_MAIL_WEBMAIL" = no ]; then echo "OXPANEL_MAIL_WEBMAIL=false"; else echo "OXPANEL_MAIL_WEBMAIL=true"; fi
+      if [ "$OPT_MAIL_ANTIVIRUS" = yes ]; then echo "OXPANEL_MAIL_ANTIVIRUS=true"; else echo "OXPANEL_MAIL_ANTIVIRUS=false"; fi
+      ;;
+    no) ;;
+    *) env_block_current | grep -E "$MAIL_KEYS" || true;;
+  esac
+}
+
+mail_packages_present() { installed postfix && installed dovecot && installed dovecot-pigeonhole && installed rspamd; }
+mail_in_block() { env_block_current | grep -qx 'OXPANEL_MAIL=true'; }
+mail_wanted() { [ "$OPT_MAIL" = yes ] || { [ -z "$OPT_MAIL" ] && mail_in_block; }; }
+# The block's value of an email setting (for a run that does not mention email).
+mail_block_value() { env_block_current | sed -n "s/^$1=//p" | tail -1; }
+# Another mail server that would hold port 25.
+other_mta() {
+  local u
+  for u in sendmail exim; do
+    if unit_active "$u" || unit_enabled "$u"; then echo "$u"; return 0; fi
+  done
 }
 
 # DNS hosting is configured in the installer's block (by an earlier run).
@@ -682,6 +750,126 @@ stage_dns() {
   fi
 }
 
+# ------------------------------------------------------------------ stage: mail
+# shellcheck disable=SC2016  # $basearch is dnf's variable, written literally
+RSPAMD_REPO='[rspamd]
+name=Rspamd stable repository (rspamd.com)
+baseurl=https://rspamd.com/rpm-stable/centos-9/$basearch
+enabled=1
+gpgcheck=1
+repo_gpgcheck=1
+gpgkey=https://rspamd.com/rpm/rspamd.asc'
+ROUNDCUBE_NGINX_NOTE="# OxPanel: Roundcube is served by OxPanel as webmail.<domain> (its own PHP-FPM), not in the default server."
+
+# The services the engine runs for email once it is on.
+mail_units() {
+  local u="postfix dovecot rspamd oxpanel-mail-policy"
+  if [ "$OPT_MAIL_WEBMAIL" != no ] && installed roundcubemail; then u="$u oxpanel-webmail"; fi
+  echo "$u"
+}
+
+# ClamAV for Rspamd: clamd@scan on its UNIX socket, which Rspamd's account may use.
+mail_antivirus_setup() {
+  local conf=/etc/clamd.d/scan.conf before
+  [ -f "$conf" ] || die "$conf is missing (clamd not installed?)"
+  before="$(sha256sum <"$conf")"
+  sed -i -e 's/^Example$/# Example (removed by OxPanel)/' \
+         -e 's|^#[[:space:]]*LocalSocket[[:space:]].*|LocalSocket /run/clamd.scan/clamd.sock|' \
+         -e 's|^#[[:space:]]*LocalSocketGroup[[:space:]].*|LocalSocketGroup virusgroup|' \
+         -e 's|^#[[:space:]]*LocalSocketMode[[:space:]].*|LocalSocketMode 660|' "$conf"
+  grep -q '^LocalSocket /run/clamd.scan/clamd.sock' "$conf" || printf 'LocalSocket /run/clamd.scan/clamd.sock\n' >>"$conf"
+  grep -q '^LocalSocketGroup ' "$conf" || printf 'LocalSocketGroup virusgroup\n' >>"$conf"
+  grep -q '^LocalSocketMode ' "$conf" || printf 'LocalSocketMode 660\n' >>"$conf"
+  if [ "$(sha256sum <"$conf")" != "$before" ]; then changed "$conf: clamd listens on /run/clamd.scan/clamd.sock for the group virusgroup"; flag_set clamd-changed; fi
+  if getent group virusgroup >/dev/null && ! id -nG _rspamd | tr ' ' '\n' | grep -qx virusgroup; then
+    run usermod -aG virusgroup _rspamd || return 1
+    changed "_rspamd added to virusgroup (it may scan through clamd's socket)"
+  fi
+  if [ ! -s /var/lib/clamav/main.cvd ] && [ ! -s /var/lib/clamav/main.cld ]; then
+    run freshclam || warn "freshclam could not download the virus signatures yet; clamav-freshclam.service retries"
+  fi
+  local u
+  for u in clamav-freshclam clamd@scan; do
+    if ! unit_enabled "$u" || ! unit_active "$u"; then run systemctl enable --now "$u" || return 1; changed "$u enabled and started"
+    elif [ "$u" = clamd@scan ] && flag_is clamd-changed; then run systemctl restart "$u" || return 1; fi
+  done
+}
+
+stage_mail() {
+  if ! mail_wanted; then
+    if [ "$OPT_MAIL" = no ] || [ -z "$(env_block_current | grep -E "$MAIL_KEYS" || true)" ]; then
+      rm -f "$FLAG_DIR/env-changed"
+      engine_env_block
+      if flag_is env-changed && unit_active oxpanel-daemon; then run systemctl restart oxpanel-daemon || return 1; fi
+    fi
+    if [ "$OPT_MAIL" = no ]; then
+      local u
+      for u in oxpanel-mail-policy oxpanel-webmail; do
+        if unit_active "$u" || unit_enabled "$u"; then run systemctl disable --now "$u" || true; changed "$u stopped and disabled (--no-mail)"; fi
+      done
+      note "email is off; Postfix, Dovecot and Rspamd were left as they are (stop them yourself if nothing else uses them)"
+    fi
+    note "email not requested (--mail to switch it on)"; return 0
+  fi
+  local pkgs="postfix dovecot dovecot-pigeonhole rspamd" missing="" pkg u
+  # Rspamd needs EPEL's libraries (jemalloc, hyperscan, libsodium); Roundcube
+  # and ClamAV are in EPEL. Decided (and refused when not allowed) before any change.
+  if ! installed epel-release; then
+    [ "$OPT_EPEL" = yes ] || die "email needs EPEL (Rspamd's libraries, Roundcube) and EPEL is not enabled; run again with --enable-epel"
+    run dnf -y install epel-release || return 1
+    changed "EPEL enabled (epel-release installed); it stays enabled so Rspamd's libraries and Roundcube get their updates"
+  fi
+  if [ "$(cat "$RSPAMD_REPO_FILE" 2>/dev/null || true)" != "$RSPAMD_REPO" ]; then
+    printf '%s\n' "$RSPAMD_REPO" >"$RSPAMD_REPO_FILE"; chmod 0644 "$RSPAMD_REPO_FILE"; quiet restorecon "$RSPAMD_REPO_FILE" || true
+    changed "wrote $RSPAMD_REPO_FILE (rspamd's own repository, over HTTPS, packages and metadata signed)"
+  fi
+  if [ "$OPT_MAIL_WEBMAIL" != no ]; then pkgs="$pkgs roundcubemail php-pdo php-fpm php-cli"; fi
+  if [ "$OPT_MAIL_ANTIVIRUS" = yes ]; then pkgs="$pkgs clamav clamd clamav-update"; fi
+  for pkg in $pkgs; do installed "$pkg" || missing="$missing $pkg"; done
+  if [ -n "$missing" ]; then
+    # shellcheck disable=SC2086  # a list of package names on purpose
+    run dnf -y install $missing || return 1
+    changed "installed$missing"
+  fi
+  # The rspamd package does not create the account its unit runs as.
+  if ! getent passwd _rspamd >/dev/null; then
+    run useradd -r -d /var/lib/rspamd -s /sbin/nologin _rspamd || return 1
+    changed "created the _rspamd account"
+  fi
+  if [ "$(stat -c %U /var/lib/rspamd 2>/dev/null)" != _rspamd ] || [ "$(stat -c %U /var/log/rspamd 2>/dev/null)" != _rspamd ]; then
+    mkdir -p /var/lib/rspamd /var/log/rspamd
+    run chown -R _rspamd:_rspamd /var/lib/rspamd /var/log/rspamd || return 1
+    changed "/var/lib/rspamd and /var/log/rspamd given to _rspamd"
+  fi
+  # Roundcube's package puts a location into Nginx's default server; OxPanel
+  # serves Roundcube itself, so that one is emptied (the file is
+  # %config(noreplace): updates leave it so).
+  if [ -e "$ROUNDCUBE_NGINX_FILE" ] && [ "$(cat "$ROUNDCUBE_NGINX_FILE")" != "$ROUNDCUBE_NGINX_NOTE" ]; then
+    printf '%s\n' "$ROUNDCUBE_NGINX_NOTE" >"$ROUNDCUBE_NGINX_FILE"
+    changed "emptied $ROUNDCUBE_NGINX_FILE (Roundcube is not served from the default server)"
+    if unit_active nginx; then run nginx -t || return 1; run systemctl reload nginx || return 1; fi
+  fi
+  if [ "$OPT_MAIL_ANTIVIRUS" = yes ]; then mail_antivirus_setup || return 1; fi
+  note "OxPanel now owns /etc/postfix/main.cf, master.cf and /etc/dovecot/dovecot.conf (the originals are kept as *.oxpanel-orig)"
+  rm -f "$FLAG_DIR/env-changed"
+  engine_env_block
+  if flag_is env-changed; then
+    run systemctl restart oxpanel-daemon || return 1
+  else
+    for u in $(mail_units); do
+      if ! unit_active "$u"; then run systemctl restart oxpanel-daemon || return 1; changed "oxpanel-daemon restarted: $u was not running"; break; fi
+    done
+  fi
+  # The daemon renders every mail server's configuration and starts them itself.
+  for u in $(mail_units); do
+    for _ in $(seq 1 60); do unit_active "$u" && break; sleep 1; done
+    unit_active "$u" || die "$u did not start; see: journalctl -u oxpanel-daemon -u $u"
+  done
+  for _ in $(seq 1 30); do oxpanel-ctl mail host 2>/dev/null | grep -q '^enabled=true ' && break; sleep 1; done
+  oxpanel-ctl mail host 2>/dev/null | grep -q '^enabled=true ' || die "the engine does not report email as enabled; see: oxpanel-ctl mail host; journalctl -u oxpanel-daemon"
+  note "email is on: $(mail_units | tr ' ' ',') running; mail host name $OPT_MAIL_HOSTNAME"
+}
+
 # ------------------------------------------------------------------ stage: firewall
 stage_firewall() {
   local svc zone any=0
@@ -691,7 +879,9 @@ stage_firewall() {
   fi
   zone="$(firewall-cmd --get-default-zone)"
   local svcs="http https"
-  if dns_wanted; then svcs="http https dns"; fi
+  if dns_wanted; then svcs="$svcs dns"; fi
+  # Email: SMTP (25), submissions (465), submission (587), IMAPS, POP3S.
+  if mail_wanted; then svcs="$svcs smtp smtps smtp-submission imaps pop3s"; fi
   for svc in $svcs; do
     if ! quiet firewall-cmd --permanent --query-service="$svc"; then run firewall-cmd --permanent --add-service="$svc" || return 1; any=1; fi
     if ! quiet firewall-cmd --query-service="$svc"; then run firewall-cmd --add-service="$svc" || return 1; any=1; fi
@@ -754,6 +944,7 @@ stage_fail2ban() {
     changed "wrote $JAIL_FILE (ban action $action, ignoreip: $ips)"
     flag_set jail-changed
   else note "jail configuration already in place"; fi
+  if mail_wanted; then fail2ban_mail_jails "$ips" "$action" || return 1; fi
   if ! unit_enabled fail2ban || ! unit_active fail2ban; then
     run systemctl enable --now fail2ban || return 1
     changed "fail2ban enabled and started"
@@ -763,6 +954,31 @@ stage_fail2ban() {
   for _ in $(seq 1 20); do quiet fail2ban-client status sshd && break; sleep 1; done
   quiet fail2ban-client status sshd || die "the sshd jail is not running; see: journalctl -u fail2ban"
   note "jail sshd is running ($(fail2ban-client status sshd | sed -n 's/.*Currently banned:[[:space:]]*//p') currently banned)"
+  if mail_wanted; then
+    for j in dovecot postfix-sasl oxpanel-webmail; do
+      for _ in $(seq 1 10); do quiet fail2ban-client status "$j" && break; sleep 1; done
+      quiet fail2ban-client status "$j" || die "the $j jail is not running; see: journalctl -u fail2ban"
+    done
+    note "mail jails dovecot, postfix-sasl and oxpanel-webmail are running"
+  fi
+}
+
+# The email jails: the same never-banned addresses and ban action as sshd's.
+fail2ban_mail_jails() {
+  local ips="$1" action="$2" tmpl=/usr/share/oxpanel/fail2ban/oxpanel-mail.local filt=/usr/share/oxpanel/fail2ban/filter.d/oxpanel-webmail.conf want
+  if [ ! -r "$tmpl" ] || [ ! -r "$filt" ]; then die "$tmpl or $filt is missing (engine package not installed?)"; fi
+  want="$(sed -e "s|@IGNORE_IP@|$ips|" -e "s|@BAN_ACTION@|$action|" "$tmpl")"
+  if [ "$(cat "$MAIL_JAIL_FILE" 2>/dev/null || true)" != "$want" ]; then
+    printf '%s\n' "$want" >"$MAIL_JAIL_FILE"; chmod 0644 "$MAIL_JAIL_FILE"; quiet restorecon "$MAIL_JAIL_FILE" || true
+    changed "wrote $MAIL_JAIL_FILE (Dovecot, Postfix submission and webmail logins)"
+    flag_set jail-changed
+  fi
+  mkdir -p /etc/fail2ban/filter.d
+  if ! cmp -s "$filt" "$MAIL_FILTER_FILE"; then
+    install -m 0644 "$filt" "$MAIL_FILTER_FILE"; quiet restorecon "$MAIL_FILTER_FILE" || true
+    changed "wrote $MAIL_FILTER_FILE"
+    flag_set jail-changed
+  fi
 }
 
 # ------------------------------------------------------------------ stage: quota
@@ -960,6 +1176,14 @@ stage_verify() {
     oxpanel-ctl host info 2>&1 | grep -q '^dns=true .*dns_available=true' || warn "the engine does not report DNS hosting as available; see: oxpanel-ctl host info | grep ^dns"
     note "DNS hosting: oxpanel-dns running"
   fi
+  if mail_wanted; then
+    local u
+    for u in $(mail_units); do unit_active "$u" || die "email is configured but $u is not running"; done
+    out="$(oxpanel-ctl mail host 2>&1)" || die "oxpanel-ctl mail host failed: $out"
+    printf '%s\n' "$out" | grep -q '^enabled=true ' || die "the engine does not report email as enabled: $out"
+    printf '%s\n' "$out" | sed -n '1p' | cut -c1-200 | sed 's/^/      mail host: /'
+    printf '%s\n' "$out" | grep '^warning:' | cut -c1-200 | sed 's/^/      mail /' || true
+  fi
   if [ "$OPT_QUOTA" = yes ] && ! flag_is reboot-required; then
     if oxpanel-ctl host info 2>&1 | grep -q ' disk_quota=true '; then note "disk quotas: active"; else warn "disk quotas were requested but the engine reports them unavailable"; fi
   fi
@@ -980,7 +1204,8 @@ do_uninstall() {
   fi
   # dnf would also remove the packages that only the engine pulled in (Nginx, ...),
   # which would take the customers' sites down. Keep every one of them.
-  for pkg in nginx php-fpm php-cli nodejs npm mariadb-server openssl acl openssh-server xfsprogs bind bind-utils publicsuffix-list; do
+  for pkg in nginx php-fpm php-cli nodejs npm mariadb-server openssl acl openssh-server xfsprogs bind bind-utils publicsuffix-list \
+             postfix dovecot dovecot-pigeonhole rspamd roundcubemail php-pdo clamav clamd clamav-update; do
     if installed "$pkg"; then run dnf -y mark install "$pkg" || true; fi
   done
   local pport; pport="$(panel_port)"
@@ -1000,10 +1225,18 @@ do_uninstall() {
     say "kept: the panel's database /var/lib/oxpanel-panel (people, plans, audit log), /etc/oxpanel-panel and its"
     say "      certificate /etc/pki/oxpanel-panel; a reinstalled panel continues with them (--purge-panel deletes them)"
   fi
+  # Email: OxPanel's own services stop with the engine (the package removal
+  # would stop them too; done here so the order is clear).
+  local u had_mail=0
+  for u in oxpanel-mail-policy oxpanel-webmail; do
+    if unit_active "$u" || unit_enabled "$u"; then run systemctl disable --now "$u" || true; say "stopped: $u"; had_mail=1; fi
+  done
+  if [ -d /var/lib/oxpanel-mail ]; then had_mail=1; fi
   if unit_active oxpanel-daemon || unit_enabled oxpanel-daemon; then run systemctl disable --now oxpanel-daemon || true; fi
   if installed oxpanel-daemon; then run dnf -y remove --noautoremove oxpanel-daemon || die "could not remove oxpanel-daemon"; say "removed: oxpanel-daemon (engine, oxpanel-ctl, oxpanel-acme, unit, SELinux module)"; fi
   if [ -e "$JAIL_FILE" ]; then rm -f "$JAIL_FILE"; say "removed: $JAIL_FILE"; if unit_active fail2ban; then run systemctl restart fail2ban || true; fi; fi
   if [ -e "$REPO_FILE" ]; then rm -f "$REPO_FILE"; say "removed: $REPO_FILE"; fi
+  if [ "$had_mail" -eq 1 ]; then uninstall_mail; fi
   if [ -f "$ENV_FILE" ]; then
     # Only reachable when the file was edited (rpm keeps those as .rpmsave).
     say "kept: $ENV_FILE"
@@ -1022,6 +1255,13 @@ do_uninstall() {
   say "    TSIG/rndc keys in /etc/named/oxpanel, zone records in /var/lib/oxpanel/dns-zones. oxpanel-dns.service went"
   say "    with the package, so THE HOSTED DOMAINS DO NOT RESOLVE until a reinstall (secondaries keep answering"
   say "    until their zones expire). Keep the signing keys: new ones would need a new DS at every registrar"
+  if [ "$had_mail" -eq 1 ] && [ "$OPT_PURGE_MAIL" != yes ]; then
+    say "  - email: the mailboxes (in the homes, ~/mail), the mail records in /var/lib/oxpanel/mail, DKIM keys and"
+    say "    the policy map in /var/lib/oxpanel-mail, Roundcube's database in /var/lib/oxpanel-webmail, the configuration"
+    say "    OxPanel wrote for Postfix, Dovecot, Rspamd and Nginx. Postfix and Dovecot keep receiving and serving mail, but"
+    say "    mailboxes and sites CANNOT SEND until a reinstall (the mail policy service went with the package), and webmail"
+    say "    is down. --purge-mail deletes OxPanel's mail configuration and puts the distribution's back"
+  fi
   say "  - per-tenant slices, PHP-FPM, application and scheduled-task units (they keep running and the tasks keep firing;"
   say "    the engine can no longer manage them; scheduled backups, which the engine itself starts, pause until a reinstall;"
   say "    Node.js/Python applications and scheduled tasks need the OxPanel SELinux module, which the package removal took out: reinstall to restore it)"
@@ -1029,6 +1269,31 @@ do_uninstall() {
   say "  - the oxpanel groups and /var/lib/oxpanel-installer, $LOG"
   printf 'result=uninstalled\nfinished=%s\n' "$(date -u +%FT%TZ)" >"$STATE_DIR/status"
   say "RESULT: uninstalled"
+}
+
+# Email on uninstall: with --purge-mail, OxPanel's mail configuration and state
+# go and the distribution's Postfix and Dovecot configuration comes back; the
+# mailboxes in the homes and the engine's records stay either way.
+uninstall_mail() {
+  local f d any=0
+  if [ "$OPT_PURGE_MAIL" != yes ]; then return 0; fi
+  for f in /etc/postfix/main.cf /etc/postfix/master.cf /etc/dovecot/dovecot.conf; do
+    if [ -e "$f.oxpanel-orig" ]; then mv -f "$f.oxpanel-orig" "$f"; quiet restorecon "$f" || true; say "restored: $f (the distribution's, from $f.oxpanel-orig)"; any=1; fi
+  done
+  for d in /etc/postfix/oxpanel /etc/dovecot/oxpanel /var/lib/oxpanel-mail /etc/oxpanel-webmail /var/lib/oxpanel-webmail \
+           /var/spool/postfix/oxpanel-milter /etc/pki/oxpanel-mail /etc/nginx/conf.d/oxpanel-mail.conf "$MAIL_JAIL_FILE" "$MAIL_FILTER_FILE"; do
+    if [ -e "$d" ]; then rm -rf "$d"; say "deleted (--purge-mail): $d"; any=1; fi
+  done
+  for f in /etc/rspamd/local.d/* /etc/rspamd/rspamd.local.lua; do
+    [ -f "$f" ] || continue
+    case "$(head -n 1 "$f")" in
+      "# Managed by oxpanel-daemon"*|"-- Managed by oxpanel-daemon"*) rm -f "$f"; say "deleted (--purge-mail): $f"; any=1;;
+    esac
+  done
+  [ "$any" -eq 1 ] || return 0
+  if unit_active nginx; then run systemctl reload nginx || true; fi
+  for d in postfix dovecot rspamd fail2ban; do if unit_active "$d"; then run systemctl restart "$d" || true; fi; done
+  say "email: Postfix, Dovecot and Rspamd run with the distribution's configuration again (no customer domain is served)"
 }
 
 # ------------------------------------------------------------------ main
@@ -1076,7 +1341,8 @@ enabled afterwards (fail2ban needs its updates). Disable it later with: dnf conf
   fi
   check_quota_offer
   decide_dns
-  say "decisions: fail2ban=${OPT_FAIL2BAN:-no} epel=${OPT_EPEL:-no} quota=${OPT_QUOTA:-no} reboot=${OPT_REBOOT:-no} mariadb=$OPT_MARIADB php=$OPT_PHP nodejs=$OPT_NODEJS dns=$(dns_wanted && echo yes || echo no)$([ "$INTERACTIVE" -eq 1 ] && echo ' (interactive)' || echo ' (unattended)')"
+  decide_mail
+  say "decisions: fail2ban=${OPT_FAIL2BAN:-no} epel=${OPT_EPEL:-no} quota=${OPT_QUOTA:-no} reboot=${OPT_REBOOT:-no} mariadb=$OPT_MARIADB php=$OPT_PHP nodejs=$OPT_NODEJS dns=$(dns_wanted && echo yes || echo no) mail=$(mail_wanted && echo yes || echo no)$([ "$INTERACTIVE" -eq 1 ] && echo ' (interactive)' || echo ' (unattended)')"
 
   if ! installed php-fpm && [ ! -e "$STATE_DIR/php-fpm-installed-by-installer" ]; then : >"$STATE_DIR/php-fpm-installed-by-installer"; fi
   stage nodejs   "Node.js 22 module stream"                      stage_nodejs
@@ -1088,8 +1354,9 @@ enabled afterwards (fail2ban needs its updates). Disable it later with: dnf conf
   stage panel    "panel hook (optional)"                          stage_panel
   stage daemon   "oxpanel-daemon service"                         stage_daemon
   stage dns      "DNS hosting (optional): BIND as oxpanel-dns"    stage_dns
+  stage mail     "email (optional): Postfix, Dovecot, Rspamd, Roundcube" stage_mail
   stage panelweb "panel: HTTPS, service, first administrator (optional)" stage_panelweb
-  stage firewall "firewalld: ports 80 and 443 (53 with DNS, the panel's port)" stage_firewall
+  stage firewall "firewalld: ports 80 and 443 (53 with DNS, mail ports with email, the panel's port)" stage_firewall
   stage fail2ban "login banning with fail2ban (optional)"         stage_fail2ban
   stage quota    "disk quotas (optional)"                         stage_quota
   stage verify   "final verification"                             stage_verify
@@ -1133,6 +1400,56 @@ UDP) is opened in firewalld." "Set up DNS hosting?"
         die "the distribution's named.service is running or enabled ($n zone statement(s) in /etc/named.conf, which may serve real zones). It would hold port 53. Move what it serves, then run again with --disable-stock-named (nothing was changed)."
       fi
     fi
+  fi
+}
+
+# Email: asked (interactive) or taken from flags. The mail host name is never
+# invented: it is the host's own fully-qualified name unless one is given.
+decide_mail() {
+  local fqdn mem
+  if [ -z "$OPT_MAIL" ] && mail_in_block; then
+    # A run that does not mention email keeps what the block says.
+    [ -n "$OPT_MAIL_HOSTNAME" ] || OPT_MAIL_HOSTNAME="$(mail_block_value OXPANEL_MAIL_HOSTNAME)"
+    if [ -z "$OPT_MAIL_WEBMAIL" ] && [ "$(mail_block_value OXPANEL_MAIL_WEBMAIL)" = false ]; then OPT_MAIL_WEBMAIL=no; fi
+    if [ -z "$OPT_MAIL_ANTIVIRUS" ] && [ "$(mail_block_value OXPANEL_MAIL_ANTIVIRUS)" = true ]; then OPT_MAIL_ANTIVIRUS=yes; fi
+    return 0
+  fi
+  decide OPT_MAIL "Email: mailboxes, forwarders, autoresponders and webmail for the customers' domains
+(Postfix and Dovecot from AlmaLinux, Rspamd from rspamd's own signed repository, Roundcube from EPEL).
+OxPanel takes over Postfix's and Dovecot's configuration. You need a host name for the mail server that
+resolves to this host (ideally its reverse DNS name); ports 25, 465, 587, 993 and 995 are opened in firewalld." "Set up email?"
+  [ "$OPT_MAIL" = yes ] || return 0
+  [ -n "$OPT_MAIL_WEBMAIL" ] || OPT_MAIL_WEBMAIL=yes
+  if [ -z "$OPT_MAIL_HOSTNAME" ]; then
+    fqdn="$(hostname -f 2>/dev/null || hostname 2>/dev/null || true)"
+    case "$fqdn" in *.*) OPT_MAIL_HOSTNAME="$(printf '%s' "$fqdn" | tr '[:upper:]' '[:lower:]')";; esac
+    if [ "$INTERACTIVE" -eq 1 ]; then
+      printf 'Mail host name [%s]: ' "${OPT_MAIL_HOSTNAME:-none}" >&2
+      read -r fqdn || fqdn=""
+      if [ -n "$fqdn" ]; then OPT_MAIL_HOSTNAME="$fqdn"; fi
+    fi
+  fi
+  printf '%s' "$OPT_MAIL_HOSTNAME" | grep -Eq '^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]*[a-z0-9]$' \
+    || die "email needs the mail server's host name: --mail-hostname mail.example.net (got '${OPT_MAIL_HOSTNAME}')"
+  decide OPT_MAIL_ANTIVIRUS "Antivirus: ClamAV can scan every message (through Rspamd). It needs about 1 GB of memory
+and downloads its signatures daily." "Scan mail with ClamAV?"
+  if [ "$OPT_MAIL_ANTIVIRUS" = yes ]; then
+    mem="$(awk '/^MemTotal:/{print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 0)"
+    warn "ClamAV needs about 1 GB of memory (this host has ${mem} MB in total)"
+  fi
+  if grep -Eq '^[[:space:]]*OXPANEL_MAIL=' "$ENV_FILE" 2>/dev/null && ! mail_in_block && ! env_block_current | grep -q '^OXPANEL_MAIL='; then
+    die "$ENV_FILE already configures email outside the installer's block; change it there, or remove those lines and run again"
+  fi
+  local mta; mta="$(other_mta || true)"
+  if [ -n "$mta" ]; then
+    die "$mta.service is running or enabled: it would hold port 25. OxPanel's email uses Postfix; stop and disable $mta (systemctl disable --now $mta), then run again (nothing was changed)."
+  fi
+  if ! installed epel-release; then
+    decide OPT_EPEL "Enabling EPEL: Rspamd (the spam filter and DKIM signer, from rspamd's own repository) needs
+libraries from EPEL, and Roundcube and ClamAV are in EPEL. EPEL (Extra Packages for Enterprise Linux) is a
+community repository run by the Fedora project; it stays enabled afterwards so those packages get updates.
+Disable it later with: dnf config-manager --set-disabled epel" "Enable EPEL?"
+    [ "$OPT_EPEL" = yes ] || die "email needs EPEL, and EPEL was not allowed. Run again with --enable-epel, or without --mail."
   fi
 }
 

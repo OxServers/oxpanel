@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Phase 12 — upgrade (INSTALL=upgrade). Phase 10 installed the 0.1.0 engine by hand.
+# Phase 12 — upgrade (INSTALL=upgrade). Phase 10 installed the old engine (0.2.0, without email) by hand.
 # Here: tenants and sites are created with it (static, PHP, Node.js), then the
 # release's install.sh upgrades the host. The tenants must survive with the same
 # uid and home, the sites must keep answering, and the new features must work on the
@@ -40,7 +40,7 @@ ok "install.sh upgraded the host ($(( $(date +%s) - start ))s)"
 NEWV=$(rpm -q --qf '%{VERSION}-%{RELEASE}' oxpanel-daemon)
 check "the engine package changed ($OLDV -> $NEWV)" test "$OLDV" != "$NEWV"
 check "the installer says what it upgraded" bash -c "grep -q 'oxpanel-daemon $OLDV -> $NEWV' upgrade.log"
-check "the new engine runs" bash -c 'oxpanel-daemon --version | grep -q "0\.2\."'
+check "the new engine runs" bash -c 'oxpanel-daemon --version | grep -q "0\.3\."'
 eventually "the daemon is active after the upgrade" 30 1 daemon_active
 check "the daemon's journal has no errors since the upgrade" bash -c '! journalctl -u oxpanel-daemon --since "-5min" -p err --no-pager | grep -q oxpanel-daemon'
 
@@ -66,6 +66,12 @@ check "host reconcile is clean after the upgrade (the daemon re-rendered what ch
 
 # ---- the new engine's features work on the old tenant
 check "the DNS server's unit came with the upgrade, not started (DNS hosting is off until configured)" bash -c 'systemctl cat oxpanel-dns.service >/dev/null && ! systemctl -q is-active oxpanel-dns && oxpanel-ctl host info | grep -q "^dns=false"'
+check "the email units came with the upgrade, not started (email is off until install.sh --mail)" bash -c 'systemctl cat oxpanel-mail-policy.service oxpanel-webmail.service >/dev/null && ! systemctl -q is-active oxpanel-mail-policy && ! systemctl -q is-active oxpanel-webmail'
+check "the engine answers about email: off" bash -c 'oxpanel-ctl mail host | grep -q "^enabled=false "'
+check "an email request is refused with mail_unavailable, nothing else" bash -c 'out=$(oxpanel-ctl mail domain-list --tenant '"$T"' 2>&1); echo "$out" | grep -q "mail_unavailable"'
+check "the upgrade created the email accounts" bash -c 'getent passwd oxpanel-mail >/dev/null && getent passwd oxpanel-webmail >/dev/null'
+check "the upgrade did not touch Postfix or Dovecot (no OxPanel configuration while email is off)" bash -c '! grep -qs "Managed by oxpanel-daemon" /etc/postfix/main.cf /etc/dovecot/dovecot.conf && test ! -e /var/lib/oxpanel-mail'
+check "PHP sends through OxPanel's sendmail, which hands non-account mail to Postfix unchanged" bash -c 'php -i 2>/dev/null | grep -q "^sendmail_path => /usr/sbin/oxpanel-daemon sendmail -t -i"'
 check "the new host info shows the databases" bash -c 'oxpanel-ctl host info | grep -q "^database_engine=mariadb available=true"'
 check "an SFTP key can be added to the pre-existing tenant" bash -c "ssh-keygen -q -t ed25519 -N '' -f /root/acc/upg.key && oxpanel-ctl sftp add-key $T --key-file /root/acc/upg.key.pub --label upg | grep -q '^changed=true'"
 check "a database for it" oxpanel-ctl db create ${T}_shop --tenant $T

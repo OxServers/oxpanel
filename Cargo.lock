@@ -928,7 +928,7 @@ checksum = "384b8ab6d37215f3c5301a95a4accb5d64aa607f1fcb26a11b5303878451b4fe"
 
 [[package]]
 name = "oxpanel-acme"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
  "ring",
@@ -940,7 +940,7 @@ dependencies = [
 
 [[package]]
 name = "oxpanel-bench"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "hyper-util",
  "nix",
@@ -954,7 +954,7 @@ dependencies = [
 
 [[package]]
 name = "oxpanel-ctl"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "clap",
  "hyper-util",
@@ -968,7 +968,7 @@ dependencies = [
 
 [[package]]
 name = "oxpanel-daemon"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64 0.22.1",
  "bcrypt",
@@ -1001,7 +1001,7 @@ dependencies = [
 
 [[package]]
 name = "oxpanel-proto"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "prost",
  "prost-types",

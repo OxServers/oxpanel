@@ -1,34 +1,49 @@
 # OxPanel (email): ban addresses that keep failing to log in to a mailbox
 # over IMAPS/POP3S (Dovecot), SMTP submission (Postfix's SASL) or webmail
-# (Roundcube). Installed by install.sh --mail when login banning is on.
-# The loopback is never banned: webmail logs in to Dovecot from 127.0.0.1,
-# and its own jail bans the browser's address instead.
-
-[DEFAULT]
-ignoreip = 127.0.0.1/8 ::1
+# (Roundcube).
+#
+# Installed by `install.sh --mail` (with login banning on) as
+# /etc/fail2ban/jail.d/50-oxpanel-mail.local, with the @PLACEHOLDERS@ filled
+# in exactly as for the sshd jail. The loopback is always in ignoreip:
+# webmail logs in to Dovecot from 127.0.0.1, so a webmail password guesser is
+# banned by its own jail (the browser's address), never the loopback.
+#
+# Lift a ban by hand:  fail2ban-client set dovecot unbanip 203.0.113.9
 
 [dovecot]
-enabled  = true
-backend  = systemd
-port     = imaps,pop3s
-maxretry = 5
-findtime = 10m
-bantime  = 1h
+enabled   = true
+backend   = systemd
+port      = imaps,pop3s
+maxretry  = 5
+findtime  = 10m
+bantime   = 1h
+bantime.increment = true
+bantime.maxtime   = 1w
+ignoreip  = @IGNORE_IP@
+banaction = @BAN_ACTION@
 
 [postfix-sasl]
-enabled  = true
-backend  = systemd
-port     = submission,submissions
-maxretry = 5
-findtime = 10m
-bantime  = 1h
+enabled   = true
+backend   = systemd
+port      = submission,465
+maxretry  = 5
+findtime  = 10m
+bantime   = 1h
+bantime.increment = true
+bantime.maxtime   = 1w
+ignoreip  = @IGNORE_IP@
+banaction = @BAN_ACTION@
 
 [oxpanel-webmail]
-enabled  = true
-backend  = systemd
+enabled   = true
+backend   = systemd
 journalmatch = SYSLOG_IDENTIFIER=oxpanel-webmail
-filter   = oxpanel-webmail
-port     = http,https
-maxretry = 5
-findtime = 10m
-bantime  = 1h
+filter    = oxpanel-webmail
+port      = http,https
+maxretry  = 5
+findtime  = 10m
+bantime   = 1h
+bantime.increment = true
+bantime.maxtime   = 1w
+ignoreip  = @IGNORE_IP@
+banaction = @BAN_ACTION@
