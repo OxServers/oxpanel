@@ -171,11 +171,53 @@ After the reboot run the same command again: it notices that quotas are active,
 confirms `disk_quota=true` through the engine and finishes. On a host whose homes
 are not on XFS it says so and changes nothing.
 
-**Installing the panel (optional hook).** The panel is a separate product. If you
-have its RPM: `sudo ./install.sh --panel-rpm oxpanel-panel-X.rpm`. The installer
-installs it and makes sure the `panelapi` account exists and is a member of group
-`oxpanel` (§5; the panel's own package normally creates it, the installer repairs or
-creates it otherwise). `--panel-account` does only the account. The panel needs all
+**Installing the panel (optional).** The panel (web interface and panel API) is a
+separate, proprietary product with its own RPM, `oxpanel-panel`. A release bundle
+that includes it (§11: `make dist PANEL_RPM=…`) installs it by itself; otherwise
+`sudo ./install.sh --panel-rpm oxpanel-panel-X.rpm` (`--no-panel` ignores a bundled
+one). The `panel` stage installs or upgrades the package and makes sure the
+`panelapi` account exists and is a member of group `oxpanel` (§5; the package
+creates it with sysusers, the installer repairs it otherwise; `--panel-account` does
+only the account). The `panelweb` stage then runs the package's
+`oxpanel-panel-setup enable`, starts `oxpanel-panel.service`, creates the first
+administrator and checks that the panel answers over HTTPS:
+
+* **Where it is served.** By default on a **port of its own, 8443** (HTTPS, any host
+  name or address: `https://<host>:8443/`), so it never competes with customers' sites
+  for a name on 443 and the engine's catch-all servers stay as they are; firewalld
+  gets `8443/tcp`. `--panel-port N` picks another port (labelled `http_port_t` for
+  SELinux if needed). `--panel-hostname panel.example.net` serves it instead under a
+  host name of its own on 80/443 (no extra port; the name must point at this host;
+  its server block is read before OxPanel's own, so a customer site with the same
+  name can never capture it). The block is `/etc/nginx/conf.d/00-oxpanel-panel.conf`,
+  outside the engine's directory, so `host reconcile` never reports it.
+* **Certificate.** A self-signed one (`/etc/pki/oxpanel-panel/`) is made at install so
+  the panel works at once (browsers warn). Install a real one with
+  `oxpanel-panel-setup certificate --cert fullchain.pem --key key.pem` (checked against
+  the key and the host name, `nginx -t`, rolled back if refused). In host-name mode
+  `/.well-known/acme-challenge/` of the panel's name is served from
+  `/var/lib/oxpanel-panel-acme`, so any ACME client works with a webroot, e.g.
+  `certbot certonly --webroot -w /var/lib/oxpanel-panel-acme -d panel.example.net`
+  with a deploy hook that runs the command above. The engine's own certificate
+  machinery is for customers' sites and is not used for the panel.
+* **The first administrator** (`--panel-admin NAME`, default `admin`) gets a random
+  one-time password, **printed at the end of the run and never written to the log**;
+  the first sign-in forces a new password and two-factor enrolment. A later run finds
+  the administrator and creates nothing. Lost access: `panel-api reset-password` (see
+  the panel's README).
+* **How it is wired.** The panel API listens on a UNIX socket,
+  `/run/oxpanel-panel/panel.sock` (directory `panelapi:nginx 2750`, socket `0660`): only
+  Nginx can reach it — not tenants' code, which can reach any loopback TCP port — and no
+  process can take its address over while the panel restarts. Nginx adds a secret header
+  the panel requires (generated at install; `/etc/oxpanel-panel/secret.env` and the
+  root-only `/etc/nginx/oxpanel-panel-proxy.inc`) and the client's address. The panel
+  runs as `panelapi` in its own SELinux domain `oxpanel_panel_t` (the package's policy
+  module `oxpanel-panel`), the only domain whose socket the web server may connect to.
+
+`--uninstall` removes the panel package (its Nginx block and SELinux module go with it)
+and closes its port, but **keeps its database** (`/var/lib/oxpanel-panel`: people,
+plans, audit log), configuration and certificate, and says so; a reinstall continues
+with them. `--uninstall --purge-panel` deletes them too. The panel needs all
 engine scopes, so none are set; for a deployment that wants fewer,
 `--panel-scopes read+vhost` writes `OXPANEL_PEER_SCOPES=<panelapi uid>:read+vhost`
 in the installer's block of `/etc/oxpanel/daemon.env` (§5). That block, between the
@@ -1443,6 +1485,8 @@ make integration   # boots systemd in a container, installs from packaging/, run
 make rpm           # build the engine RPM (with oxpanel-acme) from the working tree into dist/rpms/
 make rpmlint       # rpm -qpR and rpmlint of that RPM
 make dist          # dist/release/: RPM + install.sh + HANDBOOK.md + SHA256SUMS (no tag, no signing, no upload)
+make dist PANEL_RPM=/path/oxpanel-panel-X.rpm   # the same, with the (proprietary) panel RPM in the bundle;
+                   # it is built in the panel's own repository and never kept in this one
 make rpm-old       # RPM of an older commit (OLD_REF=d38bae2) for the upgrade acceptance run
 make acceptance    # REAL AlmaLinux 9 VM (KVM, SELinux enforcing): install like a user, run all phases
 ./scripts/dev.sh cargo <anything>   # run cargo inside the image
@@ -1462,6 +1506,7 @@ workstation; you only need `/dev/kvm` to be readable — and drives it over SSH.
 | `INSTALL=rpm` | | Builds the RPM from your working tree and `dnf install`s it in the VM. Fast path for uncommitted changes and for the packaging. |
 | `INSTALL=installer` | | Builds the release (`make dist`), copies `dist/release` into the VM, installs firewalld (a host that has a firewall) and runs `install.sh --yes --quota --no-reboot --fail2ban --enable-epel`; asserts the second run changes nothing; phase 15 reboots and runs the installer again. Default phases add 16 (fail2ban) and 95 (uninstall). |
 | `INSTALL=upgrade` | | Installs the 0.1.0 RPM (built from `OLD_REF`, default `d38bae2`, by `make rpm-old`) by hand, creates tenants and sites, then upgrades with the release's `install.sh` (phase 12). Default phases `10 12 20 30`. |
+| `INSTALL=product` | | The whole product: needs `PANEL_RPM=/path/oxpanel-panel-X.rpm` (built in the panel's repository). Builds the release with the panel in it (`make dist PANEL_RPM=…`) and runs `install.sh --yes --fail2ban --enable-epel` on a host with firewalld, keeping the first administrator's one-time password it prints; asserts a second run changes nothing and creates no second administrator. Default phases `10 25 20 30 60 95`. With `KEEP=1` the panel is also reachable from the workstation at `https://127.0.0.1:8443/` (a browser, or the panel's Playwright suites with `make ui-e2e-host`). |
 | `GIT_REF=<branch or sha>` | current branch | Which commit the git install checks out. CI passes the pushed SHA. |
 | `PHASES="10 15 20 30 40 50 60 70 80 90"` | all | Subset of phases (below). |
 | `KEEP=1` | | Leave the VM running afterwards; the report prints the `ssh` line (`make acceptance-destroy` removes it). |
@@ -1473,6 +1518,7 @@ Phases: **10** install (`dnf install` of the RPM or the handbook's source instal
 **12** (upgrade mode) upgrade 0.1.0 to the current release with `install.sh`: tenants, sites and limits survive, and the new features (SFTP, databases and their trash, backups, the file manager, deleting the tenant in one step) work on the pre-existing tenant ·
 **15** host preparation for disk quotas: runs §9.1's block (in installer mode the installer already did it, and is run again after the reboot), reboots, checks the quota option is on ·
 **16** (installer mode) fail2ban: wrong SFTP passwords from one address of a network namespace get it banned, a correct login from another address works, an address on the ignore list is never banned, no AVC denials ·
+**25** (product mode) the panel as a deployed service (unit, `panelapi`, SELinux domain, socket and file modes, Nginx order, firewall, reconcile clean), its transport (HTTPS, HTTP/2, TLS versions, body limits, the proxy secret on the socket), then **the whole product driven through the panel's HTTPS API as a browser does** (`phases/product/drive.py`: cookie, CSRF token, Origin, forced password change, two-factor enrolment; plan, reseller, customer and hosting account; static, PHP and Node.js sites fetched through Nginx; content uploaded over SFTP; certificate upload; database used from PHP; backup and restore; suspend and resume; deletion), and what a tenant's code can reach of the panel (socket, database, secret, key; forged forwarding headers) ·
 **20** the 1219-check integration suite on the real host (`tests-integration/run-inside.sh`: everything above plus HTTPS and ACME against a local test CA, SFTP, quotas, databases and backups) ·
 **30** SELinux: enforcing, docroot labels, `semanage` rule lifecycle, site serves, **zero AVC denials** ·
 **40** sandbox: private network/UTS/mount namespaces, seccomp, capability bounding set, read-only `/usr` ·

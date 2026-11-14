@@ -34,6 +34,28 @@ if [ -s dns_serial.pre ]; then
   check "the same signing key (same DS) after reboot" test "$(oxpanel-ctl dns zone-show boota.test --tenant boota | sed -n 's/^ds=//p')" = "$(cat dns_ds.pre)"
   check "the site's address record after reboot" test "$(dig +short +norec @127.0.0.1 boota.test A)" = 192.0.2.60
 fi
+if rpm -q oxpanel-panel >/dev/null 2>&1; then
+  eventually "the panel is active after boot" 60 1 systemctl -q is-active oxpanel-panel
+  check "the panel's socket came back (panelapi:nginx 0660)" test "$(stat -c '%U:%G %a' /run/oxpanel-panel/panel.sock)" = "panelapi:nginx 660"
+  check "the panel runs in its own domain after boot" bash -c "ps -o label= -p \$(systemctl show -p MainPID --value oxpanel-panel) | grep -q ':oxpanel_panel_t:'"
+  eventually "the panel answers over HTTPS after boot" 30 1 oxpanel-panel-setup status
+  if [ -s panel-admin.json ]; then
+    check "the administrator signs in after boot (password + TOTP) and the panel reaches the engine" python3 - <<'EOF'
+import json, sys, time
+sys.path.insert(0, "phases/product")
+import drive
+cred = json.load(open("panel-admin.json"))
+port = open("/etc/oxpanel-panel/setup.conf").read().split("PORT=")[1].split()[0]
+b = drive.Browser(f"https://127.0.0.1:{port}", "after-boot")
+# A code is accepted once: wait for a fresh 30-second step.
+time.sleep(31 - time.time() % 30)
+r = b.post("/api/v1/auth/login", {"username": cred["user"], "password": cred["password"], "totp_code": drive.totp(cred["totp_secret"])}, csrf=False)
+assert r.status == 200 and not r.body.get("restriction"), r
+r = b.get("/api/v1/host")
+assert r.status == 200 and r.body.get("engine_version"), r
+EOF
+  fi
+fi
 check "no drift after reboot" bash -c "oxpanel-ctl host reconcile | grep -q '^drifts=0$'"
 check "boota slice loaded with its MemoryMax" test "$(systemctl show -p MemoryMax --value oxpanel-tenant-boota.slice)" = 268435456
 check "boota slice CPUWeight" test "$(systemctl show -p CPUWeight --value oxpanel-tenant-boota.slice)" = 40

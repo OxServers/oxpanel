@@ -47,6 +47,7 @@ OPT_YES=0 OPT_FORCE=0 OPT_UNINSTALL=0 OPT_CHECK=0 OPT_ONLY=""
 OPT_FAIL2BAN="" OPT_EPEL="" OPT_QUOTA="" OPT_REBOOT="" OPT_MARIADB=yes OPT_PHP=yes OPT_NODEJS=yes
 OPT_HARDEN_EXISTING="" OPT_PANEL_ACCOUNT="" OPT_SWITCH_NODEJS="" OPT_MASK_PHPFPM=""
 OPT_IGNORE_IP="" OPT_PANEL_SCOPES="" OPT_PANEL_RPM="" OPT_REPO_URL="" OPT_ANSWERS="" OPT_HOME_BASE=""
+OPT_PANEL_PORT="" OPT_PANEL_HOSTNAME="" OPT_PANEL_ADMIN="" OPT_NO_PANEL="" OPT_PURGE_PANEL=""
 OPT_DNS="" OPT_DNS_NAMESERVERS="" OPT_DNS_CONTACT="" OPT_DNS_IPV4="" OPT_DNS_IPV6="" OPT_DISABLE_STOCK_NAMED=""
 DNS_KEYS='^OXPANEL_DNS(_NAMESERVERS|_SOA_CONTACT|_IPV4|_IPV6)?='
 ENGINE_RPM=""
@@ -94,11 +95,12 @@ General
   --check               preflight checks only; changes nothing
   --only STAGE          run only this stage (after preflight); stages:
                         nodejs engine selinux nginx mariadb php panel daemon dns
-                        firewall fail2ban quota verify
+                        panelweb firewall fail2ban quota verify
   --force               continue past a conflicting web server or port 80 owner
   --uninstall           remove the engine packages and OxPanel's own
                         configuration; never customers' homes, databases or
-                        backups (prints what it leaves)
+                        backups (prints what it leaves). The panel's database
+                        is kept too, unless --purge-panel
   -h, --help
 
 Packages
@@ -135,9 +137,21 @@ DNS hosting (optional; this host as the name server of its customers' domains)
   --disable-stock-named stop and disable the distribution's named.service if it
                         runs (it would hold port 53); otherwise the installer stops
 
-Panel (optional hook; the panel is a separate product)
-  --panel-rpm FILE      install the panel RPM, then make sure the `panelapi`
-                        account exists in group `oxpanel`
+Panel (optional; the panel is a separate product)
+  --panel-rpm FILE      install (or upgrade) the panel RPM, make sure the
+                        `panelapi` account exists in group `oxpanel`, put the
+                        panel on HTTPS, start it and create its first
+                        administrator. An oxpanel-panel-*.rpm beside this
+                        script is used without this option (--no-panel: not)
+  --panel-port N        serve the panel on its own HTTPS port (default 8443;
+                        opened in firewalld)
+  --panel-hostname NAME serve it instead under a host name of its own on 443
+                        (NAME must point at this host; no extra port is opened)
+  --panel-admin NAME    the first administrator's user name (default: admin);
+                        its one-time password is printed at the end, never logged
+  --no-panel            do not install a panel RPM found beside this script
+  --purge-panel         with --uninstall: also delete the panel's database,
+                        configuration and certificate
   --panel-account       only create/repair the `panelapi` account
   --panel-scopes S      confine panelapi to API scopes, e.g. read+vhost
                         (default: unconfined, which the panel needs)
@@ -174,6 +188,11 @@ parse_args() {
       --home-base) [ $# -ge 2 ] || die "--home-base needs a path"; OPT_HOME_BASE="$2"; shift;;
       --panel-rpm) [ $# -ge 2 ] || die "--panel-rpm needs a file"; OPT_PANEL_RPM="$2"; OPT_PANEL_ACCOUNT=yes; shift;;
       --panel-account) OPT_PANEL_ACCOUNT=yes;;
+      --panel-port) [ $# -ge 2 ] || die "--panel-port needs a number"; OPT_PANEL_PORT="$2"; shift;;
+      --panel-hostname) [ $# -ge 2 ] || die "--panel-hostname needs a name"; OPT_PANEL_HOSTNAME="$2"; shift;;
+      --panel-admin) [ $# -ge 2 ] || die "--panel-admin needs a user name"; OPT_PANEL_ADMIN="$2"; shift;;
+      --no-panel) OPT_NO_PANEL=yes;;
+      --purge-panel) OPT_PURGE_PANEL=yes;;
       --dns) OPT_DNS=yes;;
       --no-dns) OPT_DNS=no;;
       --dns-nameservers) [ $# -ge 2 ] || die "--dns-nameservers needs a list"; OPT_DNS_NAMESERVERS="$2"; shift;;
@@ -228,6 +247,9 @@ load_answers() {
       panel_scopes) [ -n "$OPT_PANEL_SCOPES" ] || OPT_PANEL_SCOPES="$val";;
       panel_rpm) [ -n "$OPT_PANEL_RPM" ] || { OPT_PANEL_RPM="$val"; OPT_PANEL_ACCOUNT=yes; };;
       panel_account) [ -n "$OPT_PANEL_ACCOUNT" ] || OPT_PANEL_ACCOUNT="$(yesno_value "$key" "$val")";;
+      panel_port) [ -n "$OPT_PANEL_PORT" ] || OPT_PANEL_PORT="$val";;
+      panel_hostname) [ -n "$OPT_PANEL_HOSTNAME" ] || OPT_PANEL_HOSTNAME="$val";;
+      panel_admin) [ -n "$OPT_PANEL_ADMIN" ] || OPT_PANEL_ADMIN="$val";;
       dns) [ -n "$OPT_DNS" ] || OPT_DNS="$(yesno_value "$key" "$val")";;
       dns_nameservers) [ -n "$OPT_DNS_NAMESERVERS" ] || OPT_DNS_NAMESERVERS="$val";;
       dns_contact) [ -n "$OPT_DNS_CONTACT" ] || OPT_DNS_CONTACT="$val";;
@@ -356,7 +378,9 @@ preflight() {
     else die "port 80 is in use by something other than nginx: $(printf '%s' "$listener" | head -1 | tr -s ' ')"; fi
   fi
   if [ -d /etc/nginx ]; then
-    EXISTING_DEFAULT_SERVER="$(grep -rlE '^[^#]*listen[^;]*default_server' /etc/nginx --include='*.conf' 2>/dev/null | grep -v '/oxpanel\.d/\|00-oxpanel\.conf' || true)"
+    # Only a default server on the ports the engine's catch-all uses (80, 443)
+    # clashes with it; one on another port (the panel's 8443) does not.
+    EXISTING_DEFAULT_SERVER="$(grep -rlE '^[^#]*listen[[:space:]]+([^;[:space:]]*:)?(80|443)([[:space:]][^;]*)?[[:space:]]default_server' /etc/nginx --include='*.conf' 2>/dev/null | grep -v '/oxpanel\.d/\|00-oxpanel\.conf' || true)"
     if [ -n "$EXISTING_DEFAULT_SERVER" ]; then
       warn "Nginx already defines a default_server ($(printf '%s' "$EXISTING_DEFAULT_SERVER" | tr '\n' ' ')); the engine's own catch-all will be turned off so the two do not clash (OXPANEL_NGINX_DEFAULT_SERVER=false in $ENV_FILE)"
     fi
@@ -462,7 +486,7 @@ stage_engine() {
 # from scratch each run, so a second run changes nothing and a hand edit outside
 # it is never touched. The block is a function of host facts and options only;
 # the panel's peer-scope line is kept from the previous run unless a new one is given.
-env_block_current() { awk -v b="$ENV_BEGIN" -v e="$ENV_END" '$0==b{f=1;next} $0==e{f=0;next} f' "$ENV_FILE"; }
+env_block_current() { [ -r "$ENV_FILE" ] || return 0; awk -v b="$ENV_BEGIN" -v e="$ENV_END" '$0==b{f=1;next} $0==e{f=0;next} f' "$ENV_FILE"; }
 env_block_content() {
   local scopes=""
   if [ -n "$EXISTING_DEFAULT_SERVER" ]; then echo "OXPANEL_NGINX_DEFAULT_SERVER=false"; fi
@@ -673,6 +697,14 @@ stage_firewall() {
     if ! quiet firewall-cmd --query-service="$svc"; then run firewall-cmd --add-service="$svc" || return 1; any=1; fi
   done
   if [ "$any" -eq 1 ]; then changed "firewalld: ${svcs// /, } opened in zone $zone"; else note "firewalld already allows ${svcs// /, } in zone $zone"; fi
+  # The panel's own HTTPS port (port mode; in host-name mode it shares 443).
+  local pport; pport="$(panel_port)"
+  if [ -n "$pport" ] && panel_installed; then
+    any=0
+    if ! quiet firewall-cmd --permanent --query-port="$pport/tcp"; then run firewall-cmd --permanent --add-port="$pport/tcp" || return 1; any=1; fi
+    if ! quiet firewall-cmd --query-port="$pport/tcp"; then run firewall-cmd --add-port="$pport/tcp" || return 1; any=1; fi
+    if [ "$any" -eq 1 ]; then changed "firewalld: panel port $pport/tcp opened in zone $zone"; else note "firewalld already allows the panel port $pport/tcp"; fi
+  fi
   note "(only the default zone '$zone' was changed; interfaces in other zones are yours)"
 }
 
@@ -799,7 +831,7 @@ stage_quota() {
 
 # ------------------------------------------------------------------ stage: panel
 stage_panel() {
-  local uid rpmfile name want_scopes="$OPT_PANEL_SCOPES"
+  local uid rpmfile name want_scopes="$OPT_PANEL_SCOPES" before tver
   if [ "$OPT_PANEL_ACCOUNT" != yes ]; then note "no panel requested (--panel-rpm FILE, or --panel-account)"; return 0; fi
   if [ -n "$OPT_PANEL_RPM" ]; then
     rpmfile="$OPT_PANEL_RPM"
@@ -807,7 +839,12 @@ stage_panel() {
     verify_checksum "$rpmfile"
     name="$(rpm_field "$rpmfile" NAME)"
     case "$name" in oxpanel-panel*) ;; *) die "$rpmfile is not an OxPanel panel package (name: $name)";; esac
-    if ! installed "$name"; then run dnf -y install "$rpmfile" || return 1; changed "installed $name"; fi
+    tver="$(rpm -qp --qf '%{VERSION}-%{RELEASE}' "$rpmfile" 2>/dev/null)"
+    before="$(rpm -q --qf '%{VERSION}-%{RELEASE}' "$name" 2>/dev/null || true)"
+    if ! installed "$name"; then run dnf -y install "$rpmfile" || return 1; changed "installed $name $tver"
+    elif [ "$before" = "$tver" ]; then note "$name $before is already installed"
+    elif version_lt "$before" "$tver"; then run dnf -y install "$rpmfile" || return 1; changed "$name $before -> $tver"
+    else warn "$name $before is newer than $rpmfile ($tver); not downgraded"; fi
   fi
   # The panel service account: no login, member of the engine's group, which is
   # all the engine checks (HANDBOOK 5). A panel package usually creates it with
@@ -836,6 +873,66 @@ stage_panel() {
   fi
 }
 
+# ------------------------------------------------------------------ stage: panelweb
+# The panel package brings `oxpanel-panel-setup` (it owns the panel's Nginx
+# block, certificate and proxy secret); this stage asks it to put the panel on
+# HTTPS, starts the service and creates the first administrator.
+PANEL_SETUP=/usr/sbin/oxpanel-panel-setup
+panel_installed() { installed oxpanel-panel && [ -x "$PANEL_SETUP" ]; }
+
+panel_mode_args() {
+  if [ -n "$OPT_PANEL_HOSTNAME" ]; then printf -- '--hostname %s' "$OPT_PANEL_HOSTNAME"
+  elif [ -n "$OPT_PANEL_PORT" ]; then printf -- '--port %s' "$OPT_PANEL_PORT"; fi
+}
+
+# The panel's port in port mode (as configured), else nothing.
+panel_port() {
+  [ -r /etc/oxpanel-panel/setup.conf ] || return 0
+  if grep -qx 'MODE=port' /etc/oxpanel-panel/setup.conf; then sed -n 's/^PORT=//p' /etc/oxpanel-panel/setup.conf | tail -1; fi
+}
+
+# What `oxpanel-panel-setup enable` writes, as one checksum (files may not exist yet).
+panel_web_state() { { cat /etc/nginx/conf.d/00-oxpanel-panel.conf /etc/oxpanel-panel/setup.conf 2>/dev/null || true; } | sha256sum; }
+
+stage_panelweb() {
+  local before after out code args name="${OPT_PANEL_ADMIN:-admin}"
+  if ! panel_installed; then note "no panel installed"; return 0; fi
+  if [ -n "$OPT_PANEL_PORT" ] && [ -n "$OPT_PANEL_HOSTNAME" ]; then die "--panel-port and --panel-hostname exclude each other"; fi
+  before="$(panel_web_state)"
+  args="$(panel_mode_args)"
+  # shellcheck disable=SC2086  # $args is "--port N" or "--hostname NAME", validated by the setup tool
+  run "$PANEL_SETUP" enable $args || return 1
+  after="$(panel_web_state)"
+  if [ "$before" != "$after" ]; then changed "panel served by Nginx at $("$PANEL_SETUP" url)"; else note "panel already served at $("$PANEL_SETUP" url)"; fi
+  if ! unit_enabled oxpanel-panel || ! unit_active oxpanel-panel; then
+    run systemctl enable --now oxpanel-panel || return 1
+    changed "oxpanel-panel enabled and started"
+  elif [ "$before" != "$after" ]; then
+    run systemctl restart oxpanel-panel || return 1
+  else note "oxpanel-panel enabled and running"; fi
+  # The first administrator: created once, with a random password that is shown
+  # once (at the end of this run) and must be changed at the first sign-in. The
+  # output never goes to the log.
+  printf '+ %s bootstrap-admin %s (output not logged)\n' "$PANEL_SETUP" "$name" >>"$LOG"
+  if out="$("$PANEL_SETUP" bootstrap-admin "$name" 2>&1)"; then
+    # FLAG_DIR is this run's private temporary directory (0700, removed at exit).
+    printf '%s\n' "$out" | sed -n 's/^temporary password:[[:space:]]*//p' >"$FLAG_DIR/panel-admin-password"
+    printf '%s\n' "$name" >"$FLAG_DIR/panel-admin"
+    changed "panel administrator '$name' created (one-time password at the end of this run)"
+  elif printf '%s' "$out" | grep -q 'an administrator already exists'; then
+    note "the panel already has an administrator (lost access: panel-api reset-password, see the panel's README)"
+  else
+    printf '%s\n' "$out" | grep -v -i 'password' >>"$LOG" || true
+    die "could not create the panel's first administrator: $(printf '%s' "$out" | grep -v -i 'password' | head -3)"
+  fi
+  for _ in $(seq 1 20); do
+    code="$("$PANEL_SETUP" status 2>/dev/null | sed -n 's/^health:[[:space:]]*HTTP //p')"
+    [ "$code" = 200 ] && break; sleep 1
+  done
+  [ "$code" = 200 ] || die "the panel does not answer over HTTPS (HTTP ${code:-none}); see: journalctl -u oxpanel-panel -u nginx"
+  note "panel answers over HTTPS: $("$PANEL_SETUP" url)"
+}
+
 # ------------------------------------------------------------------ stage: verify
 stage_verify() {
   local out rc=0
@@ -853,6 +950,11 @@ stage_verify() {
     *) die "oxpanel-ctl host reconcile failed (exit $rc): $out";;
   esac
   if [ "$OPT_FAIL2BAN" = yes ]; then quiet fail2ban-client status sshd || die "fail2ban jail sshd is not running"; note "fail2ban jail sshd: running"; fi
+  if panel_installed && [ -e /etc/nginx/conf.d/00-oxpanel-panel.conf ]; then
+    unit_active oxpanel-panel || die "oxpanel-panel.service is not running; see: journalctl -u oxpanel-panel"
+    "$PANEL_SETUP" status >/dev/null 2>&1 || die "the panel does not answer over HTTPS; see: oxpanel-panel-setup status"
+    note "panel: running, answers over HTTPS at $("$PANEL_SETUP" url)"
+  fi
   if dns_wanted; then
     unit_active oxpanel-dns || die "DNS hosting is configured but oxpanel-dns.service is not running"
     oxpanel-ctl host info 2>&1 | grep -q '^dns=true .*dns_available=true' || warn "the engine does not report DNS hosting as available; see: oxpanel-ctl host info | grep ^dns"
@@ -881,7 +983,23 @@ do_uninstall() {
   for pkg in nginx php-fpm php-cli nodejs npm mariadb-server openssl acl openssh-server xfsprogs bind bind-utils publicsuffix-list; do
     if installed "$pkg"; then run dnf -y mark install "$pkg" || true; fi
   done
-  if installed oxpanel-panel; then run dnf -y remove --noautoremove oxpanel-panel || die "could not remove oxpanel-panel"; say "removed: oxpanel-panel"; fi
+  local pport; pport="$(panel_port)"
+  if installed oxpanel-panel; then
+    # The package's own removal scriptlet takes the panel off Nginx and stops it.
+    run dnf -y remove --noautoremove oxpanel-panel || die "could not remove oxpanel-panel"
+    say "removed: oxpanel-panel (panel API, web interface, its Nginx server block, its SELinux module)"
+  fi
+  if [ -n "$pport" ] && unit_active firewalld && quiet firewall-cmd --permanent --query-port="$pport/tcp"; then
+    run firewall-cmd --permanent --remove-port="$pport/tcp" || true; run firewall-cmd --remove-port="$pport/tcp" || true
+    say "closed: the panel's port $pport/tcp in firewalld"
+  fi
+  if [ "$OPT_PURGE_PANEL" = yes ]; then
+    rm -rf /var/lib/oxpanel-panel /etc/oxpanel-panel /etc/pki/oxpanel-panel /var/lib/oxpanel-panel-acme
+    say "deleted (--purge-panel): the panel's database /var/lib/oxpanel-panel, /etc/oxpanel-panel, /etc/pki/oxpanel-panel"
+  elif [ -d /var/lib/oxpanel-panel ]; then
+    say "kept: the panel's database /var/lib/oxpanel-panel (people, plans, audit log), /etc/oxpanel-panel and its"
+    say "      certificate /etc/pki/oxpanel-panel; a reinstalled panel continues with them (--purge-panel deletes them)"
+  fi
   if unit_active oxpanel-daemon || unit_enabled oxpanel-daemon; then run systemctl disable --now oxpanel-daemon || true; fi
   if installed oxpanel-daemon; then run dnf -y remove --noautoremove oxpanel-daemon || die "could not remove oxpanel-daemon"; say "removed: oxpanel-daemon (engine, oxpanel-ctl, oxpanel-acme, unit, SELinux module)"; fi
   if [ -e "$JAIL_FILE" ]; then rm -f "$JAIL_FILE"; say "removed: $JAIL_FILE"; if unit_active fail2ban; then run systemctl restart fail2ban || true; fi; fi
@@ -920,6 +1038,14 @@ main() {
   mkdir -p "$STATE_DIR"; chmod 0700 "$STATE_DIR"
   : >>"$LOG"; chmod 0600 "$LOG"
   load_answers
+  # A release bundle that contains the panel installs it (--no-panel: not).
+  if [ -z "$OPT_PANEL_RPM" ] && [ "$OPT_NO_PANEL" != yes ] && [ "$OPT_UNINSTALL" -ne 1 ]; then
+    local f
+    for f in "$HERE"/oxpanel-panel-[0-9]*.rpm; do
+      if [ -e "$f" ]; then OPT_PANEL_RPM="$f"; OPT_PANEL_ACCOUNT=yes; fi
+    done
+  fi
+  if [ "$OPT_NO_PANEL" = yes ]; then OPT_PANEL_RPM=""; fi
   if [ "$OPT_YES" -ne 1 ] && [ -t 0 ] && [ -t 1 ]; then INTERACTIVE=1; fi
   FLAG_DIR="$(mktemp -d)"; CHANGE_FILE="$FLAG_DIR/changes"; WARN_FILE="$FLAG_DIR/warnings"; : >"$CHANGE_FILE"; : >"$WARN_FILE"
   trap 'rm -rf "$FLAG_DIR"' EXIT
@@ -962,7 +1088,8 @@ enabled afterwards (fail2ban needs its updates). Disable it later with: dnf conf
   stage panel    "panel hook (optional)"                          stage_panel
   stage daemon   "oxpanel-daemon service"                         stage_daemon
   stage dns      "DNS hosting (optional): BIND as oxpanel-dns"    stage_dns
-  stage firewall "firewalld: ports 80 and 443 (and 53 with DNS)"  stage_firewall
+  stage panelweb "panel: HTTPS, service, first administrator (optional)" stage_panelweb
+  stage firewall "firewalld: ports 80 and 443 (53 with DNS, the panel's port)" stage_firewall
   stage fail2ban "login banning with fail2ban (optional)"         stage_fail2ban
   stage quota    "disk quotas (optional)"                         stage_quota
   stage verify   "final verification"                             stage_verify
@@ -1031,6 +1158,18 @@ finish() {
   if flag_is reboot-required; then reboot=yes; fi
   say ""
   if [ "$w" -gt 0 ]; then say "Warnings ($w):"; sed 's/^/  - /' "$WARN_FILE"; fi
+  if [ -s "$FLAG_DIR/panel-admin" ]; then
+    # Printed to the terminal only, never to the log.
+    printf '\nThe panel: %s\n' "$("$PANEL_SETUP" url)"
+    printf '  administrator:      %s\n' "$(cat "$FLAG_DIR/panel-admin")"
+    printf '  one-time password:  %s\n' "$(cat "$FLAG_DIR/panel-admin-password" 2>/dev/null)"
+    printf '  It is shown only now. Sign in, then choose a new password and set up two-factor authentication.\n'
+    printf '  The certificate is self-signed until you install your own:\n'
+    printf '    oxpanel-panel-setup certificate --cert FULLCHAIN.pem --key KEY.pem\n\n'
+    say "panel administrator created; its one-time password was printed on the terminal (not logged)"
+  elif panel_installed && [ -e /etc/nginx/conf.d/00-oxpanel-panel.conf ]; then
+    say "The panel: $("$PANEL_SETUP" url)"
+  fi
   printf 'result=ok\nversion=%s\nchanges=%s\nwarnings=%s\nreboot_required=%s\nfinished=%s\n' "$(cur_version)" "$n" "$w" "$reboot" "$(date -u +%FT%TZ)" >"$STATE_DIR/status"
   if [ "$reboot" = yes ]; then
     say "RESULT: ok changes=$n warnings=$w reboot_required=yes"
