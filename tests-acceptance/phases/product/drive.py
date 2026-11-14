@@ -301,7 +301,10 @@ def drive_files(cust, sites, alice_uid):
     check(r.status == 200 and r.body.get("content") == "<h1>fm-note-1</h1>\n" and r.body.get("editable") is True
           and r.body.get("binary") is False, "file manager: the editor reads it back", repr(r))
     opened = r.body or {}
-    r = cust.put(f"{base}/content", {"path": page, "content": "<h1>fm-note-2</h1>\n", "overwrite": True,
+    # The change differs in size too: the panel's stale-save check compares the
+    # size and the modification time, which is in whole seconds, and the stale
+    # save below comes within the same second.
+    r = cust.put(f"{base}/content", {"path": page, "content": "<h1>fm-note-2, longer</h1>\n", "overwrite": True,
                                     "expected_modified": opened.get("modified"), "expected_size": opened.get("size_bytes")})
     check(r.status in (200, 201), "file manager: the editor saves a change over the version it opened", repr(r))
     r = cust.put(f"{base}/content", {"path": page, "content": "<h1>stale</h1>\n", "overwrite": True,
@@ -310,7 +313,7 @@ def drive_files(cust, sites, alice_uid):
           " (409 file_changed)", repr(r))
     r = cust.put(f"{base}/access", {"path": page, "access": "web_readable"})
     check(r.status == 200, "file manager: the page is made readable by the web server", repr(r))
-    good, code, body = wait_site(sites["static"], "200", "<h1>fm-note-2</h1>", "/fm-note.html")
+    good, code, body = wait_site(sites["static"], "200", "<h1>fm-note-2, longer</h1>", "/fm-note.html")
     check(good, "the edited page is served by Nginx", f"{code} {body[:200]}")
     r = cust.get(f"{base}/download?path={page}")
     check(r.status == 200 and r.headers.get("content-type", "").startswith("application/octet-stream")
