@@ -32,10 +32,12 @@ pub fn refuse_tenant_deletion(ctx: &Ctx, tenant: &Username) -> Result<()> {
 /// maps and the password files follow; a suspended account's sessions end.
 /// The caller holds the mutation lock.
 pub async fn tenant_changed(ctx: &Ctx, tenant: &Username, suspended: bool) -> Result<()> {
-    let domains = MailStore::new(&ctx.config).list_tenant(tenant.as_str())?;
-    if domains.is_empty() || !ctx.config.mail.enabled {
+    if !ctx.config.mail.enabled {
         return Ok(());
     }
+    // Every account is in the policy service's map (its sites' mail), with
+    // or without mail domains.
+    let domains = MailStore::new(&ctx.config).list_tenant(tenant.as_str())?;
     ops::apply(ctx).await?;
     if suspended {
         for d in &domains {

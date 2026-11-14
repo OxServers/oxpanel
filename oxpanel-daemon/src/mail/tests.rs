@@ -1109,6 +1109,21 @@ async fn an_account_with_mail_is_deleted_only_with_everything() {
 }
 
 #[tokio::test]
+async fn suspending_an_account_without_mail_domains_reaches_the_policy_map() {
+    // Its sites' mail is the policy service's to refuse (found on the VM:
+    // the map kept an account without mail domains unsuspended).
+    let h = harness().await;
+    h.domain().await;
+    let map = |h: &H| -> render::PolicyMap {
+        serde_json::from_str(&h.read(h.cfg().state_dir.join("policy.json"))).unwrap()
+    };
+    h.tenants.set_suspended("bob", true).await.unwrap();
+    assert!(map(&h).accounts["bob"].suspended);
+    h.tenants.set_suspended("bob", false).await.unwrap();
+    assert!(!map(&h).accounts["bob"].suspended);
+}
+
+#[tokio::test]
 async fn a_mail_domain_without_mailboxes_goes_with_its_account() {
     let h = harness().await;
     h.domain().await;
