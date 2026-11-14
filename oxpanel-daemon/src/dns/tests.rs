@@ -900,3 +900,75 @@ async fn host_facts_flag_a_single_server() {
         f.warnings
     );
 }
+
+/// Found by phase 80: a tenant could create the zone
+/// `catalog.oxpanel.invalid`, the engine's own catalog. The server's
+/// configuration then held two zone statements of that name, the checker
+/// rejected it, and every later DNS change of every tenant (and every
+/// cascading deletion, which removes zones) failed. Special-use domains
+/// (`localhost`, reverse zones, `.invalid` …) are refused the same way.
+#[tokio::test]
+async fn the_catalog_and_special_use_domains_cannot_become_zones() {
+    let h = harness().await;
+    for zone in [
+        "catalog.oxpanel.invalid",
+        "oxpanel.invalid",
+        "x.catalog.oxpanel.invalid",
+        "example.invalid",
+        "my.localhost",
+        "0.0.127.in-addr.arpa",
+        "2.0.192.in-addr.arpa",
+        "8.b.d.0.1.0.0.2.ip6.arpa",
+        "printer.local",
+        "hidden.onion",
+        "x.alt",
+    ] {
+        let e = h.dns.create_zone("alice", zone).await.unwrap_err();
+        assert!(
+            matches!(&e, Error::DnsConflict(m) if m.contains("special-use") || m.contains("catalog")),
+            "{zone}: {e}"
+        );
+    }
+    assert!(h.dns.list_zones("alice").await.unwrap().is_empty());
+    // A site with such a name gets no zone either (and the site itself works).
+    h.site("catalog.oxpanel.invalid", "alice", &["www.localhost"])
+        .await;
+    assert!(h.dns.list_zones("").await.unwrap().is_empty());
+    // An ordinary zone still works.
+    h.dns.create_zone("alice", "example.com").await.unwrap();
+}
+
+/// Found by phase 80: a zone whose creation the server's configuration
+/// checker rejected kept its record and its file. Every later configuration
+/// then held it, and was rejected too: no tenant could change DNS any more,
+/// and cascading deletions failed. The creation is now refused whole.
+#[tokio::test]
+async fn a_zone_the_configuration_checker_rejects_leaves_nothing() {
+    let h = harness().await;
+    h.dns.create_zone("alice", "example.com").await.unwrap();
+    h.sys.script_failure(
+        bin::NAMED_CHECKCONF,
+        1,
+        "zones.conf:9: zone 'x': already exists",
+    );
+    let e = h.dns.create_zone("bob", "example.net").await.unwrap_err();
+    assert!(matches!(&e, Error::DnsZoneRejected(_)), "{e}");
+    assert!(
+        h.zone_file("example.net").is_none(),
+        "zone file left behind"
+    );
+    let zones: Vec<String> = h
+        .dns
+        .list_zones("")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|z| z.record.zone)
+        .collect();
+    assert_eq!(zones, ["example.com"], "record left behind");
+    // The next change of anyone works again.
+    h.dns.create_zone("bob", "example.net").await.unwrap();
+    h.add("alice", "example.com", rec("x", RrType::Txt, "y"))
+        .await
+        .unwrap();
+}

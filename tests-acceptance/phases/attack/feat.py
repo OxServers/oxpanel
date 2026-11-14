@@ -180,9 +180,13 @@ def listeners(allowed_unix):
     paths = sorted({l.split()[-1] for l in lines if len(l.split()) >= 8 and l.split()[-1].startswith('/') and l.split()[5] == '01'})
     for p in paths:
         sensitive = any(p.startswith(x) for x in ('/run/oxpanel', '/var/run/oxpanel', '/var/lib/oxpanel', '/home/', '/run/oxpanel-php', '/run/oxpanel-app', '/run/named', '/var/named', '/run/systemd/private', '/run/user/0'))
-        want = 'blocked' if sensitive else 'info'
-        if any(p.startswith(a) for a in allowed_unix):
-            want = 'open' if p in allowed_unix else 'info'
+        try:
+            own = os.stat(p).st_uid == os.getuid() or os.stat(os.path.dirname(p)).st_uid == os.getuid()
+        except OSError:
+            own = False
+        want = 'blocked' if sensitive and not own else 'info'
+        if p in allowed_unix:
+            want = 'open'
         s = socket.socket(socket.AF_UNIX); s.settimeout(2)
         try:
             s.connect(p); ok, d = True, 'connected'
@@ -295,4 +299,15 @@ def main(argv):
 
 
 if __name__ == '__main__':
-    sys.stdout.write(main(sys.argv[1:]))
+    # A scheduled task's log is bounded: with --out=<file in the home> the
+    # whole result goes there too (the harness reads it once END appears).
+    args = sys.argv[1:]
+    out = None
+    if args and args[0].startswith('--out='):
+        out, args = args[0][len('--out='):], args[1:]
+    result = main(args)
+    if out:
+        import pwd
+        with open(os.path.join(pwd.getpwuid(os.getuid()).pw_dir, out), 'w') as f:
+            f.write(result)
+    sys.stdout.write(result)

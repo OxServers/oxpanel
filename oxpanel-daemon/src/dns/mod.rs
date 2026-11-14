@@ -342,7 +342,33 @@ pub fn check_rules(zone: &Domain, rrs: &[Rr], claimed: &[(RelName, String)]) -> 
 
 /// Whether `zone` may be created for `tenant`: not a public suffix, not
 /// overlapping any zone, and no other tenant's site inside it.
+/// Top-level domains reserved for special use (RFC 6761, 6762, 7686, 9476
+/// and `.arpa`'s reverse trees): never delegated to anyone on the Internet,
+/// so a tenant holding one could only shadow the host's own resolution of
+/// it (`localhost`, the reverse zone of an address) or the engine's own
+/// zone below `.invalid`.
+const RESERVED_TLDS: &[&str] = &["invalid", "localhost", "local", "arpa", "onion", "alt"];
+
+/// Why no tenant may hold `zone`, if it is reserved: the engine's catalog of
+/// hosted zones (a second zone statement of that name makes the server's
+/// configuration invalid, and every later DNS change of every tenant, and
+/// every cascading deletion, fail) or a special-use domain.
+fn reserved_zone(zone: &str) -> Option<String> {
+    if is_within(zone, zone::CATALOG_ZONE) || is_within(zone::CATALOG_ZONE, zone) {
+        return Some(format!(
+            "'{zone}' is the engine's own catalog of hosted zones, or contains it"
+        ));
+    }
+    let tld = zone.rsplit('.').next().unwrap_or(zone);
+    RESERVED_TLDS.contains(&tld).then(|| {
+        format!("'{zone}' is in the special-use domain '.{tld}', which no tenant can hold")
+    })
+}
+
 fn check_zone_free(ctx: &Ctx, list: &SuffixList, zone: &Domain, tenant: &str) -> Result<()> {
+    if let Some(why) = reserved_zone(zone.as_str()) {
+        return Err(Error::DnsConflict(why));
+    }
     if list.registrable(zone.as_str()).is_none() {
         return Err(Error::DnsConflict(format!(
             "'{zone}' is a public suffix (names below it belong to different owners); a zone must be a registrable domain such as example.{zone}, or a name below one"
@@ -412,7 +438,22 @@ async fn finish_creation(ctx: &Ctx, recs: Vec<ZoneRecord>) -> Result<Vec<ZoneRec
     for rec in recs {
         written.push(ops::apply_zone(ctx, None, rec, None).await?);
     }
-    ops::apply_server(ctx).await?;
+    if let Err(e) = ops::apply_server(ctx).await {
+        if matches!(e, Error::DnsZoneRejected(_)) {
+            // The server's checker refused the configuration with the new
+            // zones in it (`apply_server` put the previous one back): the
+            // creation is refused whole. Left behind, the record and the
+            // file would be part of every later configuration, and every
+            // DNS change of every tenant would be rejected with it.
+            for rec in &written {
+                let zone = rec.domain()?;
+                ops::remove_zone_files(ctx, &zone)?;
+                store.delete(&zone)?;
+                warn!(%zone, tenant = %rec.tenant, "the DNS server rejected the configuration with the new zone; its creation was undone");
+            }
+        }
+        return Err(e);
+    }
     let mut out = Vec::new();
     for mut rec in written {
         rec.state = ZoneState::Ready;

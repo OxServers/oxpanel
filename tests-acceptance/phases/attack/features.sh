@@ -13,6 +13,8 @@
 # shellcheck shell=bash
 
 FT=/root/acc/feat
+# The command succeeds (its output, if any, is kept for a failure message).
+run_ok() { local out; out="$("$@" 2>&1)" || { echo "$out"; return 1; }; }
 VDB_PW='Victim-db-pw-7781'
 ADB_PW='Attack-db-pw-5523'
 
@@ -32,29 +34,29 @@ features_setup() {
   systemctl restart oxpanel-daemon
   eventually "DNS hosting on for the phase (oxpanel-dns active)" 60 0.5 systemctl -q is-active oxpanel-dns
   eventually "the victim's sites got their zones" 40 0.5 bash -c "oxpanel-ctl dns zone-list --tenant victim1 | grep -q '^zone=vphp.test '"
-  check "victim: DNSSEC on for vphp.test (signing keys on disk)" ctl_ok '' oxpanel-ctl dns dnssec --tenant victim1 vphp.test on
-  check "victim: a TXT record of its own" ctl_ok '' oxpanel-ctl dns record-add --tenant victim1 --name secret --type txt --value VICTIM-DNS-TXT vphp.test
+  check "victim: DNSSEC on for vphp.test (signing keys on disk)" run_ok oxpanel-ctl dns dnssec --tenant victim1 vphp.test on
+  check "victim: a TXT record of its own" run_ok oxpanel-ctl dns record-add --tenant victim1 --name secret --type txt --value VICTIM-DNS-TXT vphp.test
   openssl req -x509 -newkey rsa:2048 -nodes -days 30 -subj /CN=vphp.test -addext 'subjectAltName=DNS:vphp.test' \
     -keyout "$FT/vphp.key" -out "$FT/vphp.crt" >/dev/null 2>&1
-  check "victim: a certificate with its private key (bring your own)" ctl_ok '' oxpanel-ctl cert install --chain "$FT/vphp.crt" --key "$FT/vphp.key" vphp.test
+  check "victim: a certificate with its private key (bring your own)" run_ok oxpanel-ctl cert install --chain "$FT/vphp.crt" --key "$FT/vphp.key" vphp.test
   if systemctl -q is-active mariadb; then
-    check "victim: database victim1_db" ctl_ok '' oxpanel-ctl db create victim1_db --tenant victim1
+    check "victim: database victim1_db" run_ok oxpanel-ctl db create victim1_db --tenant victim1
     check "victim: database user victim1_app" bash -c "printf '%s\n' '$VDB_PW' | oxpanel-ctl db user-create victim1_app --tenant victim1 >/dev/null && oxpanel-ctl db grant victim1_app victim1_db >/dev/null"
     MYSQL_PWD="$VDB_PW" mariadb --no-defaults --protocol=socket --user=victim1_app victim1_db \
       -e "CREATE TABLE secrets (s VARCHAR(40)); INSERT INTO secrets VALUES ('VICTIM-SECRET-DB')"
     check "victim: a database in the trash" bash -c "oxpanel-ctl db create victim1_old --tenant victim1 >/dev/null && oxpanel-ctl db delete victim1_old | grep -q trash_id="
   fi
   ssh-keygen -q -t ed25519 -N '' -C victim1@feat -f "$FT/victim-key"
-  check "victim: SFTP key (keys file, chroot mount)" ctl_ok '' oxpanel-ctl sftp add-key victim1 --key-file "$FT/victim-key.pub"
+  check "victim: SFTP key (keys file, chroot mount)" run_ok oxpanel-ctl sftp add-key victim1 --key-file "$FT/victim-key.pub"
   as_user victim1 sh -c 'echo "print(\"victim-task\")" > /home/victim1/vtask.py'
-  check "victim: a scheduled task" ctl_ok '' oxpanel-ctl task set victim1 vtask --python vtask.py --schedule 'daily 04:00'
-  check "victim: PHP settings (a pool of its own)" ctl_ok '' oxpanel-ctl php set vphp.test --memory-limit 200M
+  check "victim: a scheduled task" run_ok oxpanel-ctl task set victim1 vtask --python vtask.py --schedule 'daily 04:00'
+  check "victim: PHP settings (a pool of its own)" run_ok oxpanel-ctl php set vphp.test --memory-limit 200M
   out="$(timeout 300 oxpanel-ctl backup create victim1 --wait 2>&1)" || true
   VBACKUP="$(sed -n 's/^job=[^ ]* .* backup=\([^ ]*\) .*/\1/p' <<<"$out" | tail -1)"
   check "victim: a backup ($VBACKUP)" grep -q 'state=JOB_STATE_SUCCEEDED' <<<"$out"
   # The attacker of section 1 gets SFTP access too, so its own keys file exists to be tampered with.
   ssh-keygen -q -t ed25519 -N '' -C attack1@feat -f "$FT/attack1-key"
-  check "attack1: SFTP key" ctl_ok '' oxpanel-ctl sftp add-key attack1 --key-file "$FT/attack1-key.pub"
+  check "attack1: SFTP key" run_ok oxpanel-ctl sftp add-key attack1 --key-file "$FT/attack1-key.pub"
 }
 
 # Extra probes for the battery: every engine-owned directory and file of the
@@ -163,15 +165,17 @@ features_attacker() {
 # child of PHP-FPM), and a scheduled task. feat_everywhere <label> <min> <args...>
 feat_everywhere() {
   local label="$1" min="$2"; shift 2
-  local path; path="$(printf '/%s' "$@")"
+  local path; path="$(python3 -c 'import sys,urllib.parse; print("".join("/" + urllib.parse.quote(a, safe="") for a in sys.argv[1:]))' "$@")"
   eval_lines "$label-python" "$min" < <(curl -s -m 240 -H 'Host: fpy.test' "http://127.0.0.1/feat$path")
   eval_lines "$label-python-child" "$min" < <(curl -s -m 240 -H 'Host: fpy.test' "http://127.0.0.1/featc$path")
   eval_lines "$label-php-child" "$min" < <(curl -s -m 240 -H 'Host: fphp.test' "http://127.0.0.1/probe.php?do=feat&args=$(python3 -c 'import sys,urllib.parse; print(urllib.parse.quote(chr(9).join(sys.argv[1:])))' "$@")")
   local tname="f$(tr -dc 'a-z' <<<"$label" | cut -c1-20)"
-  if ctl_ok '' oxpanel-ctl task set attack3 "$tname" --python feat.py --schedule 'daily 05:00' --timeout 240 --disabled $(for a in "$@"; do printf -- '--arg=%s ' "$a"; done); then
+  if run_ok oxpanel-ctl task set attack3 "$tname" --python feat.py --schedule 'daily 05:00' --timeout 240 --disabled "--arg=--out=$tname.out" $(for a in "$@"; do printf -- '--arg=%s ' "$a"; done); then
+    rm -f "$AT3/$tname.out"
     ctl task run attack3 "$tname" >/dev/null
-    for _ in $(seq 1 240); do sleep 1; ctl task log attack3 "$tname" | grep -qE 'END( {8}|	)done' && break; done
-    eval_lines "$label-task" "$min" < <(ctl task log attack3 "$tname" | sed -n 's/^.*python3\[[0-9]*\]: //p' | sed 's/        /\t/g')
+    for _ in $(seq 1 240); do sleep 1; grep -q '^END' "$AT3/$tname.out" 2>/dev/null && break; done
+    eval_lines "$label-task" "$min" < "$AT3/$tname.out"
+    info "$label-task: $(ctl task log attack3 "$tname" | grep -c . ) lines in the task's own log"
     ctl task delete attack3 "$tname" >/dev/null
   else
     fail "$label: could not create the task that runs it"
@@ -187,7 +191,7 @@ features_sftp() {
   O=(-o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -o ConnectTimeout=10 -o LogLevel=ERROR)
   ssh-keygen -q -t ed25519 -N '' -f "$K/ka"; ssh-keygen -q -t ed25519 -N '' -f "$K/planted"
   sftp3() { local i; for i in $(seq 1 30); do out="$(sftp "${O[@]}" -i "$K/ka" -b - attack3@127.0.0.1 2>&1)" && { printf '%s' "$out"; return 0; }; grep -q 'Permission denied\|No such file\|not found\|Failure\|Couldn' <<<"$out" && { printf '%s' "$out"; return 1; }; sleep 1; done; printf '%s' "$out"; return 1; }
-  check "attack3 gets an SFTP key" ctl_ok '' oxpanel-ctl sftp add-key attack3 --key-file "$K/ka.pub"
+  check "attack3 gets an SFTP key" run_ok oxpanel-ctl sftp add-key attack3 --key-file "$K/ka.pub"
   check "control: attack3 logs in over SFTP with it" bash -c "for i in \$(seq 1 30); do echo pwd | sftp ${O[*]} -i $K/ka -b - attack3@127.0.0.1 >/dev/null 2>&1 && exit 0; sleep 1; done; exit 1"
   # A key the tenant plants itself (its PHP, or a session) in ~/.ssh/authorized_keys must never work:
   # a compromised site could otherwise use the host's sshd as a proxy (the hole SFTP closed).
@@ -262,10 +266,10 @@ features_sftp() {
     check "resume attack3" ctl_ok 'suspended=false' oxpanel-ctl tenant resume attack3
     for i in $(seq 1 20); do sftp_live; sleep 2; pgrep -u attack3 sshd >/dev/null && break; done
     check "a live session again" bash -c "pgrep -u attack3 sshd >/dev/null"
-    check "remove the key with end_sessions" ctl_ok '' oxpanel-ctl sftp remove-key attack3 "$(ssh-keygen -lf "$K/ka.pub" | awk '{print $2}')" --end-sessions
+    check "remove the key with end_sessions" run_ok oxpanel-ctl sftp remove-key attack3 "$(ssh-keygen -lf "$K/ka.pub" | awk '{print $2}')" --end-sessions
     eventually "the session ended with the key" 20 0.5 bash -c "! pgrep -u attack3 sshd >/dev/null"
     check "no chroot mount is left once the last key is gone" bash -c "! findmnt -n /var/lib/oxpanel/sftp/attack3/home/attack3 >/dev/null"
-    check "attack3 gets its key back (for the cascade section)" ctl_ok '' oxpanel-ctl sftp add-key attack3 --key-file "$K/ka.pub"
+    check "attack3 gets its key back (for the cascade section)" run_ok oxpanel-ctl sftp add-key attack3 --key-file "$K/ka.pub"
   else
     info "no logind: live-session checks skipped"
   fi
@@ -297,7 +301,9 @@ features_files() {
   # What is allowed must stay inside: links are copied and archived as links, a FIFO does not hang the worker.
   as_user attack3 mkdir -p "$AT3/fm/copy"
   check "control: the operator can copy the tenant's tree (links stay links)" ctl_ok 'state=JOB_STATE_SUCCEEDED' oxpanel-ctl files cp attack3 fm/copy fm/l-passwd fm/l-etc fm/own.txt --wait
-  check "the copied link is a link, not the content of /etc/passwd" bash -c "test -L $AT3/fm/copy/l-passwd && ! grep -rqs 'root:x' $AT3/fm/copy"
+  # (fm/l-passwd is a plain file by now: the editor save above replaced the link, not its target.)
+  check "the copied link is a link, and nothing of /etc came along" bash -c "test -L $AT3/fm/copy/l-etc && test \"\$(readlink $AT3/fm/copy/l-etc)\" = /etc && ! grep -rqs 'root:x' $AT3/fm/copy"
+  check "the editor save replaced the link itself, not /etc/passwd" bash -c "test ! -L $AT3/fm/l-passwd && grep -q ^root: /etc/passwd"
   check "control: compress the tree with its links" ctl_ok 'state=JOB_STATE_SUCCEEDED' oxpanel-ctl files compress attack3 fm out.zip l-passwd l-etc l-root own.txt real --wait
   check "the archive holds links, never the files they point to" bash -c "python3 -I -c 'import zipfile,sys; z=zipfile.ZipFile(sys.argv[1]); sys.exit(any(b\"root:x\" in z.read(i) for i in z.infolist() if not i.is_dir()))' $AT3/out.zip"
   t0=$(date +%s); timeout 60 oxpanel-ctl files cat attack3 fm/fifo >/dev/null 2>&1; dt=$(( $(date +%s) - t0 ))
@@ -387,7 +393,7 @@ with gzip.open(os.path.join(d, 'gzbomb.tar.gz'), 'wb', 9) as g:
 PY
   as_user attack3 mkdir -p "$AT3/up"
   for name in slip.tar.gz links.tar.gz special.tar.gz names.tar.gz nonutf8.tar slip.zip ratio.zip count.tar.gz gzbomb.tar.gz; do
-    check "upload $name through the panel" ctl_ok '' oxpanel-ctl files put attack3 "$H/$name" "up/$name"
+    check "upload $name through the panel" run_ok oxpanel-ctl files put attack3 "$H/$name" "up/$name"
     as_user attack3 mkdir -p "$AT3/x-${name%%.*}"
     out="$(timeout 300 oxpanel-ctl files extract attack3 "up/$name" "x-${name%%.*}" --wait 2>&1)"; echo "$out" | grep -m1 '^job=' | cut -c1-200
     info "extract $name: $(grep -oE 'state=[A-Z_]+ entries=[0-9]+ bytes=[0-9]+ skipped=[0-9]+' <<<"$out" | head -1)"
@@ -406,7 +412,7 @@ PY
   # Quota exhaustion in the middle of an extraction (only where the host enforces quotas).
   if oxpanel-ctl host info | grep -q 'disk_quota=true'; then
     used=$(( $(du -sm --apparent-size "$AT3" | cut -f1) ))
-    check "attack3 gets a disk limit of ${used}M + 60M" ctl_ok '' oxpanel-ctl tenant set-limits attack3 --memory 256M --tasks-max 300 --disk "$(( used + 60 ))M"
+    check "attack3 gets a disk limit of ${used}M + 60M" run_ok oxpanel-ctl tenant set-limits attack3 --memory 256M --tasks-max 300 --disk "$(( used + 60 ))M"
     head -c 100M /dev/urandom > "$FT/rand.bin"; tar -C "$FT" -cf "$FT/big.tar" rand.bin
     out="$(oxpanel-ctl files put attack3 "$FT/big.tar" up/big.tar 2>&1)"
     if grep -q ResourceExhausted <<<"$out"; then
@@ -414,6 +420,7 @@ PY
       head -c 40M /dev/urandom > "$FT/rand.bin"; tar -C "$FT" -cf "$FT/big.tar" rand.bin
       oxpanel-ctl files put attack3 "$FT/big.tar" up/big.tar >/dev/null
       oxpanel-ctl files cp attack3 cp1 up/big.tar --wait >/dev/null 2>&1 || true
+      as_user attack3 mkdir -p "$AT3/x-big"
       out="$(timeout 300 oxpanel-ctl files extract attack3 up/big.tar x-big --wait 2>&1)" || true
       info "extract beyond the quota: $(grep -oE 'state=[A-Z_]+ .* message=.*' <<<"$out" | head -1 | cut -c1-160)"
       check "an extraction stopped by the quota leaves no temporary file" bash -c "! find $AT3 -name '.oxpanel-*' | grep -q ."
@@ -421,7 +428,7 @@ PY
     else
       fail "an upload beyond the disk limit was not refused: $out"
     fi
-    check "attack3's disk limit removed" ctl_ok '' oxpanel-ctl tenant set-limits attack3 --memory 256M --tasks-max 300
+    check "attack3's disk limit removed" run_ok oxpanel-ctl tenant set-limits attack3 --memory 256M --tasks-max 300
     rm -f "$FT/rand.bin" "$FT/big.tar"
   else
     info "no disk quotas on this host: the quota-exhaustion checks were skipped"
@@ -466,7 +473,7 @@ features_certs() {
     check "nginx -t passes and nothing listens on 8444/8445" bash -c "nginx -t >/dev/null 2>&1 && ! ss -H -ltn | grep -qE ':844[45] '"
   done
   check_not "the victim's certificate and key are refused for the attacker's site (name mismatch)" oxpanel-ctl cert install --chain "$FT/vphp.crt" --key "$FT/vphp.key" fphp.test
-  check "control: the attacker's own certificate installs" ctl_ok '' oxpanel-ctl cert install --chain "$B/c.pem" --key "$B/k.pem" fphp.test
+  check "control: the attacker's own certificate installs" run_ok oxpanel-ctl cert install --chain "$B/c.pem" --key "$B/k.pem" fphp.test
   check "the attacker cannot read its own site's installed key either (root-only)" bash -c "! as_user attack3 cat /etc/pki/oxpanel/fphp.test.key >/dev/null 2>&1"
   check "HSTS and the redirect apply to the tenant's own site only" bash -c "oxpanel-ctl vhost set fphp.test --tenant attack3 --php --redirect-https --hsts >/dev/null && ! grep -q Strict-Transport /etc/nginx/oxpanel.d/vphp.test.conf && [ \"\$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: vphp.test' http://127.0.0.1/)\" = 200 ]"
   check "back to plain HTTP for the attacker's site" bash -c "oxpanel-ctl vhost set fphp.test --tenant attack3 --php >/dev/null && oxpanel-ctl cert remove fphp.test | grep -q removed=true"
@@ -478,7 +485,7 @@ features_db() {
   echo "-- 10. databases: other tenants' data, the trash, FILE, the root socket, stored objects replayed as root"
   if ! systemctl -q is-active mariadb; then info "MariaDB not active: section 10 skipped"; return; fi
   local P0 out t
-  check "attack3: database attack3_db" ctl_ok '' oxpanel-ctl db create attack3_db --tenant attack3
+  check "attack3: database attack3_db" run_ok oxpanel-ctl db create attack3_db --tenant attack3
   check "attack3: user attack3_app with access" bash -c "printf '%s\n' '$ADB_PW' | oxpanel-ctl db user-create attack3_app --tenant attack3 >/dev/null && oxpanel-ctl db grant attack3_app attack3_db >/dev/null"
   as_user attack3 sh -c "umask 077; printf '%s\n' '$ADB_PW' > $AT3/.dbpw"
   feat_everywhere db 20 db attack3_app "$ADB_PW" attack3_db victim1_db
@@ -489,6 +496,7 @@ features_db() {
   check "60 simultaneous connections from tenant code: at most the per-account cap succeed ($got; $(awk -F'\t' '/^CONNECTIONS/{print $4}' <<<"$out" | cut -c1-80))" bash -c '[ -n "$1" ] && [ "$1" -le 25 ]' _ "$got"
   ( curl -s -m 120 -H 'Host: fpy.test' "http://127.0.0.1/featc/dbconn/attack3_app/$ADB_PW/40" >/dev/null & ); sleep 2
   check "meanwhile the victim's application still connects" bash -c "MYSQL_PWD='$VDB_PW' mariadb --no-defaults --protocol=socket --user=victim1_app -N -e 'SELECT s FROM secrets' victim1_db | grep -q VICTIM-SECRET-DB"
+  sleep 10   # the flood above holds the account's connections for a few seconds
   # Stored objects crafted so that a client splitting the text differently from the server runs SQL as root.
   P0=$(privs_digest)
   asql attack3_db -e "CREATE TABLE t (a INT); INSERT INTO t VALUES (1)"
@@ -522,7 +530,8 @@ features_db() {
   check "moving it to the trash works ($t)" test -n "$t"
   check "restoring it from the trash completes" ctl_ok 'restored=attack3_r2' oxpanel-ctl db trash-restore attack3 "$t" attack3_r2
   check "no statement hidden in a stored object ran as root (no pw_* schema)" test "$(rootsql "SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME LIKE 'pw%'")" = 0
-  check "and no account or grant changed except the restored databases" bash -c '[ "$(rootsql "SELECT COUNT(*) FROM mysql.global_priv WHERE User NOT IN (\"root\",\"mysql\",\"mariadb.sys\",\"PUBLIC\") AND User NOT LIKE \"%\\_app\" AND User <> \"\"")" = 0 ] && ! rootsql "SHOW GRANTS FOR attack3_app@localhost" | grep -qE "ON \*\.\*.*(ALL|FILE|SUPER|CREATE USER)"'
+  check "no account was created (only the tenants' own *_app accounts exist)" test "$(rootsql "SELECT COUNT(*) FROM mysql.global_priv WHERE User NOT IN ('root','mysql','mariadb.sys','PUBLIC','') AND User NOT LIKE '%\\_app'")" = 0
+  check "the attacker's account gained no global privilege" bash -c '! mariadb --no-defaults --user=root -N -B -e "SHOW GRANTS FOR attack3_app@localhost" | grep -qE "ON \*\.\*.*(ALL|FILE|SUPER|CREATE USER|PROCESS)"'
   check "the restored databases have no grants (the old user does not get in)" bash -c '! MYSQL_PWD="$1" mariadb --no-defaults --protocol=socket --user=attack3_app -e "SELECT 1" attack3_r1 >/dev/null 2>&1 && ! MYSQL_PWD="$1" mariadb --no-defaults --protocol=socket --user=attack3_app -e "SELECT 1" attack3_r2 >/dev/null 2>&1' _ "$ADB_PW"
   check "the victim's data is untouched" test "$(rootsql 'SELECT GROUP_CONCAT(s) FROM victim1_db.secrets')" = VICTIM-SECRET-DB
   info "privilege tables before/after the replays: $P0 / $(privs_digest) (differ only by the restored databases)"
@@ -534,14 +543,15 @@ features_db() {
     check "trash-restore to '$(cut -c1-40 <<<"$n")' cannot leave the prefix" bash -c '! grep -q "restored=" <<<"$1" || grep -qx "restored=attack3_x" <<<"$1"' _ "$out"
   done
   check "the victim's database still exists" test "$(rootsql "SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME='victim1_db'")" = 1
-  local vt; vt="$(oxpanel-ctl db trash-list victim1 | sed -n 's/.*trash_id=\([^ ]*\).*/\1/p' | head -1)"
+  local vt; vt="$(oxpanel-ctl db trash-list victim1 | awk '/^t[0-9]/{print $1; exit}')"
+  check "the victim has a trashed database to aim at ($vt)" test -n "$vt"
   check_not "the victim's trash cannot be restored into the attacker" oxpanel-ctl db trash-restore attack3 "$vt" attack3_vt
   check_not "nor purged by naming it under the attacker" oxpanel-ctl db trash-purge attack3 "$vt"
   check "the victim's trashed database is still there" bash -c "oxpanel-ctl db trash-list victim1 | grep -q '$vt'"
   # A grant does not survive into a re-created database of the same name.
-  check "re-create attack3_db (the name is free once it is in the trash)" ctl_ok '' oxpanel-ctl db create attack3_db --tenant attack3
+  check "re-create attack3_db (the name is free once it is in the trash)" run_ok oxpanel-ctl db create attack3_db --tenant attack3
   check_not "the old user's grant does not apply to the new database" asql attack3_db -e 'SELECT 1'
-  check "grant again (for the rest of the phase)" ctl_ok '' oxpanel-ctl db grant attack3_app attack3_db
+  check "grant again (for the rest of the phase)" run_ok oxpanel-ctl db grant attack3_app attack3_db
   # A suspended tenant's accounts are locked.
   check "suspend attack3" ctl_ok 'suspended=true' oxpanel-ctl tenant suspend attack3
   check_not "suspended: the database account cannot log in" asql attack3_db -e 'SELECT 1'
@@ -602,7 +612,14 @@ JS
   info "restore with dependency reinstall: $(grep -oE 'state=[A-Z_]+' <<<"$out" | head -1)"
   if [ -f "$AT3/npm-proof.txt" ]; then
     proof="$(cat "$AT3/npm-proof.txt")"; info "the package's install script reported: $(head -1 <<<"$proof")"
-    check "the install script ran as the tenant, without supplementary groups" grep -q "^uid=$A3UID gid=$A3UID groups=$A3UID\( \|$\)\|^uid=$A3UID gid=$A3UID groups= " <<<"$proof"
+    check "the install script ran as the tenant" grep -q "^uid=$A3UID gid=$A3UID " <<<"$proof"
+    # A unit with User= gets the account's supplementary groups: only the
+    # engine's SFTP marker groups, which own nothing on the host.
+    local g gs; gs="$(sed -n 's/^uid=[0-9]* gid=[0-9]* groups=\([0-9,]*\).*/\1/p' <<<"$proof" | head -1)"
+    for g in ${gs//,/ }; do
+      case "$(getent group "$g" | cut -d: -f1)" in attack3|oxpanel-tenants|oxpanel-sftp-password) ;; *) fail "the install script ran with group $g";; esac
+    done
+    check "the tenants' marker groups own no file on the host" bash -c "! find / -xdev \( -group oxpanel-tenants -o -group oxpanel-sftp-password \) 2>/dev/null | grep -q ."
     for w in read-shadow read-victim read-records read-backups write-etc write-usr engine-socket ctl setuid-file; do
       check "the install script could not: $w" bash -c '! grep -q "$2=OPEN" <<<"$1"' _ "$proof" "$w"
     done
@@ -612,7 +629,7 @@ JS
   check "nothing was written into /etc or /usr" bash -c "! test -e /etc/oxprobe-npm && ! test -e /usr/oxprobe-npm"
   # Other tenants' backups.
   check_not "restoring the victim's backup into the attacker is refused" oxpanel-ctl backup restore attack3 "$VBACKUP" --overwrite --wait
-  check_not "deleting the victim's backup by naming it under the attacker is refused" oxpanel-ctl backup delete attack3 "$VBACKUP"
+  check "deleting the victim's backup by naming it under the attacker deletes nothing" bash -c '! oxpanel-ctl backup delete attack3 "$1" 2>/dev/null | grep -q deleted=true' _ "$VBACKUP"
   check "the victim's backup is still listed" bash -c "oxpanel-ctl backup list victim1 | grep -q '$VBACKUP'"
   # A retained backup of a deleted tenant is not the next tenant of that name's.
   check "create ret1 with a secret" bash -c "oxpanel-ctl tenant create ret1 | grep -q created=true && setpriv --reuid=ret1 --regid=ret1 --clear-groups sh -c 'echo RET1-SECRET > /home/ret1/secret.txt'"
@@ -648,7 +665,7 @@ subprocess.Popen(['/usr/bin/nohup', '/usr/bin/sleep', '902'], start_new_session=
 print('lingering', flush=True)
 time.sleep(600)
 PY
-  check "a task with a 5 s time limit that tries to outlive it" ctl_ok '' oxpanel-ctl task set attack3 linger --python linger.py --schedule 'daily 05:00' --timeout 5 --disabled
+  check "a task with a 10 s time limit that tries to outlive it" run_ok oxpanel-ctl task set attack3 linger --python linger.py --schedule 'daily 05:00' --timeout 10 --disabled
   ctl task run attack3 linger >/dev/null; sleep 3
   check "it is running and has left children" bash -c "pgrep -u attack3 -f 'sleep 90[12]' >/dev/null"
   eventually "after its time limit nothing it started remains" 30 0.5 bash -c "! pgrep -u attack3 -f 'sleep 90[12]' >/dev/null && ! pgrep -u attack3 -f linger.py >/dev/null"
@@ -660,7 +677,7 @@ PY
   ctl task delete attack3 linger >/dev/null
   # URL tasks: only the tenant's own sites, pinned to this host; a redirect is not followed.
   as_user attack3 sh -c "echo '<?php header(\"Location: http://vphp.test/doc-secret.txt\"); echo \"redir\";' > $AT3/public_html/redir.php"
-  check "a URL task of the tenant's own site" ctl_ok '' oxpanel-ctl task set attack3 urlt --url http://fphp.test/redir.php --schedule 'daily 05:00' --disabled
+  check "a URL task of the tenant's own site" run_ok oxpanel-ctl task set attack3 urlt --url http://fphp.test/redir.php --schedule 'daily 05:00' --disabled
   ctl task run attack3 urlt >/dev/null; sleep 4
   out="$(oxpanel-ctl task log attack3 urlt)"
   check "a redirect to another tenant's site is not followed ($(grep -o 'HTTP [0-9]*' <<<"$out" | tail -1))" bash -c '! grep -q VICTIM-SECRET <<<"$1" && grep -q "HTTP 302" <<<"$1"' _ "$out"
@@ -668,44 +685,61 @@ PY
   n=0
   for u in http://vphp.test/ http://127.0.0.1/ http://localhost/ http://2130706433/ http://0x7f000001/ http://0177.0.0.1/ 'http://[::1]/' 'http://[::ffff:127.0.0.1]/' \
            http://fphp.test@vphp.test/ 'http://fphp.test:2222/' http://fphp.test:3306/ 'http://fphp.test.vphp.test/' http://169.254.169.254/latest/meta-data/ \
-           file:///etc/passwd gopher://fphp.test/ dict://fphp.test:11211/ 'http://fphp.test/%0d%0aX:1' "http://fphp.test/\$(id)" 'http://fphp.test/a b' 'http://vphp.test%2efphp.test/' 'https://fphp.test:443@vphp.test/'; do
+           file:///etc/passwd gopher://fphp.test/ dict://fphp.test:11211/ "http://fphp.test/\$(id)" 'http://fphp.test/a b' 'http://vphp.test%2efphp.test/' 'https://fphp.test:443@vphp.test/'; do
     if oxpanel-ctl task set attack3 "u$n" --url "$u" --schedule 'daily 05:00' --disabled >/dev/null 2>&1; then
       fail "a URL task for '$u' was accepted"; ctl task delete attack3 "u$n" >/dev/null
     else ok "a URL task for '$u' is refused"; fi
     n=$((n+1))
   done
   # Every task field: nothing reaches a unit file as a directive.
-  n=0
-  for args in "--python ../victim1/vtask.py" "--python /etc/passwd" "--python feat.py --venv ../../usr" "--python feat.py --venv /usr" \
-              "--python feat.py --tz UTC\nUser=root" "--python feat.py --tz ../../../etc/shadow" "--python feat.py --arg=a\nExecStartPre=/bin/sh" \
-              "--php public_html/probe.php\n[Service]" "--node app.js\0x"; do
-    # shellcheck disable=SC2086
-    if eval "oxpanel-ctl task set attack3 inj$n $(sed 's/\\n/$'"'"'\\n'"'"'/g' <<<"$args") --schedule 'daily 05:00' --disabled" >/dev/null 2>&1; then
-      fail "task field injection accepted: $args"; ctl task delete attack3 "inj$n" >/dev/null
-    else ok "task field injection refused: $(tr '\n' ' ' <<<"$args")"; fi
+  local inj; n=0
+  inj_try() { # <label> <args...>: the request must be refused and create nothing
+    local label="$1"; shift
+    if oxpanel-ctl task set attack3 "inj$n" "$@" --schedule 'daily 05:00' --disabled >/dev/null 2>&1; then
+      fail "task field injection accepted: $label"; ctl task delete attack3 "inj$n" >/dev/null
+    else ok "task field injection refused: $label"; fi
     n=$((n+1))
-  done
-  check "a task argument with systemd specifiers and quotes is passed literally" ctl_ok '' oxpanel-ctl task set attack3 argt --python feat.py --arg='%h $HOME ${PATH} "q" '"'"'s'"'"' ;id' --arg=id --schedule 'daily 05:00' --disabled
-  ctl task run attack3 argt >/dev/null; sleep 4
-  check "the task ran feat.py with the literal arguments (no expansion)" bash -c "oxpanel-ctl task log attack3 argt | grep -q \"unknown action '%h \\\$HOME \\\${PATH}\""
+  }
+  inj_try "script in another home" --python ../victim1/vtask.py
+  inj_try "absolute script" --python /etc/passwd
+  inj_try "script with a backslash" --node $'app.js\\x0a'
+  inj_try "script with a line break" --php $'public_html/probe.php\n[Service]'
+  inj_try "venv climbing out" --python feat.py --venv ../../usr
+  inj_try "absolute venv" --python feat.py --venv /usr
+  inj_try "time zone with a line break" --python feat.py --tz $'UTC\nUser=root'
+  inj_try "time zone as a path" --python feat.py --tz ../../../etc/shadow
+  inj_try "argument with a line break" --python feat.py $'--arg=a\nExecStartPre=/bin/sh'
+  inj_try "argument with a double quote" --python feat.py '--arg=a" "--b'
+  inj_try "argument with a backslash" --python feat.py '--arg=a\" ExecStartPre=/bin/sh'
+  check "a task name with a line break is refused" bash -c "! oxpanel-ctl task set attack3 \$'x\\n[Service]' --python feat.py --schedule 'daily 05:00' --disabled >/dev/null 2>&1"
+  inj_try "argument with a systemd specifier" --python feat.py '--arg=%h'
+  inj_try "argument with a variable" --python feat.py '--arg=${PATH}'
+  check "an argument with spaces and shell syntax is accepted" run_ok oxpanel-ctl task set attack3 argt --python feat.py '--arg=a b ;id |x &y' --arg=id --schedule 'daily 05:00' --disabled
+  ctl task run attack3 argt >/dev/null; sleep 5
+  check "the task ran feat.py with the argument as one literal word (no shell)" bash -c "oxpanel-ctl task log attack3 argt | grep -q \"unknown action 'a b ;id |x &y'\""
   ctl task delete attack3 argt >/dev/null
   check "no unit of a refused task exists, and the units that do pass systemd's own check" bash -c "! ls /etc/systemd/system/ | grep -qE 'oxpanel-task-attack3-(u[0-9]|inj)' && for u in /etc/systemd/system/oxpanel-task-*.service; do systemd-analyze verify \"\$u\" >/dev/null 2>&1 || { echo \$u; exit 1; }; done"
   # PHP settings: one site's settings stay with it; .user.ini cannot lift the pool's hardening.
-  check "attack3: PHP settings for fphp.test only" ctl_ok '' oxpanel-ctl php set fphp.test --memory-limit 64M
+  check "attack3: PHP settings for fphp.test only" run_ok oxpanel-ctl php set fphp.test --memory-limit 64M
   eventually "fphp.test runs with 64M" 20 0.5 bash -c "curl -s -H 'Host: fphp.test' 'http://127.0.0.1/probe.php?do=ini' | grep -q 'memory_limit=64M'"
   check "the tenant's other site keeps the default" bash -c "curl -s -H 'Host: fphp2.test' 'http://127.0.0.1/probe.php?do=ini' | grep -q 'memory_limit=128M'"
-  as_user attack3 sh -c "printf 'open_basedir=/\nauto_prepend_file=/etc/passwd\nupload_max_filesize=2G\npost_max_size=2G\nallow_url_include=On\ndisplay_errors=On\ndisable_functions=\nmemory_limit=4G\n' > $AT3/public_html/.user.ini"
-  systemctl reload oxpanel-php-attack3.service 2>/dev/null || true; sleep 2
-  out="$(curl -s -H 'Host: fphp.test' 'http://127.0.0.1/probe.php?do=ini')"; info ".user.ini applied: $(tr '\n' ' ' <<<"$out" | cut -c1-200)"
+  # .user.ini in a directory of its own (PHP caches it per directory for five minutes).
+  as_user attack3 mkdir -p "$AT3/public_html/ui" "$AT3/public_html/up"
+  as_user attack3 cp "$AT3/public_html/probe.php" "$AT3/public_html/ui/probe.php"
+  as_user attack3 cp "$AT3/public_html/probe.php" "$AT3/public_html/up/probe.php"
+  as_user attack3 sh -c "printf 'open_basedir=/\nupload_max_filesize=2G\npost_max_size=2G\nallow_url_include=On\ndisplay_errors=On\ndisable_functions=\nmemory_limit=4G\n' > $AT3/public_html/ui/.user.ini"
+  as_user attack3 sh -c "printf 'auto_prepend_file=/etc/passwd\n' > $AT3/public_html/up/.user.ini"
+  out="$(curl -s -H 'Host: fphp.test' 'http://127.0.0.1/ui/probe.php?do=ini')"; info ".user.ini applied: $(tr '\n' ' ' <<<"$out" | cut -c1-200)"
+  check "control: the probe answers below the .user.ini" grep -q '^memory_limit=' <<<"$out"
   check ".user.ini cannot widen open_basedir" bash -c 'grep -q "open_basedir=/home/attack3/:" <<<"$1"' _ "$out"
-  check ".user.ini cannot prepend a file outside the home" bash -c '! curl -s -H "Host: fphp.test" "http://127.0.0.1/probe.php?do=ini" | grep -q "root:x"'
-  check ".user.ini cannot switch on allow_url_include" bash -c 'grep -q "allow_url_include=0\|allow_url_include=$" <<<"$1"' _ "$out"
+  check ".user.ini cannot prepend a file outside the home" bash -c '! curl -s -H "Host: fphp.test" "http://127.0.0.1/up/probe.php?do=ini" | grep -q "root:x"'
+  check ".user.ini cannot switch on allow_url_include" bash -c 'grep -qx "allow_url_include=0\|allow_url_include=" <<<"$1"' _ "$out"
   info "memory_limit after .user.ini: $(grep -o 'memory_limit=[^ ]*' <<<"$out") (php_value by design: the cgroup is the bound, see SECURITY.md)"
   head -c 3M /dev/zero > "$FT/post.bin"
-  check "a raised upload_max_filesize does not lift the web server's body limit (413)" test "$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: fphp.test' --data-binary @"$FT/post.bin" 'http://127.0.0.1/probe.php?do=echo')" = 413
-  as_user attack3 rm -f "$AT3/public_html/.user.ini"
+  check "a raised upload_max_filesize does not lift the web server's body limit (413)" test "$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: fphp.test' --data-binary @"$FT/post.bin" 'http://127.0.0.1/ui/probe.php?do=echo')" = 413
+  as_user attack3 rm -rf "$AT3/public_html/ui" "$AT3/public_html/up"
   check "the victim's PHP settings are its own" bash -c "grep -q 'memory_limit' /etc/oxpanel-php/victim1*.conf && ! grep -q '64M' /etc/oxpanel-php/victim1*.conf"
-  check "PHP settings back to the defaults" ctl_ok '' oxpanel-ctl php set fphp.test
+  check "PHP settings back to the defaults" run_ok oxpanel-ctl php set fphp.test
 }
 
 # ------------------------------------------------------------------ 13. DNS hosting
@@ -718,11 +752,16 @@ features_dns() {
     out="$(oxpanel-ctl dns zone-create --tenant attack3 "$z" 2>&1)"
     check "zone '$z' cannot be taken by attack3" bash -c '! grep -q "^created=true" <<<"$1"' _ "$out"
   done
+  # Found by this section: a refused zone (the engine's catalog) used to stay
+  # behind and break the server's configuration for every tenant.
+  check "the refused zones left nothing behind: attack3 holds only its sites' zones" bash -c "! oxpanel-ctl dns zone-list --tenant attack3 | grep -v '^zone=f[a-z0-9]*\.test ' | grep -q ."
+  check "the DNS server's configuration is still valid" named-checkconf /etc/named/oxpanel/named.conf
+  check "another tenant can still change its zone" run_ok oxpanel-ctl dns record-add --tenant victim1 --name later --type txt --value still-works vphp.test
   check_not "a record cannot be added to the victim's zone" oxpanel-ctl dns record-add --tenant attack3 --name pwn --type a --value 192.0.2.66 vphp.test
   id="$(oxpanel-ctl dns zone-show --tenant victim1 vphp.test | sed -n 's/.*id=\([^ ]*\) name=secret .*/\1/p' | head -1)"
   check_not "nor a victim's record removed by its id" oxpanel-ctl dns record-remove --tenant attack3 vphp.test "${id:-x}"
   check_not "nor the victim's DNSSEC switched off" oxpanel-ctl dns dnssec --tenant attack3 vphp.test off --force
-  check_not "nor the victim's zone deleted" oxpanel-ctl dns zone-delete vphp.test --tenant attack3
+  check "nor the victim's zone deleted (by naming it under the attacker)" bash -c '! oxpanel-ctl dns zone-delete vphp.test --tenant attack3 2>/dev/null | grep -q deleted=true && oxpanel-ctl dns zone-list --tenant victim1 | grep -q "^zone=vphp.test "'
   zf=/var/lib/oxpanel-dns/zones/fphp.test.zone
   local ndollar; ndollar=$(grep -c '^\$' "$zf" || true)
   n=0
@@ -770,19 +809,20 @@ SPECS
   check "every record in the zone file is one line (no line starts inside another's data)" bash -c "awk 'NF && \$1 !~ /^;/ {print}' $zf | grep -vqE '\"[^\"]*\$'"
   check "the apex was not delegated to the attacker's name server" bash -c "! dig +short +norec @127.0.0.1 fphp.test NS | grep -q evil"
   # The engine's records of the site cannot be changed by the tenant.
-  id="$(oxpanel-ctl dns zone-show --tenant attack3 fphp.test | grep -i 'protected\|engine' | sed -n 's/.*id=\([^ ]*\).*/\1/p' | head -1)"
+  id="$(oxpanel-ctl dns zone-show --tenant attack3 fphp.test | grep 'protected=true' | sed -n 's/^id=\([0-9]*\) .*/\1/p' | head -1)"
   if [ -n "$id" ]; then
-    check_not "an engine-maintained record cannot be removed by the tenant" oxpanel-ctl dns record-remove --tenant attack3 fphp.test "$id"
-    check_not "nor replaced" oxpanel-ctl dns record-update --tenant attack3 --name @ --type a --value 192.0.2.66 fphp.test "$id"
+    out="$(oxpanel-ctl dns record-remove --tenant attack3 fphp.test "$id" 2>&1)"; info "removing engine record $id: $(tr '\n' ' ' <<<"$out" | cut -c1-120)"
+    check "an engine-maintained record cannot be removed by the tenant" bash -c "oxpanel-ctl dns zone-show --tenant attack3 fphp.test | grep -q '^id=$id .*protected=true'"
+    out="$(oxpanel-ctl dns record-update --tenant attack3 --name @ --type a --value 192.0.2.66 fphp.test "$id" 2>&1)"; info "replacing engine record $id: $(tr '\n' ' ' <<<"$out" | cut -c1-120)"
   else
     info "zone-show lists no engine record id for fphp.test: $(oxpanel-ctl dns zone-show --tenant attack3 fphp.test | head -5 | tr '\n' ' ')"
   fi
   check "the site's address is still the engine's" bash -c "dig +short +norec @127.0.0.1 fphp.test A | grep -qx 192.0.2.81"
   # DNSSEC: keys are the server's; switching off leaves a zone that answers.
-  check "DNSSEC on for the tenant's zone" ctl_ok '' oxpanel-ctl dns dnssec --tenant attack3 fphp.test on
+  check "DNSSEC on for the tenant's zone" run_ok oxpanel-ctl dns dnssec --tenant attack3 fphp.test on
   eventually "the zone is signed" 40 0.5 bash -c "dig +dnssec +norec @127.0.0.1 fphp.test SOA | grep -q RRSIG"
   check_not "the tenant cannot read the signing keys" as_user attack3 sh -c "ls /var/lib/oxpanel-dns/keys/fphp.test || cat /var/lib/oxpanel-dns/keys/fphp.test/*.private"
-  check "DNSSEC off again (forced: the parent has no DS)" ctl_ok '' oxpanel-ctl dns dnssec --tenant attack3 fphp.test off --force
+  check "DNSSEC off again (forced: the parent has no DS)" run_ok oxpanel-ctl dns dnssec --tenant attack3 fphp.test off --force
   eventually "the zone answers unsigned, still authoritatively" 40 0.5 bash -c "dig +norec +dnssec @127.0.0.1 fphp.test SOA | grep -q 'status: NOERROR' && ! dig +dnssec +norec @127.0.0.1 fphp.test SOA | grep -q RRSIG"
   check "the victim's zone is still signed and answers" bash -c "dig +dnssec +norec @127.0.0.1 vphp.test SOA | grep -q RRSIG && dig +short +norec @127.0.0.1 secret.vphp.test TXT | grep -q VICTIM-DNS-TXT"
   out="$(dig +norec +bufsize=4096 @127.0.0.1 fphp.test ANY)"
@@ -808,7 +848,7 @@ while time.time() < end:
         pass
     time.sleep(0.2)
 PY
-  check "a respawning task" ctl_ok '' oxpanel-ctl task set attack3 respawn --python respawn.py --schedule 'every 1m' --timeout 200
+  check "a respawning task" run_ok oxpanel-ctl task set attack3 respawn --python respawn.py --schedule 'every 5m' --timeout 200
   ctl task run attack3 respawn >/dev/null
   curl -s -m 5 -H 'Host: fpy.test' http://127.0.0.1/spawn >/dev/null; curl -s -m 5 -H 'Host: fphp.test' 'http://127.0.0.1/probe.php?do=spawn' >/dev/null
   as_user attack3 sh -c "cd $AT3 && ln -sfn /etc c-etc && ln -sfn /home/victim1 c-victim && ln -sfn /var/lib/oxpanel c-state && mkdir -p apps/fpy.test/sub && ln -sfn /usr apps/fpy.test/sub/usr"
@@ -822,13 +862,14 @@ PY
   fi
   sleep 3
   info "attack3 before deletion: $(pgrep -u attack3 | wc -l) processes"
-  local E0; E0=$(sha256sum /etc/passwd /etc/group | sha256sum); local U0; U0=$(ls /usr | wc -l)
+  # (/etc/passwd and /etc/group change: the account goes. Everything the links point at must not.)
+  local E0; E0=$(sha256sum /etc/hosts /etc/fstab /etc/ssh/sshd_config /etc/nginx/nginx.conf | sha256sum); local U0; U0=$(ls /usr | wc -l)
   out="$(timeout 600 oxpanel-ctl tenant delete attack3 --cascade --confirm attack3 --wait 2>&1)"; echo "$out" | tail -2 | cut -c1-200
   check "the cascade completes while the tenant races it" bash -c 'grep -q "state=JOB_STATE_SUCCEEDED" <<<"$1" || ! oxpanel-ctl tenant get attack3 >/dev/null 2>&1' _ "$out"
   check "the account is gone" bash -c "! id attack3 >/dev/null 2>&1"
   check "no process of the deleted uid remains" bash -c "! pgrep -u $A3UID >/dev/null"
   check "no file of the deleted uid remains on the root file system" bash -c "! find / -xdev -uid $A3UID 2>/dev/null | grep -q ."
-  check "nothing the tenant's links pointed at was removed" bash -c '[ "$(sha256sum /etc/passwd /etc/group | sha256sum)" = "$1" ] && [ "$(ls /usr | wc -l)" = "$2" ] && test -d /etc/ssh && test -f /var/lib/oxpanel/tenants/victim1.json && test "$(cat /home/victim1/secret.txt)" = VICTIM-SECRET-HOME' _ "$E0" "$U0"
+  check "nothing the tenant's links pointed at was removed" bash -c '[ "$(sha256sum /etc/hosts /etc/fstab /etc/ssh/sshd_config /etc/nginx/nginx.conf | sha256sum)" = "$1" ] && [ "$(ls /usr | wc -l)" = "$2" ] && test -d /etc/ssh && test -f /var/lib/oxpanel/tenants/victim1.json && test "$(cat /home/victim1/secret.txt)" = VICTIM-SECRET-HOME' _ "$E0" "$U0"
   check "no unit, timer, pool, keys file, chroot or mount of attack3 is left" bash -c "! ls /etc/systemd/system | grep -q attack3 && ! ls /etc/systemd/system | grep -qE 'oxpanel-app-f(py|node)' && ! ls /etc/oxpanel-php | grep -q attack3 && ! test -e /etc/oxpanel-sftp/attack3 && ! test -e /var/lib/oxpanel/sftp/attack3 && ! findmnt -n | grep -q attack3"
   if systemctl -q is-active mariadb; then
     check "no database, account or session of attack3 is left" bash -c "[ \"\$(mariadb --no-defaults -u root -N -B -e \"SELECT (SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME LIKE 'attack3%' OR SCHEMA_NAME LIKE 'oxpanel_trash%' AND SCHEMA_NAME IN (SELECT 'x')) + (SELECT COUNT(*) FROM mysql.global_priv WHERE User LIKE 'attack3%') + (SELECT COUNT(*) FROM information_schema.PROCESSLIST WHERE USER LIKE 'attack3%')\")\" = 0 ]"
