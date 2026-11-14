@@ -301,19 +301,21 @@ def drive_files(cust, sites, alice_uid):
     check(r.status == 200 and r.body.get("content") == "<h1>fm-note-1</h1>\n" and r.body.get("editable") is True
           and r.body.get("binary") is False, "file manager: the editor reads it back", repr(r))
     opened = r.body or {}
-    # The change differs in size too: the panel's stale-save check compares the
-    # size and the modification time, which is in whole seconds, and the stale
-    # save below comes within the same second.
-    r = cust.put(f"{base}/content", {"path": page, "content": "<h1>fm-note-2, longer</h1>\n", "overwrite": True,
-                                    "expected_modified": opened.get("modified"), "expected_size": opened.get("size_bytes")})
-    check(r.status in (200, 201), "file manager: the editor saves a change over the version it opened", repr(r))
-    r = cust.put(f"{base}/content", {"path": page, "content": "<h1>stale</h1>\n", "overwrite": True,
-                                    "expected_modified": opened.get("modified"), "expected_size": opened.get("size_bytes")})
-    check(r.status == 409 and r.code == "file_changed", "a save over a file that changed since it was opened is refused"
-          " (409 file_changed)", repr(r))
+    check(len(opened.get("version") or "") == 64, "file manager: the editor gets the content's version (SHA-256)",
+          repr(r))
+    # The change has the same size and comes within the same second as the
+    # stale save below: only the content's version tells them apart.
+    r = cust.put(f"{base}/content", {"path": page, "content": "<h1>fm-note-2</h1>\n", "overwrite": True,
+                                    "expected_version": opened.get("version")})
+    check(r.status in (200, 201) and len(r.body.get("version") or "") == 64,
+          "file manager: the editor saves a change over the version it opened", repr(r))
+    r = cust.put(f"{base}/content", {"path": page, "content": "<h1>stale!</h1>\n", "overwrite": True,
+                                    "expected_version": opened.get("version")})
+    check(r.status == 409 and r.code == "file_changed", "a save over a file that changed since it was opened is refused,"
+          " even at the same size within the same second (409 file_changed)", repr(r))
     r = cust.put(f"{base}/access", {"path": page, "access": "web_readable"})
     check(r.status == 200, "file manager: the page is made readable by the web server", repr(r))
-    good, code, body = wait_site(sites["static"], "200", "<h1>fm-note-2, longer</h1>", "/fm-note.html")
+    good, code, body = wait_site(sites["static"], "200", "<h1>fm-note-2</h1>", "/fm-note.html")
     check(good, "the edited page is served by Nginx", f"{code} {body[:200]}")
     r = cust.get(f"{base}/download?path={page}")
     check(r.status == 200 and r.headers.get("content-type", "").startswith("application/octet-stream")
@@ -756,7 +758,10 @@ echo "php-ok ", PHP_VERSION, " uid=", getmyuid(), " euid=", function_exists('pos
     p = sftp(key, "alice", "pwd\n", tries=3)
     check(p.returncode != 0, "SFTP is cut while suspended", p.stdout + p.stderr)
     r = cust.put(f"/api/v1/sites/{sites['static']}", {"document_root": "public_html", "aliases": ["alice.test"]})
-    info(f"customer changes a site of its suspended account: {r!r}"[:300])
+    check(r.status == 409 and r.code == "account_suspended",
+          "the customer of a suspended account is refused a site change (409 account_suspended)", repr(r))
+    r = reseller.put(f"/api/v1/sites/{sites['static']}", {"document_root": "public_html", "aliases": ["alice.test"]})
+    check(r.status == 200, "its reseller may still change the site", repr(r))
     good, code, _ = wait_site(sites["static"], "503", tries=6)
     check(good, "the changed site of a suspended account still answers 503", code)
     r = reseller.post("/api/v1/accounts/alice/resume")
