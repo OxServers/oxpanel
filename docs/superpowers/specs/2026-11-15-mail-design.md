@@ -265,3 +265,47 @@ web interface; DKIM rotation with a waiting period for external DNS (the
 new key is used at once; the response lists the record to publish);
 deleting a mail domain record (mode `off`, or the account's deletion);
 recreating deleted mailboxes from a backup.
+
+## Deviations from the contract (for the console)
+
+The proto follows the console's assumed block (names, field numbers)
+except:
+
+- `DeleteMailboxResponse` has only `deleted`; there is no `job` field and no
+  `JOB_KIND_DELETE_MAILBOX`: the mailbox leaves the servers at once and its
+  mail is removed in the background (resumed at start-up).
+- `MailWarningKind` adds `MAIL_WARNING_KIND_SERVICE_NOT_RUNNING = 4`.
+  `GetMailHost` produces `NO_CERTIFICATE` and `SERVICE_NOT_RUNNING`; the
+  reverse-DNS and port-25 checks are not run by `GetMailHost` (the reverse
+  name is in `CheckDeliverability`; outbound port 25 is not probed).
+- `Mailbox.last_login` is never set.
+- `MailDomain.dkim` is unset unless the mode is `LOCAL`; `published` is
+  `YES` when the zone is hosted here, otherwise `UNKNOWN` (never `NO`).
+- `MailDnsRecord`: `type` is `MX`, `TXT`, `CNAME` or `SRV`; for SRV `value`
+  is `"<weight> <port> <target>"` and `priority` the priority.
+- `SetMailDomainRequest.catch_all`: a local part or an address of the
+  domain, and it must be a mailbox of the domain; `external_mx` only (and
+  required, 1..=10) in `EXTERNAL`.
+- `PutMailboxRequest.quota_bytes` 0 means "none of its own", which under an
+  account maximum is that maximum. A new mailbox needs a password (`invalid
+  password` otherwise).
+- Error codes (message prefix `code: …`): as contracted, plus
+  `mail_domain_not_found` (NOT_FOUND), `mail_domain_not_owned`
+  (FAILED_PRECONDITION), `mailbox_not_found`, `forwarder_not_found`,
+  `queued_mail_not_found` (NOT_FOUND). gRPC statuses: `mail_unavailable`,
+  `mail_domain_not_local` FAILED_PRECONDITION; `mailbox_exists`,
+  `address_in_use` ALREADY_EXISTS; `mailbox_limit_reached`
+  RESOURCE_EXHAUSTED; `mailbox_quota_above_limit`, `forward_loop`,
+  `too_many_destinations`, `weak_password` INVALID_ARGUMENT.
+  `mailbox_exists` occurs only while a mailbox of that address is still
+  being removed (`PutMailbox` is create-or-update). Field validation errors
+  keep the engine's usual `invalid <field>: …` (INVALID_ARGUMENT). Changes
+  to a suspended account's email: `tenant '<name>' is suspended`
+  (FAILED_PRECONDITION). Deleting an account that still has mailboxes or
+  forwarders: `tenant '<name>' still has mailboxes or forwarders; …`
+  (FAILED_PRECONDITION).
+- `GetMailQueueRequest.page_size` 0 is 100, at most 1000.
+- Scopes: `GetMailHost`, `GetMailQueue`, `CheckDeliverability`, every
+  `Get*`/`List*` and `GetMailUsage`/`GetMailLimits` need `read`;
+  `DeleteQueuedMail`, `FlushMailQueue`, `SetMailLimits` need `tenant`; the
+  other changes `vhost`.
