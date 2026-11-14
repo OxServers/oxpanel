@@ -2652,7 +2652,8 @@ if [ -x /usr/sbin/postfix ] && [ -x /usr/sbin/dovecot ] && [ -x /usr/bin/rspamd 
   oxpanel-ctl mail mailbox-delete link@mx1.oxtest --tenant mailx >/dev/null
 
   echo "-- reconcile"
-  check "no mail drift" bash -c '! oxpanel-ctl host reconcile | grep -q MAIL'
+  # (A removed mailbox is drift until its mail is deleted, in the background.)
+  check "no mail drift" eventually 60 bash -c '! oxpanel-ctl host reconcile | grep -q MAIL'
   echo '# edited' >> /etc/postfix/oxpanel/aliases
   check "an edited map is drift" grep -q 'MAIL_CONFIG_DRIFT.*aliases' <(oxpanel-ctl host reconcile || true)
   systemctl restart oxpanel-daemon
@@ -2739,7 +2740,10 @@ if [ -x /usr/sbin/postfix ] && [ -x /usr/sbin/dovecot ] && [ -x /usr/bin/rspamd 
   timeout 300 oxpanel-ctl tenant delete maily --cascade --confirm maily --wait >/dev/null 2>&1 || true
   check "no mail drift at the end" eventually 30 bash -c '! oxpanel-ctl host reconcile | grep -q MAIL'
 
-  # Back as it was.
+  # Back as it was (the zones DNS hosting gave the other tenants' sites go too).
+  if [ "$dns_for_mail" = 1 ]; then
+    oxpanel-ctl dns zone-list | sed -n 's/^zone=\([^ ]*\) tenant=\([^ ]*\) .*/\1 \2/p' | while read -r z t; do oxpanel-ctl dns zone-delete "$z" --tenant "$t" >/dev/null 2>&1 || true; done
+  fi
   cp -p "$ME/daemon.env.bak" /etc/oxpanel/daemon.env
   if [ "$dns_for_mail" = 1 ]; then systemctl disable --now oxpanel-dns >/dev/null 2>&1 || true; fi
   if [ "$mail_was_on" = 0 ]; then systemctl disable --now oxpanel-mail-policy oxpanel-webmail >/dev/null 2>&1 || true; fi
