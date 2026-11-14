@@ -47,6 +47,12 @@ struct Inner {
     acme_lifetime: Option<u64>,
     /// Failures the tests switch on.
     faults: FakeFaults,
+    /// `systemctl show` reports only the transient units `systemd-run`
+    /// started as having run; any other is "not-found", as on a real host
+    /// (off by default: most tests record jobs by hand).
+    track_units: bool,
+    /// Transient units started with `systemd-run --unit=…`.
+    started_units: std::collections::BTreeSet<String>,
     /// User quotas are enforced on the (one) fake file system.
     quota_enforced: bool,
     /// Per-uid quota state of the fake file system.
@@ -169,6 +175,22 @@ impl FakeSystem {
     pub fn dns_follow(&self, zones_dir: &Path) {
         if let Ok(mut i) = self.inner.lock() {
             i.dns.zones_dir = Some(zones_dir.to_owned());
+        }
+    }
+
+    /// DNS: the fake server also follows the zone statements in `zones_conf`
+    /// (see `FakeDns::zones_conf`).
+    pub fn dns_follow_conf(&self, zones_conf: &Path) {
+        if let Ok(mut i) = self.inner.lock() {
+            i.dns.zones_conf = Some(zones_conf.to_owned());
+        }
+    }
+
+    /// Report job units that `systemd-run` never started as "not-found"
+    /// (what systemd says about them), instead of as finished.
+    pub fn set_track_units(&self, on: bool) {
+        if let Ok(mut i) = self.inner.lock() {
+            i.track_units = on;
         }
     }
 
@@ -604,6 +626,21 @@ fn limit_value(command: &str, key: &str) -> Option<u64> {
 /// The commands of the feature modules (SFTP, HTTPS, quotas, databases,
 /// backup jobs). Order matters: the SFTP session check is a `systemctl show
 /// --property=ActiveState` too, and must not be answered as a job unit.
+/// Remember the transient unit a `systemd-run --unit=…` starts.
+fn note_started_unit(i: &mut Inner, spec: &CommandSpec) {
+    if spec.program != bin::SYSTEMD_RUN {
+        return;
+    }
+    if let Some(unit) = spec
+        .args
+        .iter()
+        .find_map(|a| a.to_str()?.strip_prefix("--unit=").map(str::to_owned))
+    {
+        i.started_units
+            .insert(unit.trim_end_matches(".service").to_owned());
+    }
+}
+
 fn fake_feature_command(i: &mut Inner, spec: &CommandSpec) -> Option<CommandOutput> {
     super::fake_dns::command(&mut i.dns, spec)
         .or_else(|| fake_ssh_and_accounts(i, spec))
@@ -793,6 +830,21 @@ fn emulate_job(i: &mut Inner, spec: &CommandSpec) -> Option<CommandOutput> {
             }
             Some(output(program, 0, "", ""))
         }
+        bin::SYSTEMCTL
+            if has_flag(args, "--property=ActiveState")
+                && i.track_units
+                && !args
+                    .last()
+                    .and_then(|u| u.to_str())
+                    .is_some_and(|u| i.started_units.contains(u.trim_end_matches(".service"))) =>
+        {
+            Some(output(
+                program,
+                0,
+                "LoadState=not-found\nActiveState=inactive\nSubState=dead\nResult=success\nExecMainStatus=0\n",
+                "",
+            ))
+        }
         bin::SYSTEMCTL if has_flag(args, "--property=ActiveState") => Some(output(
             program,
             0,
@@ -826,6 +878,7 @@ impl System for FakeSystem {
         {
             return Ok(output(spec.program, code, "", &stderr));
         }
+        note_started_unit(&mut i, &spec);
         if let Some(out) = fake_feature_command(&mut i, &spec) {
             return Ok(out);
         }

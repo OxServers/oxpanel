@@ -81,6 +81,17 @@ class Handler(BaseHTTPRequestHandler):
         u = self.path
         if u.startswith('/probe'):
             return self.reply(battery())
+        if u.startswith('/feat/'):      # feature attacks in this process (the language API)
+            import importlib, urllib.parse
+            sys.path.insert(0, '/home/ATTACKER/'.rstrip('/'))
+            import feat
+            importlib.reload(feat)
+            return self.reply(feat.main([urllib.parse.unquote(a) for a in u[len('/feat/'):].split('/')]))
+        if u.startswith('/featc/'):     # the same as a child process
+            import urllib.parse
+            args = [urllib.parse.unquote(a) for a in u[len('/featc/'):].split('/')]
+            p = subprocess.run(['/usr/bin/python3', '/home/ATTACKER/feat.py'] + args, capture_output=True, timeout=200)
+            return self.reply(p.stdout.decode('utf-8', 'replace'))
         if u.startswith('/echo'):
             return self.reply(repr((requests, u, dict(self.headers))))
         if u.startswith('/count'):

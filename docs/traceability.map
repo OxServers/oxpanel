@@ -419,6 +419,7 @@
   sh tests-integration/run-inside.sh not even by its absolute path one level up
   sh tests-integration/run-inside.sh mount unit is active and enabled
   sh tests-acceptance/phases/60-reboot-post.sh SFTP chroot mount came back by itself
+  sh tests-acceptance/phases/attack/features.sh the chroot shows only /home
 [SFTP access] Files just work
   sh tests-integration/run-inside.sh uploaded file belongs to the tenant
   sh tests-integration/run-inside.sh uploaded file inherits the web server's ACL
@@ -464,6 +465,7 @@
   sh tests-integration/run-inside.sh no login while suspended
   sh tests-integration/run-inside.sh login works again after resume
   sh tests-integration/run-inside.sh deletion removed keys file, mount, unit and chroot
+  it crash_safety_features sftp_certificates_and_quotas_survive_interruption_at_every_command
 [SFTP access] Reconciliation
   unit host reports_sftp_drift_and_orphans
   unit host reports_password_drift_both_ways
@@ -509,6 +511,7 @@
   sh tests-integration/run-inside.sh user cannot read mysql.*
   sh tests-integration/run-inside.sh user cannot reach another tenant's database
   sh tests-integration/run-inside.sh user cannot read files
+  sh tests-acceptance/phases/attack/features.sh the attacker's account gained no global privilege
 [Databases (MariaDB)] No SQL injection, no secret leaks
   unit db/mariadb statements_quote_identifiers_and_escape_grant_wildcards
   unit db/mariadb password_hash_is_what_mariadb_computes
@@ -551,6 +554,7 @@
   sh tests-integration/run-inside.sh a repeated request returns the running job
   sh tests-integration/run-inside.sh the worker outlives the daemon
   sh tests-integration/run-inside.sh the restarted daemon finishes the backup
+  it crash_safety_features jobs_survive_interruption_at_every_command
 [Backups and restores] Contents
   unit backup backups_include_each_database_as_a_dump_and_its_objects
   unit backup a_finished_backup_is_sealed_with_checksums_and_a_manifest
@@ -700,6 +704,8 @@
   sh tests-integration/run-inside.sh nobody can create a zone for a public suffix
   sh tests-integration/run-inside.sh a site of tenant B inside tenant A's zone gets no records
   sh tests-integration/run-inside.sh reset to defaults removes the tenant's records
+  unit dns/tests the_catalog_and_special_use_domains_cannot_become_zones
+  sh tests-acceptance/phases/attack/features.sh the refused zones left nothing behind
 [DNS hosting] Records
   unit dns/rr every_type_renders_one_exact_line
   unit dns/rr names_cannot_escape_the_zone_or_carry_syntax
@@ -730,6 +736,8 @@
   sh tests-integration/run-inside.sh a zone the server's checker rejects is refused with its reason
   sh tests-integration/run-inside.sh and never activated (file and served serial unchanged)
   sh tests-integration/run-inside.sh reloads exactly the changed zone
+  unit dns/tests a_zone_the_configuration_checker_rejects_leaves_nothing
+  it crash_safety_features tasks_php_settings_schedules_and_dns_survive_interruption_at_every_command
 [DNS hosting] Serials
   unit dns/zone serials_only_ever_increase
   unit dns/tests serials_increase_and_identical_requests_change_nothing
@@ -743,6 +751,7 @@
   sh tests-integration/run-inside.sh switching DNSSEC off is refused while the parent publishes the DS
   sh tests-integration/run-inside.sh the secondary serves the signed zone
   sh tests-integration/run-inside.sh a tenant cannot read the signing keys
+  it crash_safety_features tasks_php_settings_schedules_and_dns_survive_interruption_at_every_command
 [DNS hosting] Outside checks
   unit dns/tests the_check_reports_delegation_in_plain_words
   unit dns/wire soa_ns_and_ds_answers_are_read

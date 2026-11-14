@@ -23,6 +23,24 @@ pub(crate) struct FakeDns {
     pub secondaries_lag: bool,
     /// Answer lines (after the index) the resolver gives, per (name, type).
     pub resolver: BTreeMap<(String, String), String>,
+    /// The server's zone statements (`zones.conf`), when a test lets the
+    /// fake follow them: a `reconfig` then serves exactly the configured
+    /// zones and reloads a zone whose statement changed (DNSSEC on or off),
+    /// as BIND does.
+    pub zones_conf: Option<PathBuf>,
+    /// The statements as of the last load.
+    pub statements: BTreeMap<String, String>,
+}
+
+/// `zone "<name>" { … };` statements of a `zones.conf`, by zone name.
+fn zone_statements(text: &str) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    for part in text.split("zone \"").skip(1) {
+        if let Some((name, rest)) = part.split_once('"') {
+            out.insert(name.to_owned(), rest.to_owned());
+        }
+    }
+    out
 }
 
 fn out(program: &'static str, code: i32, stdout: &str) -> CommandOutput {
@@ -57,16 +75,27 @@ impl FakeDns {
         let Some(dir) = self.zones_dir.clone() else {
             return;
         };
+        let statements = self
+            .zones_conf
+            .as_ref()
+            .map(|p| zone_statements(&std::fs::read_to_string(p).unwrap_or_default()));
         let mut served = BTreeMap::new();
         if let Ok(rd) = std::fs::read_dir(&dir) {
             for e in rd.flatten() {
                 let name = e.file_name().to_string_lossy().into_owned();
                 if let Some(zone) = name.strip_suffix(".zone") {
-                    let serial = self
-                        .served
-                        .get(zone)
-                        .copied()
-                        .or_else(|| file_serial(&e.path()));
+                    let changed = match &statements {
+                        // Not configured: not served.
+                        Some(st) if !st.contains_key(zone) => continue,
+                        Some(st) => self.statements.get(zone) != st.get(zone),
+                        None => false,
+                    };
+                    let kept = if changed {
+                        None
+                    } else {
+                        self.served.get(zone).copied()
+                    };
+                    let serial = kept.or_else(|| file_serial(&e.path()));
                     if let Some(s) = serial {
                         served.insert(zone.to_owned(), s);
                     }
@@ -74,6 +103,9 @@ impl FakeDns {
             }
         }
         self.served = served;
+        if let Some(st) = statements {
+            self.statements = st;
+        }
     }
 
     fn reload(&mut self, zone: &str) {

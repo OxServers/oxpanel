@@ -373,6 +373,13 @@ is-active oxpanel-daemon`, `journalctl -u oxpanel-daemon -p err --since '5 min a
     do a few by hand): as `acme`, `ls /home/foo-bar`, `cat /etc/shadow`,
     `ls /var/lib/oxpanel`, `ln -s /etc /home/acme/evil; ctl vhost set evil.test --tenant acme --root evil`
     (the last as root: refused). **Expect:** every attempt refused.
+    Phase 80 also attacks every newer feature from tenant code (sections
+    7-15: SFTP, the file manager, certificates, databases, backups,
+    scheduled tasks and PHP settings, DNS, cascade deletion, every local
+    listener); by hand, try at least: `ssh -N -L 9000:127.0.0.1:80 acme@host`
+    with the tenant's key (no forward), a zone named
+    `catalog.oxpanel.invalid` (refused, and DNS changes keep working),
+    `dig @127.0.0.1 <another tenant's zone> AXFR` as the tenant (refused).
 11. **Memory and fork limits.** `ctl tenant set-limits acme --memory 64M --tasks-max 20`, then
     as the tenant (through the Node app, add `/hog` that allocates) or
     `systemd-run --slice=oxpanel-tenant-acme.slice --uid=acme -p MemoryMax=… tail /dev/zero`:
