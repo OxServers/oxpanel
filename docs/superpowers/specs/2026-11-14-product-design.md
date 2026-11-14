@@ -79,8 +79,11 @@ engine's records, reconcile and Automatic HTTPS for no gain.
 
 **Request limits.** Nginx's `client_max_body_size` is 4 MiB, above every limit the
 panel enforces itself (64 KiB default, 1 MiB maximum by configuration, file-manager
-chunks of 192 KiB of data in base64), so the panel answers with its own error codes;
-`proxy_request_buffering off`; `proxy_read_timeout 360 s` for dependency
+chunks of at most 192 KiB of raw bytes), so the panel answers with its own error codes;
+request bodies are read whole before they reach the panel (`proxy_request_buffering on`:
+passed through as they arrive, a body the panel refuses before reading it ended as a 502
+instead of the panel's own answer), file-manager downloads are passed on unbuffered;
+`proxy_read_timeout 360 s` for dependency
 installation. The browser's own `Host` (port included) is passed, because the panel
 compares `Origin` with `Host`.
 

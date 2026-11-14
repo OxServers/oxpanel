@@ -34,6 +34,7 @@ check "database directory is panelapi 0700, the file 0600" bash -c 'test "$(stat
 check "the proxy secret: secret.env root:panelapi 0640, the Nginx include root 0600" bash -c 'test "$(stat -c "%U:%G %a" /etc/oxpanel-panel/secret.env)" = "root:panelapi 640" && test "$(stat -c "%U %a" /etc/nginx/oxpanel-panel-proxy.inc)" = "root 600"'
 check "the TLS key is root 0600 and cert_t" bash -c 'test "$(stat -c "%U %a" /etc/pki/oxpanel-panel/panel.key)" = "root 600" && ls -Z /etc/pki/oxpanel-panel/panel.key | grep -q ":cert_t:"'
 check "the panel's server block is outside the engine's directory" bash -c 'test -f /etc/nginx/conf.d/00-oxpanel-panel.conf && ! ls /etc/nginx/oxpanel.d | grep -q panel'
+check "Nginx reads request bodies whole before the panel, and streams file-manager downloads" bash -c 'nginx -T 2>/dev/null | grep -q "^[[:space:]]*proxy_request_buffering on;" && nginx -T 2>/dev/null | grep -A1 "files/download" | grep -q "proxy_buffering off;"'
 check "Nginx reads the panel's block before OxPanel's own" bash -c 'nginx -T 2>/dev/null | grep "^# configuration file /etc/nginx/conf.d/" | head -2 | tail -1 | grep -q 00-oxpanel.conf && nginx -T 2>/dev/null | grep "^# configuration file /etc/nginx/conf.d/" | head -1 | grep -q 00-oxpanel-panel.conf'
 check "firewalld opened the panel's port" bash -c "! systemctl -q is-active firewalld || firewall-cmd --query-port=${PORT}/tcp"
 check "engine reconcile is clean with the panel installed" bash -c 'oxpanel-ctl host reconcile | grep -qx "drifts=0"'

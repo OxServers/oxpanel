@@ -12,6 +12,7 @@ Output: `ok   - …`, `FAIL: …`, `info - …` lines (the rig counts them).
 Usage: drive.py PANEL_URL ADMIN_USER ADMIN_TEMP_PASSWORD
 """
 import base64
+import glob
 import hashlib
 import hmac
 import http.client
@@ -71,9 +72,11 @@ def totp(secret_b32, at=None):
 
 
 class Resp:
-    def __init__(self, status, headers, raw):
+    def __init__(self, status, headers, data):
         self.status = status
         self.headers = headers
+        self.data = data  # the bytes as received (file-manager downloads)
+        raw = data.decode("utf-8", "replace")
         self.raw = raw
         try:
             self.body = json.loads(raw) if raw else None
@@ -106,7 +109,7 @@ class Browser:
         self.ctx.verify_mode = ssl.CERT_NONE  # the panel's certificate is self-signed at install
         self.set_cookie_headers = []
 
-    def request(self, method, path, body=None, headers=None, csrf=True, origin=True):
+    def request(self, method, path, body=None, headers=None, csrf=True, origin=True, raw=None):
         h = {"Host": self.netloc, "Accept": "application/json", "User-Agent": f"oxpanel-acceptance/{self.name}"}
         if self.cookie:
             h["Cookie"] = self.cookie
@@ -114,6 +117,9 @@ class Browser:
         if body is not None:
             data = json.dumps(body).encode()
             h["Content-Type"] = "application/json"
+        elif raw is not None:
+            data = raw  # a file-manager upload chunk: raw bytes
+            h["Content-Type"] = "application/octet-stream"
         if method not in ("GET", "HEAD"):
             if origin:
                 h["Origin"] = self.origin
@@ -125,7 +131,7 @@ class Browser:
         try:
             c.request(method, path, body=data, headers=h)
             r = c.getresponse()
-            raw = r.read().decode("utf-8", "replace")
+            got = r.read()
             hdrs = r.getheaders()
         finally:
             c.close()
@@ -136,7 +142,7 @@ class Browser:
                 val = rest.split(";", 1)[0]
                 if name == "__Host-oxpanel_session":
                     self.cookie = None if val == "" or "Max-Age=0" in v else f"{name}={val}"
-        resp = Resp(r.status, dict((k.lower(), v) for k, v in hdrs), raw)
+        resp = Resp(r.status, dict((k.lower(), v) for k, v in hdrs), got)
         if isinstance(resp.body, dict) and resp.body.get("csrf_token"):
             self.csrf = resp.body["csrf_token"]
         return resp
@@ -229,6 +235,198 @@ def poll_job(b, account, job_id, timeout=600):
     return None, time.time() - t0
 
 
+def poll_deletion(b, deletion_id, timeout=600):
+    t0 = time.time()
+    while time.time() - t0 < timeout:
+        r = b.get(f"/api/v1/deletions/{deletion_id}")
+        if r.status != 200 or r.body.get("state") != "running":
+            return r, time.time() - t0
+        time.sleep(2)
+    return None, time.time() - t0
+
+
+def drive_files(cust, sites, alice_uid):
+    """The file manager through Nginx: a chunked upload, a listing, the editor, downloads."""
+    base = "/api/v1/accounts/alice/files"
+    blob = os.urandom(450_000) + b"<html><script>alert(1)</script></html>"
+    r = cust.post(f"{base}/uploads", {"path": "public_html/fm-blob.bin", "overwrite": False})
+    check(r.status == 201 and r.body.get("upload_id") and r.body.get("max_chunk_bytes"),
+          "file manager: an upload is started", repr(r), fatal=True)
+    up, chunk = r.body["upload_id"], int(r.body["max_chunk_bytes"])
+    off, n, last = 0, 0, None
+    while off < len(blob):
+        piece = blob[off:off + chunk]
+        last = cust.put(f"{base}/uploads/{up}?offset={off}", raw=piece)
+        if last.status != 200:
+            break
+        off += len(piece)
+        n += 1
+    check(off == len(blob) and (last.body or {}).get("received_bytes") == len(blob) and n >= 3,
+          f"file manager: {len(blob)} bytes sent in {n} raw chunks of at most {chunk} bytes", repr(last))
+    r = cust.post(f"{base}/uploads/{up}/finish", {"size_bytes": len(blob), "sha256": hashlib.sha256(blob).hexdigest()})
+    check(r.status in (200, 201), "file manager: the upload is finished with its size and SHA-256", repr(r))
+    target = "/home/alice/public_html/fm-blob.bin"
+    st = os.stat(target) if os.path.exists(target) else None
+    check(st is not None and st.st_size == len(blob) and str(st.st_uid) == alice_uid,
+          "the uploaded file is on disk, owned by the account", repr(st))
+    # A checksum that does not match discards the upload.
+    r = cust.post(f"{base}/uploads", {"path": "public_html/fm-bad.bin", "overwrite": False})
+    if check(r.status == 201, "file manager: a second upload is started", repr(r)):
+        bad = r.body["upload_id"]
+        cust.put(f"{base}/uploads/{bad}?offset=0", raw=b"twelve bytes")
+        r = cust.post(f"{base}/uploads/{bad}/finish", {"size_bytes": 12, "sha256": "0" * 64})
+        check(r.status == 422 and r.code == "upload_checksum_mismatch",
+              "a wrong checksum is refused (422 upload_checksum_mismatch)", repr(r))
+        check(not os.path.exists("/home/alice/public_html/fm-bad.bin"), "and nothing of it is left in place")
+    r = cust.get(f"{base}?path=public_html")
+    names = {e.get("name"): e for e in (r.body or {}).get("entries", [])}
+    check(r.status == 200 and names.get("fm-blob.bin", {}).get("size_bytes") == len(blob)
+          and names.get("fm-blob.bin", {}).get("type") == "file",
+          "file manager: the folder lists the file with its size", repr(r)[:400])
+    r = cust.get(f"{base}/download?path=public_html/fm-blob.bin")
+    check(r.status == 200 and r.data == blob, "file manager: the download is byte for byte what was uploaded",
+          f"HTTP {r.status}, {len(r.data)} bytes")
+    ctype, disp = r.headers.get("content-type", ""), r.headers.get("content-disposition", "")
+    check(ctype.startswith("application/octet-stream") and disp.startswith("attachment")
+          and "fm-blob.bin" in disp and r.headers.get("x-content-type-options") == "nosniff"
+          and "sandbox" in r.headers.get("content-security-policy", ""),
+          "the download is an attachment, application/octet-stream, nosniff, sandboxed", repr(r.headers))
+    r = cust.get(f"{base}/download?path=public_html")
+    check(r.status == 409 and r.code == "is_a_directory", "a folder cannot be downloaded (409 is_a_directory)", repr(r))
+    # The editor.
+    page = "public_html/fm-note.html"
+    r = cust.put(f"{base}/content", {"path": page, "content": "<h1>fm-note-1</h1>\n", "overwrite": False})
+    check(r.status in (200, 201), "file manager: the editor creates a file", repr(r))
+    r = cust.get(f"{base}/content?path={page}")
+    check(r.status == 200 and r.body.get("content") == "<h1>fm-note-1</h1>\n" and r.body.get("editable") is True
+          and r.body.get("binary") is False, "file manager: the editor reads it back", repr(r))
+    opened = r.body or {}
+    r = cust.put(f"{base}/content", {"path": page, "content": "<h1>fm-note-2</h1>\n", "overwrite": True,
+                                    "expected_modified": opened.get("modified"), "expected_size": opened.get("size_bytes")})
+    check(r.status in (200, 201), "file manager: the editor saves a change over the version it opened", repr(r))
+    r = cust.put(f"{base}/content", {"path": page, "content": "<h1>stale</h1>\n", "overwrite": True,
+                                    "expected_modified": opened.get("modified"), "expected_size": opened.get("size_bytes")})
+    check(r.status == 409 and r.code == "file_changed", "a save over a file that changed since it was opened is refused"
+          " (409 file_changed)", repr(r))
+    r = cust.put(f"{base}/access", {"path": page, "access": "web_readable"})
+    check(r.status == 200, "file manager: the page is made readable by the web server", repr(r))
+    good, code, body = wait_site(sites["static"], "200", "<h1>fm-note-2</h1>", "/fm-note.html")
+    check(good, "the edited page is served by Nginx", f"{code} {body[:200]}")
+    r = cust.get(f"{base}/download?path={page}")
+    check(r.status == 200 and r.headers.get("content-type", "").startswith("application/octet-stream")
+          and r.headers.get("content-disposition", "").startswith("attachment"),
+          "an HTML file is downloaded as an attachment, never rendered in the panel's origin", repr(r.headers))
+    r = cust.post(f"{base}/delete", {"paths": ["public_html/fm-blob.bin"]})
+    check(r.status == 202, "file manager: a delete job is started", repr(r))
+    check(eventually(lambda: not os.path.exists("/home/alice/public_html/fm-blob.bin"), 30, 1) is True,
+          "and the file is gone")
+
+
+def drive_php_settings(cust, sites):
+    d = sites["php"]
+    r = cust.put(f"/api/v1/sites/{d}/php-settings", {"memory_limit_mb": 200, "max_input_vars": 2000})
+    check(r.status == 200 and (r.body.get("settings") or {}).get("memory_limit_mb") == 200,
+          "customer changes the PHP site's settings (memory_limit 200 MiB, max_input_vars 2000)", repr(r)[:400])
+    good, code, body = wait_site(d, "200", "memory_limit=200M max_input_vars=2000", "/?ini=1", tries=60)
+    check(good, "the PHP page sees the new settings", f"{code} {body[:200]}")
+    r = cust.put(f"/api/v1/sites/{d}/php-settings", {"memory_limit_mb": 1_000_000})
+    check(r.status == 422 and r.code == "validation_failed", "a setting above the account's cap is refused (422)",
+          repr(r)[:300])
+    info(f"refusal of memory_limit_mb=1000000: {r.raw[:300]}")
+    good, code, body = wait_site(d, "200", "memory_limit=200M", "/?ini=1", tries=4)
+    check(good, "and the settings in force are unchanged", f"{code} {body[:200]}")
+
+
+def drive_task(cust, alice_uid):
+    script = ("const fs = require('fs'), path = require('path');\n"
+              "fs.writeFileSync(path.join(__dirname, 'task-ran.txt'), 'task-ok ' + process.getuid() + ' ' + process.argv[2]);\n"
+              "console.log('task-output-ok');\n")
+    r = cust.put("/api/v1/accounts/alice/files/content", {"path": "task.js", "content": script, "overwrite": False})
+    check(r.status in (200, 201), "the task's script is written with the editor", repr(r))
+    r = cust.put("/api/v1/accounts/alice/tasks/drive-task",
+                 {"kind": "node", "script": "task.js", "args": ["hello"],
+                  "schedule": {"form": "daily", "hour": 4, "minute": 0}, "timeout_seconds": 60})
+    check(r.status == 201, "customer creates a scheduled task (Node.js, daily)", repr(r)[:400])
+    units = glob.glob("/etc/systemd/system/oxpanel-task-alice-*.timer")
+    check(len(units) == 1, "the engine wrote its timer", repr(units))
+    r = cust.get("/api/v1/accounts/alice/tasks")
+    items = (r.body or {}).get("items", r.body if isinstance(r.body, list) else [])
+    task = next((t for t in items if t.get("name") == "drive-task"), {})
+    check(r.status == 200 and task.get("enabled") is True and task.get("next_run"),
+          "the task is listed, enabled, with its next run", repr(r)[:400])
+    r = cust.post("/api/v1/accounts/alice/tasks/drive-task/run")
+    check(r.status == 200 and r.body.get("started") is True, "customer runs it now", repr(r))
+
+    def done():
+        r2 = cust.get("/api/v1/accounts/alice/tasks")
+        its = (r2.body or {}).get("items", r2.body if isinstance(r2.body, list) else [])
+        t = next((x for x in its if x.get("name") == "drive-task"), {})
+        return (t.get("running") is False and t.get("last_result") is not None, t)
+    res = eventually(done, 60, 1)
+    check(res[0] is True and res[1].get("last_result") == "success", "the run finishes with success", repr(res[1])[:400])
+    try:
+        ran = open("/home/alice/task-ran.txt").read()
+    except OSError as e:
+        ran = repr(e)
+    check(ran == f"task-ok {alice_uid} hello", "it ran as the account, with its argument", ran)
+    r = cust.get("/api/v1/accounts/alice/tasks/drive-task/output")
+    check(r.status == 200 and "task-output-ok" in (r.body or {}).get("text", ""), "its output is readable", repr(r)[:300])
+
+
+DNS_FLAGS = ["--dns-nameservers", "ns1.product.example,ns2.product.example", "--dns-contact",
+             "hostmaster@product.example", "--dns-ipv4", "192.0.2.25", "--disable-stock-named"]
+
+
+def dig(name, rtype="A"):
+    return sh("dig", "+short", "+norec", "+time=2", "+tries=1", "@127.0.0.1", name, rtype).stdout.strip()
+
+
+def drive_dns(admin, cust):
+    """DNS hosting through the panel. The product is installed without it; the
+    operator switches it on with the installer (as the handbook says), and it is
+    switched off again at the end of the drive. Returns whether it switched it on."""
+    switched = False
+    caps = admin.get("/api/v1/host/capabilities").body or {}
+    if not (caps.get("dns") or {}).get("available"):
+        p = sh("bash", "/root/acc/release/install.sh", "--yes", "--dns", *DNS_FLAGS, "--only", "dns", timeout=900)
+        check(p.returncode == 0, "the operator switches DNS hosting on with the installer", p.stdout[-1500:] + p.stderr[-500:],
+              fatal=True)
+        switched = True
+    res = eventually(lambda: (lambda c: ((c.get("dns") or {}).get("available") is True, c))(
+        admin.get("/api/v1/host/capabilities").body or {}), 60, 1)
+    check(res[0] is True, "the panel reports DNS hosting available", repr(res[1])[:300], fatal=True)
+
+    def zone_there():
+        r2 = cust.get("/api/v1/accounts/alice/dns/zones")
+        return (r2.status == 200 and "alice.test" in r2.raw, r2)
+    res = eventually(zone_there, 30, 1)
+    check(res[0] is True, "the account's sites got their zone (alice.test) by themselves", repr(res[1])[:300])
+    if res[0] is not True:
+        r = cust.post("/api/v1/accounts/alice/dns/zones", {"zone": "alice.test"})
+        info(f"zone created explicitly: {r!r}"[:300])
+    r = cust.get("/api/v1/accounts/alice/dns/zones/alice.test")
+    check(r.status == 200 and any(x.get("protected") for x in r.body.get("records", [])),
+          "the zone lists the engine's own (protected) records", repr(r)[:400])
+    r = cust.post("/api/v1/accounts/alice/dns/zones/alice.test/records",
+                  {"name": "bad", "type": "A", "value": "not-an-address"})
+    check(r.status == 422 and "ipv4_required" in r.raw, "a malformed record is refused (422, reason ipv4_required)",
+          repr(r)[:300])
+    r = cust.post("/api/v1/accounts/alice/dns/zones/alice.test/records",
+                  {"name": "drive", "type": "A", "ttl": 300, "value": "192.0.2.77"})
+    check(r.status == 201 and r.body.get("id"), "customer adds an A record through the panel", repr(r)[:300])
+    rec_id = (r.body or {}).get("id")
+    res = eventually(lambda: (lambda a: (a == "192.0.2.77", a))(dig("drive.alice.test")), 30, 1)
+    check(res[0] is True, "the host's name server answers it (dig @127.0.0.1 drive.alice.test)", repr(res[1]))
+    res = eventually(lambda: (lambda a: ("ns1.product.example" in a, a))(dig("alice.test", "SOA")), 10, 1)
+    check(res[0] is True, "and the zone's SOA names the configured primary", repr(res[1]))
+    if rec_id:
+        r = cust.delete(f"/api/v1/accounts/alice/dns/zones/alice.test/records/{rec_id}")
+        check(r.status in (200, 204), "customer deletes the record", repr(r))
+        res = eventually(lambda: (lambda a: (a == "", a))(dig("drive.alice.test")), 30, 1)
+        check(res[0] is True, "the name server no longer answers it", repr(res[1]))
+    return switched
+
+
 def sftp(key, user, batch, tries=40):
     for _ in range(tries):
         p = sh("sftp", *SSH_O, "-i", key, "-b", "-", f"{user}@127.0.0.1", inp=batch, timeout=60)
@@ -248,13 +446,18 @@ def main():
     admin = Browser(url, "admin")
     r = admin.get("/api/v1/health")
     check(r.status == 200 and r.body.get("status"), "health over HTTPS through Nginx", repr(r), fatal=True)
-    for hname, want in [("content-security-policy", "default-src 'self'"), ("x-content-type-options", "nosniff"),
-                        ("strict-transport-security", "max-age=")]:
+    # An API answer is never a document: its CSP forbids everything and sandboxes it.
+    api_csp = r.headers.get("content-security-policy", "")
+    check("default-src 'none'" in api_csp and "sandbox" in api_csp and "frame-ancestors 'none'" in api_csp,
+          "an API answer carries the sandboxing CSP (default-src 'none'; frame-ancestors 'none'; sandbox)", api_csp)
+    for hname, want in [("x-content-type-options", "nosniff"), ("strict-transport-security", "max-age=")]:
         check(want in r.headers.get(hname, ""), f"answer carries {hname}", repr(r.headers))
     r = admin.get("/")
     check(r.status == 200 and "<html" in r.raw.lower(),
           "the web interface (index.html) is served at /", repr(r)[:300])
-    check("script-src 'self'" in r.headers.get("content-security-policy", ""), "index.html is served with the CSP")
+    ui_csp = r.headers.get("content-security-policy", "")
+    check("default-src 'self'" in ui_csp and "script-src 'self'" in ui_csp and "sandbox" not in ui_csp,
+          "index.html is served with the application's CSP (default-src 'self')", ui_csp)
     r = admin.post("/api/v1/auth/login", {"username": admin_user, "password": "wrong-password-123456"}, csrf=False)
     check(r.status == 401 and r.code == "invalid_credentials", "a wrong password is refused", repr(r))
     r = admin.first_login(admin_user, admin_temp, pw["admin"])
@@ -369,6 +572,8 @@ def main():
     check(r.status == 201, "customer creates a Node.js application", repr(r), fatal=True)
     node_site = r.body
     info(f"node site as created: {json.dumps(node_site)[:400]}")
+    r = cust.put(f"/api/v1/sites/{sites['static']}", {"document_root": "public_html"})
+    check(r.status == 200, "PUT on an existing site updates it (200, not 201)", repr(r))
     r = cust.get("/api/v1/sites")
     check(r.status == 200 and r.body.get("total") == 3, "the customer lists its three sites", repr(r))
     p = sh("nginx", "-t")
@@ -390,6 +595,10 @@ if (isset($_GET['db'])) {
   $db->query('INSERT INTO t VALUES (42)');
   $row = $db->query('SELECT v FROM t')->fetch_row();
   echo "DB-OK ", $row[0];
+  exit;
+}
+if (isset($_GET['ini'])) {
+  echo 'memory_limit=', ini_get('memory_limit'), ' max_input_vars=', ini_get('max_input_vars');
   exit;
 }
 if (isset($_GET['probe'])) {
@@ -433,6 +642,12 @@ echo "php-ok ", PHP_VERSION, " uid=", getmyuid(), " euid=", function_exists('pos
     info(f"node app answered {time.time() - t0:.1f}s after the restart call")
     r = cust.get(f"/api/v1/sites/{sites['static']}/logs?kind=access&max_bytes=4096")
     check(r.status == 200 and "GET / " in json.dumps(r.body), "the site's access log is readable by its owner", repr(r)[:300])
+
+    # ------------------------------------------------------------ file manager, PHP settings, a task, DNS
+    drive_files(cust, sites, alice_uid)
+    drive_php_settings(cust, sites)
+    drive_task(cust, alice_uid)
+    dns_switched = drive_dns(admin, cust)
 
     # ------------------------------------------------------------ HTTPS
     cert = os.path.join(WORK, "c.pem")
@@ -562,7 +777,11 @@ echo "php-ok ", PHP_VERSION, " uid=", getmyuid(), " euid=", function_exists('pos
     r = cust.delete("/api/v1/accounts/alice/database-users/alice_app")
     check(r.status in (200, 204), "customer deletes the database user", repr(r))
     r = cust.delete("/api/v1/accounts/alice/databases/alice_shop")
-    check(r.status in (200, 204), "customer deletes the database", repr(r))
+    check(r.status == 200 and r.body.get("trash_id") and r.body.get("purge_at"),
+          "customer deletes the database: it goes to the trash (trash_id, purge date)", repr(r))
+    r = cust.get("/api/v1/accounts/alice/database-trash")
+    check(r.status == 200 and any(t.get("name") == "alice_shop" for t in r.body.get("items", [])),
+          "the deleted database is listed in the account's trash", repr(r)[:300])
     r = cust.get("/api/v1/accounts/alice/backups")
     for b in (r.body or {}).get("items", []):
         r2 = cust.delete(f"/api/v1/accounts/alice/backups/{b['id']}")
@@ -572,20 +791,45 @@ echo "php-ok ", PHP_VERSION, " uid=", getmyuid(), " euid=", function_exists('pos
     r = cust.delete("/api/v1/accounts/alice")
     check(r.status == 409 and r.code == "last_hosting_account", "a customer cannot delete its last account", repr(r))
     r = reseller.delete("/api/v1/accounts/alice?remove_files=true")
-    if r.status == 409 and r.code == "account_has_databases":
-        # The real engine keeps a deleted database in the account's trash for
-        # 30 days, and an account with a trash cannot be deleted. The panel API on
-        # this branch has no trash routes yet (and its own database list is empty):
-        # the operator has to purge it on the host.
-        info("DIFFERENCE: deleting the account is refused (409 account_has_databases) although the panel lists no"
-             " database: the engine holds the deleted database in its trash; purged with oxpanel-ctl")
-        p = sh("oxpanel-ctl", "db", "trash-purge", "alice")
-        check(p.returncode == 0, "operator purges the account's database trash on the host", p.stdout + p.stderr)
-        r = reseller.delete("/api/v1/accounts/alice?remove_files=true")
-    check(r.status in (200, 204), "reseller deletes the account (and its files)", repr(r))
+    check(r.status == 409 and r.code == "account_has_databases",
+          "deleting the account is refused while its database trash is not empty (409 account_has_databases)", repr(r))
+    r = cust.delete("/api/v1/accounts/alice/database-trash", {"confirm_account": "someone-else"})
+    check(r.status == 422 and "confirmation_mismatch" in r.raw, "emptying the trash needs the account's name typed again",
+          repr(r))
+    r = cust.delete("/api/v1/accounts/alice/database-trash", {"confirm_account": "alice"})
+    check(r.status == 200, "customer empties the database trash through the panel", repr(r))
+    r = cust.get("/api/v1/accounts/alice/database-trash")
+    check(r.status == 200 and not r.body.get("items"), "the trash is empty", repr(r)[:300])
+    # Something in the trash again, for the one-step deletion to take with it.
+    r = cust.post("/api/v1/accounts/alice/databases", {"suffix": "scratch"})
+    check(r.status == 201, "customer creates another database", repr(r))
+    r = cust.delete("/api/v1/accounts/alice/databases/alice_scratch")
+    check(r.status == 200 and r.body.get("trash_id"), "and deletes it (to the trash)", repr(r))
+    r = cust.post("/api/v1/accounts/alice/deletion", {"confirm_account": "alice", "final_backup_retain_days": 0})
+    check(r.status == 409 and r.code == "last_hosting_account",
+          "the one-step deletion of a customer's own last account is refused too", repr(r))
+    r = reseller.post("/api/v1/accounts/alice/deletion", {"confirm_account": "alice", "final_backup_retain_days": 0})
+    check(r.status == 202 and (r.body.get("deletion") or {}).get("id"),
+          "reseller deletes the account in one step, trash, task, zones and files included (202)", repr(r), fatal=True)
+    d, secs = poll_deletion(reseller, r.body["deletion"]["id"])
+    check(d is not None and d.status == 200 and d.body.get("state") == "succeeded",
+          f"the deletion succeeds ({secs:.0f}s)", repr(d)[:600])
+    p = sh("mariadb", "--no-defaults", "-u", "root", "-N", "-B", "-e",
+           "SELECT COUNT(*) FROM information_schema.SCHEMATA WHERE SCHEMA_NAME LIKE 'alice\\_%'"
+           " OR SCHEMA_NAME LIKE 'oxpanel\\_trash\\_%'")
+    check(p.returncode == 0 and p.stdout.strip() == "0", "no database of the account is left, not even in the trash",
+          p.stdout + p.stderr)
+    left = glob.glob("/etc/systemd/system/oxpanel-task-alice-*")
+    check(not left, "no scheduled task of the account is left (its timer and service are gone)", repr(left))
     p = sh("oxpanel-ctl", "tenant", "get", "alice")
     check(p.returncode != 0, "the engine no longer has the account", p.stdout)
     check(not os.path.exists("/home/alice"), "its home is gone")
+    if dns_switched:
+        res = eventually(lambda: (lambda a: (a == "", a))(dig("alice.test", "SOA")), 30, 1)
+        check(res[0] is True, "the account's zone went with it", repr(res[1]))
+        p = sh("bash", "/root/acc/release/install.sh", "--yes", "--no-dns", "--only", "dns", timeout=600)
+        check(p.returncode == 0, "the operator switches DNS hosting off again (for the later phases)",
+              p.stdout[-1500:] + p.stderr[-500:])
     r = reseller.delete(f"/api/v1/users/{cust_id}")
     check(r.status in (200, 204), "reseller deletes the customer", repr(r))
     r = admin.delete(f"/api/v1/users/{reseller_id}")
