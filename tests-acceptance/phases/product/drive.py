@@ -668,9 +668,15 @@ echo "php-ok ", PHP_VERSION, " uid=", getmyuid(), " euid=", function_exists('pos
     good, code, body = wait_site(sites["static"], "200", "static-ok", https=True)
     check(good, "the site answers over HTTPS with it", f"{code} {body[:200]}")
     info(f"HTTPS with the uploaded certificate answered {time.time() - t0:.1f}s after the upload returned")
-    served = sh("bash", "-c", f"echo | openssl s_client -connect 127.0.0.1:443 -servername {sites['static']} 2>/dev/null"
-                              f" | openssl x509 -noout -fingerprint -sha256").stdout.strip()
     mine = sh("openssl", "x509", "-in", cert, "-noout", "-fingerprint", "-sha256").stdout.strip()
+
+    def served_cert():
+        # Read again until it matches: the reload that brings the certificate
+        # in may still be finishing (a handshake during it can come back empty).
+        return sh("bash", "-c", f"echo | openssl s_client -connect 127.0.0.1:443 -servername {sites['static']}"
+                                f" 2>/dev/null | openssl x509 -noout -fingerprint -sha256").stdout.strip()
+    served = eventually(lambda: (lambda f: f == mine or f)(served_cert()), 20, 0.5)
+    served = mine if served is True else served
     check(served and served == mine, "Nginx serves exactly the uploaded certificate", f"{served} vs {mine}")
     r = cust.put(f"/api/v1/sites/{sites['php']}/certificate",
                  {"certificate_chain_pem": open(cert).read(), "private_key_pem": open(ckey).read()})
