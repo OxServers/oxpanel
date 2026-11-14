@@ -84,7 +84,8 @@ RCPT). Removing a mailbox removes it from the servers at once, then its mail
 symlink) in the background, resumed at start-up. Because the account owns
 `~/mail`, symlinks there can only lead its own identity somewhere it can
 already write; backups read the home as the account (links are stored as
-links). SELinux labels `~/mail` `mail_home_rw_t`.
+links). Mail keeps the home's own label (`user_home_t`), which Dovecot may
+use under the stock policy (proven on the enforcing VM).
 
 **Passwords** are hashed in the daemon with bcrypt (cost 12, `$2y$`), stored
 as Dovecot's `{BLF-CRYPT}` in the record and Dovecot's password file
@@ -246,10 +247,12 @@ does not recreate deleted mailboxes.
 Narrow additions to `packaging/selinux/oxpanel.cil`: the policy service and
 Roundcube's PHP-FPM run in `oxpanel_app_t` (with `httpd_exec_t` as an
 entrypoint for php-fpm); their socket directories are `httpd_var_run_t`
-(Nginx and sites' PHP may connect, through the existing rule);
-`/home/*/mail` is `mail_home_rw_t`; autoresponder scripts are
-`dovecot_var_lib_t`. Further rules only where the enforcing VM showed a
-denial (see the CIL file for each rule's reason).
+(Nginx and sites' PHP may connect, through the existing rule); autoresponder
+scripts are `dovecot_var_lib_t`. Found on the enforcing VM and allowed
+narrowly: Postfix's SMTP server connecting to the policy service (`policy.sock`)
+and to Rspamd's milter (Rspamd has no policy module: unconfined service
+domain; its socket is in Postfix's spool), and Dovecot's delivery running
+OxPanel's sendmail for autoresponders (`sendmail.sock`).
 
 ## Not included
 

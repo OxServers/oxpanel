@@ -2414,7 +2414,8 @@ message MailDnsRecord {
   // Relative to the zone the record belongs in ("@", "_dmarc", ...); for a
   // domain whose DNS is elsewhere, relative to the mail domain.
   string name = 1;
-  // "MX", "TXT", "SRV", "CNAME", "A", "AAAA".
+  // "MX", "TXT", "SRV", "CNAME". For SRV, `value` is "<weight> <port> <target>"
+  // and `priority` its priority; for MX, `priority` is the preference.
   string type = 2;
   string value = 3;
   uint32 priority = 4;

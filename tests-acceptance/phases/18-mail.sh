@@ -50,10 +50,10 @@ check "mail domain m2.oxacc.test" oxpanel-ctl mail domain-set m2.oxacc.test --te
 P1='Amber-Field-2207'; P2='Silver-Coast-6164'
 check "mailbox info@m1" bash -c "echo '$P1' | oxpanel-ctl mail mailbox-set info@m1.oxacc.test --tenant acmail1 --password"
 check "mailbox info@m2" bash -c "echo '$P2' | oxpanel-ctl mail mailbox-set info@m2.oxacc.test --tenant acmail2 --password"
-check "the mailbox directory carries the mail-in-home label" bash -c "ls -dZ /home/acmail1/mail/m1.oxacc.test/info | grep -q mail_home_rw_t"
+check "the mailbox directory belongs to the account, private" test "$(stat -c '%U %a' /home/acmail1/mail/m1.oxacc.test/info)" = "acmail1 700"
 check "delivery on port 25" python3 "$MC" deliver 25 a@remote.example info@m1.oxacc.test --subject acc-in
 eventually "IMAPS reads it" 40 0.5 python3 "$MC" imap-find info@m1.oxacc.test "$P1" acc-in
-check "delivered files keep the label" bash -c "test -z \"\$(find /home/acmail1/mail -type f ! -context '*mail_home_rw_t*')\""
+check "delivered files belong to the account" bash -c "test -z \"\$(find /home/acmail1/mail -type f ! -user acmail1)\""
 check "submission sends to the other customer" python3 "$MC" submit 587 info@m1.oxacc.test "$P1" info@m1.oxacc.test info@m2.oxacc.test --subject acc-sub
 eventually "it arrives, DKIM-signed" 40 0.5 python3 "$MC" imap-find info@m2.oxacc.test "$P2" acc-sub --out /root/acc/acc-sub.eml
 PUB="$(oxpanel-ctl mail domain-show m1.oxacc.test --tenant acmail1 | sed -n 's/.*record=v=DKIM1; k=rsa; p=//p')"

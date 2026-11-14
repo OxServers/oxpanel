@@ -81,9 +81,23 @@
 ; Roundcube's PHP-FPM is the distribution's php-fpm (httpd_exec_t), started
 ; by systemd straight into oxpanel_app_t.
 (allow oxpanel_app_t httpd_exec_t (file (entrypoint)))
-; Mailboxes in tenant homes (~/mail): the type the stock policy gives mail in
-; home directories, which Dovecot (delivery, IMAP, POP3) may manage.
-(filecon "/home/[^/]+/mail(/.*)?" any (system_u object_r mail_home_rw_t ((s0) (s0))))
+; Postfix's SMTP server asks the mail policy service (oxpanel_app_t, socket
+; in /run/oxpanel-mail) at the end of every message sent through submission:
+; is the mailbox enabled, the account suspended, a limit reached. The socket
+; is 0660 group postfix, so no other process of these domains can use it.
+(allow postfix_smtpd_t oxpanel_app_t (unix_stream_socket (connectto)))
+(allow postfix_smtpd_t httpd_var_run_t (sock_file (write)))
+; Autoresponders: Dovecot's delivery (dovecot_t, with the account's uid) runs
+; OxPanel's sendmail, which hands the reply to the policy service like a
+; site's mail (sendmail.sock), so it is checked and counted as the account's.
+(allow dovecot_t oxpanel_app_t (unix_stream_socket (connectto)))
+(allow dovecot_t httpd_var_run_t (sock_file (write)))
+; Postfix's SMTP server passes every message to Rspamd's milter. Rspamd has
+; no policy module of its own (the stock unconfined service domain); its
+; socket is in /var/spool/postfix/oxpanel-milter (_rspamd:postfix 0750, so
+; only Postfix can reach it), labelled like the rest of Postfix's spool.
+(allow postfix_smtpd_t unconfined_service_t (unix_stream_socket (connectto)))
+(allow postfix_smtpd_t postfix_spool_t (sock_file (write)))
 ; Autoresponder scripts (root-owned, read by Dovecot's delivery): the type of
 ; Dovecot's own state.
 (filecon "/var/lib/oxpanel-mail/sieve(/.*)?" any (system_u object_r dovecot_var_lib_t ((s0) (s0))))
