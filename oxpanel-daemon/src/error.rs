@@ -463,6 +463,8 @@ pub enum MailCode {
     WeakPassword,
     /// A message in the queue that is not there (any more).
     QueuedMailNotFound,
+    /// The account is suspended: its email cannot be changed.
+    AccountSuspended,
 }
 
 impl MailCode {
@@ -482,14 +484,16 @@ impl MailCode {
             Self::TooManyDestinations => "too_many_destinations",
             Self::WeakPassword => "weak_password",
             Self::QueuedMailNotFound => "queued_mail_not_found",
+            Self::AccountSuspended => "account_suspended",
         }
     }
 
     fn status(self, message: String) -> Status {
         match self {
-            Self::Unavailable | Self::DomainNotLocal | Self::DomainNotOwned => {
-                Status::failed_precondition(message)
-            }
+            Self::Unavailable
+            | Self::DomainNotLocal
+            | Self::DomainNotOwned
+            | Self::AccountSuspended => Status::failed_precondition(message),
             Self::DomainNotFound
             | Self::MailboxNotFound
             | Self::ForwarderNotFound

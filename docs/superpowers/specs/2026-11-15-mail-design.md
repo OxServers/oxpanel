@@ -170,7 +170,7 @@ Suspending an account: its mailboxes are added to Dovecot's deny passdb (no
 IMAP/POP3/submission/webmail login; sessions ended with `doveadm kick`), its
 domains answer 450 on every Postfix listener (deferred, not bounced: senders
 retry for days), its sites' sendmail is refused. Resuming undoes it. Changes
-to a suspended account's email are refused (`TenantSuspended`), like DNS.
+to a suspended account's email are refused (`account_suspended`), like DNS.
 Deleting an account is refused while it has mailboxes or forwarders; the
 cascading deletion removes its mail domains (servers first), DKIM keys,
 autoresponder scripts, webmail certificates and limits, before its sites and
@@ -300,7 +300,7 @@ except:
   `mailbox_exists` occurs only while a mailbox of that address is still
   being removed (`PutMailbox` is create-or-update). Field validation errors
   keep the engine's usual `invalid <field>: …` (INVALID_ARGUMENT). Changes
-  to a suspended account's email: `tenant '<name>' is suspended`
+  to a suspended account's email: `account_suspended: …`
   (FAILED_PRECONDITION). Deleting an account that still has mailboxes or
   forwarders: `tenant '<name>' still has mailboxes or forwarders; …`
   (FAILED_PRECONDITION).

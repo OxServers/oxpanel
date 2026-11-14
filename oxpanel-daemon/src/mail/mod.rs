@@ -373,7 +373,10 @@ impl MailService {
             return Err(Error::TenantNotReady(tenant.to_string()));
         }
         if change && t.suspended {
-            return Err(Error::TenantSuspended(tenant.to_string()));
+            return Err(Error::mail(
+                MailCode::AccountSuspended,
+                format!("account '{tenant}' is suspended: its email can be read but not changed"),
+            ));
         }
         Ok(t)
     }

@@ -507,7 +507,7 @@ async fn suspension_denies_logins_and_defers_mail_and_resuming_undoes_it() {
         .put_mailbox("alice", "example.test", "new", 0, PW, true)
         .await
         .unwrap_err();
-    assert!(matches!(e, Error::TenantSuspended(_)), "{e}");
+    assert_eq!(code(&e), Some(MailCode::AccountSuspended), "{e}");
     h.tenants.set_suspended("alice", false).await.unwrap();
     assert_eq!(h.dovecot("deny"), "");
     assert_eq!(h.map("recipient_access"), render::HEADER);
