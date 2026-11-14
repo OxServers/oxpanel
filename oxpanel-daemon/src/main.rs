@@ -439,7 +439,7 @@ async fn mail_certificates_periodically(ctx: Ctx) {
     }
     tokio::time::sleep(oxpanel_daemon::auto_https::FIRST_SWEEP_AFTER).await;
     loop {
-        oxpanel_daemon::mail::certificates_sweep(&ctx).await;
+        oxpanel_daemon::mail::certificates_sweep(&ctx, false).await;
         tokio::time::sleep(oxpanel_daemon::auto_https::SWEEP_EVERY).await;
     }
 }

@@ -67,8 +67,8 @@ pub const MIN_QUOTA_BYTES: u64 = 1024 * 1024;
 pub const MAX_EXTERNAL_MX: usize = 10;
 
 /// Obtain the mail certificates that are missing or due (logged, never fatal).
-pub async fn certificates_sweep(ctx: &Ctx) {
-    match certs::sweep(ctx).await {
+pub async fn certificates_sweep(ctx: &Ctx, force: bool) {
+    match certs::sweep(ctx, force).await {
         Ok(0) => {}
         Ok(n) => info!(certificates = n, "mail certificates installed"),
         Err(e) => warn!(error = %e, "mail certificates could not be checked"),
@@ -83,7 +83,7 @@ fn certificates_soon(ctx: &Ctx) {
     let ctx = ctx.clone();
     tokio::spawn(async move {
         tokio::time::sleep(crate::auto_https::AFTER_CHANGE_DELAY).await;
-        certificates_sweep(&ctx).await;
+        certificates_sweep(&ctx, true).await;
     });
 }
 

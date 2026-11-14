@@ -78,10 +78,25 @@ async fn current(ctx: &Ctx, name: &Domain) -> bool {
 
 /// Obtain or renew the certificates email needs. Runs from the daemon's
 /// periodic task; does nothing while email or Automatic HTTPS is off.
-pub async fn sweep(ctx: &Ctx) -> Result<usize> {
+/// One sweep at a time (each name's ACME client runs as a unit of its
+/// own name; two sweeps would start it twice).
+static SWEEPING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+/// `force`: after a change of email (a domain set up), try names that are
+/// backing off too — as `RunAutoHttps` does for a site; the pre-check keeps
+/// names that do not resolve from reaching the authority.
+pub async fn sweep(ctx: &Ctx, force: bool) -> Result<usize> {
     if !ctx.config.auto_https.is_on() || crate::acme::unavailable_reason(ctx).await?.is_some() {
         return Ok(0);
     }
+    let _running = if force {
+        SWEEPING.lock().await
+    } else {
+        let Ok(g) = SWEEPING.try_lock() else {
+            return Ok(0);
+        };
+        g
+    };
     let names = {
         let _guard = ctx.lock.lock().await;
         wanted_names(ctx)?
@@ -92,9 +107,10 @@ pub async fn sweep(ctx: &Ctx) -> Result<usize> {
             continue;
         }
         let mut backoff = load_backoff(ctx);
-        if backoff
-            .get(name.as_str())
-            .is_some_and(|b| b.next_attempt_unix > now_unix())
+        if !force
+            && backoff
+                .get(name.as_str())
+                .is_some_and(|b| b.next_attempt_unix > now_unix())
         {
             continue;
         }
