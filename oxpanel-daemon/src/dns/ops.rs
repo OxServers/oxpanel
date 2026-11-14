@@ -233,16 +233,32 @@ async fn write_zone(
     Ok(rec)
 }
 
+/// How often, and how far apart, a refused `rndc` is tried again while the
+/// server's unit is active (its control channel may not listen yet).
+const RNDC_RETRIES: u32 = 10;
+const RNDC_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+
 /// Run rndc with `args`; if the server is not running, start it instead
 /// (it then loads everything from its files).
 async fn rndc(ctx: &Ctx, args: &[&str]) -> Result<()> {
-    let result = ctx.sys.run(bind::rndc(&ctx.config, args)).await?;
+    let mut result = ctx.sys.run(bind::rndc(&ctx.config, args)).await?;
     if result.success() {
         return Ok(());
     }
     if !server_active(ctx).await? {
         warn!("the DNS server is not running; starting it");
         return start_server(ctx).await;
+    }
+    // The unit is `Type=simple`: "active" as soon as named runs, before its
+    // control channel listens. A command right after the server started
+    // (found by acceptance phase 60: the first record of a zone created by
+    // the start-up convergence) is refused for a moment; try again briefly.
+    for _ in 0..RNDC_RETRIES {
+        tokio::time::sleep(RNDC_RETRY_DELAY).await;
+        result = ctx.sys.run(bind::rndc(&ctx.config, args)).await?;
+        if result.success() {
+            return Ok(());
+        }
     }
     Err(Error::Internal(format!(
         "rndc {} failed ({}); see `journalctl -u {}`",

@@ -972,3 +972,24 @@ async fn a_zone_the_configuration_checker_rejects_leaves_nothing() {
         .await
         .unwrap();
 }
+
+/// Found by acceptance phase 60: right after the server was started (its
+/// unit is active before named's control channel listens), the first
+/// `rndc reload` was refused and the record change failed with an internal
+/// error. A refused command is now tried again for a few seconds.
+#[tokio::test]
+async fn a_reload_refused_while_the_server_starts_is_tried_again() {
+    let h = harness().await;
+    h.site("example.com", "alice", &[]).await;
+    h.sys.clear_calls();
+    // The next systemd-run (the rndc reload) is refused once.
+    h.sys.script_failure(
+        bin::SYSTEMD_RUN,
+        1,
+        "rndc: connect failed: connection refused",
+    );
+    h.add("alice", "example.com", rec("x", RrType::Txt, "y"))
+        .await
+        .unwrap();
+    assert_eq!(h.rndc_calls().len(), 2, "{:?}", h.rndc_calls());
+}
