@@ -771,6 +771,107 @@
   sh tests-acceptance/phases/30-selinux.sh DNS data directory is named_cache_t
   sh tests-acceptance/phases/60-reboot-post.sh the signed zone answers after reboot
 
+[Email] Mail component
+  unit mail/config email_is_off_by_default_and_needs_a_host_name_when_on
+  unit mail/tests email_off_answers_mail_unavailable
+  unit mail/tests setting_up_a_domain_runs_exactly_these_commands
+  sh tests-integration/run-inside.sh a mail domain is refused while email is off (mail_unavailable)
+  sh tests-integration/run-inside.sh the original main.cf is kept
+  sh tests-integration/run-inside.sh Postfix accepts its configuration
+  sh tests-acceptance/phases/18-mail.sh install.sh --mail succeeded
+[Email] Mail domains
+  unit mail/tests a_domain_must_be_a_name_the_account_holds
+  unit mail/tests switching_the_mode_keeps_mailboxes_but_serves_them_only_locally
+  sh tests-integration/run-inside.sh another account's site cannot become my mail domain
+  sh tests-integration/run-inside.sh the mail host name cannot be a mail domain
+  sh tests-acceptance/phases/attack/mail.sh the victim's webmail name cannot be the attacker's site
+[Email] Mailboxes
+  unit mail/tests a_mailbox_is_made_as_the_account_and_only_its_files_change
+  unit mail/tests mailbox_refusals_carry_their_codes
+  unit mail/tests deleting_a_mailbox_removes_its_mail_as_the_account
+  it crash_safety_mail email_workflows_survive_interruption_at_every_command
+  sh tests-integration/run-inside.sh the mailbox lives in the account's home, owned by it, private
+  sh tests-integration/run-inside.sh the oversized message is not in the mailbox
+  sh tests-integration/run-inside.sh the account's mailbox limit is enforced (mailbox_limit_reached)
+  sh tests-integration/run-inside.sh a disabled mailbox still receives
+[Email] Mailbox passwords
+  unit mail/password hashes_are_bcrypt_in_dovecots_form_and_never_the_password
+  unit mail/tests the_password_is_only_ever_a_hash_in_the_password_file
+  it feature_properties an_accepted_password_is_one_line
+  sh tests-integration/run-inside.sh no password is stored in plain text anywhere
+  sh tests-integration/run-inside.sh a weak password is refused
+[Email] Forwarders and catch-all
+  unit mail/tests mailboxes_and_forwarders_do_not_share_an_address_by_accident
+  unit mail/tests forward_loops_and_too_many_destinations_are_refused
+  unit mail/tests a_catch_all_must_be_a_mailbox_of_the_domain
+  sh tests-integration/run-inside.sh the forwarded message arrives
+  sh tests-integration/run-inside.sh the catch-all mailbox has it
+  sh tests-integration/run-inside.sh a forwarding circle is refused (forward_loop)
+[Email] Autoresponders
+  unit mail/tests autoresponders_are_sieve_scripts_the_account_cannot_change
+  sh tests-integration/run-inside.sh the reply reaches the sender
+  sh tests-integration/run-inside.sh its script is not writable by the account
+  sh tests-acceptance/phases/18-mail.sh the reply arrives (Dovecot → OxPanel's sendmail → Postfix)
+[Email] Sending rules
+  unit mail/tests maps_and_password_files_are_rendered_from_the_records
+  sh tests-integration/run-inside.sh port 25 relays nothing (open relay refused)
+  sh tests-integration/run-inside.sh a mailbox cannot send as another address (envelope)
+  sh tests-integration/run-inside.sh a mailbox cannot send as another address (From:)
+  sh tests-acceptance/phases/attack/mail.sh mail from the internet claiming the victim's domain is not signed with its key
+[Email] Site mail
+  unit mail/policy sites_send_only_from_their_own_domains_within_the_limit
+  unit mail/policy messages_are_parsed_and_rebuilt_safely
+  unit mail/sendmail the_usual_sendmail_arguments_are_understood
+  sh tests-integration/run-inside.sh a site sends from its own domain
+  sh tests-integration/run-inside.sh a site cannot send as another customer's domain
+  sh tests-acceptance/phases/18-mail.sh the site's message arrives
+[Email] Sending limits
+  unit mail/policy mailbox_and_account_limits_count_recipients_per_hour
+  unit mail/policy policy_answers_in_postfixs_words
+  unit mail/tests limits_and_usage
+  sh tests-integration/run-inside.sh the mailbox's hourly limit defers the next message (4xx)
+  sh tests-integration/run-inside.sh and sendmail says to try later (EX_TEMPFAIL)
+[Email] DKIM
+  unit mail/tests rotating_the_dkim_key_keeps_the_old_one_published
+  sh tests-integration/run-inside.sh the DKIM key is readable by root and the signer only
+  sh tests-integration/run-inside.sh the DKIM signature verifies against the domain's key
+  sh tests-acceptance/phases/18-mail.sh the DKIM signature verifies
+[Email] Mail DNS records
+  unit mail/records each_mode_gets_exactly_its_records
+  unit mail/tests mail_records_are_protected_records_of_the_hosted_zone
+  unit mail/certs reverse_names_are_built_for_both_families
+  sh tests-integration/run-inside.sh the published DKIM record is the signing key
+  sh tests-integration/run-inside.sh the account cannot add its own MX beside the engine's
+[Email] TLS
+  sh tests-integration/run-inside.sh submission offers no login before STARTTLS
+  sh tests-integration/run-inside.sh does not listen (no plain-text client port, no filter TCP port)
+  sh tests-integration/run-inside.sh the mail host name gets a certificate from the CA
+  sh tests-integration/run-inside.sh IMAPS presents the CA's certificate
+[Email] Webmail
+  unit mail/tests the_webmail_is_offered_with_roundcube_and_only_over_https_once_certified
+  sh tests-integration/run-inside.sh without its certificate, webmail is never served over plain HTTP (503)
+  sh tests-integration/run-inside.sh a webmail login succeeds
+  sh tests-acceptance/phases/18-mail.sh a webmail login succeeds under enforcing
+[Email] Suspension and deletion
+  unit mail/tests suspension_denies_logins_and_defers_mail_and_resuming_undoes_it
+  unit mail/tests an_account_with_mail_is_deleted_only_with_everything
+  unit mail/tests a_mail_domain_without_mailboxes_goes_with_its_account
+  sh tests-integration/run-inside.sh a suspended account's mailbox cannot log in
+  sh tests-integration/run-inside.sh mail for a suspended account is deferred (450), not bounced
+  sh tests-integration/run-inside.sh a cascading deletion removes the account with its email
+[Email] Mail queue
+  unit mail/tests the_queue_is_read_attributed_and_managed
+  unit mail/queue postqueue_json_is_read_and_bounded
+  sh tests-integration/run-inside.sh the queue can be read
+[Email] Mail reconciliation
+  unit mail/tests reconcile_reports_mail_drift_and_orphans
+  sh tests-integration/run-inside.sh an edited map is drift
+  sh tests-integration/run-inside.sh a restart puts it right
+[Email] Mail in backups
+  sh tests-integration/run-inside.sh the backup holds the mailbox
+  sh tests-integration/run-inside.sh the mail is back
+  sh tests-acceptance/phases/attack/mail.sh a backup of the attacker stores the link, not the victim's mail
+
 [API, transport and authentication] gRPC over a UNIX socket only
   it grpc_uds full_tenant_and_vhost_lifecycle_over_uds
   sh tests-integration/run-inside.sh socket is root:oxpanel 0660

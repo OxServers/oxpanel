@@ -206,6 +206,48 @@ operator granted that uid; arbitrary field values.
   account (0600) and are never read by the engine. The delegation and DS
   checks run in a transient unit under a dynamic unprivileged user.
 
+### 3.5 Email (a customer, its code, and the Internet)
+
+Email (`docs/superpowers/specs/2026-11-15-mail-design.md`) adds listeners on
+25, 465, 587, 993 and 995 and a customer-controlled directory (`~/mail`).
+What stops each attempt (tests: `run-inside.sh` "email", acceptance phase
+18, phase 80 section 16):
+
+- **Relaying.** Port 25 accepts only mail for hosted domains
+  (`reject_unauth_destination`; `permit_mynetworks` appears nowhere, so the
+  loopback is the Internet too); 587/465 need a login. Tenant code cannot use
+  Postfix's sendmail (`authorized_submit_users = root`), cannot enter
+  `public/` or `private/` (Postfix's own directories) and cannot reach the
+  filter's milter socket (`_rspamd:postfix 0750`) or the policy socket
+  (group `postfix`): a forged policy request cannot use up another
+  customer's limit, and nothing can be signed with a customer's DKIM key
+  except through Postfix.
+- **Spoofing.** A mailbox sends only as itself (envelope: Postfix's login
+  map; `From:`: the filter); a site only as an address at its own account's
+  domains (the policy service takes the account from the kernel's peer
+  credentials). Mail from the Internet claiming a hosted domain is never
+  signed (signing needs a login).
+- **Reading another customer's mail.** Mail is owned by the account's uid in
+  its own home (`0700`), delivered and read only with that identity (Dovecot
+  refuses uids outside the engine's tenant range); the password file is
+  `root:dovecot 0640`; LMTP and auth sockets are Postfix's alone; the file
+  manager, backups and mailbox removal work as the account. Webmail and the
+  policy service run as their own accounts, which can read no home.
+- **Injection.** Every field is allow-listed (local parts, destinations,
+  subjects, bodies, MX hosts, queue ids); renderers add only constant text;
+  Sieve strings are escaped; addresses reach SMTP commands only after a
+  check for spaces, brackets and line breaks.
+- **Symlinks in `~/mail`.** Followed only with the account's own identity
+  (delivery, `rm`, `tar`), so they lead nowhere it could not already write.
+- **Abuse of the host's reputation.** Hourly recipient limits per account and
+  per mailbox, for submission, sites and autoresponders alike; forwarders at
+  most 10 destinations, no loops through this host, Postfix's expansion
+  limits; autoresponders answer once per sender per day and never lists,
+  bulk or spam-marked mail.
+- **Password guessing.** Dovecot's failure delay; fail2ban jails for Dovecot,
+  Postfix's logins and webmail when login banning is on (the loopback is
+  never banned: webmail logs in from it).
+
 ## 4. What the tests prove, by layer
 
 | Layer | Where | Runs in |
@@ -313,6 +355,22 @@ Stated plainly, in order of how much they matter.
     changes them (phase 80 records `memory_limit` after a `.user.ini` as
     `info`). The cgroup bounds memory, Nginx's `client_max_body_size` bounds
     uploads (asserted), the hardening lines cannot be changed (asserted).
+
+16. **Email: first come, first served, like sites and zones.** A mail domain
+    must be a name the account already holds here; nothing proves it owns
+    the domain. A forwarder may point anywhere, and mail forwarded from
+    outside does not count against the account's limits (only its number of
+    destinations is bounded).
+17. **Email: what the filter decides.** Spam and malware scoring is
+    Rspamd's (without Redis: no Bayes, greylisting or its own rate limits);
+    ClamAV is off by default. Rspamd asks public DNS block lists from the
+    host's resolver; large public resolvers are refused by some lists.
+18. **Email: one certificate name.** Every client protocol presents the mail
+    host name's certificate (no SNI per mail domain); until it is issued, a
+    self-signed one.
+19. **Email: webmail and the policy service run in `oxpanel_app_t`.** Like
+    tenant applications, they are confined by their own accounts and
+    systemd sandboxes, not by a dedicated SELinux policy.
 
 ## 6. Defects found by the testing work
 

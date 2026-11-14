@@ -1425,6 +1425,109 @@ them is signed with a new key, i.e. a new DS at the registrar).
    registrar of their domain, or no A record for `ns1`/`ns2` in that zone.
 6. `host reconcile`: a zone the server does not serve, a secondary behind.
 
+### 9.3 Email: mailboxes for the customers' domains
+
+Email is an optional component (design record:
+`docs/superpowers/specs/2026-11-15-mail-design.md`). Install it with the
+installer — on a new host or on an installed one:
+
+```sh
+sudo ./install.sh --only mail --mail --mail-hostname mail.example.net --enable-epel
+sudo ./install.sh --only firewall --mail --mail-hostname mail.example.net   # opens 25, 465, 587, 993, 995
+```
+
+What that does: Postfix, Dovecot and Pigeonhole from AppStream; Rspamd from
+rspamd.com's signed repository (written as `/etc/yum.repos.d/rspamd.repo`,
+HTTPS, signatures checked) with its libraries from EPEL; Roundcube from EPEL
+(`--no-webmail` leaves it out); ClamAV only with `--mail-antivirus` (about
+1 GB of memory). It creates the `_rspamd` account, empties the Roundcube
+snippet the EPEL package puts into Nginx's default server, writes
+`OXPANEL_MAIL=true` and `OXPANEL_MAIL_HOSTNAME` into `daemon.env` and
+restarts the daemon, which renders every configuration file and starts
+`postfix`, `dovecot`, `rspamd`, `oxpanel-mail-policy` and `oxpanel-webmail`.
+It refuses to run while sendmail or exim is the active mail server.
+
+**OxPanel owns Postfix's `main.cf` and `master.cf` and Dovecot's
+`dovecot.conf` while email is on** (the originals are kept once as
+`*.oxpanel-orig`). Do not edit them: `oxpanel-ctl host reconcile` reports a
+change (`MAIL_CONFIG_DRIFT`) and the next restart of the daemon puts it back.
+
+**Before customers use it:**
+
+- The mail host name must resolve to this host (A/AAAA), and the host's
+  address must have it as its reverse name (PTR) — ask the provider of the
+  address; many receivers refuse mail otherwise. `oxpanel-ctl mail check
+  <domain>` reports both.
+- Outbound port 25 must be open at the provider (many clouds block it).
+- The certificate of the mail host name (and of every
+  `webmail.<domain>`) comes from the ACME authority by itself, through
+  Automatic HTTPS, once the names point here and port 80 is reachable;
+  until then clients see a self-signed one (`oxpanel-ctl mail host` warns).
+
+Settings (`/etc/oxpanel/daemon.env`, see `packaging/daemon.env`):
+`OXPANEL_MAIL_RATE_ACCOUNT` and `OXPANEL_MAIL_RATE_MAILBOX` (recipients per
+hour; 500 and 200 by default, 0 = unlimited), `OXPANEL_MAIL_MAX_MAILBOXES`,
+`OXPANEL_MAIL_MAX_MAILBOX_BYTES` (defaults for accounts without their own
+limits), `OXPANEL_MAIL_MESSAGE_MAX_BYTES` (25 MiB), `OXPANEL_MAIL_WEBMAIL`,
+`OXPANEL_MAIL_ANTIVIRUS`.
+
+```sh
+# A customer's domain (one of its sites' names, or inside one of its DNS zones)
+oxpanel-ctl mail domain-set acme.example --tenant acme
+# created=true
+# domain=acme.example tenant=acme mode=local mailboxes=0 forwarders=0 catch_all=- dns_hosted=true external_mx=-
+#   dkim selector=ox1794700000 published=yes record=v=DKIM1; k=rsa; p=MIIBIj…
+# With DNS hosted here, MX, SPF, DKIM, DMARC, webmail/autoconfig CNAMEs and the
+# SRV records are in the zone (protected). Otherwise the answer lists them:
+#   create @ MX 10 mail.example.net
+#   create @ TXT v=spf1 a:mail.example.net ~all
+#   …
+
+# A mailbox (password on standard input, never an argument), 2 GiB
+echo 'Long-Unique-Passphrase-1' | oxpanel-ctl mail mailbox-set info@acme.example --tenant acme --password --quota 2147483648
+# A forwarder, a catch-all, an autoresponder
+oxpanel-ctl mail forwarder-set sales@acme.example --tenant acme --to info@acme.example --to boss@gmail.com
+oxpanel-ctl mail domain-set acme.example --tenant acme --catch-all info
+oxpanel-ctl mail autoreply info@acme.example --tenant acme --subject 'Away' --body 'Back on Monday.'
+
+# The customer's mail goes elsewhere (Google Workspace, Microsoft 365):
+oxpanel-ctl mail domain-set acme.example --tenant acme --mode external --mx aspmx.l.google.com --mx alt1.aspmx.l.google.com
+
+# Limits of an account (staff), its usage, the queue
+oxpanel-ctl mail limits-set acme --max-mailboxes 20 --max-mailbox-bytes 5368709120 --per-hour-account 300 --per-hour-mailbox 100
+oxpanel-ctl mail usage acme
+oxpanel-ctl mail queue
+oxpanel-ctl mail check acme.example     # MX, SPF, DKIM, DMARC, reverse DNS from outside
+```
+
+Mail clients: IMAPS 993, POP3S 995, SMTP 587 (STARTTLS) or 465 (TLS), user
+name = the full address, server = the mail host name. Thunderbird finds this
+by itself (`autoconfig.<domain>`). Webmail: `https://webmail.<domain>/`.
+
+**What customers' sites send.** PHP's `mail()` uses OxPanel's sendmail
+(`/etc/php.d/90-oxpanel-mail.ini`): the sender (`From:` or `-f`) must be an
+address at one of the account's domains; the account's hourly limit
+applies. A script that sends without a `From:` header is refused (set one).
+Other code (Node.js, Python) sends through submission with a mailbox's
+login, like a mail client.
+
+**Where things are.** Mail: `~/mail/<domain>/<local>/` in the customer's
+home (counted by its disk quota; included in its backups). Records:
+`/var/lib/oxpanel/mail/`. DKIM keys, autoresponder scripts, the policy
+service's map and counters: `/var/lib/oxpanel-mail/`. Certificates:
+`/etc/pki/oxpanel-mail/`. Roundcube: `/etc/oxpanel-webmail/`,
+`/var/lib/oxpanel-webmail/`. Logs: `journalctl -u postfix -u dovecot -u
+rspamd -u oxpanel-mail-policy -t oxpanel-webmail`.
+
+**Suspension** stops the account's logins and sending and defers (450)
+mail for its domains; senders keep it and retry for days. **Deleting** an
+account is refused while it has mailboxes or forwarders, unless it is
+deleted with everything it has.
+
+**Turning email off**: `install.sh --no-mail` (or `--uninstall`, with
+`--purge-mail` to put Postfix's and Dovecot's own files back and remove
+OxPanel's mail state; mailboxes in homes are never removed by it).
+
 ## 10. Troubleshooting
 
 | Symptom | Cause / fix |
