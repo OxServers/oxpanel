@@ -1679,6 +1679,14 @@ records load with defaults for new fields. Backup, restore and file-manager jobs
 that are running keep running in their own units and are picked up by the new
 daemon; a customer deletion (cascade) that was running continues where it stopped.
 
+**0.2.0 to 0.3.0** adds email (§9.3). The upgrade itself changes nothing for
+hosts without email: the package adds two accounts (`oxpanel-mail`,
+`oxpanel-webmail`), two units that only start once email is switched on, and
+`/etc/php.d/90-oxpanel-mail.ini` (sites' `mail()` goes through OxPanel's
+sendmail, which hands the message to Postfix's own sendmail unchanged while
+email is off). Switch email on afterwards with `install.sh --mail`. The
+acceptance rig proves the upgrade from 0.2.0 (`INSTALL=upgrade`).
+
 **Uninstall the engine, keep the tenants:** `sudo ./install.sh --uninstall` (asks first;
 `--yes` to skip the question). It removes the engine package (and the panel package, if
 installed) and what the installer itself added (the fail2ban jail file, the repository

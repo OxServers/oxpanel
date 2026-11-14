@@ -139,7 +139,7 @@ PY
     check "fail2ban watches Dovecot" bash -c "fail2ban-client status dovecot >/dev/null"
     check "fail2ban watches Postfix's logins" bash -c "fail2ban-client status postfix-sasl >/dev/null"
     check "fail2ban watches webmail" bash -c "fail2ban-client status oxpanel-webmail >/dev/null"
-    check "the loopback is never banned (webmail logs in from it)" bash -c "fail2ban-client get dovecot ignoreip | grep -q 127.0.0.1"
+    check "the loopback is never banned (webmail logs in from it)" bash -c "fail2ban-client get dovecot ignoreip | grep -qE \"127\\.0\\.0\\.(1|0/8)\""
   else
     info "fail2ban is not active here: the ban itself is covered in installer mode"
   fi
