@@ -111,6 +111,13 @@ first kind: `getattr` by `php-fpm` on `/etc/shadow` and `/etc/gshadow`
 (`shadow_t`) and on a systemd unit file (`systemd_unit_file_t`), `read` of a
 unit file by a child `cat`, `mounton /mnt` by `mount` (`httpd_t`), and a
 `dbus-broker` refusal to write into a PHP child's pipe after `systemd-run`.
+With sections 7-15 (m4-attacks, on the VM) a run raises 43, still all of
+the first kind; the new ones are PHP's children (`httpd_t`) refused
+`name_connect` to the loopback ports of sshd, Nginx, rpcbind and BIND's
+control channel (`ssh_port_t`, `http_port_t`, `portmap_port_t`,
+`rndc_port_t`) and access to the rpcbind and udev sockets while section 15
+tries every listener; the application domain and scheduled tasks are not
+refused them by SELinux (gap 2) and are recorded as `info`.
 They show the layering working: `stat()` of `/etc/shadow` is allowed by Unix
 permissions (search permission on `/etc` is all it needs) and SELinux refuses it,
 while opening the file was refused by Unix permissions first; the application unit
