@@ -10,7 +10,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
-use tracing::{info, warn};
+use tracing::info;
 
 use super::config::MailConfig;
 use super::render::{self, Account, Model, HEADER};

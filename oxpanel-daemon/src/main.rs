@@ -508,6 +508,18 @@ fn make_system(config: &mut Config) -> Result<Arc<dyn System>, Fatal> {
         fake.install_mariadb();
         // Let the developer running the daemon talk to it.
         config.allowed_uids.insert(nix::unistd::geteuid().as_raw());
+        // Email's files go below the state directory, never to /etc.
+        let mail = config.state_dir.join("dry-run-mail");
+        config.mail.postfix_dir = mail.join("postfix");
+        config.mail.dovecot_dir = mail.join("dovecot");
+        config.mail.rspamd_dir = mail.join("rspamd");
+        config.mail.state_dir = mail.join("state");
+        config.mail.webmail_dir = mail.join("webmail");
+        config.mail.webmail_data_dir = mail.join("webmail-data");
+        config.mail.nginx_file = mail.join("nginx-mail.conf");
+        config.mail.run_dir = mail.join("run");
+        config.mail.milter_dir = mail.join("milter");
+        config.mail.selfsigned_dir = mail.join("pki");
         warn!("DRY RUN: no accounts, files under /etc or services will be touched");
         return Ok(Arc::new(fake));
     }

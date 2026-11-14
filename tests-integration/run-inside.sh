@@ -1400,7 +1400,7 @@ dry() { setpriv --reuid=panelapi --regid=panelapi --clear-groups --no-new-privs 
   OXPANEL_NGINX_LOG_DIR="$DRY/log" OXPANEL_PHP_CONF_DIR="$DRY/php" OXPANEL_SOCKET_PATH="$DRY/sock" \
   OXPANEL_TLS_DIR="$DRY/pki" OXPANEL_ACME_DIR="$DRY/acme" \
   OXPANEL_SSHD_DROPIN_FILE="$DRY/sshd_config.d/60-oxpanel.conf" OXPANEL_SFTP_KEYS_DIR="$DRY/sftp-keys" \
-  OXPANEL_BACKUP_DIR="$DRY/backups" \
+  OXPANEL_BACKUP_DIR="$DRY/backups" OXPANEL_MAIL=true OXPANEL_MAIL_HOSTNAME=mail.dry.test \
   OXPANEL_SOCKET_GROUP= OXPANEL_ALLOWED_UIDS="$(id -u panelapi)" "$@"; }
 real_dropin="$(sha256sum /etc/ssh/sshd_config.d/60-oxpanel.conf 2>/dev/null || true)"
 dry /usr/sbin/oxpanel-daemon --dry-run > /root/dry-run.log 2>&1 &
@@ -1410,6 +1410,10 @@ check "the dry-run daemon runs without root and opens its socket" test -S "$DRY/
 check "an unprivileged client creates a tenant in it" grep -q '^created=true' <(dry oxpanel-ctl tenant create dryt --memory 64M)
 check "and a virtual host" grep -q '^changed=true' <(dry oxpanel-ctl vhost set dry.test --tenant dryt)
 check "the fake host reports the dry-run flag" grep -q ' dry_run=true' <(dry oxpanel-ctl host info)
+check "email works in the dry run: a mail domain" grep -q '^created=true' <(dry oxpanel-ctl mail domain-set dry.test --tenant dryt)
+check "and a mailbox" grep -q '^created=true' <(echo 'Dry-Run-Pass-9182' | dry oxpanel-ctl mail mailbox-set info@dry.test --tenant dryt --password)
+check "and its listing" grep -q '^mailbox=info@dry.test ' <(dry oxpanel-ctl mail mailbox-list dry.test --tenant dryt)
+check "the dry run's mail files stay below its state directory" bash -c "test -f '$DRY/state/dry-run-mail/postfix/main.cf' && ! grep -q dry.test /etc/postfix/oxpanel/* 2>/dev/null"
 check "the records are written under the dry-run state directory" test -f "$DRY/state/tenants/dryt.json"
 check_not "no real account was created" id dryt
 check "no real unit or Nginx file was written" bash -c '! ls /etc/systemd/system/oxpanel-tenant-dryt.slice /etc/nginx/oxpanel.d/dry.test.conf 2>/dev/null | grep -q .'
