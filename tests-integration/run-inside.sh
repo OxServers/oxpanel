@@ -1411,7 +1411,7 @@ check "an unprivileged client creates a tenant in it" grep -q '^created=true' <(
 check "and a virtual host" grep -q '^changed=true' <(dry oxpanel-ctl vhost set dry.test --tenant dryt)
 check "the fake host reports the dry-run flag" grep -q ' dry_run=true' <(dry oxpanel-ctl host info)
 check "email works in the dry run: a mail domain" grep -q '^created=true' <(dry oxpanel-ctl mail domain-set dry.test --tenant dryt)
-check "and a mailbox" grep -q '^created=true' <(echo 'Dry-Run-Pass-9182' | dry oxpanel-ctl mail mailbox-set info@dry.test --tenant dryt --password)
+check "and a mailbox" grep -q '^created=true' <(echo 'Lantern-Pass-9182' | dry oxpanel-ctl mail mailbox-set info@dry.test --tenant dryt --password)
 check "and its listing" grep -q '^mailbox=info@dry.test ' <(dry oxpanel-ctl mail mailbox-list dry.test --tenant dryt)
 check "the dry run's mail files stay below its state directory" bash -c "test -f '$DRY/state/dry-run-mail/postfix/main.cf' && ! grep -q dry.test /etc/postfix/oxpanel/* 2>/dev/null"
 check "the records are written under the dry-run state directory" test -f "$DRY/state/tenants/dryt.json"
