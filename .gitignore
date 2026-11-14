@@ -17,3 +17,6 @@
 
 # Integration-test artefacts
 /tests-integration/.cache/
+
+# Python bytecode (the acceptance probes are run by python3 on the host for checks)
+__pycache__/

@@ -69,7 +69,11 @@ features_mail() {
   check "an autoresponder subject with a line break is refused" bash -c "! oxpanel-ctl mail autoreply shop@$AD --tenant attack3 --subject \$'x\nBcc: a@b.example' --body x >/dev/null 2>&1"
   check "an external MX with a line break is refused" bash -c "! oxpanel-ctl mail domain-set $AD --tenant attack3 --mode external --mx \$'mx.example.org\nrelay' >/dev/null 2>&1"
   check "an autoresponder body that tries to end the Sieve string stays text" run_ok ctl mail autoreply "shop@$AD" --tenant attack3 --subject 'away "x"; redirect "a@b.example";' --body $'line\n.\n"; redirect "evil@relay.example"; keep;'
-  check "the script compiles and holds no redirect (the text stayed text)" bash -c "sievec /var/lib/oxpanel-mail/sieve/$AD/shop.sieve $FT/shop.svbin && ! sieve-dump $FT/shop.svbin | grep -qiE '^ *[0-9a-f]+: *redirect'"
+  # sievec writes its output by renaming a new file over it: never give it a
+  # path that is not a scratch file of the test (with /dev/null it replaced
+  # the device and broke the host).
+  check "the script compiles and holds no redirect (the text stayed text)" bash -c "rm -f $FT/shop.svbin $FT/shop.dump && sievec /var/lib/oxpanel-mail/sieve/$AD/shop.sieve $FT/shop.svbin && sieve-dump $FT/shop.svbin > $FT/shop.dump && grep -qiE '^ *[0-9a-f]+: *vacation' $FT/shop.dump && ! grep -qiE '^ *[0-9a-f]+: *redirect' $FT/shop.dump"
+  check "/dev/null is still the null device" test -c /dev/null
   check "Postfix still accepts its maps" bash -c "postfix check >/dev/null 2>&1"
   check "Dovecot still accepts its configuration" bash -c "doveconf -n >/dev/null 2>&1"
   ctl mail autoreply "shop@$AD" --tenant attack3 --off >/dev/null

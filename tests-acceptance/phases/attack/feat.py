@@ -362,15 +362,23 @@ def mail(victim_home, victim_domain, own_domain, sendmail):
     rc, out = run(['/usr/bin/doveadm', 'fetch', '-u', f'info@{victim_domain}', 'text', 'all'], timeout=8)
     emit('mail-doveadm-fetch', rc == 0 and 'VICTIM' in out, 'blocked', out.strip()[:80])
     # Relaying through the loopback, with and without a login.
-    r = smtp_dialog(('127.0.0.1', 25), timeout=5, lines=['EHLO attacker', f'MAIL FROM:<x@{own_domain}>', 'RCPT TO:<victim@relay.example>'])
-    emit('mail-relay-25', r.startswith('250'), 'blocked', r[:80])
+    # Every dialog may fail to connect: PHP's children run in httpd_t, which
+    # SELinux does not let connect to the SMTP ports at all (blocked, too).
+    try:
+        r = smtp_dialog(('127.0.0.1', 25), timeout=5, lines=['EHLO attacker', f'MAIL FROM:<x@{own_domain}>', 'RCPT TO:<victim@relay.example>'])
+        emit('mail-relay-25', r.startswith('250'), 'blocked', r[:80])
+    except OSError as e:
+        emit('mail-relay-25', False, 'blocked', e.strerror or type(e).__name__)
     try:
         r = smtp_dialog(('127.0.0.1', 587), timeout=5, lines=['EHLO attacker', f'MAIL FROM:<x@{own_domain}>', 'RCPT TO:<victim@relay.example>'])
         emit('mail-relay-587-no-login', r.startswith('250'), 'blocked', r[:80])
     except OSError as e:
-        emit('mail-relay-587-no-login', False, 'blocked', str(e))
-    r = smtp_dialog(('127.0.0.1', 25), timeout=5, lines=['EHLO attacker', 'VRFY info@' + victim_domain])
-    emit('mail-vrfy', r.startswith('25'), 'blocked', r[:80])
+        emit('mail-relay-587-no-login', False, 'blocked', e.strerror or type(e).__name__)
+    try:
+        r = smtp_dialog(('127.0.0.1', 25), timeout=5, lines=['EHLO attacker', 'VRFY info@' + victim_domain])
+        emit('mail-vrfy', r.startswith('25'), 'blocked', r[:80])
+    except OSError as e:
+        emit('mail-vrfy', False, 'blocked', e.strerror or type(e).__name__)
     # OxPanel's sendmail: as another customer (envelope, From:), as itself.
     msg = f'From: ceo@{victim_domain}\nTo: info@{victim_domain}\nSubject: forged\n\nx\n'.encode()
     rc, out = run([sendmail, '-t', '-i'], stdin=msg, timeout=8)
