@@ -316,21 +316,22 @@ async fn a_mailbox_is_made_as_the_account_and_only_its_files_change() {
     let run_as = mkdirs[0].run_as.unwrap();
     assert_eq!((run_as.uid, run_as.gid), (alice.uid, alice.gid));
     // Only the files that changed are announced: maps (Postfix), the
-    // password files (Dovecot's cache flushed, no reload), the policy map.
+    // password files (Dovecot reloaded: it forgets cached logins), the policy map.
     let units: Vec<String> = h
         .argvs(bin::SYSTEMCTL)
         .into_iter()
         .filter(|a| a[0] == "reload-or-restart")
         .map(|a| a[2].clone())
         .collect();
-    assert_eq!(units, [ops::POSTFIX_SERVICE, ops::POLICY_SERVICE]);
     assert_eq!(
-        h.argvs(bin::DOVEADM)
-            .into_iter()
-            .filter(|a| a[0] != "-f")
-            .collect::<Vec<_>>(),
-        vec![vec!["auth".to_owned(), "cache".into(), "flush".into()]]
+        units,
+        [
+            ops::POSTFIX_SERVICE,
+            ops::DOVECOT_SERVICE,
+            ops::POLICY_SERVICE
+        ]
     );
+    assert!(h.argvs(bin::DOVEADM).into_iter().all(|a| a[0] == "-f"));
     // The quota is read with doveadm.
     assert!(h.argvs(bin::DOVEADM).contains(&vec![
         "-f".to_owned(),
@@ -454,14 +455,16 @@ async fn maps_and_password_files_are_rendered_from_the_records() {
     let home = h.home("alice");
     assert!(
         users.contains(&format!(
-            "off@example.test::{}:{}::{}/mail/example.test/off::quota_rule=*:storage=20971520B\n",
+            "off@example.test::{}:{}::{}/mail/example.test/off::userdb_quota_rule=*:storage=20971520B\n",
             alice.uid,
             alice.gid,
             home.display()
         )),
         "{users}"
     );
-    assert!(users.contains("info@example.test::") && users.contains("quota_rule=*:storage=0\n"));
+    assert!(
+        users.contains("info@example.test::") && users.contains("userdb_quota_rule=*:storage=0\n")
+    );
     // Policy map: mailboxes and the account.
     let policy: render::PolicyMap =
         serde_json::from_str(&h.read(h.cfg().state_dir.join("policy.json"))).unwrap();
@@ -611,7 +614,7 @@ async fn mailbox_refusals_carry_their_codes() {
         )
         .await
         .unwrap();
-    for (q, why) in [(0, "no limit of its own"), (60 << 20, "above")] {
+    for (q, why) in [(60 << 20, "above")] {
         let e = h
             .mail
             .put_mailbox("alice", "example.test", "info", q, PW, true)
@@ -1199,8 +1202,18 @@ async fn email_off_answers_mail_unavailable() {
 async fn the_queue_is_read_attributed_and_managed() {
     let h = harness().await;
     h.domain().await;
+    // Postfix's tools run in transient units; what they print is read back
+    // from the journal.
+    let tools = |h: &H| -> Vec<Vec<String>> {
+        h.argvs(bin::SYSTEMD_RUN)
+            .into_iter()
+            .filter(|a| a.iter().any(|x| x.starts_with("--unit=oxpanel-mailq-")))
+            .map(|a| a.into_iter().skip_while(|x| x != "--").skip(1).collect())
+            .collect()
+    };
+    h.sys.clear_calls();
     h.sys.script_stdout(
-        bin::POSTQUEUE,
+        bin::JOURNALCTL,
         r#"{"queue_name":"deferred","queue_id":"ABCDE12345","arrival_time":100,"message_size":10,"sender":"info@example.test","recipients":[{"address":"x@y.org","delay_reason":"timed out"}]}
 {"queue_name":"deferred","queue_id":"FFFFF00000","arrival_time":200,"message_size":10,"sender":"wp@www.bob.test","recipients":[]}"#,
     );
@@ -1214,15 +1227,28 @@ async fn the_queue_is_read_attributed_and_managed() {
         (q[1].tenant.as_str(), q[1].reason.as_str()),
         ("alice", "timed out")
     );
-    assert_eq!(h.argvs(bin::POSTQUEUE), vec![vec!["-j".to_owned()]]);
+    assert_eq!(
+        tools(&h),
+        vec![vec![bin::POSTQUEUE.to_owned(), "-j".into()]]
+    );
+    let run = h.argvs(bin::SYSTEMD_RUN);
+    assert_eq!(&run[0][..3], ["--wait", "--collect", "--quiet"]);
+    assert!(
+        h.argvs(bin::POSTQUEUE).is_empty(),
+        "never run in the daemon's own unit"
+    );
+    h.sys.clear_calls();
     h.sys.script_stdout(
-        bin::POSTQUEUE,
+        bin::JOURNALCTL,
         r#"{"queue_id":"ABCDE12345","recipients":[]}"#,
     );
     assert!(h.mail.delete_queued("ABCDE12345").await.unwrap());
     assert_eq!(
-        h.argvs(bin::POSTSUPER),
-        vec![vec!["-d".to_owned(), "ABCDE12345".into()]]
+        tools(&h),
+        vec![
+            vec![bin::POSTQUEUE.to_owned(), "-j".into()],
+            vec![bin::POSTSUPER.to_owned(), "-d".into(), "ABCDE12345".into()]
+        ]
     );
     let e = h.mail.delete_queued("ZZZZZ99999").await.unwrap_err();
     assert_eq!(code(&e), Some(MailCode::QueuedMailNotFound));
@@ -1235,8 +1261,11 @@ async fn the_queue_is_read_attributed_and_managed() {
     h.sys.clear_calls();
     assert_eq!(h.mail.flush_queue().await.unwrap(), 0);
     assert_eq!(
-        h.argvs(bin::POSTQUEUE),
-        vec![vec!["-j".to_owned()], vec!["-f".to_owned()]]
+        tools(&h),
+        vec![
+            vec![bin::POSTQUEUE.to_owned(), "-j".into()],
+            vec![bin::POSTQUEUE.to_owned(), "-f".into()]
+        ]
     );
 }
 
@@ -1453,8 +1482,16 @@ async fn the_webmail_is_offered_with_roundcube_and_only_over_https_once_certifie
     // A certificate for the name switches it to HTTPS.
     let name = Domain::parse("webmail.example.test").unwrap();
     std::fs::create_dir_all(&h.ctx.config.tls_dir).unwrap();
-    std::fs::write(crate::tls::cert_path(&h.ctx.config.tls_dir, &name), "c").unwrap();
-    std::fs::write(crate::tls::key_path(&h.ctx.config.tls_dir, &name), "k").unwrap();
+    std::fs::write(
+        crate::tls::cert_path(&h.ctx.config.mail.selfsigned_dir, &name),
+        "c",
+    )
+    .unwrap();
+    std::fs::write(
+        crate::tls::key_path(&h.ctx.config.mail.selfsigned_dir, &name),
+        "k",
+    )
+    .unwrap();
     {
         let _g = h.ctx.lock.lock().await;
         ops::apply(&h.ctx).await.unwrap();

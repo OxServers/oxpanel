@@ -3,7 +3,7 @@
 # Python code, and from the network. Every attempt must fail. Sections 7-15
 # (phases/attack/features.sh) attack the features added since: SFTP, the file
 # manager, certificates, databases, backups, scheduled tasks and PHP settings,
-# DNS hosting and cascade deletion.
+# DNS hosting and cascade deletion; section 16 (phases/attack/mail.sh) email.
 #
 # How the phase tells "denied" from "a hole":
 #   * Every probe has an expected result. A probe that is OPEN where BLOCKED is
@@ -69,6 +69,7 @@ check "suspend susp1" bash -c "oxpanel-ctl tenant suspend susp1 | grep -q 'suspe
 
 # The features added since this phase was written (sections 7-15 and the battery's extra probes).
 source "$A/features.sh"
+source "$A/mail.sh"
 echo "-- setup: the victim gets one of every feature"
 features_setup
 
@@ -412,6 +413,7 @@ features_backups
 features_tasks
 features_dns
 features_listeners
+features_mail
 features_cascade
 check "the attacks on the features changed nothing outside the tenants (permissions, ACLs, labels)" test "$(snap)" = "$SNAP7"
 features_teardown

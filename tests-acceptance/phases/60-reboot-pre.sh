@@ -50,6 +50,16 @@ if [ -x /usr/sbin/named ] && [ -x /usr/bin/dig ]; then
 else
   rm -f dns_serial.pre
 fi
+# Email (on since phase 18): a mailbox with a message must survive the reboot.
+if oxpanel-ctl mail host 2>/dev/null | grep -q '^enabled=true'; then
+  check "a mail domain for boota" ctl_ok '^created=' oxpanel-ctl mail domain-set boota.test --tenant boota
+  check "a mailbox" bash -c "echo 'Reboot-Mail-Pass-31' | oxpanel-ctl mail mailbox-set info@boota.test --tenant boota --password >/dev/null"
+  check "a message before the reboot" python3 /root/acc/mail-client.py deliver 25 a@remote.example info@boota.test --subject before-reboot
+  eventually "it is in the mailbox" 40 0.5 python3 /root/acc/mail-client.py imap-find info@boota.test Reboot-Mail-Pass-31 before-reboot
+  echo yes > mail.pre
+else
+  rm -f mail.pre
+fi
 cat /proc/sys/kernel/random/boot_id > boot_id.pre
 oxpanel-ctl tenant list > tenants.pre
 oxpanel-ctl vhost list > vhosts.pre

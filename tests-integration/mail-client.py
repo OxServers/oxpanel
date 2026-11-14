@@ -1,0 +1,290 @@
+#!/usr/bin/env python3
+"""A mail client for the integration and acceptance tests (standard library
+only, plus the openssl command for DKIM).
+
+    mail-client.py deliver PORT FROM TO [--from-header A] [--subject S] [--size N] [--host H]
+    mail-client.py submit PORT USER PASS FROM TO [--from-header A] [--subject S]
+    mail-client.py imap-count USER PASS          (prints the number of messages)
+    mail-client.py imap-find USER PASS SUBJECT [--out FILE]
+    mail-client.py imap-clear USER PASS
+    mail-client.py pop3 USER PASS
+    mail-client.py auth-before-tls PORT          (0 if AUTH is not offered before STARTTLS)
+    mail-client.py dkim-verify FILE PUBKEY_B64   (0 if the DKIM-Signature verifies)
+
+Exit status: 0 accepted / found / verified, 2 refused by the server,
+3 login failed, 4 not found, 1 anything else.
+"""
+
+import base64
+import imaplib
+import os
+import poplib
+import re
+import smtplib
+import ssl
+import subprocess
+import sys
+import tempfile
+import time
+
+CTX = ssl.create_default_context()
+CTX.check_hostname = False
+CTX.verify_mode = ssl.CERT_NONE
+
+
+def opt(args, name, default=None):
+    if name in args:
+        i = args.index(name)
+        v = args[i + 1]
+        del args[i : i + 2]
+        return v
+    return default
+
+
+def message(frm, to, subject, size):
+    body = "hello from the OxPanel tests\r\n"
+    if size:
+        line = "x" * 76 + "\r\n"
+        body += line * (int(size) // len(line) + 1)
+    return (
+        f"From: {frm}\r\nTo: {to}\r\nSubject: {subject}\r\n"
+        f"Date: {time.strftime('%a, %d %b %Y %H:%M:%S +0000', time.gmtime())}\r\n"
+        f"Message-ID: <{time.time_ns()}@oxpanel.test>\r\n\r\n{body}"
+    )
+
+
+def deliver(args):
+    hdr = opt(args, "--from-header")
+    subject = opt(args, "--subject", f"test {time.time_ns()}")
+    size = opt(args, "--size")
+    host = opt(args, "--host", "127.0.0.1")
+    port, frm, to = args
+    s = smtplib.SMTP(host, int(port), timeout=60)
+    s.ehlo("tester.oxpanel.test")
+    try:
+        s.sendmail(frm, [to], message(hdr or frm, to, subject, size))
+    except smtplib.SMTPException as e:
+        print(f"refused: {e}")
+        return 2
+    finally:
+        try:
+            s.quit()
+        except Exception:
+            pass
+    print("accepted")
+    return 0
+
+
+def submit(args):
+    hdr = opt(args, "--from-header")
+    subject = opt(args, "--subject", f"test {time.time_ns()}")
+    port, user, pw, frm, to = args
+    if int(port) == 465:
+        s = smtplib.SMTP_SSL("127.0.0.1", 465, context=CTX, timeout=60)
+    else:
+        s = smtplib.SMTP("127.0.0.1", int(port), timeout=60)
+        s.ehlo()
+        s.starttls(context=CTX)
+        s.ehlo()
+    try:
+        try:
+            s.login(user, pw)
+        except smtplib.SMTPAuthenticationError as e:
+            print(f"login failed: {e}")
+            return 3
+        try:
+            s.sendmail(frm, [to], message(hdr or frm, to, subject, None))
+        except smtplib.SMTPException as e:
+            print(f"refused: {e}")
+            return 2
+    finally:
+        try:
+            s.quit()
+        except Exception:
+            pass
+    print("accepted")
+    return 0
+
+
+def imap_login(user, pw):
+    m = imaplib.IMAP4_SSL("127.0.0.1", 993, ssl_context=CTX)
+    try:
+        m.login(user, pw)
+    except imaplib.IMAP4.error as e:
+        print(f"login failed: {e}")
+        return None
+    return m
+
+
+def imap_count(args):
+    m = imap_login(*args)
+    if not m:
+        return 3
+    _, d = m.select("INBOX")
+    print(int(d[0]))
+    m.logout()
+    return 0
+
+
+def imap_find(args):
+    out = opt(args, "--out")
+    user, pw, subject = args
+    m = imap_login(user, pw)
+    if not m:
+        return 3
+    m.select("INBOX")
+    # A literal: the subject may hold quotes.
+    m.literal = subject.encode()
+    _, d = m.search(None, "SUBJECT")
+    ids = d[0].split()
+    if not ids:
+        m.logout()
+        return 4
+    _, data = m.fetch(ids[-1], "(RFC822)")
+    raw = data[0][1]
+    if out:
+        with open(out, "wb") as f:
+            f.write(raw)
+    m.logout()
+    return 0
+
+
+def imap_clear(args):
+    m = imap_login(*args)
+    if not m:
+        return 3
+    m.select("INBOX")
+    m.store("1:*", "+FLAGS", "\\Deleted")
+    m.expunge()
+    m.logout()
+    return 0
+
+
+def pop3(args):
+    user, pw = args
+    p = poplib.POP3_SSL("127.0.0.1", 995, context=CTX)
+    try:
+        p.user(user)
+        p.pass_(pw)
+    except poplib.error_proto as e:
+        print(f"login failed: {e}")
+        return 3
+    print(p.stat()[0])
+    p.quit()
+    return 0
+
+
+def auth_before_tls(args):
+    s = smtplib.SMTP("127.0.0.1", int(args[0]), timeout=30)
+    s.ehlo()
+    offered = s.has_extn("auth")
+    s.quit()
+    return 1 if offered else 0
+
+
+# ---- DKIM (RFC 6376), relaxed/relaxed, rsa-sha256 --------------------------
+
+
+def unfold(raw):
+    """Header fields as (name, raw text incl. name and colon), in order."""
+    head = raw.split(b"\r\n\r\n", 1)[0].decode("latin-1")
+    fields = []
+    for line in head.split("\r\n"):
+        if line[:1] in (" ", "\t") and fields:
+            fields[-1] = fields[-1] + "\r\n" + line
+        else:
+            fields.append(line)
+    return [(f.split(":", 1)[0].strip().lower(), f) for f in fields if ":" in f]
+
+
+def relaxed_header(field):
+    name, value = field.split(":", 1)
+    value = re.sub(r"\r\n", "", value)
+    value = re.sub(r"[ \t]+", " ", value).strip()
+    return f"{name.strip().lower()}:{value}"
+
+
+def relaxed_body(raw):
+    body = raw.split(b"\r\n\r\n", 1)[1] if b"\r\n\r\n" in raw else b""
+    lines = body.split(b"\r\n")
+    out = [re.sub(rb"[ \t]+", b" ", l).rstrip(b" \t") for l in lines]
+    while out and out[-1] == b"":
+        out.pop()
+    return b"".join(l + b"\r\n" for l in out)
+
+
+def dkim_verify(args):
+    path, pubkey = args
+    raw = open(path, "rb").read().replace(b"\r\n", b"\n").replace(b"\n", b"\r\n")
+    fields = unfold(raw)
+    sig = [f for n, f in fields if n == "dkim-signature"]
+    if not sig:
+        print("no DKIM-Signature")
+        return 4
+    sigfield = sig[0]
+    tags = {}
+    for part in re.sub(r"\s+", "", sigfield.split(":", 1)[1]).split(";"):
+        if "=" in part:
+            k, v = part.split("=", 1)
+            tags[k] = v
+    if tags.get("a") != "rsa-sha256" or tags.get("c") != "relaxed/relaxed":
+        print(f"unexpected a= or c=: {tags.get('a')} {tags.get('c')}")
+        return 1
+    import hashlib
+
+    bh = base64.b64encode(hashlib.sha256(relaxed_body(raw)).digest()).decode()
+    if bh != tags["bh"]:
+        print("body hash mismatch")
+        return 2
+    # Signed headers, each name taking the next instance from the bottom.
+    remaining = {}
+    for n, f in fields:
+        remaining.setdefault(n, []).append(f)
+    data = ""
+    for name in tags["h"].lower().split(":"):
+        if remaining.get(name):
+            data += relaxed_header(remaining[name].pop()) + "\r\n"
+    # Only the b= tag is emptied, not bh=.
+    unsigned = re.sub(r"(^|;)(\s*b=)[^;]*", r"\1\2", sigfield)
+    data += relaxed_header(unsigned)
+    with tempfile.TemporaryDirectory() as d:
+        pem = os.path.join(d, "pub.pem")
+        with open(pem, "w") as f:
+            f.write("-----BEGIN PUBLIC KEY-----\n")
+            for i in range(0, len(pubkey), 64):
+                f.write(pubkey[i : i + 64] + "\n")
+            f.write("-----END PUBLIC KEY-----\n")
+        sigbin = os.path.join(d, "sig")
+        with open(sigbin, "wb") as f:
+            f.write(base64.b64decode(tags["b"]))
+        payload = os.path.join(d, "data")
+        with open(payload, "wb") as f:
+            f.write(data.encode("latin-1"))
+        r = subprocess.run(
+            ["openssl", "dgst", "-sha256", "-verify", pem, "-signature", sigbin, payload],
+            capture_output=True,
+        )
+    print(r.stdout.decode().strip() or r.stderr.decode().strip())
+    return 0 if r.returncode == 0 else 2
+
+
+def main():
+    cmd, args = sys.argv[1], sys.argv[2:]
+    return {
+        "deliver": deliver,
+        "submit": submit,
+        "imap-count": imap_count,
+        "imap-find": imap_find,
+        "imap-clear": imap_clear,
+        "pop3": pop3,
+        "auth-before-tls": auth_before_tls,
+        "dkim-verify": dkim_verify,
+    }[cmd](args)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (OSError, smtplib.SMTPException, imaplib.IMAP4.error) as e:
+        print(f"error: {e}")
+        sys.exit(1)

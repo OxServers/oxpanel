@@ -601,6 +601,11 @@ impl TenantService {
         crate::php::set_running(&self.ctx, &rec, false).await?;
         crate::app::set_running_all(&self.ctx, &rec, false).await?;
         crate::task::remove_all(&self.ctx, &rec.username).await?;
+        // Email: mail domains, DKIM keys, autoresponders and the webmail
+        // names' certificates (the mail itself goes with the home), before the
+        // sites (whose names the webmail servers sit beside in Nginx) and the
+        // zones that carry the mail records.
+        crate::mail::remove_tenant_mail(&self.ctx, name).await?;
         let vhosts = vhost::VHostService::new(self.ctx.clone());
         for v in self.ctx.store.list_vhosts()? {
             if v.tenant == rec.username {
@@ -609,9 +614,6 @@ impl TenantService {
                     .await?;
             }
         }
-        // Email: mail domains, DKIM keys, autoresponders (the mail itself
-        // goes with the home), before the zones that carry their records.
-        crate::mail::remove_tenant_mail(&self.ctx, name).await?;
         // DNS zones: the sites' automatic ones went with the sites; what is
         // left holds the tenant's own records (and DNSSEC keys) and goes now.
         crate::dns::remove_tenant_zones(&self.ctx, name).await?;

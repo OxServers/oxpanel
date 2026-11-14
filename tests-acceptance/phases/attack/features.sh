@@ -889,7 +889,8 @@ PY
 # ------------------------------------------------------------------ 15. every local listener and socket
 features_listeners() {
   echo "-- 15. every listener and UNIX socket on the host, from tenant code"
-  feat_everywhere listeners 10 listeners /var/lib/mysql/mysql.sock
+  # Sites hand their mail to the policy service through sendmail.sock (by design).
+  feat_everywhere listeners 10 listeners /var/lib/mysql/mysql.sock /run/oxpanel-mail/sendmail.sock
 }
 
 features_teardown() {

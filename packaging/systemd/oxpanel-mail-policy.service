@@ -25,6 +25,9 @@ Group=oxpanel-mail
 SupplementaryGroups=postfix postdrop
 RuntimeDirectory=oxpanel-mail
 RuntimeDirectoryMode=0755
+# SELinux: the domain of tenant applications (see packaging/selinux/oxpanel.cil);
+# "-": ignored where SELinux is off.
+SELinuxContext=-system_u:system_r:oxpanel_app_t:s0
 UMask=0027
 
 # --- Isolation ---------------------------------------------------------------

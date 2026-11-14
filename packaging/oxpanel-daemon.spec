@@ -80,6 +80,9 @@ cargo build --release --locked -p oxpanel-daemon -p oxpanel-ctl -p oxpanel-acme
 install -D -m 0755 target/release/oxpanel-daemon %{buildroot}%{_sbindir}/oxpanel-daemon
 install -D -m 0755 target/release/oxpanel-ctl    %{buildroot}%{_bindir}/oxpanel-ctl
 install -D -m 0755 target/release/oxpanel-acme   %{buildroot}%{_libexecdir}/oxpanel/oxpanel-acme
+# OxPanel's sendmail under the name Dovecot's autoresponders run (the daemon
+# binary acts as sendmail when called by that name).
+ln -s ../../sbin/oxpanel-daemon %{buildroot}%{_libexecdir}/oxpanel/sendmail
 install -D -m 0644 packaging/systemd/oxpanel-daemon.service %{buildroot}%{_unitdir}/oxpanel-daemon.service
 install -D -m 0644 packaging/systemd/oxpanel-dns.service %{buildroot}%{_unitdir}/oxpanel-dns.service
 install -D -m 0644 packaging/systemd/oxpanel-mail-policy.service %{buildroot}%{_unitdir}/oxpanel-mail-policy.service
@@ -134,6 +137,7 @@ if [ "$1" -eq 0 ] && /usr/sbin/selinuxenabled 2>/dev/null; then /usr/sbin/semodu
 %{_bindir}/oxpanel-ctl
 %dir %{_libexecdir}/oxpanel
 %{_libexecdir}/oxpanel/oxpanel-acme
+%{_libexecdir}/oxpanel/sendmail
 %{_unitdir}/oxpanel-daemon.service
 %{_unitdir}/oxpanel-dns.service
 %{_unitdir}/oxpanel-mail-policy.service

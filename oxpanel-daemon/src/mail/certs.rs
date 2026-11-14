@@ -66,8 +66,8 @@ pub fn wanted_names(ctx: &Ctx) -> Result<Vec<Domain>> {
 
 /// Whether `name` has a certificate that is not due for renewal.
 async fn current(ctx: &Ctx, name: &Domain) -> bool {
-    let crt = crate::tls::cert_path(&ctx.config.tls_dir, name);
-    if !crt.exists() || !crate::tls::key_path(&ctx.config.tls_dir, name).exists() {
+    let crt = crate::tls::cert_path(&ctx.config.mail.selfsigned_dir, name);
+    if !crt.exists() || !crate::tls::key_path(&ctx.config.mail.selfsigned_dir, name).exists() {
         return false;
     }
     let due = now_unix().saturating_add(ctx.config.acme_renew_before.as_secs());
@@ -179,12 +179,12 @@ async fn install(ctx: &Ctx, name: &Domain) -> Result<()> {
     let chain = crate::tls::normalise_pem(&chain, crate::tls::PemKind::Chain)?;
     crate::tls::verify_material(ctx, name, &chain, &key).await?;
     fsutil::write_atomic(
-        &crate::tls::key_path(&cfg.tls_dir, name),
+        &crate::tls::key_path(&cfg.mail.selfsigned_dir, name),
         key.as_bytes(),
         crate::tls::KEY_MODE,
     )?;
     fsutil::write_atomic(
-        &crate::tls::cert_path(&cfg.tls_dir, name),
+        &crate::tls::cert_path(&cfg.mail.selfsigned_dir, name),
         chain.as_bytes(),
         crate::tls::CERT_MODE,
     )?;

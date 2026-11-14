@@ -55,7 +55,10 @@ pub struct MailConfig {
     /// The filter's milter socket directory: `_rspamd:postfix 0750`, so no
     /// local process other than Postfix (and the filter) can reach it.
     pub milter_dir: PathBuf,
-    /// The self-signed certificate used until the mail host name has a real one.
+    /// Certificates of the mail names (root-only): the mail host name's and
+    /// the webmail names' (`<name>.crt`, `<name>.key`, obtained like the
+    /// sites' through ACME), and the self-signed one used until the mail host
+    /// name has a real one. Apart from the sites' (`/etc/pki/oxpanel`).
     pub selfsigned_dir: PathBuf,
     /// Roundcube's front page as packaged: webmail is offered when it exists.
     pub roundcube_index: PathBuf,

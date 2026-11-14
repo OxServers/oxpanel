@@ -175,7 +175,10 @@ impl Policy {
                     .any(|o| d == *o || d.ends_with(&format!(".{o}")))
             })
         };
-        if !owned(sender) {
+        if sender.is_empty() && from.is_empty() {
+            return Verdict::Refuse("the null sender needs a From: header".to_owned());
+        }
+        if !sender.is_empty() && !owned(sender) {
             return Verdict::Refuse(format!(
                 "the sender {sender} is not at one of this account's domains"
             ));
@@ -364,6 +367,11 @@ pub fn prepare(req: &SubmitRequest, msg: &[u8]) -> Result<SiteMessage, String> {
         .flat_map(|(_, v)| addresses(v))
         .collect();
     let sender = match (&req.sender, from.first()) {
+        // The null sender (an automatic reply): From: must say who sends.
+        (Some(s), Some(_)) if s == "<>" => String::new(),
+        (Some(s), None) if s == "<>" => {
+            return Err("a message with the null sender needs a From: header".to_owned())
+        }
         (Some(s), _) if !s.is_empty() => s.clone(),
         (_, Some(f)) => f.clone(),
         _ => {
@@ -373,7 +381,7 @@ pub fn prepare(req: &SubmitRequest, msg: &[u8]) -> Result<SiteMessage, String> {
             )
         }
     };
-    if !plain_address(&sender) {
+    if !sender.is_empty() && !plain_address(&sender) {
         return Err(format!(
             "the sender '{}' is not a plain address",
             printable(&sender)

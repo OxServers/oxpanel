@@ -300,6 +300,39 @@ fn check_owned(ctx: &Ctx, tenant: &str, domain: &Domain) -> Result<()> {
     }
 }
 
+/// Whether a site of `tenant` may be called `name`: never the mail host
+/// name, and not `webmail.`/`autoconfig.`/`autodiscover.` of another
+/// account's local mail domain (those names are served for that account).
+pub fn check_site_name(ctx: &Ctx, name: &str, tenant: &str) -> Result<()> {
+    let cfg = &ctx.config.mail;
+    if !cfg.enabled {
+        return Ok(());
+    }
+    if cfg.hostname.as_ref().is_some_and(|h| h.as_str() == name) {
+        return Err(Error::invalid(
+            "domain",
+            format!("'{name}' is this host's mail host name"),
+        ));
+    }
+    for prefix in ["webmail.", "autoconfig.", "autodiscover."] {
+        let Some(base) = name.strip_prefix(prefix) else {
+            continue;
+        };
+        let Ok(base) = Domain::parse(base) else {
+            continue;
+        };
+        if let Some(rec) = MailStore::new(&ctx.config).load(&base)? {
+            if rec.tenant != tenant && rec.mode == MailMode::Local && render::live(&rec) {
+                return Err(Error::VHostOwnedByOther {
+                    domain: name.to_owned(),
+                    owner: rec.tenant,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 // ---- The service ------------------------------------------------------------------
 
 #[derive(Debug, Clone)]

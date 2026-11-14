@@ -31,6 +31,9 @@ RuntimeDirectory=oxpanel-webmail
 RuntimeDirectoryMode=0711
 StateDirectory=oxpanel-webmail oxpanel-webmail/temp
 StateDirectoryMode=0700
+# SELinux: the domain of tenant applications (see packaging/selinux/oxpanel.cil);
+# "-": ignored where SELinux is off.
+SELinuxContext=-system_u:system_r:oxpanel_app_t:s0
 UMask=0077
 
 # --- Isolation ---------------------------------------------------------------

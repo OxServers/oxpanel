@@ -65,6 +65,15 @@ check "records intact" test -f /var/lib/oxpanel/tenants/boota.json -a -f /var/li
 check "no sandbox directive ignored on this boot" bash -c "! journalctl -b -u oxpanel-daemon --no-pager | grep -qi ignoring"
 check "no daemon errors on this boot" bash -c '! journalctl -b -u oxpanel-daemon -p err --no-pager | grep -q oxpanel-daemon'
 n=$(avc_count); if [ "$n" = 0 ]; then ok "zero AVC denials on this boot"; else avc_dump; fail "$n AVC denial(s) on this boot"; fi
+if [ -s mail.pre ]; then
+  for u in postfix dovecot rspamd oxpanel-mail-policy oxpanel-webmail; do eventually "$u is active after the reboot" 60 1 systemctl -q is-active "$u"; done
+  eventually "the message is still in the mailbox" 60 1 python3 /root/acc/mail-client.py imap-find info@boota.test Reboot-Mail-Pass-31 before-reboot
+  check "delivery works after the reboot" python3 /root/acc/mail-client.py deliver 25 a@remote.example info@boota.test --subject after-reboot
+  eventually "and the new message arrives" 40 0.5 python3 /root/acc/mail-client.py imap-find info@boota.test Reboot-Mail-Pass-31 after-reboot
+  check "submission works after the reboot" python3 /root/acc/mail-client.py submit 587 info@boota.test Reboot-Mail-Pass-31 info@boota.test info@boota.test --subject sent-after-reboot
+  check "the policy service counted it" bash -c "oxpanel-ctl mail usage boota | grep -qv 'sent_this_hour=0'"
+  check "the mailbox goes" ctl_ok '^deleted=true' oxpanel-ctl mail mailbox-delete info@boota.test --tenant boota
+fi
 check "unknown host still closed" test "$(curl -s -H 'Host: nobody.test' http://127.0.0.1/; echo "rc=$?")" = "rc=52"
 for d in boota.test bootb.test bootphp.test bootnode.test; do check "remove $d" bash -c "oxpanel-ctl vhost remove $d | grep -q '^removed=true'"; done
 if [ -s dns_serial.pre ]; then

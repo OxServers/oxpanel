@@ -117,7 +117,9 @@ impl MailService {
             .sum())
     }
 
-    fn check_quota(limits: &Limits, quota: u64) -> Result<()> {
+    /// The size limit a mailbox gets for `quota`: 0 means "none of its
+    /// own", which under an account maximum is that maximum.
+    fn check_quota(limits: &Limits, quota: u64) -> Result<u64> {
         if quota > 0 && quota < MIN_QUOTA_BYTES {
             return Err(Error::invalid(
                 "quota_bytes",
@@ -125,13 +127,13 @@ impl MailService {
             ));
         }
         let max = limits.max_mailbox_bytes;
-        if max > 0 && (quota == 0 || quota > max) {
+        if max > 0 && quota > max {
             return Err(Error::mail(
                 MailCode::MailboxQuotaAboveLimit,
                 format!("a mailbox of this account may hold at most {max} bytes"),
             ));
         }
-        Ok(())
+        Ok(if quota == 0 { max } else { quota })
     }
 
     /// Create or update a mailbox.
@@ -162,7 +164,7 @@ impl MailService {
         let t = self.tenant(&tenant, true)?;
         let mut rec = self.local_domain(&tenant, &domain)?;
         let limits = self.limits(&tenant)?;
-        Self::check_quota(&limits, quota_bytes)?;
+        let quota_bytes = Self::check_quota(&limits, quota_bytes)?;
         let created = match rec.mailboxes.get_mut(local.as_str()) {
             Some(m) if m.state == RecordState::Deleting => {
                 return Err(Error::mail(

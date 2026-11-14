@@ -56,8 +56,9 @@ pub fn parse_args(args: &[String]) -> Result<SubmitRequest, String> {
             s => req.recipients.push(s.to_owned()),
         }
     }
+    // `-f <>` (or an empty -f): the null sender, as autoresponders use it.
     if req.sender.as_deref() == Some("") {
-        req.sender = None;
+        req.sender = Some("<>".to_owned());
     }
     Ok(req)
 }

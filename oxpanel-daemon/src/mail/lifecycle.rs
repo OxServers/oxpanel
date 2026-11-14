@@ -20,7 +20,8 @@ use crate::validate::{Domain, MailLocalPart, Username};
 /// [`remove_tenant_mail`]). Mail domains without either go with the account.
 pub fn refuse_tenant_deletion(ctx: &Ctx, tenant: &Username) -> Result<()> {
     if MailStore::new(&ctx.config).list()?.iter().any(|d| {
-        d.tenant == tenant.as_str() && (d.live_mailboxes().next().is_some() || !d.forwarders.is_empty())
+        d.tenant == tenant.as_str()
+            && (d.live_mailboxes().next().is_some() || !d.forwarders.is_empty())
     }) {
         return Err(Error::TenantHasMailDomains(tenant.to_string()));
     }
@@ -82,6 +83,12 @@ pub async fn remove_tenant_mail(ctx: &Ctx, tenant: &Username) -> Result<usize> {
         ops::prune_dkim_keys(ctx, None, &d.domain)?;
         let sieve = ctx.config.mail.state_dir.join("sieve").join(&d.domain);
         fsutil::remove_dir_tree(&sieve)?;
+        // The webmail name's certificate goes with the domain.
+        if let Ok(name) = Domain::parse(&super::webmail::webmail_name(&d.domain)) {
+            let dir = &ctx.config.mail.selfsigned_dir;
+            fsutil::remove_if_exists(&crate::tls::cert_path(dir, &name))?;
+            fsutil::remove_if_exists(&crate::tls::key_path(dir, &name))?;
+        }
         store.delete(&dom)?;
         if let Err(e) = crate::dns::mail_changed(ctx, &dom).await {
             warn!(domain = %dom, error = %e, "the zone keeps its mail records until it is re-rendered");

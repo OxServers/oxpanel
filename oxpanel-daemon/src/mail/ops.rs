@@ -70,8 +70,8 @@ async fn own_gid(ctx: &Ctx, path: &Path, g: u32) -> Result<()> {
 /// place, otherwise the self-signed one made at first start.
 pub fn certificate(ctx: &Ctx, host: &Domain) -> (PathBuf, PathBuf, bool) {
     let real = (
-        crate::tls::cert_path(&ctx.config.tls_dir, host),
-        crate::tls::key_path(&ctx.config.tls_dir, host),
+        crate::tls::cert_path(&ctx.config.mail.selfsigned_dir, host),
+        crate::tls::key_path(&ctx.config.mail.selfsigned_dir, host),
     );
     if real.0.exists() && real.1.exists() {
         return (real.0, real.1, true);
@@ -438,8 +438,8 @@ pub fn webmail_sites(ctx: &Ctx, m: &Model) -> Result<Vec<webmail::WebmailSite>> 
         let Ok(dn) = Domain::parse(&name) else {
             continue;
         };
-        let crt = crate::tls::cert_path(&ctx.config.tls_dir, &dn);
-        let key = crate::tls::key_path(&ctx.config.tls_dir, &dn);
+        let crt = crate::tls::cert_path(&ctx.config.mail.selfsigned_dir, &dn);
+        let key = crate::tls::key_path(&ctx.config.mail.selfsigned_dir, &dn);
         let tls = (crt.exists() && key.exists()).then_some((crt, key));
         out.push(webmail::WebmailSite { name, tls });
     }
@@ -642,7 +642,13 @@ pub async fn reload(ctx: &Ctx, c: Changed) -> Result<()> {
     if c.postfix {
         units.push(POSTFIX_SERVICE);
     }
-    if c.dovecot {
+    // Passwords, disabled mailboxes, suspension: Dovecot re-reads its
+    // password files by itself, but only when it sees their time stamp
+    // change (two changes within one second can go unnoticed — found with a
+    // suspension right after a mailbox change) and it caches logins. A
+    // reload re-reads everything and forgets the cache; open sessions stay
+    // (those that must end are ended with `doveadm kick`).
+    if c.dovecot || c.dovecot_auth {
         units.push(DOVECOT_SERVICE);
     }
     if c.rspamd {
@@ -655,20 +661,6 @@ pub async fn reload(ctx: &Ctx, c: Changed) -> Result<()> {
         ctx.sys
             .run_ok(systemctl(ctx).args(["reload-or-restart", "--", unit]))
             .await?;
-    }
-    if c.dovecot_auth && !c.dovecot {
-        // Passwords, disabled mailboxes, suspension: Dovecot re-reads the
-        // files by itself, but must forget what it has cached.
-        let out = ctx
-            .sys
-            .run(
-                CommandSpec::new(bin::DOVEADM, ctx.config.command_timeout)
-                    .args(["auth", "cache", "flush"]),
-            )
-            .await?;
-        if !out.success() {
-            warn!(output = %out.combined_lossy(), "the Dovecot authentication cache could not be flushed (is dovecot running?)");
-        }
     }
     if c.nginx {
         crate::nginx::reload(ctx.sys.as_ref(), ctx.config.command_timeout).await?;

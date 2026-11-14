@@ -276,12 +276,124 @@ def db_connections(user, pw, n):
     OUT.append(f'CONNECTIONS\t{ok}\t{n}\t{err}')
 
 
+# ---------------------------------------------------------------- email
+
+def smtp_dialog(addr, lines, timeout=15):
+    """Speak SMTP: send each line after reading a reply; the last reply."""
+    fam = socket.AF_UNIX if isinstance(addr, str) else socket.AF_INET
+    s = socket.socket(fam, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(addr)
+        f = s.makefile('rb')
+        def reply():
+            text = b''
+            while True:
+                l = f.readline()
+                if not l:
+                    return text
+                text += l
+                if l[3:4] != b'-':
+                    return text
+        last = reply()
+        for l in lines:
+            s.sendall(l.encode() + b'\r\n')
+            last = reply()
+            if not last or last[:1] in (b'4', b'5'):
+                break
+        return last.decode('latin-1').strip()
+    finally:
+        s.close()
+
+
+def mail(victim_home, victim_domain, own_domain, sendmail):
+    """What a customer's code tries against email (each must fail)."""
+    # Another customer's mail on disk.
+    for path in (f'{victim_home}/mail', f'{victim_home}/mail/{victim_domain}/info/cur'):
+        try:
+            os.listdir(path)
+            emit(f'mail-list-{path}', True, 'blocked', 'listed')
+        except OSError as e:
+            emit(f'mail-list-{path}', False, 'blocked', e.strerror)
+    # The mail servers' secrets and maps.
+    for path in ('/etc/dovecot/oxpanel/passwd', '/etc/dovecot/oxpanel/users', '/etc/postfix/oxpanel/aliases',
+                 '/etc/postfix/oxpanel/senders', '/var/lib/oxpanel-mail/policy.json', '/var/lib/oxpanel-mail/webmail.deskey',
+                 '/etc/oxpanel-webmail/roundcube/config.inc.php', '/var/lib/oxpanel-webmail/roundcube.db',
+                 f'/var/lib/oxpanel-mail/sieve/{victim_domain}/info.sieve', '/var/lib/oxpanel/mail/domains/' + victim_domain + '.json'):
+        try:
+            with open(path, 'rb') as fh:
+                fh.read(16)
+            emit(f'mail-read-{path}', True, 'blocked', 'read')
+        except OSError as e:
+            emit(f'mail-read-{path}', False, 'blocked', e.strerror)
+    try:
+        keys = os.listdir('/var/lib/oxpanel-mail/dkim')
+        emit('mail-list-dkim-keys', True, 'blocked', f'{len(keys)} entries')
+    except OSError as e:
+        emit('mail-list-dkim-keys', False, 'blocked', e.strerror)
+    # Sockets that only Postfix (or root) may use.
+    for path in ('/var/spool/postfix/private/dovecot-lmtp', '/var/spool/postfix/private/auth',
+                 '/var/spool/postfix/public/oxinject', '/var/spool/postfix/public/pickup',
+                 '/run/oxpanel-mail/policy.sock', '/var/spool/postfix/oxpanel-milter/milter.sock',
+                 '/run/dovecot/auth-userdb', '/run/dovecot/auth-master', '/run/dovecot/doveadm-server',
+                 '/run/oxpanel-webmail/php.sock'):
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(3)
+        try:
+            s.connect(path)
+            emit(f'mail-connect-{path}', True, 'blocked', 'connected')
+        except OSError as e:
+            emit(f'mail-connect-{path}', False, 'blocked', e.strerror or type(e).__name__)
+        finally:
+            s.close()
+    # Forged policy requests (to use up a victim's hourly limit).
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.connect('/run/oxpanel-mail/policy.sock')
+        s.sendall(b'request=smtpd_access_policy\nsasl_username=info@' + victim_domain.encode() + b'\nrecipient_count=100000\n\n')
+        emit('mail-forge-policy', True, 'blocked', s.recv(100))
+    except OSError as e:
+        emit('mail-forge-policy', False, 'blocked', e.strerror or type(e).__name__)
+    # Postfix's own submission paths.
+    rc, out = run(['/usr/sbin/sendmail.postfix', '-f', f'x@{own_domain}', f'info@{victim_domain}'], stdin=b'Subject: x\n\nx\n')
+    emit('mail-postfix-sendmail', rc == 0, 'blocked', out.strip()[:80])
+    rc, out = run(['/usr/sbin/postdrop'], stdin=b'')
+    emit('mail-postdrop', rc == 0, 'blocked', out.strip()[:80])
+    rc, out = run(['/usr/bin/doveadm', 'fetch', '-u', f'info@{victim_domain}', 'text', 'all'])
+    emit('mail-doveadm-fetch', rc == 0 and 'VICTIM' in out, 'blocked', out.strip()[:80])
+    # Relaying through the loopback, with and without a login.
+    r = smtp_dialog(('127.0.0.1', 25), ['EHLO attacker', f'MAIL FROM:<x@{own_domain}>', 'RCPT TO:<victim@relay.example>'])
+    emit('mail-relay-25', r.startswith('250'), 'blocked', r[:80])
+    try:
+        r = smtp_dialog(('127.0.0.1', 587), ['EHLO attacker', f'MAIL FROM:<x@{own_domain}>', 'RCPT TO:<victim@relay.example>'])
+        emit('mail-relay-587-no-login', r.startswith('250'), 'blocked', r[:80])
+    except OSError as e:
+        emit('mail-relay-587-no-login', False, 'blocked', str(e))
+    r = smtp_dialog(('127.0.0.1', 25), ['EHLO attacker', 'VRFY info@' + victim_domain])
+    emit('mail-vrfy', r.startswith('25'), 'blocked', r[:80])
+    # OxPanel's sendmail: as another customer (envelope, From:), as itself.
+    msg = f'From: ceo@{victim_domain}\nTo: info@{victim_domain}\nSubject: forged\n\nx\n'.encode()
+    rc, out = run([sendmail, '-t', '-i'], stdin=msg)
+    emit('mail-sendmail-from-victim', rc == 0, 'blocked', out.strip()[:80])
+    msg = f'From: shop@{own_domain}\nTo: info@{victim_domain}\nSubject: forged\n\nx\n'.encode()
+    rc, out = run([sendmail, '-t', '-i', '-f', f'ceo@{victim_domain}'], stdin=msg)
+    emit('mail-sendmail-envelope-victim', rc == 0, 'blocked', out.strip()[:80])
+    msg = f'From: shop@{own_domain}\nTo: info@{victim_domain}\nSubject: header\r\nBcc: injected@relay.example\n\nx\n'.encode()
+    rc, out = run([sendmail, '-i', f'info@{victim_domain}\nRCPT TO:<x@relay.example>'], stdin=msg)
+    emit('mail-sendmail-rcpt-injection', rc == 0, 'blocked', out.strip()[:80])
+    msg = f'From: shop@{own_domain}\nTo: info@{victim_domain}\nSubject: control\n\nx\n'.encode()
+    rc, out = run([sendmail, '-t', '-i'], stdin=msg)
+    emit('mail-sendmail-own-domain', rc == 0, 'open', out.strip()[:80])
+
+
 def main(argv):
     action = argv[0] if argv else ''
     if action == 'dns':
         dns(argv[1])
     elif action == 'listeners':
         listeners(argv[1:])
+    elif action == 'mail':
+        mail(*argv[1:5])
     elif action == 'db':
         db(*argv[1:5])
     elif action == 'dbconn':

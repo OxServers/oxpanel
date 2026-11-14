@@ -16,8 +16,12 @@ if [ "${SKIP_INSTALL:-0}" != 1 ]; then
   install -m0755 /work/target/release/oxpanel-daemon /usr/sbin/oxpanel-daemon
   install -m0755 /work/target/release/oxpanel-ctl /usr/bin/oxpanel-ctl
   install -Dm0755 /work/target/release/oxpanel-acme /usr/libexec/oxpanel/oxpanel-acme
+  ln -sfn ../../sbin/oxpanel-daemon /usr/libexec/oxpanel/sendmail
   install -Dm0644 /work/packaging/systemd/oxpanel-daemon.service /etc/systemd/system/oxpanel-daemon.service
   install -Dm0644 /work/packaging/systemd/oxpanel-dns.service /etc/systemd/system/oxpanel-dns.service
+  install -Dm0644 /work/packaging/systemd/oxpanel-mail-policy.service /etc/systemd/system/oxpanel-mail-policy.service
+  install -Dm0644 /work/packaging/systemd/oxpanel-webmail.service /etc/systemd/system/oxpanel-webmail.service
+  if [ -d /etc/php.d ]; then install -Dm0644 /work/packaging/php.d/90-oxpanel-mail.ini /etc/php.d/90-oxpanel-mail.ini; fi
   install -Dm0644 /work/packaging/sysusers.d/oxpanel.conf /usr/lib/sysusers.d/oxpanel.conf
   install -Dm0644 /work/packaging/tmpfiles.d/oxpanel.conf /usr/lib/tmpfiles.d/oxpanel.conf
   install -Dm0640 /work/packaging/daemon.env /etc/oxpanel/daemon.env
@@ -2445,6 +2449,300 @@ CONF
   check "DNS hosting off again" grep -q '^dns=false ' <(oxpanel-ctl host info)
 else
   echo "skip - BIND, dig or the public suffix list not installed"
+fi
+
+echo "== email"
+MC="$(cd "$(dirname "$0")" && pwd)/mail-client.py"
+[ -f "$MC" ] || MC=/work/tests-integration/mail-client.py
+if [ -x /usr/sbin/postfix ] && [ -x /usr/sbin/dovecot ] && [ -x /usr/bin/rspamd ] && [ -f "$MC" ]; then
+  mc() { python3 "$MC" "$@"; }
+  eventually() { local n="$1"; shift; for _ in $(seq 1 "$n"); do "$@" >/dev/null 2>&1 && return 0; sleep 0.5; done; "$@"; }
+  ME=/root/mail-test; rm -rf "$ME"; mkdir -p "$ME"
+  cp -p /etc/oxpanel/daemon.env "$ME/daemon.env.bak"
+  mail_was_on=0; grep -q '^OXPANEL_MAIL=true' /etc/oxpanel/daemon.env && mail_was_on=1
+  if [ "$mail_was_on" = 0 ]; then
+    check "email is off by default" grep -q '^enabled=false ' <(oxpanel-ctl mail host)
+    check "a mail domain is refused while email is off (mail_unavailable)" grep -q 'mail_unavailable' <(oxpanel-ctl mail domain-set example.test --tenant alice 2>&1 || true)
+    check "--check-config refuses email without a host name" bash -c 'OXPANEL_MAIL=true /usr/sbin/oxpanel-daemon --check-config 2>&1 | grep -q OXPANEL_MAIL_HOSTNAME'
+    getent passwd _rspamd >/dev/null || useradd -r -d /var/lib/rspamd -s /sbin/nologin _rspamd
+    chown -R _rspamd:_rspamd /var/lib/rspamd /var/log/rspamd
+    [ -f /etc/nginx/default.d/roundcubemail.conf ] && echo '# OxPanel serves webmail as webmail.<domain>.' > /etc/nginx/default.d/roundcubemail.conf
+    printf '%s\n' OXPANEL_MAIL=true OXPANEL_MAIL_HOSTNAME=mail.oxtest.example >> /etc/oxpanel/daemon.env
+  fi
+  # DNS hosting on as well, so the mail records are served and DKIM can be
+  # checked against the published key.
+  dns_for_mail=0
+  if [ -x /usr/sbin/named ] && ! grep -q '^OXPANEL_DNS=true' /etc/oxpanel/daemon.env; then
+    printf '%s\n' OXPANEL_DNS=true OXPANEL_DNS_NAMESERVERS=ns1.oxtest.example,ns2.oxtest.example \
+      OXPANEL_DNS_SOA_CONTACT=hostmaster@oxtest.example OXPANEL_DNS_IPV4=192.0.2.80 >> /etc/oxpanel/daemon.env
+    dns_for_mail=1
+  fi
+  systemctl restart oxpanel-daemon
+  for u in postfix dovecot rspamd oxpanel-mail-policy; do
+    check "$u runs (enabled and started by the daemon)" eventually 60 systemctl -q is-active "$u"
+  done
+  MH="$(oxpanel-ctl mail host)"; echo "$MH" | head -3
+  check "email is on: Postfix, Dovecot and the filter present" grep -q '^enabled=true host_name=[a-z0-9.-]* postfix=true dovecot=true filter=true ' <<<"$MH"
+  HOSTNAME_MAIL="$(sed -n 's/^enabled=true host_name=\([^ ]*\) .*/\1/p' <<<"$MH")"
+  listening() { ss -Hltn "sport = :$1" | grep -q LISTEN; }
+  for p in 25 465 587 993 995; do check "port $p listens" eventually 20 listening "$p"; done
+  for p in 110 143 11332 11333 11334; do check_not "port $p does not listen (no plain-text client port, no filter TCP port)" listening "$p"; done
+  check "the original main.cf is kept" test -f /etc/postfix/main.cf.oxpanel-orig
+  check "Postfix accepts its configuration" bash -c 'postfix check >/dev/null 2>&1'
+  check "Dovecot accepts its configuration" bash -c 'doveconf -n >/dev/null 2>&1'
+  check "the filter's milter socket is reachable only by Postfix" test "$(stat -c '%U:%G %a' /var/spool/postfix/oxpanel-milter)" = "_rspamd:postfix 750"
+  check "the policy socket belongs to Postfix's group" test "$(stat -c '%G %a' /run/oxpanel-mail/policy.sock)" = "postfix 660"
+  check "the policy service runs unprivileged" test "$(ps -o user= -C oxpanel-daemon | grep -c oxpanel-mail)" -ge 1
+  check "sendmail is root's only: tenants are not authorised submitters" test "$(postconf -h authorized_submit_users)" = "root"
+
+  echo "-- mail domains: only names the account holds"
+  oxpanel-ctl tenant create mailx >/dev/null; oxpanel-ctl tenant create maily >/dev/null
+  oxpanel-ctl vhost set mx1.oxtest --tenant mailx >/dev/null; oxpanel-ctl vhost set my1.oxtest --tenant maily >/dev/null
+  out="$(oxpanel-ctl mail domain-set mx1.oxtest --tenant mailx)"; echo "$out" | head -2
+  check "a mail domain is created for the account's site" grep -q '^created=true' <<<"$out"
+  check "DKIM: a 2048-bit key with a selector" grep -q 'dkim selector=ox[0-9]* published=' <<<"$out"
+  check "mail domain replay changes nothing" grep -q '^created=false' <(oxpanel-ctl mail domain-set mx1.oxtest --tenant mailx)
+  check "another account's site cannot become my mail domain" grep -q 'mail_domain_not_owned' <(oxpanel-ctl mail domain-set mx1.oxtest --tenant maily 2>&1 || true)
+  check "a name the account does not hold is refused" grep -q 'mail_domain_not_owned' <(oxpanel-ctl mail domain-set elsewhere.oxtest --tenant maily 2>&1 || true)
+  check "the mail host name cannot be a mail domain" grep -q 'mail_domain_not_owned' <(oxpanel-ctl mail domain-set "$HOSTNAME_MAIL" --tenant maily 2>&1 || true)
+  oxpanel-ctl mail domain-set my1.oxtest --tenant maily >/dev/null
+  SEL="$(oxpanel-ctl mail domain-show mx1.oxtest --tenant mailx | sed -n 's/.*dkim selector=\([^ ]*\) .*/\1/p')"
+  KEYF="/var/lib/oxpanel-mail/dkim/mx1.oxtest.$SEL.key"
+  check "the DKIM key is readable by root and the signer only" test "$(stat -c '%U:%G %a' "$KEYF")" = "root:_rspamd 640"
+  check "the DKIM key is 2048-bit RSA" grep -q '2048 bit' <(openssl pkey -in "$KEYF" -noout -text 2>/dev/null | head -1)
+  check "the mail records are root-only" test "$(stat -c '%a' /var/lib/oxpanel/mail/domains/mx1.oxtest.json)" = "600"
+
+  echo "-- mailboxes"
+  check "a weak password is refused" grep -q 'weak_password' <(echo password123 | oxpanel-ctl mail mailbox-set info@mx1.oxtest --tenant mailx --password 2>&1 || true)
+  check "a password containing the address is refused" grep -q 'weak_password' <(echo 'my-info-mailbox-pw' | oxpanel-ctl mail mailbox-set info@mx1.oxtest --tenant mailx --password 2>&1 || true)
+  PX='Quiet-Lake-4417'; PY='Green-River-8831'
+  check "a mailbox is created" grep -q '^created=true' <(echo "$PX" | oxpanel-ctl mail mailbox-set info@mx1.oxtest --tenant mailx --password --quota 2097152)
+  echo "$PY" | oxpanel-ctl mail mailbox-set info@my1.oxtest --tenant maily --password >/dev/null
+  echo "$PY" | oxpanel-ctl mail mailbox-set sales@my1.oxtest --tenant maily --password >/dev/null
+  check "the mailbox lives in the account's home, owned by it, private" test "$(stat -c '%U:%G %a' /home/mailx/mail/mx1.oxtest/info)" = "mailx:mailx 700"
+  check "no password is stored in plain text anywhere" bash -c "! grep -rqF -e '$PX' -e '$PY' /etc/postfix /etc/dovecot /var/lib/oxpanel /var/lib/oxpanel-mail /etc/oxpanel"
+  check "Dovecot's password file holds bcrypt hashes" grep -qF 'info@mx1.oxtest:{BLF-CRYPT}$2y$12$' /etc/dovecot/oxpanel/passwd
+  check "Dovecot's password file is readable by root and dovecot only" test "$(stat -c '%U:%G %a' /etc/dovecot/oxpanel/passwd)" = "root:dovecot 640"
+  check "the password is not in the daemon's journal" bash -c "! journalctl -u oxpanel-daemon --no-pager | grep -qF '$PX'"
+
+  echo "-- receiving and reading"
+  check "port 25 accepts mail for a hosted mailbox" mc deliver 25 sender@remote.example info@mx1.oxtest --subject inbound-1
+  check "IMAPS: the message is there" eventually 20 mc imap-find info@mx1.oxtest "$PX" inbound-1
+  check "the delivered file belongs to the account" test -z "$(find /home/mailx/mail -type f ! -user mailx)"
+  check "POP3S login works" mc pop3 info@mx1.oxtest "$PX"
+  check_not "IMAPS: a wrong password is refused" mc imap-count info@mx1.oxtest wrong-password-1
+  check "port 25 relays nothing (open relay refused)" bash -c "python3 $MC deliver 25 x@remote.example victim@remote2.example | grep -q 'Relay access denied'"
+  check "port 25 refuses unknown local addresses" bash -c "python3 $MC deliver 25 x@remote.example nobody@mx1.oxtest | grep -q '550'"
+  check "submission offers no login before STARTTLS" mc auth-before-tls 587
+
+  echo "-- sending"
+  check "submission (587, STARTTLS, login) sends to another customer" mc submit 587 info@mx1.oxtest "$PX" info@mx1.oxtest info@my1.oxtest --subject sub-587
+  check "submissions (465, TLS) too" mc submit 465 info@mx1.oxtest "$PX" info@mx1.oxtest info@my1.oxtest --subject sub-465
+  check "the message arrives" eventually 20 mc imap-find info@my1.oxtest "$PY" sub-587 --out "$ME/signed.eml"
+  check "it carries a DKIM signature of the sender's domain" grep -q 'd=mx1.oxtest;' "$ME/signed.eml"
+  PUB="$(oxpanel-ctl mail domain-show mx1.oxtest --tenant mailx | sed -n 's/.*record=v=DKIM1; k=rsa; p=//p')"
+  check "the DKIM signature verifies against the domain's key" mc dkim-verify "$ME/signed.eml" "$PUB"
+  if systemctl -q is-active oxpanel-dns; then
+    pub_dns="$(dig +short +norec @127.0.0.1 "$SEL._domainkey.mx1.oxtest" TXT | tr -d '" \n' | sed 's/.*p=//')"
+    check "the published DKIM record is the signing key" test "$pub_dns" = "$PUB"
+    check "the signature verifies against the key published in DNS" mc dkim-verify "$ME/signed.eml" "$pub_dns"
+    check "MX of the zone is the mail host" grep -q "10 $HOSTNAME_MAIL." <(dig +short +norec @127.0.0.1 mx1.oxtest MX)
+    check "SPF is published" grep -q 'v=spf1 a:' <(dig +short +norec @127.0.0.1 mx1.oxtest TXT)
+    check "DMARC is published (p=none)" grep -q 'v=DMARC1; p=none' <(dig +short +norec @127.0.0.1 _dmarc.mx1.oxtest TXT)
+    check "the mail records are protected" grep -q 'origin=mail' <(oxpanel-ctl dns zone-show mx1.oxtest --tenant mailx)
+    check "the account cannot add its own MX beside the engine's" grep -q 'kept by the engine' <(oxpanel-ctl dns record-add mx1.oxtest --tenant mailx --name @ --type mx --priority 5 --value mx.elsewhere.example 2>&1 || true)
+  fi
+  check "a mailbox cannot send as another address (envelope)" bash -c "python3 $MC submit 587 info@mx1.oxtest '$PX' info@my1.oxtest info@my1.oxtest | grep -q 'not owned by user'"
+  check "a mailbox cannot send as another address (From:)" bash -c "python3 $MC submit 587 info@mx1.oxtest '$PX' info@mx1.oxtest info@my1.oxtest --from-header info@my1.oxtest | grep -q 'must be your own address'"
+  check "a mailbox cannot send as another mailbox of the same customer" bash -c "python3 $MC submit 587 info@my1.oxtest '$PY' sales@my1.oxtest info@mx1.oxtest | grep -q 'not owned by user'"
+  check "submission without a login relays nothing" bash -c "python3 -c 'import smtplib,ssl; c=ssl.create_default_context(); c.check_hostname=False; c.verify_mode=ssl.CERT_NONE; s=smtplib.SMTP(\"127.0.0.1\",587); s.starttls(context=c); s.sendmail(\"a@mx1.oxtest\",[\"b@remote.example\"],\"x\")' 2>&1 | grep -q '5[0-9][0-9]'"
+
+  echo "-- site mail (PHP mail(), sendmail) as the account"
+  if [ -x /usr/bin/php ]; then
+    phpmail() { local u="$1" from="$2" to="$3" subj="$4"; as_user "$u" php -r "exit(mail('$to', '$subj', 'site body', 'From: $from') ? 0 : 1);"; }
+    check "a site sends from its own domain" phpmail mailx wordpress@mx1.oxtest info@my1.oxtest site-1
+    check "the site's message arrives, signed" eventually 20 mc imap-find info@my1.oxtest "$PY" site-1 --out "$ME/site.eml"
+    check "the site's message is DKIM-signed by its domain" mc dkim-verify "$ME/site.eml" "$PUB"
+    check "Postfix knows which account sent it" bash -c "journalctl -u postfix --no-pager | grep -q 'sasl_username=site.mailx'"
+    check_not "a site cannot send as another customer's domain" phpmail mailx ceo@my1.oxtest info@my1.oxtest site-spoof
+    check_not "a site cannot use Postfix's sendmail directly" bash -c "printf 'Subject: x\n\nx\n' | setpriv --reuid=mailx --regid=mailx --clear-groups --no-new-privs -- /usr/sbin/sendmail.postfix -f a@mx1.oxtest info@my1.oxtest"
+  fi
+
+  echo "-- forwarders, catch-all, autoresponder"
+  check "a forwarder is created" grep -q '^created=true' <(oxpanel-ctl mail forwarder-set sales@mx1.oxtest --tenant mailx --to info@my1.oxtest)
+  check "it forwards" mc deliver 25 someone@remote.example sales@mx1.oxtest --subject fwd-1
+  check "the forwarded message arrives" eventually 20 mc imap-find info@my1.oxtest "$PY" fwd-1
+  check "a forwarder over a mailbox without keep_copy is refused (address_in_use)" grep -q 'address_in_use' <(oxpanel-ctl mail forwarder-set info@mx1.oxtest --tenant mailx --to x@remote.example 2>&1 || true)
+  check "a mailbox over a forwarder is refused (address_in_use)" grep -q 'address_in_use' <(echo "$PX" | oxpanel-ctl mail mailbox-set sales@mx1.oxtest --tenant mailx --password 2>&1 || true)
+  oxpanel-ctl mail forwarder-set loop1@mx1.oxtest --tenant mailx --to loop2@mx1.oxtest >/dev/null
+  check "a forwarding circle is refused (forward_loop)" grep -q 'forward_loop' <(oxpanel-ctl mail forwarder-set loop2@mx1.oxtest --tenant mailx --to loop1@mx1.oxtest 2>&1 || true)
+  args=(); for i in $(seq 1 11); do args+=(--to "d$i@remote.example"); done
+  check "more than ten destinations are refused (too_many_destinations)" grep -q 'too_many_destinations' <(oxpanel-ctl mail forwarder-set many@mx1.oxtest --tenant mailx "${args[@]}" 2>&1 || true)
+  check "a destination with a line break is refused" bash -c "! oxpanel-ctl mail forwarder-set inj@mx1.oxtest --tenant mailx --to \$'a@b.example\nroot' 2>/dev/null"
+  check "the catch-all must be a mailbox of the domain" grep -q 'catch_all' <(oxpanel-ctl mail domain-set mx1.oxtest --tenant mailx --catch-all x@remote.example 2>&1 || true)
+  oxpanel-ctl mail domain-set mx1.oxtest --tenant mailx --catch-all info >/dev/null
+  check "mail to an unknown address goes to the catch-all" mc deliver 25 someone@remote.example random-1@mx1.oxtest --subject catch-1
+  check "the catch-all mailbox has it" eventually 20 mc imap-find info@mx1.oxtest "$PX" catch-1
+  check "an autoresponder is switched on" grep -q 'enabled=true' <(oxpanel-ctl mail autoreply info@mx1.oxtest --tenant mailx --subject 'Away "until" Monday' --body $'I am away.\nBack soon.')
+  check "its script is not writable by the account" test "$(stat -c '%U %a' /var/lib/oxpanel-mail/sieve/mx1.oxtest/info.sieve)" = "root 640"
+  check "it answers a sender once" mc submit 587 info@my1.oxtest "$PY" info@my1.oxtest info@mx1.oxtest --subject needs-reply
+  check "the reply reaches the sender" eventually 30 mc imap-find info@my1.oxtest "$PY" 'until" Monday'
+  check "a list message gets no reply (no backscatter to lists)" bash -c "grep -q 'list-id' /var/lib/oxpanel-mail/sieve/mx1.oxtest/info.sieve"
+  oxpanel-ctl mail autoreply info@mx1.oxtest --tenant mailx --off >/dev/null
+  check "switched off, its script is gone" test ! -e /var/lib/oxpanel-mail/sieve/mx1.oxtest/info.sieve
+
+  echo "-- quota"
+  check "a mailbox size above the account's limit is refused" bash -c "oxpanel-ctl mail limits-set mailx --max-mailboxes 3 --max-mailbox-bytes 104857600 --per-hour-account 0 --per-hour-mailbox 0 >/dev/null && oxpanel-ctl mail mailbox-set info@mx1.oxtest --tenant mailx --quota 209715200 2>&1 | grep -q mailbox_quota_above_limit"
+  check "a message larger than the mailbox's room is not delivered" mc deliver 25 big@remote.example info@mx1.oxtest --subject too-big --size 3000000
+  check "the mail server says the mailbox is full" eventually 30 bash -c "journalctl -u postfix --no-pager | grep -q 'to=<info@mx1.oxtest>.*status=bounced.*\(full\|quota\)'"
+  check_not "the oversized message is not in the mailbox" mc imap-find info@mx1.oxtest "$PX" too-big
+  echo "$PX" | oxpanel-ctl mail mailbox-set two@mx1.oxtest --tenant mailx --password >/dev/null
+  echo "$PX" | oxpanel-ctl mail mailbox-set three@mx1.oxtest --tenant mailx --password >/dev/null
+  check "the account's mailbox limit is enforced (mailbox_limit_reached)" grep -q 'mailbox_limit_reached' <(echo "$PX" | oxpanel-ctl mail mailbox-set four@mx1.oxtest --tenant mailx --password 2>&1 || true)
+
+  echo "-- sending limits"
+  oxpanel-ctl mail limits-set mailx --max-mailboxes 0 --max-mailbox-bytes 0 --per-hour-account 0 --per-hour-mailbox 2 >/dev/null
+  sent="$(sed -n 's/.*sent_this_hour=\([0-9]*\).*/\1/p' <(oxpanel-ctl mail usage mailx))"
+  check "usage counts what the account sent this hour" test "${sent:-0}" -ge 3
+  mc submit 587 two@mx1.oxtest "$PX" two@mx1.oxtest info@my1.oxtest --subject rate-1 >/dev/null || true
+  mc submit 587 two@mx1.oxtest "$PX" two@mx1.oxtest info@my1.oxtest --subject rate-2 >/dev/null || true
+  check "the mailbox's hourly limit defers the next message (4xx)" bash -c "python3 $MC submit 587 two@mx1.oxtest '$PX' two@mx1.oxtest info@my1.oxtest --subject rate-3 | grep -q '45[0-9]'"
+  oxpanel-ctl mail limits-set mailx --max-mailboxes 0 --max-mailbox-bytes 0 --per-hour-account 1 --per-hour-mailbox 0 >/dev/null
+  if [ -x /usr/bin/php ]; then
+    check_not "a site is held to the account's hourly limit too" phpmail mailx wordpress@mx1.oxtest info@my1.oxtest site-over-limit
+    check "and sendmail says to try later (EX_TEMPFAIL)" bash -c "printf 'From: wp@mx1.oxtest\nTo: info@my1.oxtest\nSubject: x\n\nx\n' | setpriv --reuid=mailx --regid=mailx --clear-groups --no-new-privs -- /usr/sbin/oxpanel-daemon sendmail -t; test \$? -eq 75"
+  fi
+  oxpanel-ctl mail limits-set mailx --max-mailboxes 0 --max-mailbox-bytes 0 --per-hour-account 0 --per-hour-mailbox 0 >/dev/null
+
+  echo "-- disabled mailbox, password change, suspension"
+  oxpanel-ctl mail mailbox-set three@mx1.oxtest --tenant mailx --disabled >/dev/null
+  check_not "a disabled mailbox cannot log in" mc imap-count three@mx1.oxtest "$PX"
+  check "a disabled mailbox still receives" mc deliver 25 a@remote.example three@mx1.oxtest --subject to-disabled
+  check "the password is changed" grep -q 'password=set' <(echo 'Brand-New-Pass-5592' | oxpanel-ctl mail mailbox-password two@mx1.oxtest --tenant mailx)
+  check_not "the old password no longer works" mc imap-count two@mx1.oxtest "$PX"
+  check "the new one does" mc imap-count two@mx1.oxtest Brand-New-Pass-5592
+  oxpanel-ctl tenant suspend mailx >/dev/null
+  check_not "a suspended account's mailbox cannot log in" mc imap-count info@mx1.oxtest "$PX"
+  check "a suspended account's mailbox cannot send" bash -c "python3 $MC submit 587 info@mx1.oxtest '$PX' info@mx1.oxtest info@my1.oxtest | grep -q 'login failed'"
+  check "mail for a suspended account is deferred (450), not bounced" bash -c "python3 $MC deliver 25 a@remote.example info@mx1.oxtest | grep -q '450'"
+  check "a suspended account's settings cannot be changed" grep -qi 'suspended' <(oxpanel-ctl mail forwarder-set x@mx1.oxtest --tenant mailx --to a@remote.example 2>&1 || true)
+  if [ -x /usr/bin/php ]; then check_not "a suspended account's site cannot send" phpmail mailx wordpress@mx1.oxtest info@my1.oxtest site-suspended; fi
+  oxpanel-ctl tenant resume mailx >/dev/null
+  check "after resuming it logs in again" mc imap-count info@mx1.oxtest "$PX"
+
+  echo "-- the account's own directory: symlinks"
+  # The account owns ~/mail: a mailbox directory replaced by a link to
+  # another customer's mail, or to /etc, must not lead delivery there.
+  echo "$PX" | oxpanel-ctl mail mailbox-set link@mx1.oxtest --tenant mailx --password >/dev/null
+  setpriv --reuid=mailx --regid=mailx --clear-groups --no-new-privs -- bash -c 'rm -rf /home/mailx/mail/mx1.oxtest/link && ln -s /home/maily/mail/my1.oxtest/info /home/mailx/mail/mx1.oxtest/link'
+  before="$(find /home/maily/mail -type f | wc -l)"
+  mc deliver 25 a@remote.example link@mx1.oxtest --subject via-link >/dev/null || true
+  sleep 3
+  check "delivery through a link does not reach another customer's mail" test "$(find /home/maily/mail -type f | wc -l)" = "$before"
+  check_not "nor does it appear in that mailbox" mc imap-find info@my1.oxtest "$PY" via-link
+  setpriv --reuid=mailx --regid=mailx --clear-groups --no-new-privs -- bash -c 'rm -f /home/mailx/mail/mx1.oxtest/link && ln -s /etc /home/mailx/mail/mx1.oxtest/link'
+  mc deliver 25 a@remote.example link@mx1.oxtest --subject via-etc >/dev/null || true
+  sleep 3
+  check "nothing is written below /etc" test -z "$(find /etc -newer "$ME/daemon.env.bak" -name '*via-etc*' 2>/dev/null; find /etc/new /etc/cur 2>/dev/null)"
+  as_user mailx rm -f /home/mailx/mail/mx1.oxtest/link
+  oxpanel-ctl mail mailbox-delete link@mx1.oxtest --tenant mailx >/dev/null
+
+  echo "-- reconcile"
+  check "no mail drift" bash -c '! oxpanel-ctl host reconcile | grep -q MAIL'
+  echo '# edited' >> /etc/postfix/oxpanel/aliases
+  check "an edited map is drift" grep -q 'MAIL_CONFIG_DRIFT.*aliases' <(oxpanel-ctl host reconcile || true)
+  systemctl restart oxpanel-daemon
+  check "a restart puts it right" eventually 30 bash -c '! oxpanel-ctl host reconcile | grep -q MAIL'
+
+  echo "-- backup and restore of a mailbox"
+  rc=0; out="$(timeout 300 oxpanel-ctl backup create mailx --wait)" || rc=$?
+  check "a backup of the account (with its mail) completes" test "$rc" -eq 0
+  MB="$(sed -n 's/^job=[^ ]* .* backup=\([^ ]*\) .*/\1/p' <<<"$out" | tail -1)"
+  check "the backup holds the mailbox" bash -c "tar -tzf /var/lib/oxpanel-backups/mailx/$MB/home.tar.gz | grep -q '^./mail/mx1.oxtest/info/'"
+  mc imap-clear info@mx1.oxtest "$PX"
+  check "the mailbox was emptied" test "$(mc imap-count info@mx1.oxtest "$PX")" = 0
+  out="$(timeout 300 oxpanel-ctl backup restore mailx "$MB" --overwrite --wait)" || true
+  check "the restore succeeds" grep -q 'state=JOB_STATE_SUCCEEDED' <<<"$out"
+  check "the mail is back" eventually 20 mc imap-find info@mx1.oxtest "$PX" inbound-1
+
+  echo "-- webmail"
+  if oxpanel-ctl mail host | grep -q 'webmail=true'; then
+    check "webmail runs" eventually 30 systemctl -q is-active oxpanel-webmail
+    check "without its certificate, webmail is never served over plain HTTP (503)" test "$(code_of webmail.mx1.oxtest /)" = "503"
+    check "the default server does not expose Roundcube" test "$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1/roundcubemail/ || true)" != "200"
+    check "client settings are served for autoconfiguration" grep -q "<hostname>$HOSTNAME_MAIL</hostname>" <(curl -s -H 'Host: autoconfig.mx1.oxtest' http://127.0.0.1/mail/config-v1.1.xml)
+    openssl req -x509 -newkey rsa:2048 -nodes -days 30 -keyout /etc/pki/oxpanel-mail/webmail.mx1.oxtest.key -out /etc/pki/oxpanel-mail/webmail.mx1.oxtest.crt -subj /CN=webmail.mx1.oxtest -addext subjectAltName=DNS:webmail.mx1.oxtest 2>/dev/null
+    oxpanel-ctl mail domain-set mx1.oxtest --tenant mailx --catch-all info >/dev/null
+    code_is() { test "$(code_of "$1" "$2")" = "$3"; }
+    check "with a certificate, plain HTTP redirects to HTTPS" eventually 20 code_is webmail.mx1.oxtest / 301
+    J="$ME/cookies"; W=(curl -sk --resolve webmail.mx1.oxtest:443:127.0.0.1 -b "$J" -c "$J")
+    page="$("${W[@]}" https://webmail.mx1.oxtest/)"
+    check "the login page is served over HTTPS" grep -q 'rcmloginuser' <<<"$page"
+    tok="$(grep -o 'name="_token" value="[^"]*"' <<<"$page" | head -1 | sed 's/.*value="//; s/"$//')"
+    "${W[@]}" -o /dev/null -d "_token=$tok&_task=login&_action=login&_timezone=UTC&_url=&_user=info@mx1.oxtest&_pass=$PX" 'https://webmail.mx1.oxtest/?_task=login'
+    check "a webmail login succeeds" grep -q 'Inbox' <("${W[@]}" 'https://webmail.mx1.oxtest/?_task=mail&_mbox=INBOX')
+    check "Roundcube's configuration is not readable by tenants" bash -c '! setpriv --reuid=mailx --regid=mailx --clear-groups --no-new-privs -- cat /etc/oxpanel-webmail/roundcube/config.inc.php'
+    check "Roundcube's database belongs to its own account" test "$(stat -c '%U %a' /var/lib/oxpanel-webmail/roundcube.db)" = "oxpanel-webmail 600"
+    rm -f /etc/pki/oxpanel-mail/webmail.mx1.oxtest.key /etc/pki/oxpanel-mail/webmail.mx1.oxtest.crt
+    oxpanel-ctl mail domain-set mx1.oxtest --tenant mailx --catch-all info >/dev/null
+    check "without it, webmail waits again (503)" eventually 20 code_is webmail.mx1.oxtest / 503
+  fi
+
+  echo "-- certificates of the mail names (ACME, against the local test CA)"
+  PEB=/usr/local/bin/oxpanel-it-pebble; PP=/usr/local/share/oxpanel-it
+  if [ "${OXPANEL_IT_SKIP_ACME:-0}" != 1 ] && [ -x "$PEB" ] && [ -f "$PP/pebble.json" ]; then
+    systemd-run --unit=oxpanel-it-pebble-mail --collect --setenv=PEBBLE_VA_NOSLEEP=1 "$PEB" -config "$PP/pebble.json" >/dev/null
+    check "Pebble is up" bash -c 'for i in $(seq 1 100); do curl -sf --cacert "$1" https://localhost:14000/dir >/dev/null && exit 0; sleep 0.1; done; exit 1' _ "$PP/ca.crt"
+    cp -p /etc/hosts "$ME/hosts.bak"
+    echo "127.0.0.1 $HOSTNAME_MAIL webmail.mx1.oxtest" >> /etc/hosts
+    printf 'OXPANEL_ACME_DIRECTORY_URL=https://localhost:14000/dir\nOXPANEL_ACME_CA_FILE=%s/ca.crt\nOXPANEL_ACME_EMAIL=hostmaster@example.org\n' "$PP" >> /etc/oxpanel/daemon.env
+    systemctl restart oxpanel-daemon
+    # Setting a domain up looks for missing certificates a few seconds later.
+    oxpanel-ctl mail domain-set mx1.oxtest --tenant mailx --catch-all info >/dev/null
+    check "the mail host name gets a certificate from the CA" eventually 240 test -s "/etc/pki/oxpanel-mail/$HOSTNAME_MAIL.crt"
+    check "its key is root-only" test "$(stat -c '%U %a' "/etc/pki/oxpanel-mail/$HOSTNAME_MAIL.key")" = "root 600"
+    issuer() { openssl s_client "$@" </dev/null 2>/dev/null | openssl x509 -noout -issuer 2>/dev/null; }
+    check "IMAPS presents the CA's certificate" eventually 40 bash -c "openssl s_client -connect 127.0.0.1:993 </dev/null 2>/dev/null | openssl x509 -noout -issuer | grep -qi pebble"
+    check "submission presents it after STARTTLS" eventually 40 bash -c "openssl s_client -starttls smtp -connect 127.0.0.1:587 </dev/null 2>/dev/null | openssl x509 -noout -issuer | grep -qi pebble"
+    check "the 'no certificate' warning is gone" bash -c '! oxpanel-ctl mail host | grep -q "no certificate"'
+    if oxpanel-ctl mail host | grep -q 'webmail=true'; then
+      check "the webmail name gets its certificate" eventually 240 test -s /etc/pki/oxpanel-mail/webmail.mx1.oxtest.crt
+      check "webmail is served over HTTPS with it" eventually 40 bash -c "openssl s_client -connect 127.0.0.1:443 -servername webmail.mx1.oxtest </dev/null 2>/dev/null | openssl x509 -noout -issuer | grep -qi pebble"
+    fi
+    check "no request, reply or pending key is left behind" bash -c 'test -z "$(find /var/lib/oxpanel-acme/csr /var/lib/oxpanel-acme/issued -mindepth 1)" && ! ls /etc/pki/oxpanel/*.pending >/dev/null 2>&1'
+    systemctl stop oxpanel-it-pebble-mail 2>/dev/null || true
+    cp -p "$ME/hosts.bak" /etc/hosts
+  else
+    echo "skip - no local test CA (Pebble) here"
+  fi
+
+  echo "-- queue"
+  check "the queue can be read" grep -q '^total=' <(oxpanel-ctl mail queue)
+  check "a malformed queue id is refused" bash -c '! oxpanel-ctl mail queue-delete "../x" 2>/dev/null'
+  check "an unknown queue id is refused (queued_mail_not_found)" grep -q 'queued_mail_not_found' <(oxpanel-ctl mail queue-delete ABCDEF12345 2>&1 || true)
+
+  echo "-- removal"
+  check "a mailbox is deleted" grep -q '^deleted=true' <(oxpanel-ctl mail mailbox-delete three@mx1.oxtest --tenant mailx)
+  check "its mail is removed (as the account)" eventually 30 test ! -e /home/mailx/mail/mx1.oxtest/three
+  check_not "it can no longer log in" mc imap-count three@mx1.oxtest "$PX"
+  oxpanel-ctl vhost remove my1.oxtest >/dev/null
+  if systemctl -q is-active oxpanel-dns; then oxpanel-ctl dns zone-delete my1.oxtest --tenant maily >/dev/null 2>&1 || true; fi
+  check "an account with mailboxes is not deleted by itself" bash -c "oxpanel-ctl tenant delete maily --remove-home 2>&1 | grep -q 'mailboxes or forwarders'"
+  out="$(timeout 300 oxpanel-ctl tenant delete mailx --cascade --confirm mailx --wait 2>&1)" || true
+  check "a cascading deletion removes the account with its email" eventually 60 bash -c '! id mailx'
+  check "its mail domain and DKIM keys are gone" bash -c "test ! -e /var/lib/oxpanel/mail/domains/mx1.oxtest.json && ! ls /var/lib/oxpanel-mail/dkim/ | grep -q mx1.oxtest"
+  check "its addresses are gone from the mail server" bash -c '! grep -q mx1.oxtest /etc/postfix/oxpanel/* /etc/dovecot/oxpanel/*'
+  timeout 300 oxpanel-ctl tenant delete maily --cascade --confirm maily --wait >/dev/null 2>&1 || true
+  check "no mail drift at the end" eventually 30 bash -c '! oxpanel-ctl host reconcile | grep -q MAIL'
+
+  # Back as it was.
+  cp -p "$ME/daemon.env.bak" /etc/oxpanel/daemon.env
+  if [ "$dns_for_mail" = 1 ]; then systemctl disable --now oxpanel-dns >/dev/null 2>&1 || true; fi
+  if [ "$mail_was_on" = 0 ]; then systemctl disable --now oxpanel-mail-policy oxpanel-webmail >/dev/null 2>&1 || true; fi
+  systemctl restart oxpanel-daemon
+  if [ "$mail_was_on" = 0 ]; then check "email off again" grep -q '^enabled=false ' <(oxpanel-ctl mail host); fi
+else
+  echo "skip - Postfix, Dovecot or Rspamd not installed"
 fi
 
 echo "== teardown"

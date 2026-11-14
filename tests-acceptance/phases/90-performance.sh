@@ -34,6 +34,21 @@ t0=$(now_ms); oxpanel-ctl vhost list >/dev/null; t1=$(now_ms); info "perf: ListV
 t0=$(now_ms); oxpanel-ctl host reconcile >/dev/null; t1=$(now_ms); info "perf: Reconcile ($N tenants, $N sites): $((t1-t0)) ms"
 t0=$(now_ms); oxpanel-ctl host info >/dev/null; t1=$(now_ms); info "perf: GetHostInfo: $((t1-t0)) ms"
 t0=$(now_ms); oxpanel-ctl tenant suspend perf50 >/dev/null; t1=$(now_ms); oxpanel-ctl tenant resume perf50 >/dev/null; t2=$(now_ms); info "perf: suspend $((t1-t0)) ms, resume $((t2-t1)) ms (one site)"
+if oxpanel-ctl mail host 2>/dev/null | grep -q '^enabled=true'; then
+  mem() { systemctl show -p MemoryCurrent --value "$1"; }
+  info "perf: email at idle, memory (MemoryCurrent, bytes): postfix=$(mem postfix) dovecot=$(mem dovecot) rspamd=$(mem rspamd) policy=$(mem oxpanel-mail-policy) webmail=$(mem oxpanel-webmail)"
+  t0=$(now_ms); oxpanel-ctl mail domain-set perf1.test --tenant perf1 >/dev/null; t1=$(now_ms); info "perf: SetMailDomain (new, with a 2048-bit DKIM key): $((t1-t0)) ms"
+  t0=$(now_ms); echo 'Perf-Mail-Pass-2026' | oxpanel-ctl mail mailbox-set info@perf1.test --tenant perf1 --password >/dev/null; t1=$(now_ms); info "perf: PutMailbox (new, bcrypt cost 12): $((t1-t0)) ms"
+  for i in $(seq 1 20); do echo 'Perf-Mail-Pass-2026' | oxpanel-ctl mail mailbox-set "m$i@perf1.test" --tenant perf1 --password >/dev/null; done
+  t0=$(now_ms); oxpanel-ctl mail mailbox-list perf1.test --tenant perf1 >/dev/null; t1=$(now_ms); info "perf: ListMailboxes (21 mailboxes, with usage): $((t1-t0)) ms"
+  t0=$(now_ms); oxpanel-ctl mail forwarder-set f@perf1.test --tenant perf1 --to x@remote.example >/dev/null; t1=$(now_ms); info "perf: PutForwarder: $((t1-t0)) ms"
+  t0=$(now_ms); oxpanel-ctl mail usage perf1 >/dev/null; t1=$(now_ms); info "perf: GetMailUsage (21 mailboxes): $((t1-t0)) ms"
+  t0=$(now_ms); oxpanel-ctl mail queue >/dev/null; t1=$(now_ms); info "perf: GetMailQueue: $((t1-t0)) ms"
+  t0=$(now_ms); python3 /root/acc/mail-client.py deliver 25 a@remote.example info@perf1.test --subject perf >/dev/null; t1=$(now_ms); info "perf: one message accepted on port 25 (filter included): $((t1-t0)) ms"
+  # Leave perf1 as it was (its site is checked below; the tenants are deleted at the end).
+  oxpanel-ctl mail forwarder-delete f@perf1.test --tenant perf1 >/dev/null
+  for i in $(seq 1 20) info; do oxpanel-ctl mail mailbox-delete "${i/#[0-9]*/m$i}@perf1.test" --tenant perf1 >/dev/null; done
+fi
 systemctl restart oxpanel-daemon; t0=$(now_ms)
 until oxpanel-ctl tenant list >/dev/null 2>&1; do sleep 0.1; [ $(( $(now_ms) - t0 )) -lt 60000 ] || break; done
 info "perf: daemon restart until it answers ($N tenants, $N sites; includes start-up convergence of every site): $(( $(now_ms) - t0 )) ms"

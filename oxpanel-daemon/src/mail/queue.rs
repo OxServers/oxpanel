@@ -2,6 +2,12 @@
 //! JSON object per message), removed with `postsuper -d`, retried with
 //! `postqueue -f`. Each message is attributed to the account whose domain
 //! sent it (a mail domain, or a site's name).
+//!
+//! Postfix's tools list the host's network interfaces when they start and
+//! stop if there are none; the daemon has no network (`PrivateNetwork=yes`),
+//! so they run in a transient unit, and their output is read back from the
+//! journal (a file systemd opened for a confined Postfix tool would be
+//! refused by SELinux, as for rndc).
 
 use super::store::MailStore;
 use crate::ctx::Ctx;
@@ -71,12 +77,49 @@ pub fn parse(text: &str) -> Vec<QueueEntry> {
     out
 }
 
-async fn read(ctx: &Ctx) -> Result<Vec<QueueEntry>> {
-    let out = ctx
+static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Run a Postfix tool in a transient unit and return what it printed.
+pub(super) async fn tool(ctx: &Ctx, program: &'static str, args: &[&str]) -> Result<String> {
+    let unit = format!(
+        "oxpanel-mailq-{}-{}",
+        std::process::id(),
+        SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
+    let timeout = ctx.config.command_timeout;
+    let started = crate::records::now_unix();
+    let ran = ctx
         .sys
-        .run_ok(CommandSpec::new(bin::POSTQUEUE, ctx.config.command_timeout).arg("-j"))
+        .run(
+            CommandSpec::new(bin::SYSTEMD_RUN, timeout)
+                .args(["--wait", "--collect", "--quiet"])
+                .arg(format!("--unit={unit}"))
+                .arg("--")
+                .arg(program)
+                .args(args),
+        )
         .await?;
-    let mut entries = parse(&out.stdout_lossy());
+    let journal = ctx
+        .sys
+        .run(
+            CommandSpec::new(bin::JOURNALCTL, timeout)
+                .args(["--no-pager", "--output=cat", "--since"])
+                .arg(format!("@{started}"))
+                .arg("--unit")
+                .arg(format!("{unit}.service")),
+        )
+        .await?;
+    if !ran.success() {
+        return Err(Error::Internal(format!(
+            "{program} failed: {}",
+            journal.stdout_lossy().lines().last().unwrap_or("")
+        )));
+    }
+    Ok(journal.stdout_lossy())
+}
+
+async fn read(ctx: &Ctx) -> Result<Vec<QueueEntry>> {
+    let mut entries = parse(&tool(ctx, bin::POSTQUEUE, &["-j"]).await?);
     let domains = MailStore::new(&ctx.config).list()?;
     let vhosts = ctx.store.list_vhosts()?;
     for e in &mut entries {
@@ -126,13 +169,7 @@ pub async fn delete(ctx: &Ctx, id: &QueueId) -> Result<bool> {
             format!("{} is not in the mail queue", id.as_str()),
         ));
     }
-    ctx.sys
-        .run_ok(
-            CommandSpec::new(bin::POSTSUPER, ctx.config.command_timeout)
-                .arg("-d")
-                .arg(id.as_str()),
-        )
-        .await?;
+    tool(ctx, bin::POSTSUPER, &["-d", id.as_str()]).await?;
     tracing::info!(queue_id = id.as_str(), "queued message removed");
     Ok(true)
 }
@@ -140,9 +177,7 @@ pub async fn delete(ctx: &Ctx, id: &QueueId) -> Result<bool> {
 /// Try to deliver everything now; returns how many messages were queued.
 pub async fn flush(ctx: &Ctx) -> Result<u32> {
     let n = u32::try_from(read(ctx).await?.len()).unwrap_or(u32::MAX);
-    ctx.sys
-        .run_ok(CommandSpec::new(bin::POSTQUEUE, ctx.config.command_timeout).arg("-f"))
-        .await?;
+    tool(ctx, bin::POSTQUEUE, &["-f"]).await?;
     Ok(n)
 }
 

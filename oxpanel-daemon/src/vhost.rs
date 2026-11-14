@@ -289,6 +289,11 @@ impl VHostService {
         let ours: Vec<&str> = std::iter::once(domain.as_str())
             .chain(aliases.iter().map(Domain::as_str))
             .collect();
+        // Names email serves: the mail host name, and the webmail and
+        // autoconfiguration names of another account's mail domains.
+        for name in &ours {
+            crate::mail::check_site_name(&self.ctx, name, tenant.as_str())?;
+        }
         for other in self
             .ctx
             .store

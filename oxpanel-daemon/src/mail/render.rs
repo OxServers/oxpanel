@@ -459,6 +459,10 @@ protocol imap {{
   mail_plugins = $mail_plugins imap_quota
 }}
 lmtp_rcpt_check_quota = yes
+# Autoresponders send through OxPanel's sendmail, as the account (delivery
+# runs with its identity): the policy service checks and counts them like
+# any mail of the account's sites.
+sendmail_path = /usr/libexec/oxpanel/sendmail
 
 plugin {{
   quota = maildir:Mailbox
@@ -499,9 +503,9 @@ pub fn dovecot_files(m: &Model) -> Result<BTreeMap<&'static str, String>> {
             let home = maildir(&account.home, &d.domain, local);
             let home = safe_path_str(&home)?;
             let quota = if mb.quota_bytes > 0 {
-                format!("quota_rule=*:storage={}B", mb.quota_bytes)
+                format!("userdb_quota_rule=*:storage={}B", mb.quota_bytes)
             } else {
-                "quota_rule=*:storage=0".to_owned()
+                "userdb_quota_rule=*:storage=0".to_owned()
             };
             let _ = writeln!(
                 users,

@@ -122,6 +122,14 @@ fn main() -> ExitCode {
     // `oxpanel-daemon worker …` is the half of a backup or restore job that
     // runs in its own transient unit; it never becomes a server.
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // Called as `sendmail` (the link /usr/libexec/oxpanel/sendmail, which
+    // Dovecot's autoresponders run): OxPanel's sendmail, whatever the arguments.
+    if std::env::args()
+        .next()
+        .is_some_and(|a| a.rsplit('/').next() == Some(oxpanel_daemon::mail::sendmail::SUBCOMMAND))
+    {
+        return ExitCode::from(oxpanel_daemon::mail::sendmail::main(&args));
+    }
     if args.first().is_some_and(|a| a == worker::SUBCOMMAND) {
         init_tracing();
         return run_worker(&args);

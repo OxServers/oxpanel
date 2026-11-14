@@ -66,3 +66,24 @@
 ; configuration in /etc/named/oxpanel is named_conf_t by the stock rule for
 ; /etc/named.
 (filecon "/var/lib/oxpanel-dns(/.*)?" any (system_u object_r named_cache_t ((s0) (s0))))
+
+; Email (the optional mail component).
+;
+; OxPanel's mail policy service (oxpanel-mail-policy.service) and Roundcube's
+; PHP-FPM master (oxpanel-webmail.service) run in oxpanel_app_t, like tenant
+; applications (SELinuxContext= in their units): confined by their own
+; accounts and systemd sandboxes. Their socket directories are labelled like
+; those of applications, so the web server (Nginx in front of Roundcube) and
+; sites' PHP (which runs in the web-server domain and calls OxPanel's
+; sendmail) may reach them with the rule above, and nothing new is needed.
+(filecon "/var/run/oxpanel-mail(/.*)?" any (system_u object_r httpd_var_run_t ((s0) (s0))))
+(filecon "/var/run/oxpanel-webmail(/.*)?" any (system_u object_r httpd_var_run_t ((s0) (s0))))
+; Roundcube's PHP-FPM is the distribution's php-fpm (httpd_exec_t), started
+; by systemd straight into oxpanel_app_t.
+(allow oxpanel_app_t httpd_exec_t (file (entrypoint)))
+; Mailboxes in tenant homes (~/mail): the type the stock policy gives mail in
+; home directories, which Dovecot (delivery, IMAP, POP3) may manage.
+(filecon "/home/[^/]+/mail(/.*)?" any (system_u object_r mail_home_rw_t ((s0) (s0))))
+; Autoresponder scripts (root-owned, read by Dovecot's delivery): the type of
+; Dovecot's own state.
+(filecon "/var/lib/oxpanel-mail/sieve(/.*)?" any (system_u object_r dovecot_var_lib_t ((s0) (s0))))
