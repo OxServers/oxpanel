@@ -2473,6 +2473,7 @@ if [ -x /usr/sbin/postfix ] && [ -x /usr/sbin/dovecot ] && [ -x /usr/bin/rspamd 
   mc() { python3 "$MC" "$@"; }
   eventually() { local n="$1"; shift; for _ in $(seq 1 "$n"); do "$@" >/dev/null 2>&1 && return 0; sleep 0.5; done; "$@"; }
   ME=/root/mail-test; rm -rf "$ME"; mkdir -p "$ME"
+  MAIL_HOUR0="$(date -u +%Y%m%d%H)"
   cp -p /etc/oxpanel/daemon.env "$ME/daemon.env.bak"
   mail_was_on=0; grep -q '^OXPANEL_MAIL=true' /etc/oxpanel/daemon.env && mail_was_on=1
   if [ "$mail_was_on" = 0 ]; then
@@ -2624,7 +2625,14 @@ if [ -x /usr/sbin/postfix ] && [ -x /usr/sbin/dovecot ] && [ -x /usr/bin/rspamd 
   echo "-- sending limits"
   oxpanel-ctl mail limits-set mailx --max-mailboxes unlimited --max-mailbox-bytes unlimited --per-hour-account unlimited --per-hour-mailbox 2 >/dev/null
   sent="$(sed -n 's/.*sent_this_hour=\([0-9]*\).*/\1/p' <(oxpanel-ctl mail usage mailx))"
-  check "usage counts what the account sent this hour" test "${sent:-0}" -ge 3
+  # Counted per clock hour (UTC): when the hour turned since the messages
+  # above were sent, the count started again (found in a run at 17:00).
+  if [ "$(date -u +%Y%m%d%H)" = "$MAIL_HOUR0" ]; then
+    check "usage counts what the account sent this hour" test "${sent:-0}" -ge 3
+  else
+    echo "info - the clock hour turned during the email section: the hourly count started again (sent=${sent:-0})"
+    check "usage counts what the account sent this hour (a new hour began)" test -n "$sent"
+  fi
   mc submit 587 two@mx1.oxtest "$PX" two@mx1.oxtest info@my1.oxtest --subject rate-1 >/dev/null || true
   mc submit 587 two@mx1.oxtest "$PX" two@mx1.oxtest info@my1.oxtest --subject rate-2 >/dev/null || true
   check "the mailbox's hourly limit defers the next message (4xx)" bash -c "python3 $MC submit 587 two@mx1.oxtest '$PX' two@mx1.oxtest info@my1.oxtest --subject rate-3 | grep -q '45[0-9]'"
