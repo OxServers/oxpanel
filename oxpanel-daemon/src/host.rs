@@ -66,6 +66,9 @@ pub enum DriftKind {
     MailConfigDrift,
     MailDomainDrift,
     OrphanMailFile,
+    HostCertificateKeyExposed,
+    OrphanHostCertificateFile,
+    HostCertificateChallengeDrift,
 }
 
 /// One difference between a record and the operating system.
@@ -138,6 +141,97 @@ pub struct HostInfo {
     pub php_cli: bool,
     /// DNS hosting (see [`crate::dns`]).
     pub dns: crate::dns::DnsFacts,
+    /// Host certificates (see [`crate::host_certs`]).
+    pub host_certificates: Vec<crate::host_certs::Status>,
+    /// The public addresses (operator's, else DNS hosting's); empty if unknown.
+    pub public_ipv4: String,
+    pub public_ipv6: String,
+    pub login_banning: LoginBanning,
+}
+
+/// Login banning: fail2ban with the jails install.sh writes.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct LoginBanning {
+    pub active: bool,
+    pub jails: Vec<String>,
+    pub detail: String,
+}
+
+/// OxPanel's jail files (written by install.sh) in fail2ban's jail directory.
+pub const JAIL_FILES: [&str; 2] = ["50-oxpanel-sshd.local", "50-oxpanel-mail.local"];
+/// Upper bound for reading one jail file.
+const MAX_JAIL_BYTES: u64 = 64 * 1024;
+
+/// The `[section]` names of a jail file whose `enabled` is true.
+fn enabled_jails(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current: Option<String> = None;
+    let mut push = |name: &mut Option<String>, enabled: bool| {
+        if let (Some(n), true) = (name.take(), enabled) {
+            out.push(n);
+        }
+    };
+    let mut enabled = false;
+    for line in text.lines().map(str::trim) {
+        if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+            push(&mut current, enabled);
+            enabled = false;
+            let ok = !name.is_empty()
+                && name.len() <= 64
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'));
+            current = ok.then(|| name.to_owned());
+        } else if let Some((k, v)) = line.split_once('=') {
+            if k.trim() == "enabled" {
+                enabled = matches!(v.trim(), "true" | "yes" | "1" | "on");
+            }
+        }
+    }
+    push(&mut current, enabled);
+    out
+}
+
+/// Whether fail2ban runs with OxPanel's jails. Read-only: the jail files
+/// (never following a symlink) and `systemctl is-active fail2ban.service`.
+pub async fn login_banning(ctx: &Ctx) -> Result<LoginBanning> {
+    let mut jails = Vec::new();
+    for file in JAIL_FILES {
+        let path = ctx.config.fail2ban_jail_dir.join(file);
+        if let Ok(Some(bytes)) = fsutil::read_untrusted(&path, MAX_JAIL_BYTES) {
+            jails.extend(enabled_jails(&String::from_utf8_lossy(&bytes)));
+        }
+    }
+    if jails.is_empty() {
+        return Ok(LoginBanning {
+            active: false,
+            jails,
+            detail: "login banning is not set up (install.sh --fail2ban)".to_owned(),
+        });
+    }
+    let running =
+        ctx.sys.is_installed(bin::FAIL2BAN_SERVER).await
+            && ctx
+                .sys
+                .run(
+                    crate::system::CommandSpec::new(bin::SYSTEMCTL, ctx.config.command_timeout)
+                        .args(["is-active", "--quiet", "--", "fail2ban.service"]),
+                )
+                .await?
+                .success();
+    let detail = if running {
+        format!(
+            "fail2ban is running with OxPanel's jails: {}",
+            jails.join(", ")
+        )
+    } else {
+        "OxPanel's jails are configured, but fail2ban is not running (systemctl enable --now fail2ban)".to_owned()
+    };
+    Ok(LoginBanning {
+        active: running,
+        jails,
+        detail,
+    })
 }
 
 /// What tenants can be given on this host beyond web hosting.
@@ -208,6 +302,10 @@ impl HostService {
             databases: crate::db::facts(&self.ctx).await?,
             php_cli: self.ctx.sys.is_installed(bin::PHP_CLI).await,
             dns: crate::dns::facts(&self.ctx).await?,
+            host_certificates: crate::host_certs::status(&self.ctx).await?,
+            public_ipv4: cfg.public_addresses().0,
+            public_ipv6: cfg.public_addresses().1,
+            login_banning: login_banning(&self.ctx).await?,
         })
     }
 
@@ -267,6 +365,7 @@ impl HostService {
         out.extend(crate::backup_schedule::drifts(cfg, &tenants)?);
         out.extend(crate::dns::drifts(&self.ctx).await?);
         out.extend(crate::mail::drifts(&self.ctx).await?);
+        out.extend(crate::host_certs::drifts(&self.ctx)?);
         Ok(out)
     }
 
@@ -809,7 +908,7 @@ fn check_backup_files(b: &BackupRecord, dir: &Path, out: &mut Vec<Drift>) -> Res
             subject,
             format!("{} is missing", manifest.display()),
         )),
-        Some(bytes) if bytes != backup::render_manifest(b)? => out.push(Drift::new(
+        Some(bytes) if !backup::manifest_matches(b, &bytes)? => out.push(Drift::new(
             DriftKind::BackupArchiveModified,
             subject,
             format!("{} differs from the record", manifest.display()),
@@ -1492,6 +1591,52 @@ mod tests {
             vec![(DriftKind::SftpAccessDrift, "alice")],
             "only the lost password remains: it must be set again"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn enabled_jails_are_read_from_a_jail_file() {
+        let text = "# c\n[sshd]\nenabled = true\nport = ssh\n\n[off]\nenabled=false\n[bad name]\nenabled=true\n[dovecot]\nenabled=yes\n";
+        assert_eq!(enabled_jails(text), vec!["sshd", "dovecot"]);
+        assert!(enabled_jails("").is_empty());
+    }
+
+    #[tokio::test]
+    async fn info_reports_login_banning_and_public_addresses() -> Result<()> {
+        let h = harness().await;
+        let i = h.host.info().await?;
+        assert!(!i.login_banning.active && i.login_banning.jails.is_empty());
+        assert!(i.login_banning.detail.contains("--fail2ban"));
+        assert_eq!((i.public_ipv4.as_str(), i.public_ipv6.as_str()), ("", ""));
+        assert!(i.host_certificates.is_empty());
+
+        let dir = h.ctx.config.fail2ban_jail_dir.clone();
+        std::fs::create_dir_all(&dir).unwrap_or_else(|e| panic!("{e}"));
+        std::fs::write(dir.join(JAIL_FILES[0]), "[sshd]\nenabled = true\n")
+            .unwrap_or_else(|e| panic!("{e}"));
+        let i = h.host.info().await?;
+        assert!(i.login_banning.active, "{:?}", i.login_banning);
+        assert_eq!(i.login_banning.jails, vec!["sshd"]);
+        let systemctl: Vec<Vec<String>> = h
+            .sys
+            .calls_to(bin::SYSTEMCTL)
+            .iter()
+            .map(|c| {
+                c.args
+                    .iter()
+                    .map(|a| a.to_string_lossy().into_owned())
+                    .collect()
+            })
+            .collect();
+        assert!(systemctl.contains(
+            &["is-active", "--quiet", "--", "fail2ban.service"]
+                .map(String::from)
+                .to_vec()
+        ));
+        h.sys.set_missing(bin::FAIL2BAN_SERVER);
+        let i = h.host.info().await?;
+        assert!(!i.login_banning.active);
+        assert!(i.login_banning.detail.contains("not running"));
         Ok(())
     }
 }

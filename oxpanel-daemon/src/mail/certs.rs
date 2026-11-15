@@ -6,7 +6,6 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 
-use serde::{Deserialize, Serialize};
 use tracing::{info, warn};
 
 use super::records::{self, MailRecord};
@@ -17,17 +16,11 @@ use crate::dns::probe::{self, Outcome, Question, Server};
 use crate::dns::wire;
 use crate::error::Result;
 use crate::fsutil;
+use crate::named_cert::{self, Backoff};
 use crate::records::now_unix;
 use crate::validate::Domain;
 
 // ---- Certificates -----------------------------------------------------------------
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-struct Backoff {
-    failures: u32,
-    next_attempt_unix: u64,
-    reason: String,
-}
 
 fn backoff_path(ctx: &Ctx) -> std::path::PathBuf {
     ctx.config.state_dir.join("mail").join("certificates.json")
@@ -64,24 +57,43 @@ pub fn wanted_names(ctx: &Ctx) -> Result<Vec<Domain>> {
     Ok(out)
 }
 
+/// Every name email's Nginx file answers on port 80: the mail host name,
+/// the autoconfiguration names and the webmail names (empty while email is
+/// off). Host certificates do not render a second server for them.
+pub fn port80_names(ctx: &Ctx) -> Result<Vec<String>> {
+    let cfg = &ctx.config.mail;
+    let Some(host) = cfg.hostname.clone().filter(|_| cfg.enabled) else {
+        return Ok(Vec::new());
+    };
+    let m = super::ops::records_model(ctx, &host)?;
+    let mut out = vec![host.to_string()];
+    out.extend(m.local().map(|d| format!("autoconfig.{}", d.domain)));
+    out.extend(
+        super::ops::webmail_sites(ctx, &m)?
+            .into_iter()
+            .map(|s| s.name),
+    );
+    Ok(out)
+}
+
 /// Whether `name` has a certificate that is not due for renewal.
 async fn current(ctx: &Ctx, name: &Domain) -> bool {
-    let crt = crate::tls::cert_path(&ctx.config.mail.selfsigned_dir, name);
-    if !crt.exists() || !crate::tls::key_path(&ctx.config.mail.selfsigned_dir, name).exists() {
-        return false;
-    }
-    let due = now_unix().saturating_add(ctx.config.acme_renew_before.as_secs());
-    crate::tls::inspect(ctx, &crt)
-        .await
-        .is_ok_and(|i| i.not_after_unix > due)
+    let dir = &ctx.config.mail.selfsigned_dir;
+    named_cert::current(
+        ctx,
+        name,
+        &crate::tls::cert_path(dir, name),
+        &crate::tls::key_path(dir, name),
+    )
+    .await
+    .is_some()
 }
 
 /// Obtain or renew the certificates email needs. Runs from the daemon's
 /// periodic task; does nothing while email or Automatic HTTPS is off.
-/// One sweep at a time (each name's ACME client runs as a unit of its
-/// own name; two sweeps would start it twice).
-static SWEEPING: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
-
+/// One sweep at a time, also with host certificates
+/// ([`named_cert::SWEEPING`]).
+///
 /// `force`: after a change of email (a domain set up), try names that are
 /// backing off too — as `RunAutoHttps` does for a site; the pre-check keeps
 /// names that do not resolve from reaching the authority.
@@ -89,14 +101,9 @@ pub async fn sweep(ctx: &Ctx, force: bool) -> Result<usize> {
     if !ctx.config.auto_https.is_on() || crate::acme::unavailable_reason(ctx).await?.is_some() {
         return Ok(0);
     }
-    let _running = if force {
-        SWEEPING.lock().await
-    } else {
-        let Ok(g) = SWEEPING.try_lock() else {
-            return Ok(0);
-        };
-        g
-    };
+    // Waits rather than skips: the host-certificate sweep starts on the same
+    // tick, and skipping would skip every time.
+    let _running = named_cert::SWEEPING.lock().await;
     let names = {
         let _guard = ctx.lock.lock().await;
         wanted_names(ctx)?
@@ -120,16 +127,9 @@ pub async fn sweep(ctx: &Ctx, force: bool) -> Result<usize> {
                 installed += 1;
             }
             Err(why) => {
-                let failures = backoff.get(name.as_str()).map_or(0, |b| b.failures) + 1;
                 warn!(%name, reason = %why, "no certificate for the mail name yet");
-                backoff.insert(
-                    name.to_string(),
-                    Backoff {
-                        failures,
-                        next_attempt_unix: now_unix() + crate::auto_https::backoff_secs(failures),
-                        reason: why.chars().take(300).collect(),
-                    },
-                );
+                let next = Backoff::after(backoff.get(name.as_str()), &why);
+                backoff.insert(name.to_string(), next);
             }
         }
         save_backoff(ctx, &backoff)?;
@@ -152,58 +152,24 @@ pub async fn sweep(ctx: &Ctx, force: bool) -> Result<usize> {
     Ok(installed)
 }
 
-/// One certificate for `name`: pre-check, order, verify, install.
+/// One certificate for `name`, installed where the mail servers read it.
 async fn obtain(ctx: &Ctx, name: &Domain) -> std::result::Result<(), String> {
-    let names = vec![name.clone()];
-    let pre = crate::acme::run_precheck(ctx, name, &names)
-        .await
-        .map_err(|e| e.to_string())?;
-    if let Some((_, why)) = pre.skipped.first() {
-        return Err(why.clone());
-    }
-    {
-        let _guard = ctx.lock.lock().await;
-        crate::acme::prepare(ctx, name, &names)
-            .await
-            .map_err(|e| e.to_string())?;
-    }
-    let ran = crate::acme::run_client(ctx, name, &names).await;
+    let m = named_cert::obtain(ctx, name).await?;
     let _guard = ctx.lock.lock().await;
-    let result = async {
-        let (ok, output) = ran.map_err(|e| e.to_string())?;
-        if !ok {
-            return Err(output
-                .lines()
-                .last()
-                .unwrap_or("the ACME client failed")
-                .to_owned());
-        }
-        install(ctx, name).await.map_err(|e| e.to_string())
-    }
-    .await;
-    let _ = crate::acme::discard(ctx, name);
-    result
-}
-
-async fn install(ctx: &Ctx, name: &Domain) -> Result<()> {
-    let cfg = &ctx.config;
-    let key = fsutil::read_optional(&crate::tls::pending_key_path(&cfg.tls_dir, name))?
-        .and_then(|k| String::from_utf8(k).ok())
-        .ok_or_else(|| crate::Error::Internal("the key of the pending request is gone".into()))?;
-    let chain = crate::acme::read_issued(ctx, name)?
-        .ok_or_else(|| crate::Error::CertificateInvalid("no certificate was delivered".into()))?;
-    let chain = crate::tls::normalise_pem(&chain, crate::tls::PemKind::Chain)?;
-    crate::tls::verify_material(ctx, name, &chain, &key).await?;
-    fsutil::write_atomic(
-        &crate::tls::key_path(&cfg.mail.selfsigned_dir, name),
-        key.as_bytes(),
+    let dir = &ctx.config.mail.selfsigned_dir;
+    let written = fsutil::write_atomic(
+        &crate::tls::key_path(dir, name),
+        m.key.as_bytes(),
         crate::tls::KEY_MODE,
-    )?;
-    fsutil::write_atomic(
-        &crate::tls::cert_path(&cfg.mail.selfsigned_dir, name),
-        chain.as_bytes(),
-        crate::tls::CERT_MODE,
-    )?;
+    )
+    .and_then(|_| {
+        fsutil::write_atomic(
+            &crate::tls::cert_path(dir, name),
+            m.chain.as_bytes(),
+            crate::tls::CERT_MODE,
+        )
+    });
+    written.map_err(|e| e.to_string())?;
     info!(%name, "mail certificate installed");
     Ok(())
 }

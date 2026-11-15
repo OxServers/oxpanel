@@ -849,6 +849,16 @@ enum DriftKind {
   // Email: a DKIM key, autoresponder script or mail left to remove that no
   // record accounts for.
   DRIFT_KIND_ORPHAN_MAIL_FILE = 42;
+  // Host certificates (engine 0.3.2): a private key in the host-certificate
+  // directory that is not a regular file readable by root only.
+  DRIFT_KIND_HOST_CERTIFICATE_KEY_EXPOSED = 43;
+  // A file in the host-certificate directory that no registration in
+  // /etc/oxpanel/host-certificates.d accounts for.
+  DRIFT_KIND_ORPHAN_HOST_CERTIFICATE_FILE = 44;
+  // The challenge-only Nginx file of host certificates is missing or differs
+  // from what the registrations render (or exists without a registration
+  // that needs it).
+  DRIFT_KIND_HOST_CERTIFICATE_CHALLENGE_DRIFT = 45;
 }
 
 message Drift {

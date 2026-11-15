@@ -156,6 +156,27 @@ impl Engine {
     }
 }
 
+fn host_certificate_to(s: &crate::host_certs::Status) -> pb::HostCertificate {
+    use crate::host_certs::State;
+    pb::HostCertificate {
+        consumer: s.consumer.clone(),
+        name: s.name.clone(),
+        state: i32::from(match s.state {
+            State::Issued => pb::HostCertificateState::Issued,
+            State::Renewing => pb::HostCertificateState::Renewing,
+            State::Pending => pb::HostCertificateState::Pending,
+            State::Disabled => pb::HostCertificateState::Disabled,
+            State::Invalid => pb::HostCertificateState::Invalid,
+        }),
+        issuer: s.issuer.clone(),
+        not_after: s.not_after_unix.map(timestamp),
+        reason: s.reason.clone(),
+        next_attempt: s.next_attempt_unix.map(timestamp),
+        certificate_path: s.certificate_path.clone(),
+        key_path: s.key_path.clone(),
+    }
+}
+
 fn timestamp(unix: u64) -> prost_types::Timestamp {
     prost_types::Timestamp {
         seconds: i64::try_from(unix).unwrap_or(i64::MAX),
@@ -216,6 +237,9 @@ fn drift_to(d: &Drift) -> pb::Drift {
         DriftKind::MailConfigDrift => pb::DriftKind::MailConfigDrift,
         DriftKind::MailDomainDrift => pb::DriftKind::MailDomainDrift,
         DriftKind::OrphanMailFile => pb::DriftKind::OrphanMailFile,
+        DriftKind::HostCertificateKeyExposed => pb::DriftKind::HostCertificateKeyExposed,
+        DriftKind::OrphanHostCertificateFile => pb::DriftKind::OrphanHostCertificateFile,
+        DriftKind::HostCertificateChallengeDrift => pb::DriftKind::HostCertificateChallengeDrift,
     };
     pb::Drift {
         kind: kind.into(),
@@ -845,6 +869,18 @@ impl OxPanelEngine for Engine {
             backup_keep: i.backup_keep,
             database_trash_days: i.db_trash_days,
             dns: Some(self.dns_host_info(i.dns)),
+            host_certificates: i
+                .host_certificates
+                .iter()
+                .map(host_certificate_to)
+                .collect(),
+            public_ipv4: i.public_ipv4,
+            public_ipv6: i.public_ipv6,
+            login_banning: Some(pb::LoginBanning {
+                active: i.login_banning.active,
+                jails: i.login_banning.jails,
+                detail: i.login_banning.detail,
+            }),
             ..pb::HostInfo::default()
         };
         self.essentials_info(&mut info, i.php_cli);
@@ -964,9 +1000,18 @@ impl OxPanelEngine for Engine {
         let r = req.into_inner();
         info!(rpc = RPC, peer, domain = %r.domain, "request");
         let tls = self.tls.clone();
+        let everything = r.domain.is_empty();
         let sites = detached(async move { tls.auto_https_run(&r.domain).await })
             .await
             .map_err(|e| fail(RPC, &peer, e))?;
+        if everything {
+            // Host certificates too (the panel's own name, …); their result
+            // is in HostInfo.host_certificates.
+            let ctx = self.tls.ctx.clone();
+            detached(async move { crate::host_certs::sweep(&ctx).await })
+                .await
+                .map_err(|e| fail(RPC, &peer, e))?;
+        }
         Ok(Response::new(pb::RunAutoHttpsResponse {
             sites: sites.iter().map(auto_https_to).collect(),
         }))
@@ -2249,6 +2294,30 @@ impl OxPanelEngine for Engine {
         req: Request<pb::SetMailDefaultsRequest>,
     ) -> Result<Response<pb::MailDefaults>, Status> {
         self.set_mail_defaults_rpc(req).await
+    }
+
+    async fn read_backup_member(
+        &self,
+        req: Request<pb::ReadBackupMemberRequest>,
+    ) -> Result<Response<pb::ReadBackupMemberResponse>, Status> {
+        const RPC: &str = "ReadBackupMember";
+        // The account's data, like ReadFile.
+        let peer = self.authorise(&req, RPC, Scope::VHost)?;
+        let r = req.into_inner();
+        if r.offset == 0 {
+            // One line per download, not per chunk.
+            info!(rpc = RPC, peer, tenant = %r.tenant, backup = %r.backup_id, member = %r.member.escape_debug(), "request");
+        }
+        let chunk = self
+            .backups
+            .read_member(&r.tenant, &r.backup_id, &r.member, r.offset, r.length)
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(pb::ReadBackupMemberResponse {
+            data: chunk.data,
+            size_bytes: chunk.size,
+            eof: chunk.eof,
+        }))
     }
 }
 

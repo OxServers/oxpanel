@@ -355,6 +355,7 @@ async fn run(cli: Cli) -> Result<(), Fatal> {
     tokio::spawn(renew_certificates_periodically(engine.tls()));
     tokio::spawn(auto_https_periodically(engine.tls()));
     tokio::spawn(mail_certificates_periodically(ctx.clone()));
+    tokio::spawn(host_certificates_periodically(ctx.clone()));
 
     resume_jobs(&ctx, &engine).await;
     // Scheduled backups: due ones (after downtime: once) now, then periodically.
@@ -452,6 +453,21 @@ async fn mail_certificates_periodically(ctx: Ctx) {
     }
 }
 
+/// Host certificates (the panel's own name, …), on the same cadence as the
+/// mail certificates. The challenge file and removed registrations are looked
+/// after even while Automatic HTTPS is off.
+async fn host_certificates_periodically(ctx: Ctx) {
+    tokio::time::sleep(oxpanel_daemon::auto_https::FIRST_SWEEP_AFTER).await;
+    loop {
+        match oxpanel_daemon::host_certs::sweep(&ctx).await {
+            Ok(0) => {}
+            Ok(n) => info!(certificates = n, "host certificates installed"),
+            Err(e) => warn!(error = %e, "host certificates could not be checked"),
+        }
+        tokio::time::sleep(oxpanel_daemon::auto_https::SWEEP_EVERY).await;
+    }
+}
+
 /// Bring what the records describe up to date with this version of the
 /// daemon. Failures are logged and left to `Reconcile`; they never stop it.
 async fn converge_at_start(ctx: &Ctx) {
@@ -496,6 +512,8 @@ async fn converge_at_start(ctx: &Ctx) {
     // Email: interrupted work finished, every file re-rendered, the servers
     // started.
     oxpanel_daemon::mail::converge(ctx).await;
+    // Host certificates: the challenge file rendered for this version.
+    oxpanel_daemon::host_certs::converge(ctx).await;
 }
 
 /// The real OS, or the in-memory fake for `--dry-run`.
@@ -533,6 +551,14 @@ fn make_system(config: &mut Config) -> Result<Arc<dyn System>, Fatal> {
         // no Unbound there, so it is not used.
         config.mail.resolver_dir = mail.join("resolver");
         config.mail.resolver_binary = mail.join("resolver").join("unbound");
+        // Host certificates too: registrations a dry run's panel writes go
+        // below the state directory, never to /etc.
+        let host = config.state_dir.join("dry-run-host-certificates");
+        config.host_certs = oxpanel_daemon::host_certs::HostCertConfig {
+            registry_dir: host.join("host-certificates.d"),
+            cert_dir: host.join("pki"),
+            nginx_file: host.join("nginx-host-certificates.conf"),
+        };
         warn!("DRY RUN: no accounts, files under /etc or services will be touched");
         return Ok(Arc::new(fake));
     }

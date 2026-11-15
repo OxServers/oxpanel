@@ -34,6 +34,8 @@ pub mod bin {
     pub const USERDEL: &str = "/usr/sbin/userdel";
     pub const NGINX: &str = "/usr/sbin/nginx";
     pub const SYSTEMCTL: &str = "/usr/bin/systemctl";
+    /// Never run: only whether it is installed (login banning in `HostInfo`).
+    pub const FAIL2BAN_SERVER: &str = "/usr/bin/fail2ban-server";
     pub const RESTORECON: &str = "/usr/sbin/restorecon";
     pub const SELINUXENABLED: &str = "/usr/sbin/selinuxenabled";
     pub const SETFACL: &str = "/usr/bin/setfacl";

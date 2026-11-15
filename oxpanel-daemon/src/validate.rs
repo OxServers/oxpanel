@@ -864,6 +864,37 @@ fn parse_id(raw: &str, prefix: char, field: &'static str) -> Result<String> {
     Ok(raw.to_owned())
 }
 
+/// The name of a host-certificate consumer (the registration file's name
+/// without `.conf`): `^[a-z][a-z0-9-]{0,30}$`. Used in file names.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct HostCertConsumer(String);
+
+impl HostCertConsumer {
+    pub fn parse(raw: &str) -> Result<Self> {
+        let mut bytes = raw.bytes();
+        let ok = bytes.next().is_some_and(|b| b.is_ascii_lowercase())
+            && raw.len() <= 31
+            && bytes.all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
+        if !ok {
+            return Err(Error::invalid(
+                "consumer",
+                "must be a lower-case letter followed by at most 30 lower-case letters, digits or '-'",
+            ));
+        }
+        Ok(Self(raw.to_owned()))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for HostCertConsumer {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
 /// A validated backup identifier: `^b[0-9]{10,20}$`.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BackupId(String);

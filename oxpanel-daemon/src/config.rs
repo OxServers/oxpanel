@@ -126,6 +126,14 @@ pub struct Config {
     pub dns: crate::dns::DnsConfig,
     /// Email (`OXPANEL_MAIL_*`), see [`crate::mail::MailConfig`].
     pub mail: crate::mail::MailConfig,
+    /// Host certificates (`OXPANEL_HOST_CERT_*`), see [`crate::host_certs`].
+    pub host_certs: crate::host_certs::HostCertConfig,
+    /// This host's public addresses as the operator gave them
+    /// (`OXPANEL_PUBLIC_IPV4`/`_IPV6`); `None` falls back to DNS hosting's.
+    pub public_ipv4: Option<std::net::Ipv4Addr>,
+    pub public_ipv6: Option<std::net::Ipv6Addr>,
+    /// fail2ban's jail directory, where install.sh writes OxPanel's jails.
+    pub fail2ban_jail_dir: PathBuf,
 }
 
 /// Settings of scheduled tasks, per-site PHP settings and scheduled backups.
@@ -321,6 +329,10 @@ impl Default for Config {
             essentials: Essentials::default(),
             dns: crate::dns::DnsConfig::default(),
             mail: crate::mail::MailConfig::default(),
+            host_certs: crate::host_certs::HostCertConfig::default(),
+            public_ipv4: None,
+            public_ipv6: None,
+            fail2ban_jail_dir: PathBuf::from("/etc/fail2ban/jail.d"),
         }
     }
 }
@@ -425,8 +437,81 @@ impl Config {
         c.essentials.read_env(&get)?;
         c.dns = crate::dns::DnsConfig::from_lookup(&get)?;
         c.mail = crate::mail::MailConfig::from_lookup(&get)?;
+        c.public_from_lookup(&get)?;
         c.validate()?;
         Ok(c)
+    }
+
+    /// The host-certificate and fail2ban paths, and
+    /// `OXPANEL_PUBLIC_IPV4` / `OXPANEL_PUBLIC_IPV6`: an address of that
+    /// family that can be reached from elsewhere (not unspecified, loopback,
+    /// multicast or broadcast). Empty means not given.
+    fn public_from_lookup(&mut self, get: &impl Fn(&str) -> Option<String>) -> Result<()> {
+        for (key, cur) in [
+            (
+                "OXPANEL_HOST_CERT_REGISTRY_DIR",
+                &mut self.host_certs.registry_dir,
+            ),
+            ("OXPANEL_HOST_CERT_DIR", &mut self.host_certs.cert_dir),
+            (
+                "OXPANEL_HOST_CERT_NGINX_FILE",
+                &mut self.host_certs.nginx_file,
+            ),
+            ("OXPANEL_FAIL2BAN_JAIL_DIR", &mut self.fail2ban_jail_dir),
+        ] {
+            if let Some(v) = get(key) {
+                let p = PathBuf::from(v.trim());
+                if !p.is_absolute() {
+                    return Err(Error::invalid(
+                        "config",
+                        format!("{key} must be an absolute path"),
+                    ));
+                }
+                *cur = p;
+            }
+        }
+        if let Some(v) = get("OXPANEL_PUBLIC_IPV4").filter(|v| !v.trim().is_empty()) {
+            let a: std::net::Ipv4Addr = v.trim().parse().map_err(|_| {
+                Error::invalid(
+                    "config",
+                    format!("OXPANEL_PUBLIC_IPV4: '{v}' is not an IPv4 address"),
+                )
+            })?;
+            if a.is_unspecified() || a.is_loopback() || a.is_multicast() || a.is_broadcast() {
+                return Err(Error::invalid(
+                    "config",
+                    format!("OXPANEL_PUBLIC_IPV4: {a} cannot be this host's public address"),
+                ));
+            }
+            self.public_ipv4 = Some(a);
+        }
+        if let Some(v) = get("OXPANEL_PUBLIC_IPV6").filter(|v| !v.trim().is_empty()) {
+            let a: std::net::Ipv6Addr = v.trim().parse().map_err(|_| {
+                Error::invalid(
+                    "config",
+                    format!("OXPANEL_PUBLIC_IPV6: '{v}' is not an IPv6 address"),
+                )
+            })?;
+            if a.is_unspecified() || a.is_loopback() || a.is_multicast() {
+                return Err(Error::invalid(
+                    "config",
+                    format!("OXPANEL_PUBLIC_IPV6: {a} cannot be this host's public address"),
+                ));
+            }
+            self.public_ipv6 = Some(a);
+        }
+        Ok(())
+    }
+
+    /// The public addresses: the operator's, else DNS hosting's (as text,
+    /// empty when unknown).
+    pub fn public_addresses(&self) -> (String, String) {
+        let v4 = self.public_ipv4.or(self.dns.ipv4);
+        let v6 = self.public_ipv6.or(self.dns.ipv6);
+        (
+            v4.map(|a| a.to_string()).unwrap_or_default(),
+            v6.map(|a| a.to_string()).unwrap_or_default(),
+        )
     }
 
     /// The `OXPANEL_ACME_*` settings.
@@ -533,6 +618,13 @@ impl Config {
             ("OXPANEL_SFTP_KEYS_DIR", &self.sftp_keys_dir),
             ("OXPANEL_MARIADB_SOCKET", &self.mariadb_socket),
             ("OXPANEL_BACKUP_DIR", &self.backup_dir),
+            (
+                "OXPANEL_HOST_CERT_REGISTRY_DIR",
+                &self.host_certs.registry_dir,
+            ),
+            ("OXPANEL_HOST_CERT_DIR", &self.host_certs.cert_dir),
+            ("OXPANEL_HOST_CERT_NGINX_FILE", &self.host_certs.nginx_file),
+            ("OXPANEL_FAIL2BAN_JAIL_DIR", &self.fail2ban_jail_dir),
         ] {
             check_path(key, p)?;
         }
@@ -931,6 +1023,12 @@ pub(crate) fn sandbox_feature_paths(cfg: &mut Config, dir: &Path) {
     cfg.mail.roundcube_index = mail.join("roundcube").join("index.php");
     cfg.mail.resolver_dir = mail.join("resolver");
     cfg.mail.resolver_binary = mail.join("unbound");
+    cfg.host_certs = crate::host_certs::HostCertConfig {
+        registry_dir: dir.join("host-certificates.d"),
+        cert_dir: dir.join("pki-host"),
+        nginx_file: dir.join("nginx-host-certificates.conf"),
+    };
+    cfg.fail2ban_jail_dir = dir.join("fail2ban-jail.d");
     for d in [dir.join("sshd_config.d"), dir.join("run")] {
         std::fs::create_dir_all(&d).unwrap_or_else(|e| panic!("{}: {e}", d.display()));
     }
@@ -1160,6 +1258,42 @@ mod tests {
             ("OXPANEL_BACKUP_WINDOW", "1-24"),
             ("OXPANEL_BACKUP_WINDOW", "3"),
             ("OXPANEL_BACKUP_SCHEDULE_CHECK_SECS", "1"),
+        ] {
+            assert!(from(&[(k, v)]).is_err(), "{k}={v}");
+        }
+    }
+
+    #[test]
+    fn public_addresses_are_the_operators_else_dns_hostings() {
+        let c = from(&[("OXPANEL_DNS_IPV4", "192.0.2.10")]).unwrap();
+        assert_eq!(c.public_addresses(), ("192.0.2.10".into(), String::new()));
+        let c = from(&[
+            ("OXPANEL_DNS_IPV4", "192.0.2.10"),
+            ("OXPANEL_PUBLIC_IPV4", " 198.51.100.7 "),
+            ("OXPANEL_PUBLIC_IPV6", "2001:db8::7"),
+        ])
+        .unwrap();
+        assert_eq!(
+            c.public_addresses(),
+            ("198.51.100.7".into(), "2001:db8::7".into())
+        );
+        assert_eq!(
+            from(&[("OXPANEL_PUBLIC_IPV4", "")])
+                .unwrap()
+                .public_addresses()
+                .0,
+            ""
+        );
+        for (k, v) in [
+            ("OXPANEL_PUBLIC_IPV4", "2001:db8::7"),
+            ("OXPANEL_PUBLIC_IPV4", "127.0.0.1"),
+            ("OXPANEL_PUBLIC_IPV4", "0.0.0.0"),
+            ("OXPANEL_PUBLIC_IPV4", "224.0.0.1"),
+            ("OXPANEL_PUBLIC_IPV4", "host.example"),
+            ("OXPANEL_PUBLIC_IPV6", "::1"),
+            ("OXPANEL_PUBLIC_IPV6", "::"),
+            ("OXPANEL_PUBLIC_IPV6", "192.0.2.1"),
+            ("OXPANEL_HOST_CERT_DIR", "relative"),
         ] {
             assert!(from(&[(k, v)]).is_err(), "{k}={v}");
         }

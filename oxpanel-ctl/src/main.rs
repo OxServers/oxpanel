@@ -432,6 +432,10 @@ enum CertCmd {
     /// Automatic HTTPS: certificates for every site without asking.
     #[command(subcommand)]
     Auto(AutoCmd),
+    /// Host certificates: the names consumers registered in
+    /// /etc/oxpanel/host-certificates.d (e.g. the panel's own name), as
+    /// key=value lines, a blank line between certificates.
+    Host { consumer: Option<String> },
 }
 
 #[derive(Subcommand, Debug)]
@@ -568,6 +572,12 @@ async fn run(cli: Cli) -> Result<ExitCode, Box<dyn std::error::Error>> {
         Cmd::Cert(cmd) => run_cert(&mut c, cmd).await?,
         Cmd::Sftp(cmd) => run_sftp(&mut c, cmd).await?,
         Cmd::Db(cmd) => run_db(&mut c, cmd).await?,
+        Cmd::Backup(BackupCmd::Download {
+            tenant,
+            backup_id,
+            member,
+            output,
+        }) => download_backup_member(&mut c, tenant, backup_id, member, output).await?,
         Cmd::Backup(cmd) => run_backup(&mut c, cmd).await?,
         Cmd::Files(cmd) => files::run(&mut c, cmd).await?,
         Cmd::Task(cmd) => essentials::run_task(&mut c, cmd).await?,
@@ -1185,6 +1195,81 @@ async fn run_cert_auto(
     Ok(ExitCode::SUCCESS)
 }
 
+/// `cert host [CONSUMER]`.
+async fn run_cert_host(
+    c: &mut OxPanelEngineClient<Channel>,
+    consumer: Option<String>,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    let all = c
+        .get_host_info(pb::GetHostInfoRequest {})
+        .await?
+        .into_inner()
+        .host_certificates;
+    let shown: Vec<&pb::HostCertificate> = all
+        .iter()
+        .filter(|h| consumer.as_ref().is_none_or(|c| *c == h.consumer))
+        .collect();
+    if let (Some(c), true) = (&consumer, shown.is_empty()) {
+        return Err(
+            tonic::Status::not_found(format!("no host-certificate registration '{c}'")).into(),
+        );
+    }
+    for (i, h) in shown.iter().enumerate() {
+        if i > 0 {
+            say!("");
+        }
+        print_host_certificate(h);
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `host info`: public addresses, login banning, host certificates (0.3.2).
+fn print_host_extras(i: &pb::HostInfo) {
+    let dash = |s: &str| {
+        if s.is_empty() {
+            "-".to_owned()
+        } else {
+            s.to_owned()
+        }
+    };
+    say!(
+        "public_ipv4={} public_ipv6={}",
+        dash(&i.public_ipv4),
+        dash(&i.public_ipv6)
+    );
+    if let Some(b) = &i.login_banning {
+        say!(
+            "login_banning={} jails={}",
+            b.active,
+            dash(&b.jails.join(","))
+        );
+        say!("login_banning_detail={}", b.detail);
+    }
+    say!("host_certificates={}", i.host_certificates.len());
+}
+
+/// One host certificate, as `key=value` lines.
+fn print_host_certificate(h: &pb::HostCertificate) {
+    let state = match pb::HostCertificateState::try_from(h.state) {
+        Ok(pb::HostCertificateState::Issued) => "issued",
+        Ok(pb::HostCertificateState::Renewing) => "renewing",
+        Ok(pb::HostCertificateState::Pending) => "pending",
+        Ok(pb::HostCertificateState::Disabled) => "disabled",
+        Ok(pb::HostCertificateState::Invalid) => "invalid",
+        _ => "unknown",
+    };
+    let time = |t: Option<&prost_types::Timestamp>| t.map(ToString::to_string).unwrap_or_default();
+    say!("consumer={}", h.consumer);
+    say!("name={}", h.name);
+    say!("state={state}");
+    say!("issuer={}", h.issuer);
+    say!("not_after={}", time(h.not_after.as_ref()));
+    say!("next_attempt={}", time(h.next_attempt.as_ref()));
+    say!("reason={}", h.reason);
+    say!("certificate={}", h.certificate_path);
+    say!("key={}", h.key_path);
+}
+
 async fn run_cert(
     c: &mut OxPanelEngineClient<Channel>,
     cmd: CertCmd,
@@ -1252,6 +1337,7 @@ async fn run_cert(
             }
         }
         CertCmd::Auto(cmd) => return run_cert_auto(c, cmd).await,
+        CertCmd::Host { consumer } => return run_cert_host(c, consumer).await,
         CertCmd::Show { domain } => {
             let vhosts = c
                 .list_virtual_hosts(pb::ListVirtualHostsRequest {
@@ -1319,6 +1405,7 @@ async fn run_host(
                 i.auto_https_enabled,
             );
             say!("disk_quota_detail={}", i.disk_quota_detail);
+            print_host_extras(&i);
             essentials::print_host_info(&i);
             // One line per database engine.
             for e in &i.database_engines {
@@ -1546,6 +1633,17 @@ enum BackupCmd {
         /// Wait for the job to finish; exits with status 5 if it failed.
         #[arg(long)]
         wait: bool,
+    },
+    /// Download one file of a complete backup (a name from `backup list`'s
+    /// members, or manifest.json), in chunks of at most 1 MiB. Written to
+    /// FILE (created, never overwritten) or to standard output.
+    Download {
+        tenant: String,
+        backup_id: String,
+        member: String,
+        /// Where to write it; standard output when absent.
+        #[arg(short = 'o', long = "output")]
+        output: Option<PathBuf>,
     },
     /// State of a backup or restore job.
     Job {
@@ -1854,6 +1952,11 @@ async fn run_backup(
                 print_backup(b);
             }
         }
+        BackupCmd::Download { .. } => {
+            return Err(tonic::Status::internal(
+                "download is handled by its own function",
+            ))
+        }
         cmd @ (BackupCmd::Retain { .. }
         | BackupCmd::ListRetained
         | BackupCmd::RestoreRetained { .. }
@@ -1873,6 +1976,65 @@ async fn run_backup(
                 .into_inner();
             say!("deleted={}", r.deleted);
         }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `backup download`: read the member chunk by chunk (ReadBackupMember)
+/// into FILE or standard output. A partial FILE is removed on failure.
+async fn download_backup_member(
+    c: &mut OxPanelEngineClient<Channel>,
+    tenant: String,
+    backup_id: String,
+    member: String,
+    output: Option<PathBuf>,
+) -> Result<ExitCode, Box<dyn std::error::Error>> {
+    use std::io::Write as _;
+    let mut sink: Box<dyn std::io::Write> = match &output {
+        Some(path) => Box::new(
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .map_err(|e| format!("cannot create {}: {e}", path.display()))?,
+        ),
+        None => Box::new(std::io::stdout().lock()),
+    };
+    let mut offset = 0u64;
+    let result: Result<(), Box<dyn std::error::Error>> = async {
+        loop {
+            let r = c
+                .read_backup_member(pb::ReadBackupMemberRequest {
+                    tenant: tenant.clone(),
+                    backup_id: backup_id.clone(),
+                    member: member.clone(),
+                    offset,
+                    length: 0,
+                })
+                .await?
+                .into_inner();
+            sink.write_all(&r.data)?;
+            offset += r.data.len() as u64;
+            if r.eof {
+                break;
+            }
+            if r.data.is_empty() {
+                return Err("the engine returned no data before the end".into());
+            }
+        }
+        sink.flush()?;
+        Ok(())
+    }
+    .await;
+    drop(sink);
+    if let Err(e) = result {
+        if let Some(path) = &output {
+            let _ = std::fs::remove_file(path);
+        }
+        return Err(e);
+    }
+    if output.is_some() {
+        say!("bytes={offset}");
     }
     Ok(ExitCode::SUCCESS)
 }
