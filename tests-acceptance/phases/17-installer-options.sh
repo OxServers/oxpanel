@@ -91,7 +91,7 @@ check "the firewall stage opens the mail ports" bash -c "$INST $MAILF --only fir
 check "with login banning, the mail jails run" bash -c "$INST $MAILF --fail2ban --only fail2ban >/dev/null 2>&1 && fail2ban-client status dovecot >/dev/null && fail2ban-client status postfix-sasl >/dev/null && fail2ban-client status oxpanel-webmail >/dev/null"
 check "the mail jails never ban the loopback (webmail logs in from there)" bash -c 'grep -q "^ignoreip  = 127.0.0.1/8 ::1" /etc/fail2ban/jail.d/50-oxpanel-mail.local'
 check "a run that does not mention email keeps it" bash -c "$INST --only engine >/dev/null 2>&1; grep -qx OXPANEL_MAIL=true $ENVF"
-check "verification checks email too" bash -c "$INST --only verify 2>&1 | grep -q 'mail host: enabled=true'"
+check "verification checks email too" bash -c "out=\$($INST --only verify 2>&1); grep -q 'mail host: enabled=true' <<<\"\$out\" || { tail -8 <<<\"\$out\"; systemctl --no-pager status oxpanel-mail-resolver | head -5; exit 1; }"
 check "--no-mail takes the lines out and stops OxPanel's mail services" bash -c "$INST --no-mail --only mail >/dev/null 2>&1; ! grep -q '^OXPANEL_MAIL' $ENVF && ! systemctl -q is-active oxpanel-mail-policy && ! systemctl -q is-active oxpanel-webmail"
 check "the engine reports email off again" bash -c 'oxpanel-ctl mail host | grep -q "^enabled=false "'
 

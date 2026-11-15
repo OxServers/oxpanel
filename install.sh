@@ -1214,7 +1214,11 @@ stage_verify() {
   fi
   if mail_wanted; then
     local u
-    for u in $(mail_units); do unit_active "$u" || die "email is configured but $u is not running"; done
+    # A unit the engine is (re)starting just now gets a few seconds.
+    for u in $(mail_units); do
+      for _ in $(seq 1 20); do unit_active "$u" && break; sleep 1; done
+      unit_active "$u" || die "email is configured but $u is not running (systemctl status $u)"
+    done
     out="$(oxpanel-ctl mail host 2>&1)" || die "oxpanel-ctl mail host failed: $out"
     printf '%s\n' "$out" | grep -q '^enabled=true ' || die "the engine does not report email as enabled: $out"
     printf '%s\n' "$out" | sed -n '1p' | cut -c1-200 | sed 's/^/      mail host: /'
