@@ -299,9 +299,14 @@ OxPanel's sendmail for autoresponders (`sendmail.sock`).
 
 Mailing lists; aliases/identities a mailbox may send as besides its own
 address; shared mailboxes, calendars, contacts (the later enterprise
-product); ManageSieve or user-written filters; per-domain SNI; Outlook's
-Autodiscover XML (the SRV/CNAME records are published; Thunderbird's
-`autoconfig` is served); greylisting, Bayes, Rspamd's
+product); ManageSieve or user-written filters; per-domain SNI for IMAP,
+POP3 and SMTP (a later item: every mail domain would need a certificate
+for a name of its own, e.g. `mail.<domain>`, issued and renewed beside the
+webmail names, and Postfix and Dovecot SNI maps; clients work with the one
+mail host name); Outlook's Autodiscover XML (a later item: it needs an
+HTTPS endpoint and so a certificate for `autodiscover.<domain>` too; the
+SRV/CNAME records are published, Thunderbird's `autoconfig` is served);
+greylisting, Bayes, Rspamd's
 web interface; checking a pending DKIM key in the background (the caller
 calls `RotateDkimKey` again); deleting a mail domain record (mode `off`, or the account's deletion);
 recreating deleted mailboxes from a backup.
