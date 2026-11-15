@@ -146,4 +146,8 @@ check "socket exists" test -S /run/oxpanel/oxpanel.sock
 check "socket is root:oxpanel 0660" test "$(stat -c '%U:%G %a' /run/oxpanel/oxpanel.sock)" = "root:oxpanel 660"
 check "daemon saw selinux=$([ "$(getenforce)" = Disabled ] && echo false || echo true)" bash -c "journalctl -b -u oxpanel-daemon --no-pager | grep -q 'selinux=$([ "$(getenforce)" = Disabled ] && echo false || echo true)'"
 check "no errors in daemon journal" bash -c '! journalctl -b -u oxpanel-daemon -p err --no-pager | grep -q oxpanel-daemon'
+# Email is off until install.sh --mail: the engine's package pulls in none of it.
+if ! grep -q '^OXPANEL_MAIL=true' /etc/oxpanel/daemon.env 2>/dev/null; then
+  check "no mail server was installed with the engine (email is off)" bash -c 'installed=$(rpm -q postfix dovecot dovecot-pigeonhole rspamd roundcubemail | grep -v "is not installed"); echo "$installed"; test -z "$installed"'
+fi
 phase_end

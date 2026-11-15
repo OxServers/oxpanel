@@ -51,13 +51,14 @@ Suggests:       php-mysqlnd
 Recommends:     bind
 Recommends:     publicsuffix-list
 # Email (off until OXPANEL_MAIL=true): Postfix, Dovecot and its Sieve plugin
-# from AppStream. The filter and DKIM signer (rspamd, from rspamd's own signed
-# repository) and the webmail (roundcubemail, from EPEL) come from other
-# repositories, so they are not recommended here: install.sh --mail adds the
-# repositories (an operator's decision) and installs them.
-Recommends:     postfix
-Recommends:     dovecot
-Recommends:     dovecot-pigeonhole
+# from AppStream. Only suggested, so that nothing of email is installed before
+# the operator asks for it (dnf installs weak "Recommends" by default):
+# install.sh --mail installs them, with the filter and DKIM signer (rspamd,
+# from rspamd's own signed repository) and the webmail (roundcubemail, from
+# EPEL), after adding those repositories (an operator's decision).
+Suggests:       postfix
+Suggests:       dovecot
+Suggests:       dovecot-pigeonhole
 Requires:       policycoreutils
 Requires:       policycoreutils-python-utils
 Requires:       libselinux-utils
