@@ -246,7 +246,7 @@ What stops each attempt (tests: `run-inside.sh` "email", acceptance phase
   most 10 destinations, no loops through this host, Postfix's expansion
   limits; autoresponders answer once per sender per day and never lists,
   bulk or spam-marked mail.
-- **The mail filter's resolver (127.0.0.1:5335).** Customer code can reach
+- **The mail filter's resolver (127.0.0.1:5336).** Customer code can reach
   loopback listeners, so it can ask this resolver questions, as it can ask
   any resolver the host can reach: that is no new capability. What it
   cannot do: reach it from outside (it listens on 127.0.0.1 only and

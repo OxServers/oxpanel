@@ -2650,12 +2650,12 @@ if [ -x /usr/sbin/postfix ] && [ -x /usr/sbin/dovecot ] && [ -x /usr/bin/rspamd 
   if [ -x /usr/sbin/unbound ] && grep -q '^OXPANEL_MAIL_RESOLVER=true' /etc/oxpanel/daemon.env; then
     check "the resolver runs (started by the daemon)" eventually 60 systemctl -q is-active oxpanel-mail-resolver
     check "as Unbound's account" test "$(ps -o user= -C unbound | head -1)" = "unbound"
-    check "it listens on 127.0.0.1:5335 only" bash -c 'test "$(ss -Hlun "sport = :5335" | awk "{print \$4}" | sort -u)" = "127.0.0.1:5335"'
+    check "it listens on 127.0.0.1:5336 only" bash -c 'test "$(ss -Hlun "sport = :5336" | awk "{print \$4}" | sort -u)" = "127.0.0.1:5336"'
     check "its configuration passes Unbound's own check" unbound-checkconf /etc/oxpanel-mail-resolver/unbound.conf
     check "only Unbound's account and root can read it" test "$(stat -c '%U:%G %a' /etc/oxpanel-mail-resolver/unbound.conf)" = "root:unbound 640"
-    check "the filter asks it" grep -q 'nameserver = \["127.0.0.1:5335"\]' /etc/rspamd/local.d/options.inc
-    check "/etc/resolv.conf does not name it" bash -c '! grep -q 5335 /etc/resolv.conf'
-    check "it refuses ANY questions" bash -c 'dig +tries=1 +time=5 @127.0.0.1 -p 5335 example.org ANY | grep -q "status: NOTIMP"'
+    check "the filter asks it" grep -q 'nameserver = \["127.0.0.1:5336"\]' /etc/rspamd/local.d/options.inc
+    check "/etc/resolv.conf does not name it" bash -c '! grep -q 5336 /etc/resolv.conf'
+    check "it refuses ANY questions" bash -c 'dig +tries=1 +time=5 @127.0.0.1 -p 5336 example.org ANY | grep -q "status: NOTIMP"'
     check "the engine reports it" grep -q 'filter_resolver=true' <(oxpanel-ctl mail host | head -1)
     systemctl stop oxpanel-mail-resolver
     check "stopped, it is reported" eventually 10 bash -c 'oxpanel-ctl mail host | grep -q "^warning: \[filter_resolver_down\]"'

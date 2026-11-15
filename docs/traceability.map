@@ -853,7 +853,7 @@
 [Email] Filter resolver
   unit mail/tests the_filter_resolver_is_configured_started_and_watched
   unit mail/tests without_the_setting_the_resolver_is_left_alone
-  sh tests-integration/run-inside.sh it listens on 127.0.0.1:5335 only
+  sh tests-integration/run-inside.sh it listens on 127.0.0.1:5336 only
   sh tests-acceptance/phases/18-mail.sh it answers a name of the test authority
   sh tests-acceptance/phases/18-mail.sh the filter asked about the sender's domain, through its resolver, at the test authority
 [Email] DKIM

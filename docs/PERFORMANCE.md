@@ -185,7 +185,7 @@ Rspamd's Spamhaus lists do nothing. Rspamd's documentation recommends a
 local recursive resolver (for example Unbound) for that reason.
 
 Since engine 0.3.1 `install.sh --mail` sets one up for the filter
-(`oxpanel-mail-resolver`, Unbound on 127.0.0.1:5335). On a cold cache it
+(`oxpanel-mail-resolver`, Unbound on 127.0.0.1:5336). On a cold cache it
 does the recursion itself, from the root, so the host's very first message
 can take about as long as before (the root, TLD and authority servers are
 asked instead of a forwarder; on a host whose upstream resolver was slow

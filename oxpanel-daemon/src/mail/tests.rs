@@ -2016,7 +2016,7 @@ async fn the_filter_resolver_is_configured_started_and_watched() {
     h.domain().await;
     let conf = h.read(render::resolver_conf_path(h.cfg()));
     for line in [
-        "interface: 127.0.0.1@5335",
+        "interface: 127.0.0.1@5336",
         "access-control: 0.0.0.0/0 refuse",
         "access-control: ::0/0 refuse",
         "access-control: 127.0.0.0/8 allow",
@@ -2031,7 +2031,7 @@ async fn the_filter_resolver_is_configured_started_and_watched() {
     assert!(!conf.contains("interface: 0.0.0.0") && !conf.contains("@53\n"));
     let options = h.read(h.cfg().rspamd_dir.join("local.d/options.inc"));
     assert!(
-        options.contains("nameserver = [\"127.0.0.1:5335\"];"),
+        options.contains("nameserver = [\"127.0.0.1:5336\"];"),
         "{options}"
     );
     // Started (enabled) before the filter that asks it; reloaded when its file changes.

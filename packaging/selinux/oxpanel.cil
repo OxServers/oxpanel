@@ -103,3 +103,18 @@
 (filecon "/var/lib/oxpanel-mail/sieve(/.*)?" any (system_u object_r dovecot_var_lib_t ((s0) (s0))))
 ; Last logins: written by Dovecot's dict service (dovecot_t), read by the daemon.
 (filecon "/var/lib/oxpanel-mail/lastlogin(/.*)?" any (system_u object_r dovecot_var_lib_t ((s0) (s0))))
+
+; The mail filter's resolver (oxpanel-mail-resolver.service): Unbound runs in
+; the stock named_t domain (its binary is named_exec_t). Its unit gives it no
+; privileges at all, which makes systemd set no_new_privs; the transition
+; from init_t into named_t under it needs this (found on the enforcing VM:
+; denied nnp_transition, the resolver then ran in init_t and could not read
+; its root key).
+(allow init_t named_t (process2 (nnp_transition nosuid_transition)))
+; Its port (127.0.0.1:5336; not 53, which the host's DNS server or resolver
+; may hold) is a DNS port: named_t may bind DNS ports only (found on the
+; enforcing VM: bind denied on a port without a label of its own). 5336 has
+; none in the stock policy (5335, Unbound's usual alternative, is howl_port_t).
+(portcon udp 5336 (system_u object_r dns_port_t ((s0) (s0))))
+(portcon tcp 5336 (system_u object_r dns_port_t ((s0) (s0))))
+

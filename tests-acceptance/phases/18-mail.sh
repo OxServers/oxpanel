@@ -32,16 +32,18 @@ done
 echo "-- the mail filter's own resolver (no Internet needed: a test authority on the loopback)"
 R=oxpanel-mail-resolver
 eventually "$R is active" 60 0.5 systemctl -q is-active "$R"
+sleep 3
+check "and stays up (not restarting)" bash -c "systemctl -q is-active $R && test \"\$(systemctl show -P NRestarts $R)\" = 0"
 check "the engine reports it" bash -c "oxpanel-ctl mail host | head -1 | grep -q 'filter_resolver=true'"
 check "the installer wrote OXPANEL_MAIL_RESOLVER=true" grep -qx 'OXPANEL_MAIL_RESOLVER=true' /etc/oxpanel/daemon.env
 check "it runs as Unbound's account" test "$(ps -o user= -C unbound | sort -u)" = "unbound"
 info "resolver context: $(ps -eZ | awk '/ unbound$/ {print $1; exit}')"
-check "it listens on 127.0.0.1:5335 only (UDP and TCP)" bash -c 'test "$( (ss -Hlun; ss -Hltn) | awk "\$4 ~ /:5335\$/ {print \$4}" | sort -u)" = "127.0.0.1:5335"'
+check "it listens on 127.0.0.1:5336 only (UDP and TCP)" bash -c 'test "$( (ss -Hlun; ss -Hltn) | awk "\$4 ~ /:5336\$/ {print \$4}" | sort -u)" = "127.0.0.1:5336"'
 check "the distribution's unbound.service is not started" bash -c '! systemctl -q is-active unbound'
-check "/etc/resolv.conf does not name it" bash -c '! grep -q "5335" /etc/resolv.conf'
-check "the filter is pointed at it" grep -q 'nameserver = \["127.0.0.1:5335"\]' /etc/rspamd/local.d/options.inc
+check "/etc/resolv.conf does not name it" bash -c '! grep -q "5336" /etc/resolv.conf'
+check "the filter is pointed at it" grep -q 'nameserver = \["127.0.0.1:5336"\]' /etc/rspamd/local.d/options.inc
 OUTER_IP="$(ip -4 -o addr show scope global | awk '{print $4}' | cut -d/ -f1 | head -1)"
-check_not "it cannot be asked on the host's own address ($OUTER_IP)" bash -c "dig +tries=1 +time=2 @$OUTER_IP -p 5335 example.org A | grep -q 'status:'"
+check_not "it cannot be asked on the host's own address ($OUTER_IP)" bash -c "dig +tries=1 +time=2 @$OUTER_IP -p 5336 example.org A | grep -q 'status:'"
 # The test authority: answers for oxresolve.test on 127.0.0.1:5399; the
 # resolver is told about it in its local.d (the operator's own place).
 AUTH_LOG=/root/acc/authority.log; : > "$AUTH_LOG"
@@ -50,7 +52,7 @@ nohup python3 "$MC" authority 5399 oxresolve.test "$AUTH_LOG" >/dev/null 2>&1 &
 printf 'server:\n  do-not-query-localhost: no\n  domain-insecure: "oxresolve.test"\n  local-zone: "test." nodefault\nstub-zone:\n  name: "oxresolve.test"\n  stub-addr: 127.0.0.1@5399\n' > /etc/oxpanel-mail-resolver/local.d/oxacc-test.conf
 chgrp unbound /etc/oxpanel-mail-resolver/local.d/oxacc-test.conf; chmod 0640 /etc/oxpanel-mail-resolver/local.d/oxacc-test.conf
 check "the resolver takes the addition (reload)" systemctl reload "$R"
-eventually "it answers a name of the test authority" 20 0.5 bash -c "dig +short +tries=1 +time=2 @127.0.0.1 -p 5335 probe.oxresolve.test A | grep -qx 192.0.2.53"
+eventually "it answers a name of the test authority" 20 0.5 bash -c "dig +short +tries=1 +time=2 @127.0.0.1 -p 5336 probe.oxresolve.test A | grep -qx 192.0.2.53"
 check "no mail drift (local.d is the operator's)" bash -c '! oxpanel-ctl host reconcile | grep -q MAIL'
 
 echo "-- the host checks behind GetMailHost's warnings (reverse DNS, outbound port 25)"
@@ -113,19 +115,28 @@ check "a message to it" python3 "$MC" submit 587 info@m2.oxacc.test "$P2" info@m
 eventually "the reply arrives (Dovecot → OxPanel's sendmail → Postfix)" 60 0.5 python3 "$MC" imap-find info@m2.oxacc.test "$P2" acc-away
 
 echo "-- the filter's DNS questions go to its resolver"
+# From an address that is not local to the filter (it skips SPF and other
+# checks for the loopback and private networks): 198.51.100.2 (TEST-NET-2,
+# never routed) in a network namespace behind a veth pair.
+ip netns del mres >/dev/null 2>&1; ip link del vmres >/dev/null 2>&1
+ip netns add mres && ip link add vmres type veth peer name pmres && ip link set pmres netns mres &&
+  ip addr add 198.51.100.1/24 dev vmres && ip link set vmres up && ip netns exec mres ip link set lo up &&
+  ip netns exec mres ip addr add 198.51.100.2/24 dev pmres && ip netns exec mres ip link set pmres up
 PROBE="rsp$RANDOM$RANDOM.oxresolve.test"
-check "a message from a sender in the test zone is accepted" python3 "$MC" deliver 25 "a@$PROBE" info@m1.oxacc.test --subject acc-resolver
+from_remote() { ip netns exec mres timeout 60 python3 "$MC" deliver 25 "a@$PROBE" info@m2.oxacc.test --host 198.51.100.1 "$@"; }
+eventually "a message from a sender in the test zone, from 198.51.100.2, is accepted" 10 2 from_remote --subject acc-resolver
 eventually "the filter asked about the sender's domain, through its resolver, at the test authority" 60 0.5 grep -q "$PROBE" "$AUTH_LOG"
 info "questions seen by the test authority: $(grep -c "$PROBE" "$AUTH_LOG") ($(grep "$PROBE" "$AUTH_LOG" | awk '{print $1"/"$2}' | sort -u | tr '\n' ' '))"
-eventually "it arrives" 40 0.5 python3 "$MC" imap-find info@m1.oxacc.test "$P1" acc-resolver
+eventually "it arrives (info@m2 has no autoresponder: nothing goes back to the test zone)" 40 0.5 python3 "$MC" imap-find info@m2.oxacc.test "$P2" acc-resolver
 check "the resolver stops (as if it had failed)" systemctl stop "$R"
 eventually "the engine warns that the filter's resolver is down" 20 1 bash -c "oxpanel-ctl mail host | grep -q '^warning: \[filter_resolver_down\]'"
 t0=$(date +%s)
-check "mail is still accepted without it" python3 "$MC" deliver 25 "a@$PROBE" info@m1.oxacc.test --subject acc-resolver-down
-eventually "and delivered (degraded filtering, not broken mail)" 60 0.5 python3 "$MC" imap-find info@m1.oxacc.test "$P1" acc-resolver-down
+check "mail is still accepted without it" from_remote --subject acc-resolver-down
+eventually "and delivered (degraded filtering, not broken mail)" 60 0.5 python3 "$MC" imap-find info@m2.oxacc.test "$P2" acc-resolver-down
 info "delivery with the resolver stopped took $(( $(date +%s) - t0 ))s"
 check "the resolver starts again" systemctl start "$R"
 eventually "the warning is gone" 20 1 bash -c "! oxpanel-ctl mail host | grep -q filter_resolver_down"
+ip netns del mres >/dev/null 2>&1; ip link del vmres >/dev/null 2>&1
 
 echo "-- webmail behind Nginx"
 openssl req -x509 -newkey rsa:2048 -nodes -days 30 -subj /CN=webmail.m1.oxacc.test -addext subjectAltName=DNS:webmail.m1.oxacc.test \

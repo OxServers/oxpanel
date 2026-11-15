@@ -1,5 +1,5 @@
 # The mail filter's own DNS resolver: Unbound (from AlmaLinux), recursive,
-# caching and DNSSEC-validating, on 127.0.0.1:5335 only, for Rspamd's
+# caching and DNSSEC-validating, on 127.0.0.1:5336 only, for Rspamd's
 # lookups (blocklists refuse questions that arrive through public
 # resolvers). It is not the system's resolver: /etc/resolv.conf is not
 # changed, and the distribution's unbound.service is not used.
@@ -9,7 +9,7 @@
 # OXPANEL_MAIL_RESOLVER=true; local.d/*.conf there is the operator's own.
 
 [Unit]
-Description=OxPanel mail filter DNS resolver (Unbound on 127.0.0.1:5335)
+Description=OxPanel mail filter DNS resolver (Unbound on 127.0.0.1:5336)
 Documentation=https://github.com/OxServers/oxpanel
 After=network-online.target
 Wants=network-online.target

@@ -85,10 +85,10 @@ forwarder are slow on a cold cache.
 **Design.** `install.sh --mail` installs Unbound (AppStream) and writes
 `OXPANEL_MAIL_RESOLVER=true`; with that and `/usr/sbin/unbound` present the
 engine renders `/etc/oxpanel-mail-resolver/unbound.conf` (root:unbound
-0640), points Rspamd at `127.0.0.1:5335` (`local.d/options.inc`) and runs
+0640), points Rspamd at `127.0.0.1:5336` (`local.d/options.inc`) and runs
 `oxpanel-mail-resolver.service`, shipped in the engine package:
 
-- 127.0.0.1, port 5335 (not 53: OxPanel's BIND or a system resolver may be
+- 127.0.0.1, port 5336 (not 53: OxPanel's BIND or a system resolver may be
   there); `access-control` refuses everything but 127.0.0.0/8;
 - recursive, caching, DNSSEC-validating (`validator iterator`, the
   distribution's root key `/var/lib/unbound/root.key`, kept current by the

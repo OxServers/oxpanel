@@ -131,7 +131,7 @@ pub const DEFAULT_PORT25_CHECK: &str = "gmail-smtp-in.l.google.com";
 
 /// The filter's resolver listens on 127.0.0.1 at this port (not 53: the
 /// host may run OxPanel's DNS server or a resolver of its own there).
-pub const RESOLVER_PORT: u16 = 5335;
+pub const RESOLVER_PORT: u16 = 5336;
 
 fn bad(key: &str, why: impl std::fmt::Display) -> Error {
     Error::invalid("config", format!("{key}: {why}"))

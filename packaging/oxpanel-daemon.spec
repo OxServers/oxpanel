@@ -171,7 +171,7 @@ if [ "$1" -eq 0 ] && /usr/sbin/selinuxenabled 2>/dev/null; then /usr/sbin/semodu
   live. Unlimited is only ever an explicit choice. Engine 0.3.0 records are
   converted when read (exactly the old defaults follow the new default).
 - The mail filter's own DNS resolver (oxpanel-mail-resolver.service, Unbound
-  on 127.0.0.1:5335), set up by install.sh --mail unless --no-mail-resolver:
+  on 127.0.0.1:5336), set up by install.sh --mail unless --no-mail-resolver:
   blocklists answer it, unlike public resolvers; resolv.conf is untouched.
 
 * Sat Nov 14 2026 OxPanel contributors - 0.3.0-1

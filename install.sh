@@ -161,7 +161,7 @@ Email (optional; mailboxes, forwarders, webmail for the customers' domains)
   --no-webmail          no Roundcube (webmail is on by default with --mail)
   --no-mail-resolver    no local DNS resolver for the mail filter. By default --mail
                         installs Unbound (AlmaLinux) and runs it for Rspamd only, on
-                        127.0.0.1:5335 (oxpanel-mail-resolver.service): blocklists such
+                        127.0.0.1:5336 (oxpanel-mail-resolver.service): blocklists such
                         as Spamhaus refuse questions that come through public
                         resolvers. /etc/resolv.conf is not changed. Use this option
                         when the host already has a suitable local resolver
@@ -880,7 +880,7 @@ stage_mail() {
     if ! unit_enabled unbound-anchor.timer || ! unit_active unbound-anchor.timer; then
       run systemctl enable --now unbound-anchor.timer || return 1; changed "unbound-anchor.timer enabled (keeps the DNSSEC root key current)"
     fi
-    note "the mail filter asks its own resolver (oxpanel-mail-resolver, Unbound on 127.0.0.1:5335); /etc/resolv.conf is unchanged"
+    note "the mail filter asks its own resolver (oxpanel-mail-resolver, Unbound on 127.0.0.1:5336); /etc/resolv.conf is unchanged"
   elif [ "$OPT_MAIL_RESOLVER" = no ]; then
     note "the mail filter uses the system's resolver (--no-mail-resolver); blocklists may refuse its questions if that is a public resolver"
   fi

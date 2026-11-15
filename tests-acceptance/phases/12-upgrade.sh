@@ -118,7 +118,7 @@ if [ "$OLD_MAIL" = 1 ]; then
   check "it says it installed Unbound for the filter" grep -q 'installed.* unbound' <<<"$out"
   eventually "the filter's resolver runs" 60 1 systemctl -q is-active oxpanel-mail-resolver
   check "the engine reports it" bash -c 'oxpanel-ctl mail host | head -1 | grep -q filter_resolver=true'
-  check "the filter asks it" grep -q '127.0.0.1:5335' /etc/rspamd/local.d/options.inc
+  check "the filter asks it" grep -q '127.0.0.1:5336' /etc/rspamd/local.d/options.inc
   check "the limits are unchanged by it" grep -q 'per_hour_account=1000(account)' <(lim upgv)
   for t in upgd upgv upgu; do oxpanel-ctl tenant delete $t --cascade --confirm $t --wait >/dev/null 2>&1 || true; done
 fi

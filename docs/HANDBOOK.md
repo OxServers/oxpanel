@@ -1515,7 +1515,7 @@ through public resolvers (Rspamd's log then shows symbols such as
 `DBL_BLOCKED_OPENRESOLVER`, and the lists do nothing). `install.sh --mail`
 therefore installs Unbound (AlmaLinux) and runs it for the filter only, as
 `oxpanel-mail-resolver.service`: recursive, caching, DNSSEC-validating,
-listening on 127.0.0.1:5335 only (not 53: the host may run OxPanel's DNS
+listening on 127.0.0.1:5336 only (not 53: the host may run OxPanel's DNS
 server or its own resolver there), refusing every other address, as
 Unbound's own account, with bounded caches and memory. The engine renders
 `/etc/oxpanel-mail-resolver/unbound.conf` and points Rspamd at it;
