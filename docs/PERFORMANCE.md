@@ -190,13 +190,14 @@ does the recursion itself, from the root, so the host's very first message
 can take about as long as before (the root, TLD and authority servers are
 asked instead of a forwarder; on a host whose upstream resolver was slow
 it is usually faster, on one next to a fast resolver possibly slower);
-after that every name it has seen is answered from its own cache in well
-under a millisecond, also after the upstream resolver's cache forgot it,
-and the blocklists answer instead of refusing. Phase 90's single-message
-figure above was measured before the resolver existed; it is not
-re-measured in this release (phase 90 runs in `INSTALL=rpm` without
-`install.sh --mail`). With the resolver stopped the filter's lookups fail
-at once (the loopback port is closed) and mail is accepted without them.
+after that every name it has seen is answered from its own cache,
+and the blocklists answer instead of refusing. Phase 90 with the resolver
+(run `20261115T151022Z`, engine 0.3.1, the VM's first messages): one
+message accepted on port 25 in 2685 ms, inside the 1.6 s to 6.2 s spread
+measured before, as expected for a cold recursive cache. With the resolver
+stopped (phase 18, delivery to reading over IMAPS) a message took 6 to 7 s:
+the filter's lookups fail (closed loopback port; Rspamd retries within its
+1 s timeout, 2 retransmits) and the message is accepted without them.
 
 ## Budgets
 
