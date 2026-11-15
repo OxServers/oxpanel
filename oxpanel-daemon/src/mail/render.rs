@@ -54,6 +54,18 @@ pub struct Model {
     pub key: PathBuf,
     pub uid_min: u32,
     pub uid_max: u32,
+    /// The group [`LAST_LOGIN_GROUP`] exists: Dovecot records last logins.
+    pub last_login: bool,
+}
+
+/// Supplementary group of Dovecot's mail processes (and nothing else) that
+/// may reach its dict service, which records last logins.
+pub const LAST_LOGIN_GROUP: &str = "oxpanel-maildict";
+
+/// `<state>/lastlogin/last-login.dict`: written by Dovecot's dict service
+/// alone (`key` and `value` lines), read by the daemon.
+pub fn last_login_file(cfg: &MailConfig) -> PathBuf {
+    cfg.state_dir.join("lastlogin").join("last-login.dict")
 }
 
 impl Model {
@@ -340,7 +352,8 @@ pub fn dovecot_conf(cfg: &MailConfig, m: &Model) -> Result<String> {
     let state = safe_path_str(&cfg.state_dir)?;
     let host = &m.hostname;
     let (uid_min, uid_max) = (m.uid_min, m.uid_max);
-    let services = dovecot_services(state, host);
+    let services = dovecot_services(state, host, m.last_login);
+    let access_groups = if m.last_login { LAST_LOGIN_GROUP } else { "" };
     Ok(format!(
         "{HEADER}# OxPanel's IMAP/POP3/LMTP server. The original is kept as dovecot.conf.oxpanel-orig.
 protocols = imap pop3 lmtp
@@ -367,7 +380,7 @@ first_valid_uid = {uid_min}
 last_valid_uid = {uid_max}
 first_valid_gid = {uid_min}
 last_valid_gid = {uid_max}
-mail_access_groups =
+mail_access_groups = {access_groups}
 mail_plugins = $mail_plugins quota
 mail_max_userip_connections = 20
 
@@ -412,7 +425,31 @@ userdb {{
 }
 
 /// Listeners, protocols and plugins of Dovecot.
-fn dovecot_services(state: &str, host: &Domain) -> String {
+fn dovecot_services(state: &str, host: &Domain, last_login: bool) -> String {
+    let (imap_plugins, pop3, last_login_plugin, last_login_service) = if last_login {
+        (
+            " last_login",
+            "protocol pop3 {\n  mail_plugins = $mail_plugins last_login\n}\n",
+            "  # Last logins (IMAP, POP3, so webmail too), kept by the dict service.\n  last_login_dict = proxy::oxlastlogin\n  last_login_key = last-login/%u\n",
+            format!(
+                "# The dict service (Dovecot's own user) alone writes the last logins;
+# the mail processes reach it through the group {LAST_LOGIN_GROUP}, which no
+# account's own code has.
+dict {{
+  oxlastlogin = file:{state}/lastlogin/last-login.dict
+}}
+service dict {{
+  unix_listener dict {{
+    mode = 0660
+    group = {LAST_LOGIN_GROUP}
+  }}
+}}
+"
+            ),
+        )
+    } else {
+        ("", "", "", String::new())
+    };
     format!(
         "service imap-login {{
   inet_listener imap {{
@@ -456,16 +493,16 @@ protocol lmtp {{
   postmaster_address = postmaster@{host}
 }}
 protocol imap {{
-  mail_plugins = $mail_plugins imap_quota
+  mail_plugins = $mail_plugins imap_quota{imap_plugins}
 }}
-lmtp_rcpt_check_quota = yes
+{pop3}{last_login_service}lmtp_rcpt_check_quota = yes
 # Autoresponders send through OxPanel's sendmail, as the account (delivery
 # runs with its identity): the policy service checks and counts them like
 # any mail of the account's sites.
 sendmail_path = /usr/libexec/oxpanel/sendmail
 
 plugin {{
-  quota = maildir:Mailbox
+{last_login_plugin}  quota = maildir:Mailbox
   quota_exceeded_message = 552 5.2.2 The mailbox is full.
   # Autoresponders only: one script per mailbox, written by the engine and
   # not writable by the account.

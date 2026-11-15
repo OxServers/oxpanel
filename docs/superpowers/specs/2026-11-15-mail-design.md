@@ -136,6 +136,18 @@ password, or containing the local part or the domain's first label. At most
   (`use_domain = header`, mismatching envelope/header domains not signed);
   never inbound mail (a forged `From:` from the internet is not signed by
   us).
+- **DKIM rotation** (`RotateDkimKey`) never signs with a key receivers
+  cannot find yet. When the domain's DNS is elsewhere it takes two calls:
+  the first makes a new key under a new selector and keeps it *pending*
+  (`dkim_pending` in the record; returned as `Dkim.pending_*` and in
+  `required_records`), the old key goes on signing; a later call looks the
+  new selector up in public DNS (the DNS probe, outside the mutation lock)
+  and switches when the record is there. `force` switches at once (the
+  caller accepts the risk). When this host serves the zone, one call does
+  both: the new key is put into the zone first, then it signs. A call while
+  a key is pending never makes another one; the old key's record stays
+  published for 7 days after the switch. The record is written before each
+  step, so an interrupted rotation continues on the next call.
 
 ### The policy service
 
@@ -148,6 +160,21 @@ on `sendmail.sock` (0666; identity from the kernel). It re-reads
 `policy.json` (rendered by the daemon: accounts with uid, suspension, limits
 and sender domains; mailboxes with account and enabled flag) whenever it
 changes.
+
+### Last logins
+
+`Mailbox.last_login` is the last IMAP or POP3 login (webmail logs in over
+IMAP), recorded by Dovecot's `last_login` plugin (IMAP and POP3 only, not
+delivery or `doveadm`) into a `file:` dict through Dovecot's dict service.
+The mail processes run as the account, so they reach the dict socket
+(`0660`, group `oxpanel-maildict`) by `mail_access_groups =
+oxpanel-maildict`, a group created by the package that only Dovecot's mail
+processes get: an account's own code (PHP, applications, tasks, SFTP) does
+not have it and cannot write anyone's last login. The dict service
+(Dovecot's own account) alone writes `/var/lib/oxpanel-mail/lastlogin/`
+(`dovecot` 0700, `dovecot_var_lib_t`); the daemon reads the file (bounded,
+no links followed) for `ListMailboxes`. Without the group (a host that has
+not got it yet) the plugin is not configured and `last_login` stays unset.
 
 ## Receiving
 
@@ -208,6 +235,20 @@ kept in `/etc/pki/oxpanel-mail` (root-only), apart from the sites'. Postfix,
 Dovecot and Nginx are reloaded after a new one. SNI per mail domain is not
 offered (one host name for every client protocol).
 
+## Host checks (`GetMailHost` warnings)
+
+`GetMailHost` (polled by dashboards) only reads the last result of two
+network checks kept in `/var/lib/oxpanel-mail/host-checks.json`; a call
+that finds it missing, older than 6 hours or about another host name starts
+a new check in the background (one at a time). Through the DNS probe's
+transient unit (the daemon has no network): the mail host name's address
+and that address's reverse name (`REVERSE_DNS_MISMATCH` unless it is the
+mail host name, or when the name does not resolve), and a TCP connection to
+port 25 of a public mail server, reading its greeting
+(`PORT_25_BLOCKED` when it fails; the server is `OXPANEL_MAIL_PORT25_CHECK`,
+by default `gmail-smtp-in.l.google.com`, `off` to never try). A check that
+cannot be made (no resolver, the target does not resolve) gives no warning.
+
 ## Webmail
 
 Roundcube, one for the host, `oxpanel-webmail.service`: its own PHP-FPM
@@ -259,11 +300,10 @@ OxPanel's sendmail for autoresponders (`sendmail.sock`).
 Mailing lists; aliases/identities a mailbox may send as besides its own
 address; shared mailboxes, calendars, contacts (the later enterprise
 product); ManageSieve or user-written filters; per-domain SNI; Outlook's
-Autodiscover XML (the SRV/CNAME records are published); last-login times
-(`Mailbox.last_login` is always unset); greylisting, Bayes, Rspamd's
-web interface; DKIM rotation with a waiting period for external DNS (the
-new key is used at once; the response lists the record to publish);
-deleting a mail domain record (mode `off`, or the account's deletion);
+Autodiscover XML (the SRV/CNAME records are published; Thunderbird's
+`autoconfig` is served); greylisting, Bayes, Rspamd's
+web interface; checking a pending DKIM key in the background (the caller
+calls `RotateDkimKey` again); deleting a mail domain record (mode `off`, or the account's deletion);
 recreating deleted mailboxes from a backup.
 
 ## Deviations from the contract (for the console)
@@ -275,12 +315,29 @@ except:
   `JOB_KIND_DELETE_MAILBOX`: the mailbox leaves the servers at once and its
   mail is removed in the background (resumed at start-up).
 - `MailWarningKind` adds `MAIL_WARNING_KIND_SERVICE_NOT_RUNNING = 4`.
-  `GetMailHost` produces `NO_CERTIFICATE` and `SERVICE_NOT_RUNNING`; the
-  reverse-DNS and port-25 checks are not run by `GetMailHost` (the reverse
-  name is in `CheckDeliverability`; outbound port 25 is not probed).
-- `Mailbox.last_login` is never set.
+  `GetMailHost` produces all four kinds. `REVERSE_DNS_MISMATCH` and
+  `PORT_25_BLOCKED` come from a check made in the background (see "Host
+  checks"): they appear a few seconds after the first `GetMailHost` call
+  (or start-up) and are at most 6 hours old.
+- `Mailbox.last_login` is set once Dovecot recorded a login (IMAP, POP3,
+  webmail); unset means never, or not recorded (a host without the group
+  `oxpanel-maildict`).
 - `MailDomain.dkim` is unset unless the mode is `LOCAL`; `published` is
   `YES` when the zone is hosted here, otherwise `UNKNOWN` (never `NO`).
+- `RotateDkimKey` is a two-step rotation (see "DKIM rotation"). Added:
+  `RotateDkimKeyRequest.force = 3` (bool: switch to the new key at once);
+  `Dkim.pending_selector = 4`, `Dkim.pending_public_key_record = 5` (the
+  new key waiting to be seen in public DNS; empty: no rotation in
+  progress) and `Dkim.pending_published = 6` (`YES`/`NO`: what the
+  `RotateDkimKey` call that returned it saw in public DNS; `YES` when the
+  zone is hosted here; `UNKNOWN` otherwise). The returned `MailDomain`
+  shows whether the switch happened: `dkim.selector` is the new selector
+  and `pending_selector` is empty. While a key is pending its TXT record is
+  also in `required_records`. No new error code: "not seen yet" is an
+  answer, not an error.
+  The dry-run engine never sees public DNS: there, with the zone not
+  hosted, the second step needs `force` (with the zone hosted one call
+  switches, as on a real host).
 - `MailDnsRecord`: `type` is `MX`, `TXT`, `CNAME` or `SRV`; for SRV `value`
   is `"<weight> <port> <target>"` and `priority` the priority.
 - `SetMailDomainRequest.catch_all`: a local part or an address of the

@@ -124,6 +124,17 @@ impl FakeDns {
                 .cloned()
                 .unwrap_or_else(|| "fail no answer from 192.0.2.53:53: timed out".to_owned());
         }
+        if qtype == "SMTP" {
+            // A mail server's greeting: set like a resolver answer, keyed
+            // by the address (`set_dns_resolver("192.0.2.25:25", "SMTP", …)`).
+            return self
+                .resolver
+                .get(&(server.to_owned(), qtype.to_owned()))
+                .cloned()
+                .unwrap_or_else(|| {
+                    format!("fail no connection to {server}: connection timed out")
+                });
+        }
         let primary = server == "127.0.0.1:53";
         if self.down && primary {
             return format!("fail no answer from {server}: connection refused");

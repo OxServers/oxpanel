@@ -33,6 +33,7 @@
 
 pub mod certs;
 pub mod config;
+pub mod hostcheck;
 pub mod ops;
 pub mod password;
 pub mod policy;
@@ -141,6 +142,16 @@ pub struct DkimView {
     pub selector: String,
     pub record: String,
     pub published: Published,
+    /// A new key waiting to be seen in public DNS before it signs.
+    pub pending: Option<PendingDkimView>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingDkimView {
+    pub selector: String,
+    pub record: String,
+    /// `Unknown` unless this answer looked (a rotation's second step).
+    pub published: Published,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -166,6 +177,8 @@ pub struct MailboxView {
     pub used_bytes: u64,
     pub messages: u64,
     pub enabled: bool,
+    /// Last IMAP/POP3 (or webmail) login; `None`: never, or not recorded.
+    pub last_login_unix: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -433,6 +446,15 @@ impl MailService {
                 } else {
                     Published::Unknown
                 },
+                pending: r.dkim_pending.as_ref().map(|p| PendingDkimView {
+                    selector: p.selector.clone(),
+                    record: records::dkim_txt(&p.public_key),
+                    published: if zone.is_some() {
+                        Published::Yes
+                    } else {
+                        Published::Unknown
+                    },
+                }),
             });
         let required_records = if zone.is_some() {
             Vec::new()
@@ -508,6 +530,17 @@ impl MailService {
                     .push((WarningKind::ServiceDown, format!("{unit} is not running")));
             }
         }
+        // The network checks come from the last background run (a few
+        // seconds after the first call, then every few hours).
+        if let Some(c) = hostcheck::cached(ctx, &host) {
+            if let Some(w) = c.reverse_dns {
+                v.warnings.push((WarningKind::ReverseDns, w));
+            }
+            if let Some(w) = c.port25 {
+                v.warnings.push((WarningKind::Port25, w));
+            }
+        }
+        hostcheck::refresh_if_stale(ctx, &host);
         Ok(v)
     }
 
@@ -594,6 +627,7 @@ impl MailService {
             catch_all: None,
             dkim: None,
             dkim_retired: Vec::new(),
+            dkim_pending: None,
             mailboxes: std::collections::BTreeMap::default(),
             forwarders: std::collections::BTreeMap::default(),
         });
@@ -669,31 +703,89 @@ impl MailService {
             .collect()
     }
 
-    /// A new DKIM key; the old one stays published for a week.
-    pub async fn rotate_dkim(&self, tenant: &str, domain: &str) -> Result<DomainView> {
+    /// Rotate the domain's DKIM key in two steps, so that mail is never
+    /// signed with a key receivers cannot find yet:
+    ///
+    /// 1. A new key is made under a new selector and kept *pending*: its
+    ///    record is returned (and published, when this host serves the
+    ///    zone); the current key keeps signing.
+    /// 2. The pending key takes over once its record is seen: at once when
+    ///    the zone is hosted here (after the zone was updated), otherwise
+    ///    on a later call that finds it in public DNS, or on any call with
+    ///    `force`. The old key's record stays published for a week.
+    ///
+    /// A call while a key is pending never makes another one.
+    pub async fn rotate_dkim(&self, tenant: &str, domain: &str, force: bool) -> Result<DomainView> {
         let tenant = Username::parse_field(tenant, "tenant")?;
         let domain = Domain::parse(domain.trim_end_matches('.'))?;
         let host = require_available(&self.ctx).await?;
+        // Look in public DNS first, without the mutation lock (it can take
+        // seconds); the answer only counts for the key it was asked about.
+        let seen = {
+            let rec = self.local_domain(&tenant, &domain)?;
+            match rec.dkim_pending.as_ref() {
+                Some(p)
+                    if !force && hosted_zone(&self.ctx, &rec.tenant, &rec.domain)?.is_none() =>
+                {
+                    let s = certs::dkim_published(&self.ctx, &rec.domain, p).await?;
+                    Some((p.selector.clone(), s))
+                }
+                _ => None,
+            }
+        };
         let _guard = self.ctx.lock.lock().await;
         self.tenant(&tenant, true)?;
         let mut rec = self.local_domain(&tenant, &domain)?;
-        let mut now = now_unix();
-        if rec.dkim.as_ref().is_some_and(|k| k.created_at_unix >= now) {
-            // Two rotations in one second still get two selectors.
-            now = rec.dkim.as_ref().map_or(now, |k| k.created_at_unix + 1);
+        let hosted = hosted_zone(&self.ctx, &rec.tenant, &rec.domain)?.is_some();
+        if rec.dkim_pending.is_none() {
+            let mut now = now_unix();
+            if let Some(last) = rec.dkim_keys().map(|k| k.created_at_unix).max() {
+                // Two rotations in one second still get two selectors.
+                now = now.max(last + 1);
+            }
+            rec.dkim_pending = Some(ops::new_dkim_key(&self.ctx, &rec.domain, now).await?);
+            // The record first: an interrupted rotation goes on from here.
+            self.store().save(&rec)?;
         }
-        let key = ops::new_dkim_key(&self.ctx, &rec.domain, now).await?;
-        if let Some(mut old) = rec.dkim.replace(key) {
-            old.retire_at_unix = Some(now_unix() + ops::DKIM_RETIRE_SECS);
-            rec.dkim_retired.push(old);
+        if hosted && !force {
+            // Publish the new key in the zone before it signs anything.
+            if let Err(e) = crate::dns::mail_changed(&self.ctx, &domain).await {
+                warn!(%domain, error = %e, "the zone could not be updated with the new DKIM key; it does not sign yet");
+                return self.domain_view(&rec, &host);
+            }
+        }
+        let pending_selector = rec.dkim_pending.as_ref().map(|p| p.selector.clone());
+        let seen_now = seen
+            .filter(|(s, _)| Some(s) == pending_selector.as_ref())
+            .and_then(|(_, s)| s);
+        let switch = force || hosted || seen_now == Some(true);
+        if switch {
+            if let Some(key) = rec.dkim_pending.take() {
+                if let Some(mut old) = rec.dkim.replace(key) {
+                    old.retire_at_unix = Some(now_unix() + ops::DKIM_RETIRE_SECS);
+                    rec.dkim_retired.push(old);
+                }
+            }
         }
         rec.dkim_retired
             .retain(|k| k.retire_at_unix.is_some_and(|t| t > now_unix()));
         self.store().save(&rec)?;
         ops::prune_dkim_keys(&self.ctx, Some(&rec), &rec.domain)?;
         self.apply(Some(&domain)).await?;
-        info!(tenant = %tenant, %domain, "DKIM key rotated");
-        self.domain_view(&rec, &host)
+        if switch {
+            info!(tenant = %tenant, %domain, forced = force, "DKIM key rotated: the new key signs");
+        } else {
+            info!(tenant = %tenant, %domain, "DKIM key rotation waits for the new record in public DNS");
+        }
+        let mut v = self.domain_view(&rec, &host)?;
+        if let Some(p) = v.dkim.as_mut().and_then(|d| d.pending.as_mut()) {
+            p.published = match seen_now {
+                Some(true) => Published::Yes,
+                Some(false) => Published::No,
+                None => p.published,
+            };
+        }
+        Ok(v)
     }
 }
 
@@ -714,6 +806,7 @@ pub(crate) fn mailbox_view(rec: &MailDomainRecord, local: &str, m: &MailboxRecor
         used_bytes: 0,
         messages: 0,
         enabled: m.enabled,
+        last_login_unix: None,
     }
 }
 

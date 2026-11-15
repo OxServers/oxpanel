@@ -101,3 +101,5 @@
 ; Autoresponder scripts (root-owned, read by Dovecot's delivery): the type of
 ; Dovecot's own state.
 (filecon "/var/lib/oxpanel-mail/sieve(/.*)?" any (system_u object_r dovecot_var_lib_t ((s0) (s0))))
+; Last logins: written by Dovecot's dict service (dovecot_t), read by the daemon.
+(filecon "/var/lib/oxpanel-mail/lastlogin(/.*)?" any (system_u object_r dovecot_var_lib_t ((s0) (s0))))

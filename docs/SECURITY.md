@@ -246,7 +246,29 @@ What stops each attempt (tests: `run-inside.sh` "email", acceptance phase
   bulk or spam-marked mail.
 - **Password guessing.** Dovecot's failure delay; fail2ban jails for Dovecot,
   Postfix's logins and webmail when login banning is on (the loopback is
-  never banned: webmail logs in from it).
+  never banned: webmail logs in from it). Acceptance phase 18 (installer
+  mode) guesses IMAP and submission passwords from an address behind a
+  veth pair and proves that it is banned by a firewall rule in both jails,
+  that another address still logs in, and that the bans can be lifted.
+- **Last logins.** Recorded by Dovecot's dict service (its own account)
+  for the mail processes, which reach its socket only through the group
+  `oxpanel-maildict` that Dovecot gives them (`mail_access_groups`); no
+  account's code has that group, so a customer cannot write anyone's last
+  login. The daemon reads the file bounded and without following links.
+- **Autoresponders cannot reach the file system.** The scripts are
+  rendered by the engine from validated text (Sieve strings escaped) in a
+  root-owned directory the account cannot write; the engine compiles them
+  with `sievec <script>` (its output next to the script, never a path a
+  request names), and delivery runs them as the account. No request can
+  name the file `sievec` or Dovecot writes. (An acceptance check once
+  passed `/dev/null` as `sievec`'s output; `sievec` replaces its output by
+  renaming a new file over it, which replaced the device and broke the
+  test VM. That was the test's own root command; the check now uses a
+  scratch file and verifies `/dev/null` is still a character device.)
+- **The host's own checks.** `GetMailHost`'s reverse-DNS and port-25 checks
+  run in the DNS probe's transient unit (dynamic user, no capabilities,
+  nothing writable); they connect to one configured public mail server
+  (`OXPANEL_MAIL_PORT25_CHECK`, `off` to never do so) and send nothing.
 
 ## 4. What the tests prove, by layer
 

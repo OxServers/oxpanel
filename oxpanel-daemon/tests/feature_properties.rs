@@ -398,6 +398,7 @@ mod mail {
                 catch_all: None,
                 dkim: None,
                 dkim_retired: vec![],
+                dkim_pending: None,
                 mailboxes: BTreeMap::new(),
                 forwarders: BTreeMap::new(),
             };
@@ -427,6 +428,7 @@ mod mail {
                 })]),
                 domains: vec![rec],
                 cert: PathBuf::from("/c"),
+                last_login: suspended,
                 key: PathBuf::from("/k"),
                 uid_min: 20000,
                 uid_max: 29999,

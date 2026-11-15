@@ -71,7 +71,9 @@ pub fn required(d: &MailDomainRecord, host: &Domain, now: u64) -> Vec<MailRecord
             mx.priority = 10;
             out.push(mx);
             out.push(MailRecord::new("@", "TXT", spf_txt(host)));
-            for k in d.dkim.iter().chain(
+            // The signing key, a new key waiting to be seen in DNS, and
+            // retired keys for their last week.
+            for k in d.dkim.iter().chain(&d.dkim_pending).chain(
                 d.dkim_retired
                     .iter()
                     .filter(|k| k.retire_at_unix.is_some_and(|t| t > now)),
@@ -148,6 +150,7 @@ mod tests {
                 created_at_unix: 0,
                 retire_at_unix: Some(100),
             }],
+            dkim_pending: None,
             mailboxes: std::collections::BTreeMap::default(),
             forwarders: std::collections::BTreeMap::default(),
         }

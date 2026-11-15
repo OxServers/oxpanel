@@ -35,6 +35,11 @@ pub struct MailConfig {
     pub rate_mailbox: u32,
     /// `OXPANEL_MAIL_MESSAGE_MAX_BYTES`: largest message accepted.
     pub message_max_bytes: u64,
+    /// `OXPANEL_MAIL_PORT25_CHECK`: a public mail server whose port 25
+    /// `GetMailHost` tries to reach, to warn when the provider blocks
+    /// outbound SMTP (default `gmail-smtp-in.l.google.com`; `off`: never
+    /// tried, no such warning).
+    pub port25_check: Option<Domain>,
     /// Fixed locations (tests move them).
     pub postfix_dir: PathBuf,
     pub dovecot_dir: PathBuf,
@@ -80,6 +85,7 @@ impl Default for MailConfig {
             rate_account: 500,
             rate_mailbox: 200,
             message_max_bytes: 25 * 1024 * 1024,
+            port25_check: Domain::parse(DEFAULT_PORT25_CHECK).ok(),
             postfix_dir: PathBuf::from("/etc/postfix"),
             dovecot_dir: PathBuf::from("/etc/dovecot"),
             rspamd_dir: PathBuf::from("/etc/rspamd"),
@@ -95,6 +101,8 @@ impl Default for MailConfig {
         }
     }
 }
+
+pub const DEFAULT_PORT25_CHECK: &str = "gmail-smtp-in.l.google.com";
 
 fn bad(key: &str, why: impl std::fmt::Display) -> Error {
     Error::invalid("config", format!("{key}: {why}"))
@@ -126,6 +134,19 @@ impl MailConfig {
         }
         if let Some(v) = get("OXPANEL_MAIL_ANTIVIRUS") {
             c.antivirus = parse_bool("OXPANEL_MAIL_ANTIVIRUS", &v)?;
+        }
+        if let Some(v) = get("OXPANEL_MAIL_PORT25_CHECK") {
+            let v = v.trim().trim_end_matches('.');
+            c.port25_check = if v.is_empty() || v.eq_ignore_ascii_case("off") {
+                None
+            } else {
+                Some(Domain::parse(v).map_err(|_| {
+                    bad(
+                        "OXPANEL_MAIL_PORT25_CHECK",
+                        format!("'{v}' is not a host name (or off)"),
+                    )
+                })?)
+            };
         }
         for (key, target) in [
             ("OXPANEL_MAIL_MAX_MAILBOXES", &mut c.max_mailboxes),
@@ -204,5 +225,24 @@ mod tests {
         assert!(from(&[("OXPANEL_MAIL_HOSTNAME", "not a name")]).is_err());
         assert!(from(&[("OXPANEL_MAIL_RATE_MAILBOX", "-1")]).is_err());
         assert!(from(&[("OXPANEL_MAIL_MESSAGE_MAX_BYTES", "10")]).is_err());
+        assert_eq!(
+            from(&[]).unwrap().port25_check.unwrap().as_str(),
+            DEFAULT_PORT25_CHECK
+        );
+        assert_eq!(
+            from(&[("OXPANEL_MAIL_PORT25_CHECK", "off")])
+                .unwrap()
+                .port25_check,
+            None
+        );
+        assert_eq!(
+            from(&[("OXPANEL_MAIL_PORT25_CHECK", "mx.example.org")])
+                .unwrap()
+                .port25_check
+                .unwrap()
+                .as_str(),
+            "mx.example.org"
+        );
+        assert!(from(&[("OXPANEL_MAIL_PORT25_CHECK", "a b")]).is_err());
     }
 }

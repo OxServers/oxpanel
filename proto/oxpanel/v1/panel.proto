@@ -2408,6 +2408,15 @@ message Dkim {
   // YES: the hosted zone carries it. UNKNOWN: the DNS is elsewhere
   // (CheckDeliverability looks).
   DkimPublished published = 3;
+  // A rotation in progress (RotateDkimKey): the new key, which does not
+  // sign until its record is seen in public DNS. Empty: none.
+  string pending_selector = 4;
+  // The TXT value to publish at <pending_selector>._domainkey.<domain>
+  // (also listed in required_records when the DNS is elsewhere).
+  string pending_public_key_record = 5;
+  // YES/NO: what the RotateDkimKey call that returned this saw in public
+  // DNS; UNKNOWN otherwise (YES when the hosted zone carries it).
+  DkimPublished pending_published = 6;
 }
 
 message MailDnsRecord {
@@ -2456,7 +2465,12 @@ message SetMailDomainResponse {
 message GetMailDomainRequest { string tenant = 1; string domain = 2; }
 message ListMailDomainsRequest { string tenant = 1; }
 message ListMailDomainsResponse { repeated MailDomain domains = 1; }
-message RotateDkimKeyRequest { string tenant = 1; string domain = 2; }
+// Two steps when the domain's DNS is not hosted here: the first call makes
+// a new key (Dkim.pending_*) and the old one keeps signing; a later call
+// switches to it once its record is seen in public DNS. `force` switches at
+// once (the caller accepts that receivers may not find the key yet). When
+// the zone is hosted here one call does both, after the zone is updated.
+message RotateDkimKeyRequest { string tenant = 1; string domain = 2; bool force = 3; }
 
 message Mailbox {
   string address = 1;

@@ -2535,6 +2535,11 @@ if [ -x /usr/sbin/postfix ] && [ -x /usr/sbin/dovecot ] && [ -x /usr/bin/rspamd 
   check "the delivered file belongs to the account" test -z "$(find /home/mailx/mail -type f ! -user mailx)"
   check "POP3S login works" mc pop3 info@mx1.oxtest "$PX"
   check_not "IMAPS: a wrong password is refused" mc imap-count info@mx1.oxtest wrong-password-1
+  if getent group oxpanel-maildict >/dev/null; then
+    check "the login is recorded: the mailbox lists its last login" eventually 10 bash -c "oxpanel-ctl mail mailbox-list mx1.oxtest --tenant mailx | grep -q '^mailbox=info@mx1.oxtest .* last_login=[0-9]\{10\}\$'"
+    check "only Dovecot's dict service writes the last logins" test "$(stat -c '%U %a' /var/lib/oxpanel-mail/lastlogin)" = "dovecot 700"
+    check "a mailbox that never logged in has no last login" bash -c "echo 'Amber-Quiet-7731' | oxpanel-ctl mail mailbox-set never@mx1.oxtest --tenant mailx --password >/dev/null && oxpanel-ctl mail mailbox-list mx1.oxtest --tenant mailx | grep -q '^mailbox=never@mx1.oxtest .* last_login=-\$' && oxpanel-ctl mail mailbox-delete never@mx1.oxtest --tenant mailx >/dev/null"
+  fi
   check "port 25 relays nothing (open relay refused)" bash -c "python3 $MC deliver 25 x@remote.example victim@remote2.example | grep -q 'Relay access denied'"
   check "port 25 refuses unknown local addresses" bash -c "python3 $MC deliver 25 x@remote.example nobody@mx1.oxtest | grep -q '550'"
   check "submission offers no login before STARTTLS" mc auth-before-tls 587

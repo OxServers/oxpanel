@@ -149,7 +149,14 @@ pub fn limits_of(cfg: &MailConfig, rec: &super::store::MailLimitsRecord) -> supe
 }
 
 /// Gather the model the files are rendered from.
-pub fn model(ctx: &Ctx, host: &Domain) -> Result<Model> {
+pub async fn model(ctx: &Ctx, host: &Domain) -> Result<Model> {
+    let mut m = records_model(ctx, host)?;
+    m.last_login = gid(ctx, render::LAST_LOGIN_GROUP).await?.is_some();
+    Ok(m)
+}
+
+/// The model from the records alone (no look at the host's groups).
+pub fn records_model(ctx: &Ctx, host: &Domain) -> Result<Model> {
     let cfg = &ctx.config;
     let store = MailStore::new(cfg);
     let tenants: Vec<TenantRecord> = ctx
@@ -192,6 +199,7 @@ pub fn model(ctx: &Ctx, host: &Domain) -> Result<Model> {
         key,
         uid_min: cfg.uid_min,
         uid_max: cfg.uid_max,
+        last_login: false,
     })
 }
 
@@ -361,6 +369,18 @@ pub async fn ensure_layout(ctx: &Ctx) -> Result<()> {
             ctx.sys.group_by_name(POSTFIX_GROUP).await?,
         ) {
             fsutil::set_owner(&cfg.milter_dir, u.uid, g)?;
+        }
+    }
+    // Dovecot's dict service (its own user) writes the last logins here.
+    let ll = cfg.state_dir.join("lastlogin");
+    created |= !ll.exists();
+    fsutil::ensure_dir(&ll, 0o700)?;
+    if !ctx.config.dry_run {
+        if let (Some(u), Some(g)) = (
+            ctx.sys.user_by_name(DOVECOT_GROUP).await?,
+            ctx.sys.group_by_name(DOVECOT_GROUP).await?,
+        ) {
+            fsutil::set_owner(&ll, u.uid, g)?;
         }
     }
     // The policy service writes its counters here.
@@ -572,7 +592,7 @@ pub async fn apply(ctx: &Ctx) -> Result<Changed> {
     };
     ensure_layout(ctx).await?;
     ensure_selfsigned(ctx, &host).await?;
-    let m = model(ctx, &host)?;
+    let m = model(ctx, &host).await?;
     let pending = marker(ctx);
     let was_pending = pending.exists();
     fsutil::write_atomic(&pending, b"", 0o600)?;
@@ -834,9 +854,7 @@ pub fn prune_dkim_keys(ctx: &Ctx, rec: Option<&MailDomainRecord>, domain: &str) 
     let dir = ctx.config.mail.state_dir.join("dkim");
     let keep: BTreeSet<String> = rec
         .map(|r| {
-            r.dkim
-                .iter()
-                .chain(&r.dkim_retired)
+            r.dkim_keys()
                 .map(|k| format!("{domain}.{}.key", k.selector))
                 .collect()
         })

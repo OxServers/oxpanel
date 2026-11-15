@@ -198,7 +198,7 @@ async fn run(op: Op, d: &Daemon) -> Result<()> {
             if record(d).is_some_and(|r| !r.dkim_retired.is_empty()) {
                 return Ok(());
             }
-            d.mail.rotate_dkim(TENANT, DOMAIN).await.map(|_| ())
+            d.mail.rotate_dkim(TENANT, DOMAIN, true).await.map(|_| ())
         }
         Op::Suspend => d.tenants.set_suspended(TENANT, true).await.map(|_| ()),
         Op::Cascade => {

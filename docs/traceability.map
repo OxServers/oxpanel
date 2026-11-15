@@ -773,6 +773,9 @@
 
 [Email] Mail component
   unit mail/config email_is_off_by_default_and_needs_a_host_name_when_on
+  unit mail/tests the_mail_host_warns_about_its_reverse_name_and_a_blocked_port_25
+  sh tests-acceptance/phases/18-mail.sh the reverse-DNS warning is produced (the mail host name does not resolve here)
+  sh tests-acceptance/phases/18-mail.sh a message with the EICAR test file is refused
   unit mail/tests email_off_answers_mail_unavailable
   unit mail/tests setting_up_a_domain_runs_exactly_these_commands
   sh tests-integration/run-inside.sh a mail domain is refused while email is off (mail_unavailable)
@@ -787,6 +790,10 @@
   sh tests-acceptance/phases/attack/mail.sh the victim's webmail name cannot be the attacker's site
 [Email] Mailboxes
   unit mail/tests a_mailbox_is_made_as_the_account_and_only_its_files_change
+  unit mail/tests last_logins_are_read_from_dovecots_dict_file
+  unit mail/tests mailboxes_list_their_last_login_when_dovecot_recorded_one
+  unit mail/tests dovecot_records_last_logins_only_with_its_group
+  sh tests-integration/run-inside.sh the login is recorded: the mailbox lists its last login
   unit mail/tests mailbox_refusals_carry_their_codes
   unit mail/tests deleting_a_mailbox_removes_its_mail_as_the_account
   it crash_safety_mail email_workflows_survive_interruption_at_every_command
@@ -832,7 +839,9 @@
   sh tests-integration/run-inside.sh the mailbox's hourly limit defers the next message (4xx)
   sh tests-integration/run-inside.sh and sendmail says to try later (EX_TEMPFAIL)
 [Email] DKIM
-  unit mail/tests rotating_the_dkim_key_keeps_the_old_one_published
+  unit mail/tests rotating_the_dkim_key_with_dns_elsewhere_waits_until_the_new_record_is_seen
+  unit mail/tests a_forced_rotation_signs_with_the_new_key_at_once
+  unit mail/tests with_the_zone_hosted_here_a_rotation_publishes_then_switches
   sh tests-integration/run-inside.sh the DKIM key is readable by root and the signer only
   sh tests-integration/run-inside.sh the DKIM signature verifies against the domain's key
   sh tests-acceptance/phases/18-mail.sh the DKIM signature verifies
@@ -965,6 +974,9 @@
   sh tests-acceptance/phases/16-fail2ban.sh the correct login from $GOOD still works
   sh tests-acceptance/phases/16-fail2ban.sh NOT banned (ignore list)
   sh tests-acceptance/phases/16-fail2ban.sh zero AVC denials (fail2ban, firewalld, sshd)
+  sh tests-acceptance/phases/18-mail.sh IMAP password guessing gets the address banned (dovecot jail)
+  sh tests-acceptance/phases/18-mail.sh SMTP AUTH guessing on submission gets it banned too (postfix-sasl jail)
+  sh tests-acceptance/phases/18-mail.sh after the unban, IMAPS works from it again
 [Operations] Disk-quota boot setting
   sh tests-acceptance/phases/15-quota-pre.sh install.sh printed exactly what remains
   sh tests-acceptance/phases/15-quota-post.sh install.sh notices that quotas are active

@@ -59,6 +59,35 @@ pub(super) fn parse_quota(text: &str) -> (u64, u64) {
     (bytes, messages)
 }
 
+/// Last logins by address, from Dovecot's dict file (`key` and `value`
+/// lines; keys `shared/last-login/<address>`). Empty when there is none.
+pub(super) fn last_logins(ctx: &Ctx) -> BTreeMap<String, u64> {
+    let path = super::render::last_login_file(&ctx.config.mail);
+    match crate::fsutil::read_untrusted(&path, 32 * 1024 * 1024) {
+        Ok(Some(bytes)) => parse_last_logins(&String::from_utf8_lossy(&bytes)),
+        Ok(None) => BTreeMap::new(),
+        Err(e) => {
+            warn!(error = %e, "last logins could not be read");
+            BTreeMap::new()
+        }
+    }
+}
+
+pub(super) fn parse_last_logins(text: &str) -> BTreeMap<String, u64> {
+    let mut out = BTreeMap::new();
+    let mut lines = text.lines();
+    while let (Some(k), Some(v)) = (lines.next(), lines.next()) {
+        let k = k
+            .strip_prefix("shared/")
+            .or_else(|| k.strip_prefix("priv/"))
+            .unwrap_or(k);
+        if let (Some(addr), Ok(t)) = (k.strip_prefix("last-login/"), v.trim().parse::<u64>()) {
+            out.insert(addr.to_ascii_lowercase(), t);
+        }
+    }
+    out
+}
+
 /// End a mailbox's IMAP/POP3 sessions (disabled, password changed,
 /// removed, suspended). Best effort: Dovecot may not be running.
 pub(super) async fn kick(ctx: &Ctx, user_mask: &str) {
@@ -237,10 +266,12 @@ impl MailService {
         let domain = Domain::parse(domain.trim_end_matches('.'))?;
         require_available(&self.ctx).await?;
         let rec = self.domain(&tenant, &domain)?;
+        let logins = last_logins(&self.ctx);
         let mut out = Vec::new();
         for (local, m) in rec.live_mailboxes() {
             let mut v = mailbox_view(&rec, local, m);
             (v.used_bytes, v.messages) = quota_usage(&self.ctx, &v.address).await;
+            v.last_login_unix = logins.get(&v.address).copied();
             out.push(v);
         }
         Ok(out)

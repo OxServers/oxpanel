@@ -56,7 +56,7 @@ pub fn wanted_names(ctx: &Ctx) -> Result<Vec<Domain>> {
     let Some(host) = cfg.hostname.clone().filter(|_| cfg.enabled) else {
         return Ok(Vec::new());
     };
-    let m = super::ops::model(ctx, &host)?;
+    let m = super::ops::records_model(ctx, &host)?;
     let mut out = vec![host];
     for s in super::ops::webmail_sites(ctx, &m)? {
         out.push(Domain::parse(&s.name)?);
@@ -210,7 +210,7 @@ async fn install(ctx: &Ctx, name: &Domain) -> Result<()> {
 
 // ---- Deliverability -----------------------------------------------------------------
 
-fn q(name: &str, qtype: u16) -> Question {
+pub(super) fn q(name: &str, qtype: u16) -> Question {
     Question {
         server: Server::Resolver,
         name: name.to_owned(),
@@ -219,7 +219,7 @@ fn q(name: &str, qtype: u16) -> Question {
     }
 }
 
-fn answer(o: Option<&Outcome>) -> Option<&probe::Answer> {
+pub(super) fn answer(o: Option<&Outcome>) -> Option<&probe::Answer> {
     match o {
         Some(Outcome::Answer(a)) if a.rcode == 0 || a.rcode == 3 => Some(a),
         _ => None,
@@ -232,6 +232,25 @@ fn check(name: &'static str, status: CheckStatus, detail: impl Into<String>) -> 
         status,
         detail: detail.into(),
     }
+}
+
+/// Whether public DNS (the host's resolver) publishes `key` at its
+/// selector: `None` when it could not be looked up.
+pub async fn dkim_published(
+    ctx: &Ctx,
+    domain: &str,
+    key: &super::store::DkimKey,
+) -> Result<Option<bool>> {
+    let name = format!("{}._domainkey.{domain}", key.selector);
+    let out = probe::run(ctx, &[q(&name, wire::TYPE_TXT)]).await?;
+    Ok(answer(out.first()).map(|a| txt_has_dkim(&a.txt, &key.public_key)))
+}
+
+/// One of `txt` is the DKIM record of `public_key` (spaces ignored: some
+/// providers show the record split or with spaces after `;`).
+pub fn txt_has_dkim(txt: &[String], public_key: &str) -> bool {
+    let want = records::dkim_txt(public_key).replace(' ', "");
+    txt.iter().any(|t| t.replace(' ', "") == want)
 }
 
 /// The reverse name of an address.
@@ -278,7 +297,7 @@ pub async fn deliverability(
     checks.push(match (rec.mode, &rec.dkim, answer(out.get(4))) {
         (MailMode::Local, Some(k), Some(a)) => {
             let want = records::dkim_txt(&k.public_key);
-            if a.txt.iter().any(|t| t.replace(' ', "") == want.replace(' ', "")) {
+            if txt_has_dkim(&a.txt, &k.public_key) {
                 check("dkim", CheckStatus::Ok, format!("{}._domainkey.{d} publishes the signing key", k.selector))
             } else {
                 check("dkim", CheckStatus::Fail, format!("{}._domainkey.{d} does not publish the signing key: create the TXT record \"{want}\"", k.selector))
@@ -390,7 +409,11 @@ fn spf_check(rec: &MailDomainRecord, host: &Domain, a: Option<&probe::Answer>) -
     }
 }
 
-async fn reverse_check(ctx: &Ctx, host: &Domain, a: Option<&probe::Answer>) -> Result<Check> {
+pub(super) async fn reverse_check(
+    ctx: &Ctx,
+    host: &Domain,
+    a: Option<&probe::Answer>,
+) -> Result<Check> {
     let Some(addr) = a.and_then(|a| a.addrs.first()).cloned() else {
         return Ok(check(
             "reverse_dns",

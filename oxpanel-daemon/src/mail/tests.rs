@@ -1049,28 +1049,294 @@ async fn autoresponders_are_sieve_scripts_the_account_cannot_change() {
     assert_eq!(code(&e), Some(MailCode::MailboxNotFound));
 }
 
+fn hex(s: &str) -> String {
+    crate::dns::wire::hex_upper(s.as_bytes())
+}
+
 #[tokio::test]
-async fn rotating_the_dkim_key_keeps_the_old_one_published() {
+async fn rotating_the_dkim_key_with_dns_elsewhere_waits_until_the_new_record_is_seen() {
+    let h = harness().await;
+    h.domain().await;
+    let map = h.cfg().state_dir.join("dkim/selectors.map");
+    let old = h.record("example.test").dkim.unwrap();
+    // Step 1: a new key to publish; the old one keeps signing.
+    let v = h
+        .mail
+        .rotate_dkim("alice", "example.test", false)
+        .await
+        .unwrap();
+    let rec = h.record("example.test");
+    let pending = rec.dkim_pending.clone().unwrap();
+    assert_ne!(pending.selector, old.selector);
+    assert_eq!(rec.dkim.as_ref().unwrap().selector, old.selector);
+    assert!(rec.dkim_retired.is_empty());
+    let d = v.dkim.unwrap();
+    assert_eq!(d.selector, old.selector);
+    let p = d.pending.unwrap();
+    assert_eq!(p.selector, pending.selector);
+    assert_eq!(p.published, Published::Unknown);
+    let names: Vec<String> = v.required_records.iter().map(|r| r.name.clone()).collect();
+    assert!(names.contains(&format!("{}._domainkey", old.selector)));
+    assert!(names.contains(&format!("{}._domainkey", pending.selector)));
+    assert!(render::dkim_key_path(h.cfg(), "example.test", &pending.selector).is_file());
+    assert_eq!(
+        h.read(map.clone()),
+        format!("{}example.test {}\n", render::HEADER, old.selector)
+    );
+    // Step 2 before the record is published: nothing changes, it says so,
+    // and no second key is made.
+    let name = format!("{}._domainkey.example.test", pending.selector);
+    h.sys.set_dns_resolver(&name, "TXT", "ok NOERROR 0");
+    let v = h
+        .mail
+        .rotate_dkim("alice", "example.test", false)
+        .await
+        .unwrap();
+    let p = v.dkim.unwrap().pending.unwrap();
+    assert_eq!(
+        (p.selector.as_str(), p.published),
+        (pending.selector.as_str(), Published::No)
+    );
+    assert_eq!(
+        h.record("example.test").dkim.unwrap().selector,
+        old.selector
+    );
+    // A record with another key does not count either.
+    h.sys.set_dns_resolver(
+        &name,
+        "TXT",
+        &format!("ok NOERROR 0 txt={}", hex("v=DKIM1; k=rsa; p=AAAA")),
+    );
+    h.mail
+        .rotate_dkim("alice", "example.test", false)
+        .await
+        .unwrap();
+    assert_eq!(
+        h.record("example.test").dkim.unwrap().selector,
+        old.selector
+    );
+    // Once public DNS has it (spaces as some providers show them), it signs.
+    let txt = records::dkim_txt(&pending.public_key).replace("; ", ";  ");
+    h.sys
+        .set_dns_resolver(&name, "TXT", &format!("ok NOERROR 0 txt={}", hex(&txt)));
+    let v = h
+        .mail
+        .rotate_dkim("alice", "example.test", false)
+        .await
+        .unwrap();
+    let rec = h.record("example.test");
+    assert_eq!(rec.dkim.as_ref().unwrap().selector, pending.selector);
+    assert!(rec.dkim_pending.is_none());
+    assert_eq!(rec.dkim_retired.len(), 1);
+    assert!(rec.dkim_retired[0].retire_at_unix.unwrap() > now_unix() + 6 * 86_400);
+    let d = v.dkim.unwrap();
+    assert_eq!(
+        (d.selector.as_str(), d.pending),
+        (pending.selector.as_str(), None)
+    );
+    assert_eq!(
+        h.read(map.clone()),
+        format!("{}example.test {}\n", render::HEADER, pending.selector)
+    );
+    for k in [&old, &pending] {
+        assert!(render::dkim_key_path(h.cfg(), "example.test", &k.selector).is_file());
+    }
+}
+
+#[tokio::test]
+async fn a_forced_rotation_signs_with_the_new_key_at_once() {
     let h = harness().await;
     h.domain().await;
     let old = h.record("example.test").dkim.unwrap();
-    let v = h.mail.rotate_dkim("alice", "example.test").await.unwrap();
+    // Forced from the start, and forced while a key is pending.
+    h.mail
+        .rotate_dkim("alice", "example.test", true)
+        .await
+        .unwrap();
+    let first = h.record("example.test").dkim.unwrap();
+    assert_ne!(first.selector, old.selector);
+    h.mail
+        .rotate_dkim("alice", "example.test", false)
+        .await
+        .unwrap();
+    let pending = h.record("example.test").dkim_pending.unwrap();
+    let v = h
+        .mail
+        .rotate_dkim("alice", "example.test", true)
+        .await
+        .unwrap();
     let rec = h.record("example.test");
-    let new = rec.dkim.clone().unwrap();
+    assert_eq!(rec.dkim.unwrap().selector, pending.selector);
+    assert!(rec.dkim_pending.is_none() && v.dkim.unwrap().pending.is_none());
+    assert_eq!(rec.dkim_retired.len(), 2);
+}
+
+#[tokio::test]
+async fn with_the_zone_hosted_here_a_rotation_publishes_then_switches() {
+    let h = harness_with(with_dns).await;
+    h.domain().await;
+    let old = h.record("example.test").dkim.unwrap();
+    let v = h
+        .mail
+        .rotate_dkim("alice", "example.test", false)
+        .await
+        .unwrap();
+    let rec = h.record("example.test");
+    let new = rec.dkim.unwrap();
     assert_ne!(new.selector, old.selector);
-    assert_eq!(v.dkim.unwrap().selector, new.selector);
-    assert_eq!(rec.dkim_retired.len(), 1);
-    assert!(rec.dkim_retired[0].retire_at_unix.unwrap() > now_unix() + 6 * 86_400);
-    let names: Vec<String> = v.required_records.iter().map(|r| r.name.clone()).collect();
-    assert!(names.contains(&format!("{}._domainkey", old.selector)));
-    assert!(names.contains(&format!("{}._domainkey", new.selector)));
-    for k in [&old, &new] {
-        assert!(render::dkim_key_path(h.cfg(), "example.test", &k.selector).is_file());
-    }
+    assert!(rec.dkim_pending.is_none());
+    let d = v.dkim.unwrap();
     assert_eq!(
-        h.read(h.cfg().state_dir.join("dkim/selectors.map")),
-        format!("{}example.test {}\n", render::HEADER, new.selector)
+        (d.selector.as_str(), d.published, d.pending),
+        (new.selector.as_str(), Published::Yes, None)
     );
+    // Both keys are in the zone: the new one signs, the old one for a week.
+    let dns = crate::dns::DnsService::new(h.ctx.clone());
+    let zone = dns.get_zone("alice", "example.test").await.unwrap();
+    for k in [&old, &new] {
+        let name = format!("{}._domainkey", k.selector);
+        assert!(
+            zone.records
+                .iter()
+                .any(|r| r.origin == "mail" && r.rr.name.as_str() == name),
+            "{name}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn the_mail_host_warns_about_its_reverse_name_and_a_blocked_port_25() {
+    let h = harness().await;
+    let host = h.cfg().hostname.clone().unwrap();
+    let target = h.cfg().port25_check.clone().unwrap();
+    // Nothing known yet (GetMailHost would start a check in the background).
+    assert_eq!(hostcheck::cached(&h.ctx, &host), None);
+    // The host's address has another reverse name; port 25 is blocked.
+    h.sys
+        .set_dns_resolver(host.as_str(), "A", "ok NOERROR 0 a=192.0.2.10");
+    h.sys.set_dns_resolver(
+        "10.2.0.192.in-addr.arpa",
+        "PTR",
+        "ok NOERROR 0 ptr=vps-123.provider.example",
+    );
+    h.sys
+        .set_dns_resolver(target.as_str(), "A", "ok NOERROR 0 a=198.51.100.25");
+    let c = hostcheck::refresh(&h.ctx, &host).await.unwrap();
+    assert!(
+        c.reverse_dns
+            .as_deref()
+            .unwrap()
+            .contains("vps-123.provider.example"),
+        "{c:?}"
+    );
+    assert!(c.port25.as_deref().unwrap().contains("port 25"), "{c:?}");
+    let v = h.mail.host().await.unwrap();
+    let kinds: Vec<WarningKind> = v.warnings.iter().map(|(k, _)| *k).collect();
+    assert!(
+        kinds.contains(&WarningKind::ReverseDns) && kinds.contains(&WarningKind::Port25),
+        "{kinds:?}"
+    );
+    // The probe connected to the target's port 25, as an SMTP question.
+    let probe = h.argvs(bin::SYSTEMD_RUN);
+    assert!(
+        probe.iter().any(|a| a
+            .windows(3)
+            .any(|w| w == ["--q", "198.51.100.25:25", target.as_str()])),
+        "{probe:?}"
+    );
+    // Fixed: the right reverse name and a greeting from the target.
+    h.sys.set_dns_resolver(
+        "10.2.0.192.in-addr.arpa",
+        "PTR",
+        &format!("ok NOERROR 0 ptr={host}"),
+    );
+    h.sys.set_dns_resolver(
+        "198.51.100.25:25",
+        "SMTP",
+        &format!("ok NOERROR 0 txt={}", hex("220 mx.google.com ESMTP")),
+    );
+    let c = hostcheck::refresh(&h.ctx, &host).await.unwrap();
+    assert_eq!((c.reverse_dns, c.port25), (None, None));
+    let v = h.mail.host().await.unwrap();
+    assert!(!v
+        .warnings
+        .iter()
+        .any(|(k, _)| matches!(k, WarningKind::ReverseDns | WarningKind::Port25)));
+}
+
+#[test]
+fn last_logins_are_read_from_dovecots_dict_file() {
+    let m = mailboxes::parse_last_logins(
+        "shared/last-login/info@example.test\n1794700000\nshared/last-login/Sales@Example.test\n1794700100\nshared/other\nx\nshared/last-login/bad@example.test\nnot-a-number\n",
+    );
+    assert_eq!(m.get("info@example.test"), Some(&1_794_700_000));
+    assert_eq!(m.get("sales@example.test"), Some(&1_794_700_100));
+    assert_eq!(m.len(), 2);
+    assert!(mailboxes::parse_last_logins("shared/last-login/x@y.test\n").is_empty());
+}
+
+#[tokio::test]
+async fn mailboxes_list_their_last_login_when_dovecot_recorded_one() {
+    let h = harness().await;
+    h.domain().await;
+    h.mailbox("info").await;
+    h.mailbox("sales").await;
+    let f = render::last_login_file(h.cfg());
+    std::fs::create_dir_all(f.parent().unwrap()).unwrap();
+    std::fs::write(&f, "shared/last-login/info@example.test\n1794700000\n").unwrap();
+    let l = h
+        .mail
+        .list_mailboxes("alice", "example.test")
+        .await
+        .unwrap();
+    let got: Vec<(&str, Option<u64>)> = l
+        .iter()
+        .map(|m| (m.local_part.as_str(), m.last_login_unix))
+        .collect();
+    assert_eq!(got, [("info", Some(1_794_700_000)), ("sales", None)]);
+}
+
+#[test]
+fn dovecot_records_last_logins_only_with_its_group() {
+    let host = Domain::parse("mail.host.net").unwrap();
+    let cfg = MailConfig::default();
+    let mut m = render::Model {
+        hostname: host,
+        accounts: std::collections::BTreeMap::new(),
+        domains: Vec::new(),
+        cert: PathBuf::from("/c"),
+        key: PathBuf::from("/k"),
+        uid_min: 1000,
+        uid_max: 60000,
+        last_login: false,
+    };
+    let off = render::dovecot_conf(&cfg, &m).unwrap();
+    assert!(
+        off.contains("mail_access_groups = \n")
+            && !off.contains("last_login")
+            && !off.contains("service dict")
+    );
+    m.last_login = true;
+    let on = render::dovecot_conf(&cfg, &m).unwrap();
+    for want in [
+        "mail_access_groups = oxpanel-maildict\n",
+        "mail_plugins = $mail_plugins imap_quota last_login\n",
+        "protocol pop3 {\n  mail_plugins = $mail_plugins last_login\n}",
+        "oxlastlogin = file:/var/lib/oxpanel-mail/lastlogin/last-login.dict",
+        "    mode = 0660\n    group = oxpanel-maildict\n",
+        "last_login_dict = proxy::oxlastlogin",
+    ] {
+        assert!(on.contains(want), "{want}\n{on}");
+    }
+    // Delivery (LMTP) is not a login.
+    let lmtp = on
+        .split("protocol lmtp")
+        .nth(1)
+        .unwrap()
+        .split('}')
+        .next()
+        .unwrap();
+    assert!(!lmtp.contains("last_login"), "{lmtp}");
 }
 
 // ---- the account's life ------------------------------------------------------------
@@ -1446,7 +1712,10 @@ async fn everything_works_in_a_dry_run() {
         .set_autoresponder("alice", "info@example.test", true, "s", "b", None, None)
         .await
         .unwrap();
-    h.mail.rotate_dkim("alice", "example.test").await.unwrap();
+    h.mail
+        .rotate_dkim("alice", "example.test", false)
+        .await
+        .unwrap();
     assert_eq!(
         h.mail
             .list_mailboxes("alice", "example.test")

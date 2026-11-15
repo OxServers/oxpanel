@@ -233,7 +233,7 @@ pub async fn drifts(ctx: &Ctx) -> Result<Vec<Drift>> {
         }
         return Ok(out);
     };
-    let m = ops::model(ctx, &host)?;
+    let m = ops::model(ctx, &host).await?;
     for (path, text) in ops::expected(ctx, &m)? {
         if let Some(why) = crate::host::compare_file(&path, &text)? {
             out.push(Drift::new(
@@ -328,9 +328,7 @@ fn orphan_drifts(
             continue;
         }
         let known = domains.iter().any(|d| {
-            d.dkim
-                .iter()
-                .chain(&d.dkim_retired)
+            d.dkim_keys()
                 .any(|k| name == format!("{}.{}.key", d.domain, k.selector))
         });
         if !known {

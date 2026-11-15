@@ -110,6 +110,11 @@ pub struct MailDomainRecord {
     /// Earlier keys whose records stay published for a while.
     #[serde(default)]
     pub dkim_retired: Vec<DkimKey>,
+    /// A new key made by `RotateDkimKey` while the domain's DNS is not
+    /// hosted here: published by the customer, not used for signing until
+    /// its record is seen in public DNS (or the rotation is forced).
+    #[serde(default)]
+    pub dkim_pending: Option<DkimKey>,
     #[serde(default)]
     pub mailboxes: BTreeMap<String, MailboxRecord>,
     #[serde(default)]
@@ -119,6 +124,14 @@ pub struct MailDomainRecord {
 impl MailDomainRecord {
     pub fn domain(&self) -> Result<Domain> {
         Domain::parse_field(&self.domain, "domain")
+    }
+
+    /// Every DKIM key the domain holds: signing, pending and retired.
+    pub fn dkim_keys(&self) -> impl Iterator<Item = &DkimKey> {
+        self.dkim
+            .iter()
+            .chain(&self.dkim_pending)
+            .chain(&self.dkim_retired)
     }
 
     /// Mailboxes that exist (not being removed).
@@ -155,7 +168,7 @@ impl MailDomainRecord {
                 return Err(Error::invalid("password", "the stored hash is not usable"));
             }
         }
-        for k in self.dkim.iter().chain(&self.dkim_retired) {
+        for k in self.dkim_keys() {
             check_selector(&k.selector)?;
             if !k
                 .public_key

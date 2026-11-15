@@ -34,6 +34,15 @@ fn unix(t: Option<prost_types::Timestamp>) -> Option<u64> {
     t.and_then(|t| u64::try_from(t.seconds).ok())
 }
 
+fn published_to(p: Published) -> i32 {
+    match p {
+        Published::Yes => pb::DkimPublished::Yes,
+        Published::No => pb::DkimPublished::No,
+        Published::Unknown => pb::DkimPublished::Unknown,
+    }
+    .into()
+}
+
 fn domain_to(d: &DomainView) -> pb::MailDomain {
     pb::MailDomain {
         domain: d.domain.clone(),
@@ -44,12 +53,23 @@ fn domain_to(d: &DomainView) -> pb::MailDomain {
         dkim: d.dkim.as_ref().map(|k| pb::Dkim {
             selector: k.selector.clone(),
             public_key_record: k.record.clone(),
-            published: match k.published {
-                Published::Yes => pb::DkimPublished::Yes,
-                Published::No => pb::DkimPublished::No,
-                Published::Unknown => pb::DkimPublished::Unknown,
-            }
-            .into(),
+            published: published_to(k.published),
+            pending_selector: k
+                .pending
+                .as_ref()
+                .map(|p| p.selector.clone())
+                .unwrap_or_default(),
+            pending_public_key_record: k
+                .pending
+                .as_ref()
+                .map(|p| p.record.clone())
+                .unwrap_or_default(),
+            pending_published: k
+                .pending
+                .as_ref()
+                .map_or(published_to(Published::Unknown), |p| {
+                    published_to(p.published)
+                }),
         }),
         dns_hosted: d.dns_hosted,
         required_records: d
@@ -80,7 +100,7 @@ fn mailbox_to(m: &MailboxView) -> pb::Mailbox {
         used_bytes: m.used_bytes,
         messages: m.messages,
         enabled: m.enabled,
-        last_login: None,
+        last_login: m.last_login_unix.map(timestamp),
     }
 }
 
@@ -313,9 +333,9 @@ impl Engine {
         const RPC: &str = "RotateDkimKey";
         let peer = self.authorise(&req, RPC, Scope::VHost)?;
         let r = req.into_inner();
-        info!(rpc = RPC, peer, tenant = %r.tenant, domain = %r.domain, "request");
+        info!(rpc = RPC, peer, tenant = %r.tenant, domain = %r.domain, force = r.force, "request");
         let mail = self.mail.clone();
-        let d = detached(async move { mail.rotate_dkim(&r.tenant, &r.domain).await })
+        let d = detached(async move { mail.rotate_dkim(&r.tenant, &r.domain, r.force).await })
             .await
             .map_err(|e| fail(RPC, &peer, e))?;
         Ok(Response::new(domain_to(&d)))

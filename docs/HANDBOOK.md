@@ -1469,7 +1469,10 @@ Settings (`/etc/oxpanel/daemon.env`, see `packaging/daemon.env`):
 hour; 500 and 200 by default, 0 = unlimited), `OXPANEL_MAIL_MAX_MAILBOXES`,
 `OXPANEL_MAIL_MAX_MAILBOX_BYTES` (defaults for accounts without their own
 limits), `OXPANEL_MAIL_MESSAGE_MAX_BYTES` (25 MiB), `OXPANEL_MAIL_WEBMAIL`,
-`OXPANEL_MAIL_ANTIVIRUS`.
+`OXPANEL_MAIL_ANTIVIRUS`, `OXPANEL_MAIL_PORT25_CHECK` (the public mail
+server whose port 25 `oxpanel-ctl mail host` tries every few hours, to warn
+when the provider blocks outbound mail; `gmail-smtp-in.l.google.com` by
+default, `off` to never try).
 
 ```sh
 # A customer's domain (one of its sites' names, or inside one of its DNS zones)
@@ -1498,6 +1501,18 @@ oxpanel-ctl mail limits-set acme --max-mailboxes 20 --max-mailbox-bytes 53687091
 oxpanel-ctl mail usage acme
 oxpanel-ctl mail queue
 oxpanel-ctl mail check acme.example     # MX, SPF, DKIM, DMARC, reverse DNS from outside
+oxpanel-ctl mail host                   # warnings: [reverse_dns] [port_25] [no_certificate] …
+
+# A new DKIM key. With the zone hosted here: one command, the new key is put in
+# the zone, then it signs. With the DNS elsewhere: two steps, the old key signs
+# until the new record is visible in public DNS.
+oxpanel-ctl mail dkim-rotate acme.example --tenant acme
+#   dkim selector=ox1794700000 published=unknown record=…            (still signing)
+#   dkim-pending selector=ox1794800000 published=unknown record=v=DKIM1; k=rsa; p=…
+#   create ox1794800000._domainkey TXT v=DKIM1; k=rsa; p=…           (publish this)
+oxpanel-ctl mail dkim-rotate acme.example --tenant acme   # again, once published:
+#   dkim selector=ox1794800000 …          (switched; or dkim-pending … published=no)
+# --force switches at once (receivers may fail the signature until the record is seen).
 ```
 
 Mail clients: IMAPS 993, POP3S 995, SMTP 587 (STARTTLS) or 465 (TLS), user

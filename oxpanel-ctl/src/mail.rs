@@ -63,11 +63,16 @@ pub(crate) enum MailCmd {
         #[arg(long)]
         tenant: String,
     },
-    /// A new DKIM key (the old one stays published for a week).
+    /// Rotate the DKIM key. When the domain's DNS is elsewhere: the first
+    /// call makes a new key to publish (the old one keeps signing); run it
+    /// again once the record is published and the new key takes over.
+    /// --force switches at once. The old key stays published for a week.
     DkimRotate {
         domain: String,
         #[arg(long)]
         tenant: String,
+        #[arg(long)]
+        force: bool,
     },
     /// Create or update a mailbox. A new mailbox, or --password, reads the
     /// password from standard input (one line).
@@ -177,6 +182,14 @@ fn mode_name(m: i32) -> &'static str {
     }
 }
 
+fn published_name(p: i32) -> &'static str {
+    match pb::DkimPublished::try_from(p) {
+        Ok(pb::DkimPublished::Yes) => "yes",
+        Ok(pb::DkimPublished::No) => "no",
+        _ => "unknown",
+    }
+}
+
 fn print_domain(d: &pb::MailDomain) {
     emit(&format!(
         "domain={} tenant={} mode={} mailboxes={} forwarders={} catch_all={} dns_hosted={} external_mx={}",
@@ -193,13 +206,17 @@ fn print_domain(d: &pb::MailDomain) {
         emit(&format!(
             "  dkim selector={} published={} record={}",
             k.selector,
-            match pb::DkimPublished::try_from(k.published) {
-                Ok(pb::DkimPublished::Yes) => "yes",
-                Ok(pb::DkimPublished::No) => "no",
-                _ => "unknown",
-            },
+            published_name(k.published),
             k.public_key_record
         ));
+        if !k.pending_selector.is_empty() {
+            emit(&format!(
+                "  dkim-pending selector={} published={} record={}",
+                k.pending_selector,
+                published_name(k.pending_published),
+                k.pending_public_key_record
+            ));
+        }
     }
     for r in &d.required_records {
         emit(&format!(
@@ -218,8 +235,15 @@ fn print_domain(d: &pb::MailDomain) {
 
 fn print_mailbox(m: &pb::Mailbox) {
     emit(&format!(
-        "mailbox={} quota_bytes={} used_bytes={} messages={} enabled={}",
-        m.address, m.quota_bytes, m.used_bytes, m.messages, m.enabled
+        "mailbox={} quota_bytes={} used_bytes={} messages={} enabled={} last_login={}",
+        m.address,
+        m.quota_bytes,
+        m.used_bytes,
+        m.messages,
+        m.enabled,
+        m.last_login
+            .as_ref()
+            .map_or_else(|| "-".to_owned(), |t| t.seconds.to_string())
     ));
 }
 
@@ -279,7 +303,14 @@ pub(crate) async fn run_mail(
                 if h.webmail_url_pattern.is_empty() { "-" } else { &h.webmail_url_pattern }
             ));
             for w in &h.warnings {
-                emit(&format!("warning: {}", w.detail));
+                let kind = match pb::MailWarningKind::try_from(w.kind) {
+                    Ok(pb::MailWarningKind::ReverseDnsMismatch) => "reverse_dns",
+                    Ok(pb::MailWarningKind::Port25Blocked) => "port_25",
+                    Ok(pb::MailWarningKind::NoCertificate) => "no_certificate",
+                    Ok(pb::MailWarningKind::ServiceNotRunning) => "service_not_running",
+                    _ => "other",
+                };
+                emit(&format!("warning: [{kind}] {}", w.detail));
             }
         }
         MailCmd::Queue { page, page_size } => {
@@ -373,9 +404,17 @@ pub(crate) async fn run_mail(
                 print_domain(d);
             }
         }
-        MailCmd::DkimRotate { domain, tenant } => {
+        MailCmd::DkimRotate {
+            domain,
+            tenant,
+            force,
+        } => {
             let d = c
-                .rotate_dkim_key(pb::RotateDkimKeyRequest { tenant, domain })
+                .rotate_dkim_key(pb::RotateDkimKeyRequest {
+                    tenant,
+                    domain,
+                    force,
+                })
                 .await?
                 .into_inner();
             print_domain(&d);

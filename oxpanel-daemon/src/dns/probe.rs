@@ -15,6 +15,10 @@
 //! `/etc/resolv.conf`) or an address with port. Answer lines:
 //! `<i> ok <rcode> <aa 0|1> [soa=<serial>] [ns=<name>]… [ds=<tag>/<alg>/<type>/<hex>]…`
 //! or `<i> fail <reason>`.
+//!
+//! One question is not DNS: type `SMTP` at an address connects to it and
+//! reads the server's greeting (email's check that outbound port 25 is not
+//! blocked): `<i> ok NOERROR 0 txt=<hex of the greeting>` or a failure.
 
 use std::fmt::Write as _;
 use std::io::{Read as _, Write as IoWrite};
@@ -35,6 +39,9 @@ const TRIES: usize = 2;
 const PARALLEL: usize = 16;
 /// How the probe's unit is bounded as a whole.
 const UNIT_TIMEOUT: Duration = Duration::from_secs(120);
+/// Not a DNS type: connect to an SMTP server and read its greeting.
+pub const TYPE_SMTP_GREETING: u16 = 0xff25;
+const SMTP_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Where a question is sent.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,6 +92,7 @@ fn type_name(t: u16) -> &'static str {
         wire::TYPE_A => "A",
         wire::TYPE_AAAA => "AAAA",
         wire::TYPE_PTR => "PTR",
+        TYPE_SMTP_GREETING => "SMTP",
         _ => "?",
     }
 }
@@ -99,6 +107,7 @@ fn type_from(s: &str) -> Option<u16> {
         "A" => Some(wire::TYPE_A),
         "AAAA" => Some(wire::TYPE_AAAA),
         "PTR" => Some(wire::TYPE_PTR),
+        "SMTP" => Some(TYPE_SMTP_GREETING),
         _ => None,
     }
 }
@@ -321,8 +330,46 @@ fn exchange_tcp(server: SocketAddr, query: &[u8]) -> std::result::Result<Vec<u8>
     Ok(buf)
 }
 
+/// Connect to an SMTP server and read the first line of its greeting.
+fn smtp_greeting(server: SocketAddr) -> String {
+    let mut s = match TcpStream::connect_timeout(&server, SMTP_TIMEOUT) {
+        Ok(s) => s,
+        Err(e) => return format!("fail no connection to {server}: {e}"),
+    };
+    if let Err(e) = s.set_read_timeout(Some(SMTP_TIMEOUT)) {
+        return format!("fail {e}");
+    }
+    let mut buf = [0u8; 256];
+    let mut got = Vec::new();
+    while !got.contains(&b'\n') && got.len() < buf.len() {
+        match s.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => got.extend_from_slice(buf.get(..n).unwrap_or_default()),
+            Err(e) => return format!("fail no greeting from {server}: {e}"),
+        }
+    }
+    let first: Vec<u8> = got
+        .split(|b| *b == b'\n')
+        .next()
+        .unwrap_or_default()
+        .iter()
+        .copied()
+        .take(120)
+        .collect();
+    if first.is_empty() {
+        return format!("fail no greeting from {server}");
+    }
+    format!("ok NOERROR 0 txt={}", wire::hex_upper(&first))
+}
+
 /// Ask one question; the answer line without the index.
 fn ask(q: &Question, resolver: Option<SocketAddr>, id: u16) -> String {
+    if q.qtype == TYPE_SMTP_GREETING {
+        return match &q.server {
+            Server::At(sa) => smtp_greeting(*sa),
+            Server::Resolver => "fail SMTP needs an address".to_owned(),
+        };
+    }
     let server = match &q.server {
         Server::At(sa) => *sa,
         Server::Resolver => match resolver {
