@@ -369,14 +369,16 @@ def deferred(refusal):
 def step_limits(admin, reseller, cust, st, plan, plan_id):
     # Counted per clock hour: never straddle the hour (the counts below are exact).
     lt = time.gmtime()
-    if lt.tm_min >= 56:
+    new_hour = lt.tm_min >= 56
+    if new_hour:
         wait = (60 - lt.tm_min) * 60 - lt.tm_sec + 5
         D.info(f"waiting {wait}s for the next clock hour (the sending counters are per hour)")
         time.sleep(wait)
     r = cust.get(f"{MAIL}/usage")
     b = r.body or {}
+    # In a new hour the count starts again from 0.
     D.check(r.status == 200 and b.get("account") == "alice" and b.get("mailboxes") == 2
-            and (b.get("bytes_used") or 0) > 0 and (b.get("messages_sent_this_hour") or 0) >= 2,
+            and (b.get("bytes_used") or 0) > 0 and (b.get("messages_sent_this_hour") or 0) >= (0 if new_hour else 2),
             "the account's email use: two mailboxes, space used, messages sent this hour", repr(r)[:400])
     D.info(f"mail usage: {r.raw[:600]}")
     D.check(eff(r, RATES[0]) == (30, "server_default") and eff(r, RATES[1]) == (20, "server_default")
