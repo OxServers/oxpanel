@@ -1465,14 +1465,76 @@ change (`MAIL_CONFIG_DRIFT`) and the next restart of the daemon puts it back.
   until then clients see a self-signed one (`oxpanel-ctl mail host` warns).
 
 Settings (`/etc/oxpanel/daemon.env`, see `packaging/daemon.env`):
-`OXPANEL_MAIL_RATE_ACCOUNT` and `OXPANEL_MAIL_RATE_MAILBOX` (recipients per
-hour; 500 and 200 by default, 0 = unlimited), `OXPANEL_MAIL_MAX_MAILBOXES`,
-`OXPANEL_MAIL_MAX_MAILBOX_BYTES` (defaults for accounts without their own
-limits), `OXPANEL_MAIL_MESSAGE_MAX_BYTES` (25 MiB), `OXPANEL_MAIL_WEBMAIL`,
-`OXPANEL_MAIL_ANTIVIRUS`, `OXPANEL_MAIL_PORT25_CHECK` (the public mail
+`OXPANEL_MAIL_MESSAGE_MAX_BYTES` (25 MiB), `OXPANEL_MAIL_WEBMAIL`,
+`OXPANEL_MAIL_ANTIVIRUS`, `OXPANEL_MAIL_RESOLVER` (written by the
+installer, see below), `OXPANEL_MAIL_PORT25_CHECK` (the public mail
 server whose port 25 `oxpanel-ctl mail host` tries every few hours, to warn
 when the provider blocks outbound mail; `gmail-smtp-in.l.google.com` by
 default, `off` to never try).
+
+**Email limits.** Every account has four: mailboxes, the largest mailbox,
+and recipients per clock hour for the whole account (its mailboxes, sites
+and autoresponders together) and for one mailbox. Each comes from the
+first of these that sets it: the account's own override (staff), the
+account's plan (copied when the plan is assigned; assigning a plan also
+ends the account's overrides, as it replaces the account's other limits),
+the **host default**. A setting is a number, `unlimited`, or `inherit`
+(say nothing); unlimited is never what a left-out value or a plan change
+gives. The host default is 30 recipients an hour per account and 20 per
+mailbox out of the box, mailboxes and mailbox size unlimited; change it
+with `oxpanel-ctl mail defaults-set` (or the panel's Email defaults
+screen): every account that follows it follows the new value at once.
+Raise it with care: a compromised mailbox or site sends spam at whatever
+rate is allowed, and the host's address on a blocklist hurts every
+customer. (`OXPANEL_MAIL_RATE_ACCOUNT`, `OXPANEL_MAIL_RATE_MAILBOX`,
+`OXPANEL_MAIL_MAX_MAILBOXES`, `OXPANEL_MAIL_MAX_MAILBOX_BYTES` change the
+built-in default until a host default is set.)
+
+```sh
+oxpanel-ctl mail defaults                       # the host default and the built-in one
+oxpanel-ctl mail defaults-set --per-hour-account 100 --per-hour-mailbox 50
+oxpanel-ctl mail limits acme                    # effective limits with their source
+# tenant=acme max_mailboxes=unlimited(default) max_mailbox_bytes=unlimited(default) per_hour_account=100(default) per_hour_mailbox=50(default)
+# plan: max_mailboxes=inherit ...
+# account: max_mailboxes=inherit ...
+oxpanel-ctl mail limits-set acme --per-hour-account 500   # an override; the rest: inherit
+oxpanel-ctl mail limits-set acme --layer plan --max-mailboxes 10   # what a panel does for a plan
+oxpanel-ctl mail limits-set acme                # no override any more
+```
+
+Upgrading from engine 0.3.0 (whose defaults were 500 and 200 an hour, and
+which stored 0 for unlimited): an account that held exactly the old
+defaults now follows the host default (30 and 20); an account with values
+of its own keeps them as its override (0 becoming an explicit unlimited).
+The records are converted when read; nothing else changes. The panel
+(0.2.1) then moves values that came from a plan into the plan layer.
+
+**The mail filter's own resolver.** Rspamd checks every message against
+DNS blocklists (Spamhaus and others), which refuse questions that come
+through public resolvers (Rspamd's log then shows symbols such as
+`DBL_BLOCKED_OPENRESOLVER`, and the lists do nothing). `install.sh --mail`
+therefore installs Unbound (AlmaLinux) and runs it for the filter only, as
+`oxpanel-mail-resolver.service`: recursive, caching, DNSSEC-validating,
+listening on 127.0.0.1:5335 only (not 53: the host may run OxPanel's DNS
+server or its own resolver there), refusing every other address, as
+Unbound's own account, with bounded caches and memory. The engine renders
+`/etc/oxpanel-mail-resolver/unbound.conf` and points Rspamd at it;
+`/etc/resolv.conf` and the distribution's `unbound.service` are not
+touched. Files you put in `/etc/oxpanel-mail-resolver/local.d/*.conf`
+(group `unbound`, mode 0640) are included and are yours, e.g. a
+`forward-zone` where outbound DNS is blocked. `--no-mail-resolver` keeps
+the system's resolver for the filter (for hosts that already have a
+suitable local one). When the resolver is down, mail still flows but the
+filter's DNS checks fail; `oxpanel-ctl mail host` warns
+`[filter_resolver_down]`.
+
+On a host upgraded from 0.3.0 the package upgrade does not set the
+resolver up (it does not install packages); the next
+`install.sh --mail` run installs Unbound and switches it on
+(`OXPANEL_MAIL_RESOLVER=true`). A plain `install.sh` run that only keeps
+the existing email settings leaves it as it was. `install.sh --uninstall`
+stops it; `--purge-mail` also deletes `/etc/oxpanel-mail-resolver`
+(Unbound stays installed).
 
 ```sh
 # A customer's domain (one of its sites' names, or inside one of its DNS zones)
@@ -1497,7 +1559,7 @@ oxpanel-ctl mail autoreply info@acme.example --tenant acme --subject 'Away' --bo
 oxpanel-ctl mail domain-set acme.example --tenant acme --mode external --mx aspmx.l.google.com --mx alt1.aspmx.l.google.com
 
 # Limits of an account (staff), its usage, the queue
-oxpanel-ctl mail limits-set acme --max-mailboxes 20 --max-mailbox-bytes 5368709120 --per-hour-account 300 --per-hour-mailbox 100
+oxpanel-ctl mail limits-set acme --max-mailboxes 20 --max-mailbox-bytes 5368709120 --per-hour-account 300 --per-hour-mailbox 100   # an override (see Email limits)
 oxpanel-ctl mail usage acme
 oxpanel-ctl mail queue
 oxpanel-ctl mail check acme.example     # MX, SPF, DKIM, DMARC, reverse DNS from outside

@@ -251,6 +251,7 @@ if [ "$INSTALL" = upgrade ]; then
   ls "$WORK"/dist/old-rpms/oxpanel-daemon-[0-9]*.rpm >/dev/null 2>&1 || die "no old RPM in dist/old-rpms (make rpm-old)"
   vm_ssh 'mkdir -p /root/acc/old-rpms'
   vm_scp "$WORK"/dist/old-rpms/oxpanel-daemon-[0-9]*.rpm /root/acc/old-rpms/
+  if [ -f "$WORK/dist/old-rpms/install.sh" ]; then vm_scp "$WORK/dist/old-rpms/install.sh" /root/acc/old-rpms/; fi
 fi
 
 for p in $PHASES; do

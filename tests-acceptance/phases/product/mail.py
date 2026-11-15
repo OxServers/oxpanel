@@ -337,26 +337,110 @@ def step_autoresponder(admin, cust, st):
 
 
 # ------------------------------------------------------------------ 6, 7. use and limits
+RATES = ("max_messages_per_hour_account", "max_messages_per_hour_mailbox")
+DEFAULTS = "/api/v1/host/mail/defaults"
+
+
+def eff(r, field):
+    """(value, source) of an effective limit in a usage answer; value None = unlimited."""
+    e = ((r.body or {}).get("limits") or {}).get(field) or {}
+    return (None if e.get("unlimited") else e.get("value")), e.get("source")
+
+
+def burst(cust, mailbox, pw, upto, tag):
+    """Send from `mailbox` (one recipient each) until a message is refused or
+    `upto` were accepted; (accepted, refusal text or None)."""
+    sent = 0
+    for i in range(upto):
+        rc, out = mc("submit", "587", mailbox, pw, mailbox, f"info@{DOM}", "--subject", f"drive-{tag}-{i}")
+        if rc != 0:
+            return sent, out
+        sent += 1
+    return sent, None
+
+
+def deferred(refusal):
+    return refusal is not None and re.search(r"\b4\d\d\b", refusal) is not None
+
+
 def step_limits(admin, reseller, cust, st, plan, plan_id):
+    # Counted per clock hour: never straddle the hour (the counts below are exact).
+    lt = time.gmtime()
+    if lt.tm_min >= 56:
+        wait = (60 - lt.tm_min) * 60 - lt.tm_sec + 5
+        D.info(f"waiting {wait}s for the next clock hour (the sending counters are per hour)")
+        time.sleep(wait)
     r = cust.get(f"{MAIL}/usage")
     b = r.body or {}
     D.check(r.status == 200 and b.get("account") == "alice" and b.get("mailboxes") == 2
             and (b.get("bytes_used") or 0) > 0 and (b.get("messages_sent_this_hour") or 0) >= 2,
             "the account's email use: two mailboxes, space used, messages sent this hour", repr(r)[:400])
-    D.info(f"mail usage: {r.raw[:400]}")
-    host_default = (r.body or {}).get("limits") or {}
-    D.check(host_default.get("max_messages_per_hour_account", 0) > 0
-            and host_default.get("max_messages_per_hour_mailbox", 0) > 0,
-            "an account made with a plan without email limits has the host's default hourly sending limits",
-            repr(host_default))
+    D.info(f"mail usage: {r.raw[:600]}")
+    D.check(eff(r, RATES[0]) == (30, "server_default") and eff(r, RATES[1]) == (20, "server_default")
+            and eff(r, "max_mailboxes") == (None, "server_default"),
+            "a new account follows the server default: 30 messages an hour, 20 per mailbox (source: server default)",
+            repr(b.get("limits")))
+    D.check("plan_limits" not in b and "account_limits" not in b,
+            "the customer sees its effective limits, not the layers behind them", repr(sorted(b)))
+    r = reseller.get(f"{MAIL}/usage")
+    D.check(r.status == 200 and (r.body or {}).get("plan_limits", {}).get(RATES[0]) == "inherit"
+            and (r.body or {}).get("account_limits", {}).get(RATES[0]) == "inherit",
+            "staff see the plan and override layers (both inherit here)", repr(r)[:400])
     r = reseller.put("/api/v1/accounts/alice/plan", {"plan_id": plan_id})
     r2 = cust.get(f"{MAIL}/usage")
-    D.check(r.status == 200 and (r2.body or {}).get("limits") == host_default,
-            "assigning that plan again keeps them (it does not lift the sending limits)", repr(r2)[:300])
+    D.check(r.status == 200 and eff(r2, RATES[0]) == (30, "server_default"),
+            "assigning that plan again keeps the server default (it does not lift the sending limits)",
+            repr(r2)[:300])
     r = cust.put(f"{MAIL}/limits", {"max_mailboxes": 5})
     D.check(r.status == 403 and r.code == "forbidden", "a customer may not set its email limits (403)", repr(r))
-    lim = {"max_mailboxes": 2, "max_mailbox_bytes": 209715200, "max_messages_per_hour_account": 100,
-           "max_messages_per_hour_mailbox": 20}
+
+    # The server default, only for the administrator.
+    r = admin.get(DEFAULTS)
+    D.check(r.status == 200 and r.body.get(RATES[0]) == 30 and r.body.get(RATES[1]) == 20
+            and r.body.get("max_mailboxes") == "unlimited" and (r.body.get("builtin") or {}).get(RATES[1]) == 20,
+            "the administrator reads the server default (30 and 20 an hour, mailboxes unlimited)", repr(r)[:300])
+    r = reseller.get(DEFAULTS)
+    D.check(r.status == 403, "a reseller may not see the server default (403)", repr(r)[:200])
+    r = cust.put(DEFAULTS, {RATES[0]: 1000})
+    D.check(r.status == 403, "nor a customer change it (403)", repr(r)[:200])
+    r = admin.put(DEFAULTS, {RATES[0]: 0})
+    D.check(field_err(r, RATES[0], "out_of_range"), "0 is not a server default (422; unlimited is said)", repr(r))
+    r = admin.put(DEFAULTS, {RATES[0]: "inherit"})
+    D.check(field_err(r, RATES[0], "out_of_range"), "nor is inherit (422)", repr(r))
+
+    # Real sending against the default: a fresh mailbox sends until it is deferred.
+    st["p_burst"] = "Amber-Lantern-5520"
+    r = cust.post(f"{MD}/mailboxes", {"local_part": "burst", "quota_bytes": 10485760, "password": st["p_burst"]})
+    D.check(r.status == 201, "customer creates burst@alice.test", repr(r)[:300], fatal=True)
+    n0 = (cust.get(f"{MAIL}/usage").body or {}).get("messages_sent_this_hour") or 0
+    expect = min(20, 30 - n0)
+    sent, refusal = burst(cust, f"burst@{DOM}", st["p_burst"], 35, "default")
+    D.info(f"server default: the account had sent {n0} this hour; burst sent {sent}, then: {refusal}")
+    D.check(sent == expect and deferred(refusal),
+            f"with the server default, burst sends exactly {expect} (20 per mailbox, 30 per account) and the next is"
+            " deferred (4xx)", f"sent={sent} expected={expect} refusal={refusal}")
+    burst_sent = sent
+    # Raising the server default lifts it, at once, for every account that follows it.
+    r = admin.put(DEFAULTS, {RATES[0]: 1000, RATES[1]: 1000})
+    D.check(r.status == 200 and r.body.get(RATES[1]) == 1000, "the administrator raises the server default to 1000",
+            repr(r)[:300])
+    r = cust.get(f"{MAIL}/usage")
+    D.check(eff(r, RATES[1]) == (1000, "server_default"), "the account follows it at once", repr(r)[:300])
+    good, rc, out = mc_until(["submit", "587", f"burst@{DOM}", st["p_burst"], f"burst@{DOM}", f"info@{DOM}",
+                              "--subject", "drive-raised"], tries=20)
+    D.check(good, "burst sends again", out)
+    burst_sent += 1
+    r = admin.get("/api/v1/audit?limit=50")
+    D.check(r.status == 200 and "mail.defaults_set" in r.raw, "the change is in the audit log (mail.defaults_set)",
+            repr(r)[:200])
+    r = admin.put(DEFAULTS, {RATES[0]: 30, RATES[1]: 20})
+    D.check(r.status == 200 and r.body.get(RATES[0]) == 30, "the server default back to 30 and 20", repr(r)[:300])
+    rc, out = mc("submit", "587", f"burst@{DOM}", st["p_burst"], f"burst@{DOM}", f"info@{DOM}",
+                 "--subject", "drive-lowered")
+    D.check(rc == 2 and deferred(out), "lowered again, burst is deferred again", out)
+
+    # A plan's limits beat the server default (here higher), on the real host.
+    lim = {"max_mailboxes": 3, "max_mailbox_bytes": 209715200, RATES[0]: 100, RATES[1]: 25}
     r = admin.post("/api/v1/plans", dict(plan, name="Standard + mail", mail_limits=lim))
     D.check(r.status == 201 and r.body.get("mail_limits") == lim, "administrator creates a plan with email limits",
             repr(r)[:400], fatal=True)
@@ -365,10 +449,16 @@ def step_limits(admin, reseller, cust, st, plan, plan_id):
     r = reseller.put("/api/v1/accounts/alice/plan", {"plan_id": mplan})
     D.check(r.status == 200, "reseller moves the account to it", repr(r)[:300])
     r = cust.get(f"{MAIL}/usage")
-    D.check(r.status == 200 and r.body.get("limits") == lim, "the account's email limits are the plan's",
-            repr(r)[:400])
-    r = cust.post(f"{MD}/mailboxes", {"local_part": "third", "quota_bytes": 1048576, "generate_password": True})
-    D.check(r.status == 409 and r.code == "mailbox_limit_reached", "a third mailbox is refused at the plan's limit"
+    D.check(r.status == 200 and eff(r, "max_mailboxes") == (3, "plan") and eff(r, RATES[0]) == (100, "plan")
+            and eff(r, RATES[1]) == (25, "plan") and eff(r, "max_mailbox_bytes") == (209715200, "plan"),
+            "the account's email limits are the plan's (source: plan)", repr(r)[:500])
+    sent, refusal = burst(cust, f"burst@{DOM}", st["p_burst"], 30, "plan")
+    burst_sent += sent
+    D.check(burst_sent == 25 and deferred(refusal),
+            "the plan's 25 an hour wins over the server default: burst reaches exactly 25, then is deferred",
+            f"burst_sent={burst_sent} refusal={refusal}")
+    r = cust.post(f"{MD}/mailboxes", {"local_part": "fourth", "quota_bytes": 1048576, "generate_password": True})
+    D.check(r.status == 409 and r.code == "mailbox_limit_reached", "a fourth mailbox is refused at the plan's limit"
             " (409 mailbox_limit_reached)", repr(r))
     r = cust.patch(f"{MD}/mailboxes/info", {"quota_bytes": 314572800})
     D.check(field_err(r, "quota_bytes", "mailbox_quota_above_limit"),
@@ -383,33 +473,40 @@ def step_limits(admin, reseller, cust, st, plan, plan_id):
     D.check(res[0] is True, "Dovecot enforces the new size (doveadm quota: STORAGE limit 153600 KiB)",
             res[1][:400])
 
-    # The hourly limit of a mailbox (20): sales sends until it is refused.
-    sent, refusal = 0, None
-    for i in range(25):
-        rc, out = mc("submit", "587", f"sales@{DOM}", st["p_sales"], f"sales@{DOM}", f"sales@{DOM}",
-                     "--subject", f"drive-rate-{i}")
-        if rc != 0:
-            refusal = out
-            break
-        sent += 1
-    D.info(f"hourly limit: {sent} accepted in this burst, then: {refusal}")
-    D.check(refusal is not None and re.search(r"\b4\d\d\b", refusal) is not None and 0 < sent <= 20,
-            "the mailbox's hourly sending limit (20) is enforced: the next message is deferred (4xx)",
+    # A staff override beats the plan.
+    r = reseller.put(f"{MAIL}/limits", {RATES[1]: 26})
+    D.check(r.status == 200 and eff(r, RATES[1]) == (26, "account") and eff(r, RATES[0]) == (100, "plan"),
+            "the reseller overrides one limit for this account (source: account); the others stay the plan's",
+            repr(r)[:400])
+    sent, refusal = burst(cust, f"burst@{DOM}", st["p_burst"], 5, "override")
+    D.check(sent == 1 and deferred(refusal), "the override wins: exactly one more, then deferred",
             f"sent={sent} refusal={refusal}")
-    rc, out = mc("submit", "587", f"sales@{DOM}", st["p_sales"], f"sales@{DOM}", f"info@{DOM}",
-                 "--subject", "drive-rate-after")
-    D.check(rc == 2, "and the one after it too", out)
+    r = admin.get("/api/v1/audit?limit=50")
+    D.check(r.status == 200 and "mail.limits_set" in r.raw, "the override is in the audit log", repr(r)[:200])
     rc, out = mc("submit", "587", f"info@{DOM}", st["p_info"], f"info@{DOM}", f"sales@{DOM}",
                  "--subject", "drive-rate-other")
     D.check(rc == 0, "another mailbox of the account still sends", out)
+
+    # Back to a plan without email limits: the server default, never unlimited.
     r = reseller.put("/api/v1/accounts/alice/plan", {"plan_id": plan_id})
-    D.check(r.status == 200, "reseller moves the account back to its plan", repr(r)[:300])
-    r = cust.get(f"{MAIL}/usage")
-    D.check(r.status == 200 and all(v == 0 for v in (r.body.get("limits") or {"x": 1}).values()),
-            "the email limits are unlimited again (0)", repr(r)[:300])
+    D.check(r.status == 200, "reseller moves the account back to its plan (no email limits)", repr(r)[:300])
+    r = reseller.get(f"{MAIL}/usage")
+    D.check(r.status == 200 and eff(r, RATES[0]) == (30, "server_default") and eff(r, RATES[1]) == (20, "server_default")
+            and (r.body.get("account_limits") or {}).get(RATES[1]) == "inherit",
+            "the limits are the server default again (the plan change also ended the override); never unlimited",
+            repr(r)[:400])
+    rc, out = mc("submit", "587", f"burst@{DOM}", st["p_burst"], f"burst@{DOM}", f"info@{DOM}",
+                 "--subject", "drive-after-plan")
+    D.check(rc == 2 and deferred(out), "so burst stays deferred", out)
+    # Unlimited is an explicit choice (the rest of the drive sends freely).
+    r = reseller.put(f"{MAIL}/limits", {RATES[0]: "unlimited", RATES[1]: "unlimited"})
+    D.check(r.status == 200 and eff(r, RATES[0]) == (None, "account") and eff(r, RATES[1]) == (None, "account"),
+            "the reseller makes the sending limits unlimited for this account, explicitly", repr(r)[:400])
     good, rc, out = mc_until(["submit", "587", f"sales@{DOM}", st["p_sales"], f"sales@{DOM}", f"info@{DOM}",
                               "--subject", "drive-rate-lifted"], tries=20)
     D.check(good, "sales sends again once the limit is lifted", out)
+    r = cust.delete(f"{MD}/mailboxes/burst", {"confirm_address": f"burst@{DOM}"})
+    D.check(r.status == 204, "customer deletes burst@alice.test", repr(r)[:300])
 
 
 # ------------------------------------------------------------------ 8. external and back
@@ -767,7 +864,8 @@ def while_suspended(admin, reseller, cust, st):
             "the engine freezes a suspended account's email for its reseller too (409)", repr(r))
     r = admin.put(f"{B}/info/password", {"generate": True})
     D.check(r.status == 409 and r.code == "account_suspended", "and for the administrator (409)", repr(r))
-    r = reseller.put(f"{MAIL}/limits", {"max_mailboxes": 3})
+    r = reseller.put(f"{MAIL}/limits", {"max_mailboxes": 3, "max_messages_per_hour_account": "unlimited",
+                                        "max_messages_per_hour_mailbox": "unlimited"})
     D.check(r.status == 200, "its email limits may still be set (200)", repr(r)[:300])
     rc, out = mc("imap-find", f"info@{DOM}", st["p_info"], "drive-in")
     D.check(rc == 3, "the suspended mailbox cannot log in over IMAPS", out)
@@ -787,8 +885,10 @@ def after_resume(reseller, st):
     good, rc, out = mc_until(["deliver", "25", "a@remote.example", f"info@{DOM}", "--subject", "drive-deferred"],
                              tries=20)
     D.check(good, "and receives mail again", out)
-    r = reseller.put(f"{MAIL}/limits", {"max_mailboxes": 0})
-    D.check(r.status == 200, "its email limits are unlimited again", repr(r)[:200])
+    r = reseller.put(f"{MAIL}/limits", {"max_mailboxes": "unlimited", "max_messages_per_hour_account": "unlimited",
+                                        "max_messages_per_hour_mailbox": "unlimited"})
+    D.check(r.status == 200 and eff(r, "max_mailboxes") == (None, "account"),
+            "its email limits are unlimited again (an explicit override)", repr(r)[:200])
 
 
 # ------------------------------------------------------------------ 16. deleting the account

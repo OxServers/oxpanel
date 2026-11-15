@@ -240,10 +240,35 @@ What stops each attempt (tests: `run-inside.sh` "email", acceptance phase
 - **Symlinks in `~/mail`.** Followed only with the account's own identity
   (delivery, `rm`, `tar`), so they lead nowhere it could not already write.
 - **Abuse of the host's reputation.** Hourly recipient limits per account and
-  per mailbox, for submission, sites and autoresponders alike; forwarders at
+  per mailbox, for submission, sites and autoresponders alike, low by
+  default (30 and 20; an administrator raises them knowingly; unlimited is
+  never the result of a left-out value or a plan change); forwarders at
   most 10 destinations, no loops through this host, Postfix's expansion
   limits; autoresponders answer once per sender per day and never lists,
   bulk or spam-marked mail.
+- **The mail filter's resolver (127.0.0.1:5335).** Customer code can reach
+  loopback listeners, so it can ask this resolver questions, as it can ask
+  any resolver the host can reach: that is no new capability. What it
+  cannot do: reach it from outside (it listens on 127.0.0.1 only and
+  refuses every other address); read or change its configuration
+  (`root:unbound 0640`, written only by the engine) or its cache (no remote
+  control channel); use it for amplification (ANY refused, minimal
+  responses, loopback only); lead it to a listener on the loopback through a
+  delegation (`do-not-query-localhost`); poison its cache (DNSSEC
+  validation where zones are signed, answers accepted only from the server
+  asked, on the random port and ID it used, bailiwick and glue hardening,
+  and a defensive cache flush after many unwanted replies; a customer
+  cannot send from another address than the loopback's, nor from the
+  authority's port while that is in use); or exhaust the host (one thread,
+  at most 512 questions in flight, about 60 MB of caches, `MemoryMax=256M`
+  and no privileges in its unit, at most 1000 questions a second to any one
+  zone's servers). A customer can slow the filter's lookups down with a
+  flood (all local programs share the loopback's address, so the resolver
+  cannot tell the filter from a customer); the filter then lets mail through
+  less well filtered, never stops it (the milter's default is to accept),
+  and the flood is the customer's own CPU. Phase 80 section 16l tries
+  forged answers, ANY, the control channel and a ten-second flood from a
+  customer's account, with a test authority on the loopback (no Internet).
 - **Password guessing.** Dovecot's failure delay; fail2ban jails for Dovecot,
   Postfix's logins and webmail when login banning is on (the loopback is
   never banned: webmail logs in from it). Acceptance phase 18 (installer

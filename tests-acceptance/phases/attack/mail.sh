@@ -28,7 +28,7 @@ features_mail() {
   eventually "victim: the secret message is in the mailbox" 40 0.5 python3 "$MCL" imap-find "info@$VD" "$VPW" VICTIM-SECRET-MAIL
   check "attacker: mail domain $AD" run_ok ctl mail domain-set "$AD" --tenant attack3
   check "attacker: mailbox shop@$AD" bash -c "echo '$APW' | oxpanel-ctl mail mailbox-set shop@$AD --tenant attack3 --password >/dev/null"
-  check "attacker: generous limits for the controls" run_ok ctl mail limits-set attack3 --max-mailboxes 0 --max-mailbox-bytes 0 --per-hour-account 1000 --per-hour-mailbox 1000
+  check "attacker: generous limits for the controls" run_ok ctl mail limits-set attack3 --max-mailboxes unlimited --max-mailbox-bytes unlimited --per-hour-account 1000 --per-hour-mailbox 1000
 
   echo "-- 16a. from the attacker's code (PHP, Python, scheduled task)"
   feat_everywhere mail 30 mail /home/victim1 "$VD" "$AD" /usr/libexec/oxpanel/sendmail
@@ -109,13 +109,13 @@ features_mail() {
   ctl mail forwarder-delete "back@$VD" --tenant victim1 >/dev/null; ctl mail forwarder-delete "fw@$AD" --tenant attack3 >/dev/null
 
   echo "-- 16h. sending limits cannot be bypassed"
-  check "a tight limit for the attacker" run_ok ctl mail limits-set attack3 --max-mailboxes 0 --max-mailbox-bytes 0 --per-hour-account 2 --per-hour-mailbox 0
+  check "a tight limit for the attacker" run_ok ctl mail limits-set attack3 --max-mailboxes unlimited --max-mailbox-bytes unlimited --per-hour-account 2 --per-hour-mailbox unlimited
   for i in 1 2 3; do python3 "$MCL" submit 587 "shop@$AD" "$APW" "shop@$AD" bank@relay.example --subject "rate-$i" >/dev/null 2>&1 || true; done
   check "over the limit, submission is deferred" bash -c "python3 $MCL submit 587 shop@$AD '$APW' shop@$AD bank@relay.example | grep -q 45"
   check "over the limit, the site's sendmail is held too" bash -c "printf 'From: shop@$AD\nTo: bank@relay.example\nSubject: x\n\nx\n' | setpriv --reuid=attack3 --regid=attack3 --clear-groups --no-new-privs -- /usr/sbin/oxpanel-daemon sendmail -t; test \$? -eq 75"
   check "the loopback's port 25 does not send out instead" bash -c "python3 $MCL deliver 25 shop@$AD bank@relay.example | grep -q 'Relay access denied'"
   check "Postfix's sendmail is not available to the attacker" bash -c "! printf 'Subject: x\n\nx\n' | setpriv --reuid=attack3 --regid=attack3 --clear-groups --no-new-privs -- /usr/sbin/sendmail.postfix -f shop@$AD bank@relay.example 2>/dev/null"
-  ctl mail limits-set attack3 --max-mailboxes 0 --max-mailbox-bytes 0 --per-hour-account 1000 --per-hour-mailbox 1000 >/dev/null
+  ctl mail limits-set attack3 --max-mailboxes unlimited --max-mailbox-bytes unlimited --per-hour-account 1000 --per-hour-mailbox 1000 >/dev/null
 
   echo "-- 16i. autoresponders: backscatter and loops"
   check "victim: an autoresponder" run_ok ctl mail autoreply "info@$VD" --tenant victim1 --subject victim-away --body 'Away.'
@@ -153,6 +153,62 @@ PY
   check_not "a suspended customer's mailbox cannot log in" python3 "$MCL" imap-count "info@$VD" "$VPW"
   check "mail for it is deferred, not bounced" bash -c "python3 $MCL deliver 25 a@remote.example info@$VD | grep -q 450"
   check "resume the victim" run_ok ctl tenant resume victim1
+
+  echo "-- 16l. the mail filter's resolver (127.0.0.1:5335), from the attacker's code"
+  if systemctl -q is-active oxpanel-mail-resolver; then
+    local RLOG=/root/acc/attack-authority.log RCONF=/etc/oxpanel-mail-resolver/local.d/oxacc-attack.conf
+    : > "$RLOG"; pkill -f 'mail-client.py authority' 2>/dev/null || true
+    nohup python3 "$MCL" authority 5399 oxresolve.test "$RLOG" >/dev/null 2>&1 &
+    printf 'server:\n  do-not-query-localhost: no\n  domain-insecure: "oxresolve.test"\n  local-zone: "test." nodefault\nstub-zone:\n  name: "oxresolve.test"\n  stub-addr: 127.0.0.1@5399\n' > "$RCONF"
+    chgrp unbound "$RCONF"; chmod 0640 "$RCONF"; systemctl reload oxpanel-mail-resolver
+    eventually "the test authority answers through the resolver" 20 0.5 bash -c "dig +short +tries=1 +time=2 @127.0.0.1 -p 5335 ready.oxresolve.test A | grep -qx 192.0.2.53"
+    asa3() { setpriv --reuid=attack3 --regid=attack3 --clear-groups --no-new-privs -- "$@"; }
+    check "the attacker cannot read the resolver's configuration" bash -c "! setpriv --reuid=attack3 --regid=attack3 --clear-groups --no-new-privs -- cat /etc/oxpanel-mail-resolver/unbound.conf 2>/dev/null"
+    check "ANY questions are refused (no amplification)" bash -c "setpriv --reuid=attack3 --regid=attack3 --clear-groups --no-new-privs -- dig +tries=1 +time=3 @127.0.0.1 -p 5335 ready.oxresolve.test ANY | grep -q 'status: NOTIMP'"
+    check "no remote control to flush or change it (nothing on 8953)" bash -c '! ss -Hltn "sport = :8953" | grep -q LISTEN'
+    check "unbound-control cannot reach it" bash -c "! timeout 10 unbound-control -s 127.0.0.1@5335 status >/dev/null 2>&1"
+    # Forged answers: the attacker races the resolver for a name it is about
+    # to look up, sending answers with every ID to the loopback's ports.
+    asa3 python3 - <<'PY' &
+import socket, struct, time, random
+def ans(qid, name, ip):
+    q = b"".join(bytes([len(l)]) + l.encode() for l in name.split(".")) + b"\0" + struct.pack(">HH", 1, 1)
+    return struct.pack(">HHHHHH", qid, 0x8400, 1, 1, 0, 0) + q + b"\xc0\x0c" + struct.pack(">HHIH", 1, 1, 86400, 4) + bytes(ip)
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+end = time.time() + 8
+while time.time() < end:
+    pkt = ans(random.randrange(65536), "poison.oxresolve.test", [6, 6, 6, 6])
+    for port in (5335, random.randrange(32768, 61000)):
+        try: s.sendto(pkt, ("127.0.0.1", port))
+        except OSError: pass
+PY
+    sleep 1
+    check "forged answers do not get into the cache" bash -c "test \"\$(dig +short +tries=1 +time=5 @127.0.0.1 -p 5335 poison.oxresolve.test A)\" = 192.0.2.53"
+    wait
+    # Exhaustion: a flood of random names for ten seconds.
+    asa3 python3 - <<'PY'
+import socket, struct, time, random, string
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM); s.setblocking(False)
+end, n = time.time() + 10, 0
+while time.time() < end:
+    name = "".join(random.choice(string.ascii_lowercase) for _ in range(20)) + ".flood.oxresolve.test"
+    q = b"".join(bytes([len(l)]) + l.encode() for l in name.split(".")) + b"\0" + struct.pack(">HH", 1, 1)
+    try: s.sendto(struct.pack(">HHHHHH", random.randrange(65536), 0x0100, 1, 0, 0, 0) + q, ("127.0.0.1", 5335)); n += 1
+    except OSError: time.sleep(0.001)
+print(f"flood: {n} questions sent")
+PY
+    check "after the flood the resolver still runs" systemctl -q is-active oxpanel-mail-resolver
+    info "resolver memory after the flood: $(( $(systemctl show -P MemoryCurrent oxpanel-mail-resolver) / 1048576 )) MiB (cap 256 MiB); questions the test authority saw: $(grep -c flood "$RLOG")"
+    check "its memory stays under the unit's cap" test "$(systemctl show -P MemoryCurrent oxpanel-mail-resolver)" -lt 268435456
+    eventually "and it answers the filter's questions again within seconds" 30 1 bash -c "dig +short +tries=1 +time=2 @127.0.0.1 -p 5335 after-flood.oxresolve.test A | grep -qx 192.0.2.53"
+    local PROBE="atk$RANDOM.oxresolve.test"
+    check "the filter's lookups go through after the flood" python3 "$MCL" deliver 25 "a@$PROBE" "info@$VD" --subject after-flood
+    eventually "(the test authority saw the filter's question)" 60 0.5 grep -q "$PROBE" "$RLOG"
+    pkill -f 'mail-client.py authority' 2>/dev/null || true
+    rm -f "$RCONF"; systemctl reload oxpanel-mail-resolver
+  else
+    info "the mail filter's resolver is not running here: 16l skipped"
+  fi
 
   echo "-- 16 teardown"
   ctl mail mailbox-delete "info@$VD" --tenant victim1 >/dev/null 2>&1; ctl mail mailbox-delete "sales@$VD" --tenant victim1 >/dev/null 2>&1

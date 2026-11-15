@@ -96,7 +96,7 @@ case "$INSTALL" in
     check "enable the Node.js 22 module stream" dnf -y -q module enable nodejs:22
     check "dnf install of the old RPM" dnf -y -q install "./$OLD"
     check "enable and start services" systemctl enable --now nginx oxpanel-daemon
-    check "the old engine is what is installed" bash -c "rpm -q --qf '%{VERSION}' oxpanel-daemon | grep -q '^0\.2\.'"
+    check "the old engine is what is installed (0.2.x, or 0.3.0 with email)" bash -c "rpm -q --qf '%{VERSION}' oxpanel-daemon | grep -Eq '^0\.(2\.|3\.0$)'"
     info "old version: $(oxpanel-daemon --version)"
     ;;
   git)

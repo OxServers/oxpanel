@@ -21,6 +21,7 @@ if [ "${SKIP_INSTALL:-0}" != 1 ]; then
   install -Dm0644 /work/packaging/systemd/oxpanel-dns.service /etc/systemd/system/oxpanel-dns.service
   install -Dm0644 /work/packaging/systemd/oxpanel-mail-policy.service /etc/systemd/system/oxpanel-mail-policy.service
   install -Dm0644 /work/packaging/systemd/oxpanel-webmail.service /etc/systemd/system/oxpanel-webmail.service
+  install -Dm0644 /work/packaging/systemd/oxpanel-mail-resolver.service /etc/systemd/system/oxpanel-mail-resolver.service
   if [ -d /etc/php.d ]; then install -Dm0644 /work/packaging/php.d/90-oxpanel-mail.ini /etc/php.d/90-oxpanel-mail.ini; fi
   install -Dm0644 /work/packaging/sysusers.d/oxpanel.conf /usr/lib/sysusers.d/oxpanel.conf
   install -Dm0644 /work/packaging/tmpfiles.d/oxpanel.conf /usr/lib/tmpfiles.d/oxpanel.conf
@@ -2472,6 +2473,7 @@ if [ -x /usr/sbin/postfix ] && [ -x /usr/sbin/dovecot ] && [ -x /usr/bin/rspamd 
     chown -R _rspamd:_rspamd /var/lib/rspamd /var/log/rspamd
     [ -f /etc/nginx/default.d/roundcubemail.conf ] && echo '# OxPanel serves webmail as webmail.<domain>.' > /etc/nginx/default.d/roundcubemail.conf
     printf '%s\n' OXPANEL_MAIL=true OXPANEL_MAIL_HOSTNAME=mail.oxtest.example >> /etc/oxpanel/daemon.env
+    if [ -x /usr/sbin/unbound ]; then echo OXPANEL_MAIL_RESOLVER=true >> /etc/oxpanel/daemon.env; fi
   fi
   # DNS hosting on as well, so the mail records are served and DKIM can be
   # checked against the published key.
@@ -2601,7 +2603,7 @@ if [ -x /usr/sbin/postfix ] && [ -x /usr/sbin/dovecot ] && [ -x /usr/bin/rspamd 
   check "switched off, its script is gone" test ! -e /var/lib/oxpanel-mail/sieve/mx1.oxtest/info.sieve
 
   echo "-- quota"
-  check "a mailbox size above the account's limit is refused" bash -c "oxpanel-ctl mail limits-set mailx --max-mailboxes 3 --max-mailbox-bytes 104857600 --per-hour-account 0 --per-hour-mailbox 0 >/dev/null && oxpanel-ctl mail mailbox-set info@mx1.oxtest --tenant mailx --quota 209715200 2>&1 | grep -q mailbox_quota_above_limit"
+  check "a mailbox size above the account's limit is refused" bash -c "oxpanel-ctl mail limits-set mailx --max-mailboxes 3 --max-mailbox-bytes 104857600 --per-hour-account unlimited --per-hour-mailbox unlimited >/dev/null && oxpanel-ctl mail mailbox-set info@mx1.oxtest --tenant mailx --quota 209715200 2>&1 | grep -q mailbox_quota_above_limit"
   check "a message larger than the mailbox's room is not delivered" mc deliver 25 big@remote.example info@mx1.oxtest --subject too-big --size 3000000
   check "the mail server says the mailbox is full" eventually 30 bash -c "journalctl -u postfix --no-pager | grep -q 'to=<info@mx1.oxtest>.*status=bounced.*\(full\|quota\)'"
   check_not "the oversized message is not in the mailbox" mc imap-find info@mx1.oxtest "$PX" too-big
@@ -2610,18 +2612,60 @@ if [ -x /usr/sbin/postfix ] && [ -x /usr/sbin/dovecot ] && [ -x /usr/bin/rspamd 
   check "the account's mailbox limit is enforced (mailbox_limit_reached)" grep -q 'mailbox_limit_reached' <(echo "$PX" | oxpanel-ctl mail mailbox-set four@mx1.oxtest --tenant mailx --password 2>&1 || true)
 
   echo "-- sending limits"
-  oxpanel-ctl mail limits-set mailx --max-mailboxes 0 --max-mailbox-bytes 0 --per-hour-account 0 --per-hour-mailbox 2 >/dev/null
+  oxpanel-ctl mail limits-set mailx --max-mailboxes unlimited --max-mailbox-bytes unlimited --per-hour-account unlimited --per-hour-mailbox 2 >/dev/null
   sent="$(sed -n 's/.*sent_this_hour=\([0-9]*\).*/\1/p' <(oxpanel-ctl mail usage mailx))"
   check "usage counts what the account sent this hour" test "${sent:-0}" -ge 3
   mc submit 587 two@mx1.oxtest "$PX" two@mx1.oxtest info@my1.oxtest --subject rate-1 >/dev/null || true
   mc submit 587 two@mx1.oxtest "$PX" two@mx1.oxtest info@my1.oxtest --subject rate-2 >/dev/null || true
   check "the mailbox's hourly limit defers the next message (4xx)" bash -c "python3 $MC submit 587 two@mx1.oxtest '$PX' two@mx1.oxtest info@my1.oxtest --subject rate-3 | grep -q '45[0-9]'"
-  oxpanel-ctl mail limits-set mailx --max-mailboxes 0 --max-mailbox-bytes 0 --per-hour-account 1 --per-hour-mailbox 0 >/dev/null
+  oxpanel-ctl mail limits-set mailx --max-mailboxes unlimited --max-mailbox-bytes unlimited --per-hour-account 1 --per-hour-mailbox unlimited >/dev/null
   if [ -x /usr/bin/php ]; then
     check_not "a site is held to the account's hourly limit too" phpmail mailx wordpress@mx1.oxtest info@my1.oxtest site-over-limit
     check "and sendmail says to try later (EX_TEMPFAIL)" bash -c "printf 'From: wp@mx1.oxtest\nTo: info@my1.oxtest\nSubject: x\n\nx\n' | setpriv --reuid=mailx --regid=mailx --clear-groups --no-new-privs -- /usr/sbin/oxpanel-daemon sendmail -t; test \$? -eq 75"
   fi
-  oxpanel-ctl mail limits-set mailx --max-mailboxes 0 --max-mailbox-bytes 0 --per-hour-account 0 --per-hour-mailbox 0 >/dev/null
+
+  echo "-- email limits: account and plan layers over the host default"
+  DEFAULTS_BEFORE="$(oxpanel-ctl mail defaults | sed -n 's/^defaults: //p')"
+  ctl_rate() { python3 -c 'import json,sys; a=json.load(open("/var/lib/oxpanel-mail/policy.json"))["accounts"][sys.argv[1]]; print(a["rate_account"], a["rate_mailbox"])' "$1"; }
+  check "0 is not a limit (unlimited is said explicitly)" bash -c '! oxpanel-ctl mail limits-set mailx --per-hour-account 0 2>/dev/null'
+  check "the built-in defaults are low sending limits, the rest unlimited" grep -qx 'builtin: max_mailboxes=unlimited max_mailbox_bytes=unlimited per_hour_account=30 per_hour_mailbox=20' <(oxpanel-ctl mail defaults)
+  oxpanel-ctl mail defaults-set --per-hour-account 30 --per-hour-mailbox 20 >/dev/null
+  check "an account that sets nothing follows the host default" grep -q 'per_hour_account=30(default) per_hour_mailbox=20(default)$' <(oxpanel-ctl mail limits-set mailx | head -1)
+  check "and so does the policy service" test "$(ctl_rate mailx)" = "30 20"
+  check "a host default is never inherit" bash -c '! oxpanel-ctl mail defaults-set --per-hour-account inherit 2>/dev/null'
+  oxpanel-ctl mail defaults-set --per-hour-account 45 >/dev/null
+  check "a new host default reaches the account at once" grep -q 'per_hour_account=45(default) per_hour_mailbox=20(default)$' <(oxpanel-ctl mail limits mailx | head -1)
+  check "the policy service has it" eventually 10 test "$(ctl_rate mailx)" = "45 20"
+  check "a plan value beats the default" grep -q 'per_hour_account=100(plan)' <(oxpanel-ctl mail limits-set mailx --layer plan --per-hour-account 100 | head -1)
+  check "an account override beats the plan" grep -q 'per_hour_account=7(account) per_hour_mailbox=20(default)$' <(oxpanel-ctl mail limits-set mailx --per-hour-account 7 | head -1)
+  check "unlimited only when said" grep -q 'per_hour_account=unlimited(account)' <(oxpanel-ctl mail limits-set mailx --per-hour-account unlimited | head -1)
+  check "the layers are shown as set" grep -qx 'plan: max_mailboxes=inherit max_mailbox_bytes=inherit per_hour_account=100 per_hour_mailbox=inherit' <(oxpanel-ctl mail limits mailx)
+  oxpanel-ctl mail limits-set mailx --layer plan >/dev/null
+  # The host default as it was (the values printed are what the engine had).
+  read -r -a d_args < <(sed 's/max_mailboxes=/--max-mailboxes /; s/max_mailbox_bytes=/--max-mailbox-bytes /; s/per_hour_account=/--per-hour-account /; s/per_hour_mailbox=/--per-hour-mailbox /' <<<"$DEFAULTS_BEFORE")
+  check "the host default is put back" oxpanel-ctl mail defaults-set "${d_args[@]}"
+  oxpanel-ctl mail limits-set mailx --max-mailboxes unlimited --max-mailbox-bytes unlimited --per-hour-account unlimited --per-hour-mailbox unlimited >/dev/null
+
+  echo "-- the mail filter's own resolver"
+  if [ -x /usr/sbin/unbound ] && grep -q '^OXPANEL_MAIL_RESOLVER=true' /etc/oxpanel/daemon.env; then
+    check "the resolver runs (started by the daemon)" eventually 60 systemctl -q is-active oxpanel-mail-resolver
+    check "as Unbound's account" test "$(ps -o user= -C unbound | head -1)" = "unbound"
+    check "it listens on 127.0.0.1:5335 only" bash -c 'test "$(ss -Hlun "sport = :5335" | awk "{print \$4}" | sort -u)" = "127.0.0.1:5335"'
+    check "its configuration passes Unbound's own check" unbound-checkconf /etc/oxpanel-mail-resolver/unbound.conf
+    check "only Unbound's account and root can read it" test "$(stat -c '%U:%G %a' /etc/oxpanel-mail-resolver/unbound.conf)" = "root:unbound 640"
+    check "the filter asks it" grep -q 'nameserver = \["127.0.0.1:5335"\]' /etc/rspamd/local.d/options.inc
+    check "/etc/resolv.conf does not name it" bash -c '! grep -q 5335 /etc/resolv.conf'
+    check "it refuses ANY questions" bash -c 'dig +tries=1 +time=5 @127.0.0.1 -p 5335 example.org ANY | grep -q "status: NOTIMP"'
+    check "the engine reports it" grep -q 'filter_resolver=true' <(oxpanel-ctl mail host | head -1)
+    systemctl stop oxpanel-mail-resolver
+    check "stopped, it is reported" eventually 10 bash -c 'oxpanel-ctl mail host | grep -q "^warning: \[filter_resolver_down\]"'
+    check "and mail still flows (the filter without DNS)" mc deliver 25 a@remote.example info@mx1.oxtest --subject resolver-down
+    check "it arrives" eventually 60 mc imap-find info@mx1.oxtest "$PX" resolver-down
+    systemctl start oxpanel-mail-resolver
+    check "started again, no warning" eventually 20 bash -c '! oxpanel-ctl mail host | grep -q filter_resolver_down'
+  else
+    echo "skip - Unbound not installed or OXPANEL_MAIL_RESOLVER not on"
+  fi
 
   echo "-- disabled mailbox, password change, suspension"
   oxpanel-ctl mail mailbox-set three@mx1.oxtest --tenant mailx --disabled >/dev/null
@@ -2751,7 +2795,7 @@ if [ -x /usr/sbin/postfix ] && [ -x /usr/sbin/dovecot ] && [ -x /usr/bin/rspamd 
   fi
   cp -p "$ME/daemon.env.bak" /etc/oxpanel/daemon.env
   if [ "$dns_for_mail" = 1 ]; then systemctl disable --now oxpanel-dns >/dev/null 2>&1 || true; fi
-  if [ "$mail_was_on" = 0 ]; then systemctl disable --now oxpanel-mail-policy oxpanel-webmail >/dev/null 2>&1 || true; fi
+  if [ "$mail_was_on" = 0 ]; then systemctl disable --now oxpanel-mail-policy oxpanel-webmail oxpanel-mail-resolver >/dev/null 2>&1 || true; fi
   systemctl restart oxpanel-daemon
   if [ "$mail_was_on" = 0 ]; then check "email off again" grep -q '^enabled=false ' <(oxpanel-ctl mail host); fi
 else

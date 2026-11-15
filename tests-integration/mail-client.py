@@ -10,6 +10,10 @@ only, plus the openssl command for DKIM).
     mail-client.py pop3 USER PASS
     mail-client.py auth-before-tls PORT          (0 if AUTH is not offered before STARTTLS)
     mail-client.py dkim-verify FILE PUBKEY_B64   (0 if the DKIM-Signature verifies)
+    mail-client.py authority PORT ZONE LOGFILE  (a tiny authoritative DNS server on
+                                                 127.0.0.1:PORT for ZONE: A 192.0.2.53 and
+                                                 TXT "v=spf1 -all" for every name in it;
+                                                 logs "name type" per question; runs until killed)
 
 Exit status: 0 accepted / found / verified, 2 refused by the server,
 3 login failed, 4 not found, 1 anything else.
@@ -292,6 +296,50 @@ def dkim_verify(args):
     return 0 if r.returncode == 0 else 2
 
 
+def authority(args):
+    """Answers every question for a name in ZONE (no network beyond the
+    loopback: the resolver tests never depend on the Internet)."""
+    import socket
+    import struct
+    port, zone, logfile = args
+    zone = zone.lower().rstrip(".")
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind(("127.0.0.1", int(port)))
+    log = open(logfile, "a", buffering=1)
+    while True:
+        data, peer = sock.recvfrom(4096)
+        if len(data) < 12:
+            continue
+        qid, flags, qd = struct.unpack(">HHH", data[:6])
+        i, labels = 12, []
+        while i < len(data) and data[i] != 0:
+            n = data[i]
+            labels.append(data[i + 1 : i + 1 + n].decode("ascii", "replace"))
+            i += 1 + n
+        i += 1
+        if qd != 1 or i + 4 > len(data):
+            continue
+        qtype, qclass = struct.unpack(">HH", data[i : i + 4])
+        question = data[12 : i + 4]
+        name = ".".join(labels).lower()
+        log.write(f"{name} {qtype}\n")
+        inside = name == zone or name.endswith("." + zone)
+        answers = b""
+        count = 0
+        if inside and qtype == 1:
+            answers = b"\xc0\x0c" + struct.pack(">HHIH", 1, 1, 60, 4) + bytes([192, 0, 2, 53])
+            count = 1
+        elif inside and qtype == 16:
+            txt = b"v=spf1 -all"
+            answers = b"\xc0\x0c" + struct.pack(">HHIH", 16, 1, 60, len(txt) + 1) + bytes([len(txt)]) + txt
+            count = 1
+        rcode = 0 if inside else 5  # REFUSED outside the zone
+        # QR, AA, RD copied, rcode
+        rflags = 0x8400 | (flags & 0x0100) | rcode
+        reply = struct.pack(">HHHHHH", qid, rflags, 1, count, 0, 0) + question + answers
+        sock.sendto(reply, peer)
+
+
 def main():
     cmd, args = sys.argv[1], sys.argv[2:]
     return {
@@ -303,6 +351,7 @@ def main():
         "pop3": pop3,
         "auth-before-tls": auth_before_tls,
         "dkim-verify": dkim_verify,
+        "authority": authority,
     }[cmd](args)
 
 

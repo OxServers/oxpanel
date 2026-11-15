@@ -125,7 +125,8 @@ password, or containing the local part or the domain's first label. At most
   the daemon binary) with the null sender; they count against the account.
 - **Limits**: recipients per clock hour (UTC) for the account (all its
   mailboxes and sites) and for each mailbox, from `SetMailLimits` or the host
-  defaults (500 / 200). Submission is checked at the end of each message by
+  defaults (30 / 20 since engine 0.3.1, 500 / 200 before; see
+  `2026-11-15-mail-defaults-design.md`). Submission is checked at the end of each message by
   the policy service (`DEFER_IF_PERMIT`, a 450: the client tries later);
   site mail fails with `EX_TEMPFAIL` (75). Counters are in
   `/var/lib/oxpanel-mail/usage/usage.json` (survive restarts);

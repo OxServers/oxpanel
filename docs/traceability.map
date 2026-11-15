@@ -838,6 +838,24 @@
   unit mail/tests limits_and_usage
   sh tests-integration/run-inside.sh the mailbox's hourly limit defers the next message (4xx)
   sh tests-integration/run-inside.sh and sendmail says to try later (EX_TEMPFAIL)
+  unit mail/tests limit_layers_plan_changes_and_live_defaults
+  unit mail/tests limits_records_of_engine_0_3_0_are_migrated
+  unit mail/limits account_over_plan_over_default
+  unit mail/limits legacy_records_migrate
+  sh tests-integration/run-inside.sh an account override beats the plan
+  sh tests-acceptance/phases/12-upgrade.sh upgd held exactly the old defaults: it follows the host default now
+[Email] Host default email limits
+  unit mail/limits the_built_in_defaults_are_low_sending_limits
+  unit mail/limits a_default_change_reaches_the_accounts_that_follow_it_only
+  unit mail/tests host_defaults_survive_an_interrupted_change_and_fail_closed
+  sh tests-integration/run-inside.sh a new host default reaches the account at once
+  sh tests-integration/run-inside.sh a host default is never inherit
+[Email] Filter resolver
+  unit mail/tests the_filter_resolver_is_configured_started_and_watched
+  unit mail/tests without_the_setting_the_resolver_is_left_alone
+  sh tests-integration/run-inside.sh it listens on 127.0.0.1:5335 only
+  sh tests-acceptance/phases/18-mail.sh it answers a name of the test authority
+  sh tests-acceptance/phases/18-mail.sh the filter asked about the sender's domain, through its resolver, at the test authority
 [Email] DKIM
   unit mail/tests rotating_the_dkim_key_with_dns_elsewhere_waits_until_the_new_record_is_seen
   unit mail/tests a_forced_rotation_signs_with_the_new_key_at_once

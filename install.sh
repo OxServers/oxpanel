@@ -50,8 +50,9 @@ OPT_IGNORE_IP="" OPT_PANEL_SCOPES="" OPT_PANEL_RPM="" OPT_REPO_URL="" OPT_ANSWER
 OPT_PANEL_PORT="" OPT_PANEL_HOSTNAME="" OPT_PANEL_ADMIN="" OPT_NO_PANEL="" OPT_PURGE_PANEL=""
 OPT_DNS="" OPT_DNS_NAMESERVERS="" OPT_DNS_CONTACT="" OPT_DNS_IPV4="" OPT_DNS_IPV6="" OPT_DISABLE_STOCK_NAMED=""
 DNS_KEYS='^OXPANEL_DNS(_NAMESERVERS|_SOA_CONTACT|_IPV4|_IPV6)?='
-OPT_MAIL="" OPT_MAIL_HOSTNAME="" OPT_MAIL_ANTIVIRUS="" OPT_MAIL_WEBMAIL="" OPT_PURGE_MAIL=""
-MAIL_KEYS='^OXPANEL_MAIL(_HOSTNAME|_WEBMAIL|_ANTIVIRUS)?='
+OPT_MAIL="" OPT_MAIL_HOSTNAME="" OPT_MAIL_ANTIVIRUS="" OPT_MAIL_WEBMAIL="" OPT_PURGE_MAIL="" OPT_MAIL_RESOLVER=""
+MAIL_KEYS='^OXPANEL_MAIL(_HOSTNAME|_WEBMAIL|_ANTIVIRUS|_RESOLVER)?='
+RESOLVER_DIR=/etc/oxpanel-mail-resolver
 MAIL_JAIL_FILE=/etc/fail2ban/jail.d/50-oxpanel-mail.local
 MAIL_FILTER_FILE=/etc/fail2ban/filter.d/oxpanel-webmail.conf
 RSPAMD_REPO_FILE=/etc/yum.repos.d/rspamd.repo
@@ -158,6 +159,12 @@ Email (optional; mailboxes, forwarders, webmail for the customers' domains)
   --mail-antivirus      also install ClamAV and scan mail with it (off by default:
                         it needs about 1 GB of memory)
   --no-webmail          no Roundcube (webmail is on by default with --mail)
+  --no-mail-resolver    no local DNS resolver for the mail filter. By default --mail
+                        installs Unbound (AlmaLinux) and runs it for Rspamd only, on
+                        127.0.0.1:5335 (oxpanel-mail-resolver.service): blocklists such
+                        as Spamhaus refuse questions that come through public
+                        resolvers. /etc/resolv.conf is not changed. Use this option
+                        when the host already has a suitable local resolver
   --purge-mail          with --uninstall: also delete the mail configuration and
                         state OxPanel wrote, and put the distribution's Postfix and
                         Dovecot configuration back (mailboxes in the homes stay)
@@ -233,6 +240,8 @@ parse_args() {
       --no-webmail) OPT_MAIL_WEBMAIL=no;;
       --webmail) OPT_MAIL_WEBMAIL=yes;;
       --purge-mail) OPT_PURGE_MAIL=yes;;
+      --mail-resolver) OPT_MAIL_RESOLVER=yes;;
+      --no-mail-resolver) OPT_MAIL_RESOLVER=no;;
       --panel-scopes) [ $# -ge 2 ] || die "--panel-scopes needs a value"; OPT_PANEL_SCOPES="$2"; shift;;
       -*) die "unknown option: $1 (see --help)";;
       *) ENGINE_RPM="$1";;
@@ -293,6 +302,7 @@ load_answers() {
       mail_hostname) [ -n "$OPT_MAIL_HOSTNAME" ] || OPT_MAIL_HOSTNAME="$val";;
       mail_antivirus) [ -n "$OPT_MAIL_ANTIVIRUS" ] || OPT_MAIL_ANTIVIRUS="$(yesno_value "$key" "$val")";;
       webmail) [ -n "$OPT_MAIL_WEBMAIL" ] || OPT_MAIL_WEBMAIL="$(yesno_value "$key" "$val")";;
+      mail_resolver) [ -n "$OPT_MAIL_RESOLVER" ] || OPT_MAIL_RESOLVER="$(yesno_value "$key" "$val")";;
       *) die "$OPT_ANSWERS:$n: unknown key '$key'";;
     esac
   done <"$OPT_ANSWERS"
@@ -566,12 +576,21 @@ mail_env_lines() {
       echo "OXPANEL_MAIL_HOSTNAME=$OPT_MAIL_HOSTNAME"
       if [ "$OPT_MAIL_WEBMAIL" = no ]; then echo "OXPANEL_MAIL_WEBMAIL=false"; else echo "OXPANEL_MAIL_WEBMAIL=true"; fi
       if [ "$OPT_MAIL_ANTIVIRUS" = yes ]; then echo "OXPANEL_MAIL_ANTIVIRUS=true"; else echo "OXPANEL_MAIL_ANTIVIRUS=false"; fi
+      if resolver_wanted && installed unbound; then echo "OXPANEL_MAIL_RESOLVER=true"; else echo "OXPANEL_MAIL_RESOLVER=false"; fi
       ;;
     no) ;;
     *) env_block_current | grep -E "$MAIL_KEYS" || true;;
   esac
 }
 
+# The mail filter's own resolver: with --mail unless --no-mail-resolver; a run
+# that does not mention email keeps what the block says (a block from before
+# 0.3.1 has no such line: no resolver until the next run with --mail).
+resolver_wanted() {
+  [ "$OPT_MAIL_RESOLVER" != no ] || return 1
+  [ "$OPT_MAIL" = yes ] && return 0
+  [ -z "$OPT_MAIL" ] && env_block_current | grep -qx 'OXPANEL_MAIL_RESOLVER=true'
+}
 mail_packages_present() { installed postfix && installed dovecot && installed dovecot-pigeonhole && installed rspamd; }
 mail_in_block() { env_block_current | grep -qx 'OXPANEL_MAIL=true'; }
 mail_wanted() { [ "$OPT_MAIL" = yes ] || { [ -z "$OPT_MAIL" ] && mail_in_block; }; }
@@ -764,6 +783,7 @@ ROUNDCUBE_NGINX_NOTE="# OxPanel: Roundcube is served by OxPanel as webmail.<doma
 # The services the engine runs for email once it is on.
 mail_units() {
   local u="postfix dovecot rspamd oxpanel-mail-policy"
+  if resolver_wanted && installed unbound; then u="$u oxpanel-mail-resolver"; fi
   if [ "$OPT_MAIL_WEBMAIL" != no ] && installed roundcubemail; then u="$u oxpanel-webmail"; fi
   echo "$u"
 }
@@ -806,7 +826,7 @@ stage_mail() {
     fi
     if [ "$OPT_MAIL" = no ]; then
       local u
-      for u in oxpanel-mail-policy oxpanel-webmail; do
+      for u in oxpanel-mail-policy oxpanel-webmail oxpanel-mail-resolver; do
         if unit_active "$u" || unit_enabled "$u"; then run systemctl disable --now "$u" || true; changed "$u stopped and disabled (--no-mail)"; fi
       done
       note "email is off; Postfix, Dovecot and Rspamd were left as they are (stop them yourself if nothing else uses them)"
@@ -827,6 +847,7 @@ stage_mail() {
   fi
   if [ "$OPT_MAIL_WEBMAIL" != no ]; then pkgs="$pkgs roundcubemail php-pdo php-fpm php-cli"; fi
   if [ "$OPT_MAIL_ANTIVIRUS" = yes ]; then pkgs="$pkgs clamav clamd clamav-update"; fi
+  if resolver_wanted; then pkgs="$pkgs unbound"; fi
   for pkg in $pkgs; do installed "$pkg" || missing="$missing $pkg"; done
   if [ -n "$missing" ]; then
     # shellcheck disable=SC2086  # a list of package names on purpose
@@ -852,6 +873,17 @@ stage_mail() {
     if unit_active nginx; then run nginx -t || return 1; run systemctl reload nginx || return 1; fi
   fi
   if [ "$OPT_MAIL_ANTIVIRUS" = yes ]; then mail_antivirus_setup || return 1; fi
+  if resolver_wanted; then
+    # The distribution's timer keeps the DNSSEC root key the resolver reads
+    # (/var/lib/unbound/root.key) up to date; unbound.service itself stays as
+    # it is (not used, not started).
+    if ! unit_enabled unbound-anchor.timer || ! unit_active unbound-anchor.timer; then
+      run systemctl enable --now unbound-anchor.timer || return 1; changed "unbound-anchor.timer enabled (keeps the DNSSEC root key current)"
+    fi
+    note "the mail filter asks its own resolver (oxpanel-mail-resolver, Unbound on 127.0.0.1:5335); /etc/resolv.conf is unchanged"
+  elif [ "$OPT_MAIL_RESOLVER" = no ]; then
+    note "the mail filter uses the system's resolver (--no-mail-resolver); blocklists may refuse its questions if that is a public resolver"
+  fi
   note "OxPanel now owns /etc/postfix/main.cf, master.cf and /etc/dovecot/dovecot.conf (the originals are kept as *.oxpanel-orig)"
   rm -f "$FLAG_DIR/env-changed"
   engine_env_block
@@ -1232,7 +1264,7 @@ do_uninstall() {
   # Email: OxPanel's own services stop with the engine (the package removal
   # would stop them too; done here so the order is clear).
   local u had_mail=0
-  for u in oxpanel-mail-policy oxpanel-webmail; do
+  for u in oxpanel-mail-policy oxpanel-webmail oxpanel-mail-resolver; do
     if unit_active "$u" || unit_enabled "$u"; then run systemctl disable --now "$u" || true; say "stopped: $u"; had_mail=1; fi
   done
   if [ -d /var/lib/oxpanel-mail ]; then had_mail=1; fi
@@ -1262,7 +1294,7 @@ do_uninstall() {
   if [ "$had_mail" -eq 1 ] && [ "$OPT_PURGE_MAIL" != yes ]; then
     say "  - email: the mailboxes (in the homes, ~/mail), the mail records in /var/lib/oxpanel/mail, DKIM keys and"
     say "    the policy map in /var/lib/oxpanel-mail, Roundcube's database in /var/lib/oxpanel-webmail, the configuration"
-    say "    OxPanel wrote for Postfix, Dovecot, Rspamd and Nginx. Postfix and Dovecot keep receiving and serving mail, but"
+    say "    OxPanel wrote for Postfix, Dovecot, Rspamd, Nginx and the filter's resolver ($RESOLVER_DIR; the resolver stopped with the package). Postfix and Dovecot keep receiving and serving mail, but"
     say "    mailboxes and sites CANNOT SEND until a reinstall (the mail policy service went with the package), and webmail"
     say "    is down. --purge-mail deletes OxPanel's mail configuration and puts the distribution's back"
   fi
@@ -1285,7 +1317,8 @@ uninstall_mail() {
     if [ -e "$f.oxpanel-orig" ]; then mv -f "$f.oxpanel-orig" "$f"; quiet restorecon "$f" || true; say "restored: $f (the distribution's, from $f.oxpanel-orig)"; any=1; fi
   done
   for d in /etc/postfix/oxpanel /etc/dovecot/oxpanel /var/lib/oxpanel-mail /etc/oxpanel-webmail /var/lib/oxpanel-webmail \
-           /var/spool/postfix/oxpanel-milter /etc/pki/oxpanel-mail /etc/nginx/conf.d/oxpanel-mail.conf "$MAIL_JAIL_FILE" "$MAIL_FILTER_FILE"; do
+           /var/spool/postfix/oxpanel-milter /etc/pki/oxpanel-mail /etc/nginx/conf.d/oxpanel-mail.conf "$MAIL_JAIL_FILE" "$MAIL_FILTER_FILE" \
+           "$RESOLVER_DIR"; do
     if [ -e "$d" ]; then rm -rf "$d"; say "deleted (--purge-mail): $d"; any=1; fi
   done
   for f in /etc/rspamd/local.d/* /etc/rspamd/rspamd.local.lua; do
@@ -1416,6 +1449,7 @@ decide_mail() {
     [ -n "$OPT_MAIL_HOSTNAME" ] || OPT_MAIL_HOSTNAME="$(mail_block_value OXPANEL_MAIL_HOSTNAME)"
     if [ -z "$OPT_MAIL_WEBMAIL" ] && [ "$(mail_block_value OXPANEL_MAIL_WEBMAIL)" = false ]; then OPT_MAIL_WEBMAIL=no; fi
     if [ -z "$OPT_MAIL_ANTIVIRUS" ] && [ "$(mail_block_value OXPANEL_MAIL_ANTIVIRUS)" = true ]; then OPT_MAIL_ANTIVIRUS=yes; fi
+    if [ -z "$OPT_MAIL_RESOLVER" ] && [ "$(mail_block_value OXPANEL_MAIL_RESOLVER)" = false ]; then OPT_MAIL_RESOLVER=no; fi
     return 0
   fi
   decide OPT_MAIL "Email: mailboxes, forwarders, autoresponders and webmail for the customers' domains

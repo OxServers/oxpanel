@@ -25,9 +25,33 @@ if ! grep -q '^OXPANEL_MAIL=true' /etc/oxpanel/daemon.env 2>/dev/null || ! syste
 fi
 HOSTNAME_MAIL="$(sed -n 's/^enabled=true host_name=\([^ ]*\) .*/\1/p' <(oxpanel-ctl mail host))"
 check "email is on" test -n "$HOSTNAME_MAIL"
-for u in postfix dovecot rspamd oxpanel-mail-policy oxpanel-webmail; do
+for u in postfix dovecot rspamd oxpanel-mail-policy oxpanel-webmail oxpanel-mail-resolver; do
   eventually "$u is active" 60 0.5 systemctl -q is-active "$u"
 done
+
+echo "-- the mail filter's own resolver (no Internet needed: a test authority on the loopback)"
+R=oxpanel-mail-resolver
+eventually "$R is active" 60 0.5 systemctl -q is-active "$R"
+check "the engine reports it" bash -c "oxpanel-ctl mail host | head -1 | grep -q 'filter_resolver=true'"
+check "the installer wrote OXPANEL_MAIL_RESOLVER=true" grep -qx 'OXPANEL_MAIL_RESOLVER=true' /etc/oxpanel/daemon.env
+check "it runs as Unbound's account" test "$(ps -o user= -C unbound | sort -u)" = "unbound"
+info "resolver context: $(ps -eZ | awk '/ unbound$/ {print $1; exit}')"
+check "it listens on 127.0.0.1:5335 only (UDP and TCP)" bash -c 'test "$( (ss -Hlun; ss -Hltn) | awk "\$4 ~ /:5335\$/ {print \$4}" | sort -u)" = "127.0.0.1:5335"'
+check "the distribution's unbound.service is not started" bash -c '! systemctl -q is-active unbound'
+check "/etc/resolv.conf does not name it" bash -c '! grep -q "5335" /etc/resolv.conf'
+check "the filter is pointed at it" grep -q 'nameserver = \["127.0.0.1:5335"\]' /etc/rspamd/local.d/options.inc
+OUTER_IP="$(ip -4 -o addr show scope global | awk '{print $4}' | cut -d/ -f1 | head -1)"
+check_not "it cannot be asked on the host's own address ($OUTER_IP)" bash -c "dig +tries=1 +time=2 @$OUTER_IP -p 5335 example.org A | grep -q 'status:'"
+# The test authority: answers for oxresolve.test on 127.0.0.1:5399; the
+# resolver is told about it in its local.d (the operator's own place).
+AUTH_LOG=/root/acc/authority.log; : > "$AUTH_LOG"
+pkill -f 'mail-client.py authority' 2>/dev/null || true
+nohup python3 "$MC" authority 5399 oxresolve.test "$AUTH_LOG" >/dev/null 2>&1 &
+printf 'server:\n  do-not-query-localhost: no\n  domain-insecure: "oxresolve.test"\n  local-zone: "test." nodefault\nstub-zone:\n  name: "oxresolve.test"\n  stub-addr: 127.0.0.1@5399\n' > /etc/oxpanel-mail-resolver/local.d/oxacc-test.conf
+chgrp unbound /etc/oxpanel-mail-resolver/local.d/oxacc-test.conf; chmod 0640 /etc/oxpanel-mail-resolver/local.d/oxacc-test.conf
+check "the resolver takes the addition (reload)" systemctl reload "$R"
+eventually "it answers a name of the test authority" 20 0.5 bash -c "dig +short +tries=1 +time=2 @127.0.0.1 -p 5335 probe.oxresolve.test A | grep -qx 192.0.2.53"
+check "no mail drift (local.d is the operator's)" bash -c '! oxpanel-ctl host reconcile | grep -q MAIL'
 
 echo "-- the host checks behind GetMailHost's warnings (reverse DNS, outbound port 25)"
 oxpanel-ctl mail host >/dev/null
@@ -87,6 +111,21 @@ check "the site cannot send as the other customer" bash -c "curl -s -H 'Host: m1
 check "an autoresponder for info@m1" oxpanel-ctl mail autoreply info@m1.oxacc.test --tenant acmail1 --subject acc-away --body 'Away until Monday.'
 check "a message to it" python3 "$MC" submit 587 info@m2.oxacc.test "$P2" info@m2.oxacc.test info@m1.oxacc.test --subject acc-needs-reply
 eventually "the reply arrives (Dovecot → OxPanel's sendmail → Postfix)" 60 0.5 python3 "$MC" imap-find info@m2.oxacc.test "$P2" acc-away
+
+echo "-- the filter's DNS questions go to its resolver"
+PROBE="rsp$RANDOM$RANDOM.oxresolve.test"
+check "a message from a sender in the test zone is accepted" python3 "$MC" deliver 25 "a@$PROBE" info@m1.oxacc.test --subject acc-resolver
+eventually "the filter asked about the sender's domain, through its resolver, at the test authority" 60 0.5 grep -q "$PROBE" "$AUTH_LOG"
+info "questions seen by the test authority: $(grep -c "$PROBE" "$AUTH_LOG") ($(grep "$PROBE" "$AUTH_LOG" | awk '{print $1"/"$2}' | sort -u | tr '\n' ' '))"
+eventually "it arrives" 40 0.5 python3 "$MC" imap-find info@m1.oxacc.test "$P1" acc-resolver
+check "the resolver stops (as if it had failed)" systemctl stop "$R"
+eventually "the engine warns that the filter's resolver is down" 20 1 bash -c "oxpanel-ctl mail host | grep -q '^warning: \[filter_resolver_down\]'"
+t0=$(date +%s)
+check "mail is still accepted without it" python3 "$MC" deliver 25 "a@$PROBE" info@m1.oxacc.test --subject acc-resolver-down
+eventually "and delivered (degraded filtering, not broken mail)" 60 0.5 python3 "$MC" imap-find info@m1.oxacc.test "$P1" acc-resolver-down
+info "delivery with the resolver stopped took $(( $(date +%s) - t0 ))s"
+check "the resolver starts again" systemctl start "$R"
+eventually "the warning is gone" 20 1 bash -c "! oxpanel-ctl mail host | grep -q filter_resolver_down"
 
 echo "-- webmail behind Nginx"
 openssl req -x509 -newkey rsa:2048 -nodes -days 30 -subj /CN=webmail.m1.oxacc.test -addext subjectAltName=DNS:webmail.m1.oxacc.test \
@@ -160,6 +199,8 @@ else
 fi
 
 echo "-- clean up (email stays on)"
+pkill -f 'mail-client.py authority' 2>/dev/null || true
+rm -f /etc/oxpanel-mail-resolver/local.d/oxacc-test.conf; systemctl reload oxpanel-mail-resolver
 check "delete acmail1 with everything" bash -c "oxpanel-ctl tenant delete acmail1 --cascade --confirm acmail1 --wait >/dev/null"
 check "delete acmail2 with everything" bash -c "oxpanel-ctl tenant delete acmail2 --cascade --confirm acmail2 --wait >/dev/null"
 check "no mail drift" bash -c '! oxpanel-ctl host reconcile | grep -q MAIL'

@@ -182,8 +182,21 @@ related finding for the owner: the same log shows `DBL_BLOCKED_OPENRESOLVER`,
 i.e. Spamhaus refuses blocklist queries that arrive through a public
 resolver, so on hosts whose `/etc/resolv.conf` points at a public resolver
 Rspamd's Spamhaus lists do nothing. Rspamd's documentation recommends a
-local recursive resolver (for example Unbound) for that reason; whether
-`install.sh --mail` should set one up is a product decision, not made here.
+local recursive resolver (for example Unbound) for that reason.
+
+Since engine 0.3.1 `install.sh --mail` sets one up for the filter
+(`oxpanel-mail-resolver`, Unbound on 127.0.0.1:5335). On a cold cache it
+does the recursion itself, from the root, so the host's very first message
+can take about as long as before (the root, TLD and authority servers are
+asked instead of a forwarder; on a host whose upstream resolver was slow
+it is usually faster, on one next to a fast resolver possibly slower);
+after that every name it has seen is answered from its own cache in well
+under a millisecond, also after the upstream resolver's cache forgot it,
+and the blocklists answer instead of refusing. Phase 90's single-message
+figure above was measured before the resolver existed; it is not
+re-measured in this release (phase 90 runs in `INSTALL=rpm` without
+`install.sh --mail`). With the resolver stopped the filter's lookups fail
+at once (the loopback port is closed) and mail is accepted without them.
 
 ## Budgets
 

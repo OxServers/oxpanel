@@ -7,7 +7,8 @@
 #
 #   scripts/build-old-rpm.sh [<git ref>]      default: v0.2.0 (the released 0.2.0 engine, without email)
 #
-# Output: dist/old-rpms/oxpanel-daemon-<version>-<release>.<dist>.x86_64.rpm
+# Output: dist/old-rpms/oxpanel-daemon-<version>-<release>.<dist>.x86_64.rpm and
+# dist/old-rpms/install.sh (that commit's installer)
 set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REF="${1:-${OLD_REF:-v0.2.0}}"
@@ -15,6 +16,9 @@ IMAGE="${OXPANEL_DEV_IMAGE:-localhost/oxpanel-dev:alma9}"
 VOLUME="${OXPANEL_OLD_TARGET_VOLUME:-oxpanel-target-old-rpm}"
 SHA="$(git -C "$ROOT" rev-parse --verify "$REF^{commit}")"
 OUT="$ROOT/dist/old-rpms"
+# The old release's own installer too (phase 12 sets email up with it when the
+# old engine has email, 0.3.x).
+mkdir -p "$OUT"; git -C "$ROOT" show "$SHA:install.sh" > "$OUT/install.sh"
 if ls "$OUT"/oxpanel-daemon-[0-9]*.rpm >/dev/null 2>&1 && [ -e "$OUT/.built-from" ] && [ "$(cat "$OUT/.built-from")" = "$SHA" ]; then
   echo "[old-rpm] already built from $SHA"; ls -1 "$OUT"/oxpanel-daemon-[0-9]*.rpm; exit 0
 fi

@@ -94,3 +94,6 @@ RUN dnf -y install epel-release \
     && dnf -y install --setopt=install_weak_deps=False postfix dovecot dovecot-pigeonhole rspamd roundcubemail php-pdo swaks \
     && dnf -y remove epel-release && rm -f /etc/yum.repos.d/rspamd.repo \
     && dnf clean all && rm -rf /var/cache/dnf
+
+# The mail filter's own DNS resolver (Unbound) for the integration suite.
+RUN dnf -y install --setopt=install_weak_deps=False unbound && dnf clean all && rm -rf /var/cache/dnf
