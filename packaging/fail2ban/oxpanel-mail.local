@@ -8,12 +8,14 @@
 # webmail logs in to Dovecot from 127.0.0.1, so a webmail password guesser is
 # banned by its own jail (the browser's address), never the loopback.
 #
+# Ports are numbers: the ban action puts them into firewall rules.
+#
 # Lift a ban by hand:  fail2ban-client set dovecot unbanip 203.0.113.9
 
 [dovecot]
 enabled   = true
 backend   = systemd
-port      = imaps,pop3s
+port      = 993,995
 maxretry  = 5
 findtime  = 10m
 bantime   = 1h
@@ -25,7 +27,7 @@ banaction = @BAN_ACTION@
 [postfix-sasl]
 enabled   = true
 backend   = systemd
-port      = submission,465
+port      = 587,465
 maxretry  = 5
 findtime  = 10m
 bantime   = 1h
@@ -39,7 +41,7 @@ enabled   = true
 backend   = systemd
 journalmatch = SYSLOG_IDENTIFIER=oxpanel-webmail
 filter    = oxpanel-webmail
-port      = http,https
+port      = 80,443
 maxretry  = 5
 findtime  = 10m
 bantime   = 1h

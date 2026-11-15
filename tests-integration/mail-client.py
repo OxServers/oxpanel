@@ -2,7 +2,7 @@
 """A mail client for the integration and acceptance tests (standard library
 only, plus the openssl command for DKIM).
 
-    mail-client.py deliver PORT FROM TO [--from-header A] [--subject S] [--size N] [--host H]
+    mail-client.py deliver PORT FROM TO [--from-header A] [--subject S] [--size N] [--host H] [--eicar]
     mail-client.py submit PORT USER PASS FROM TO [--from-header A] [--subject S]
     mail-client.py imap-count USER PASS          (prints the number of messages)
     mail-client.py imap-find USER PASS SUBJECT [--out FILE]
@@ -27,6 +27,8 @@ import sys
 import tempfile
 import time
 
+# Where submission and IMAP connect (MAIL_CLIENT_HOST; the loopback by default).
+HOST = os.environ.get("MAIL_CLIENT_HOST", "127.0.0.1")
 CTX = ssl.create_default_context()
 CTX.check_hostname = False
 CTX.verify_mode = ssl.CERT_NONE
@@ -53,16 +55,38 @@ def message(frm, to, subject, size):
     )
 
 
+def eicar_message(frm, to, subject):
+    """A message with the standard antivirus test file attached (assembled
+    here so that no file of the repository holds the whole string)."""
+    eicar = "X5O!P%@AP[4\\PZX54(P^)7CC)7}$" + "EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*"
+    b = "oxpanel-test-boundary"
+    att = base64.b64encode(eicar.encode()).decode()
+    return (
+        f"From: {frm}\r\nTo: {to}\r\nSubject: {subject}\r\nMIME-Version: 1.0\r\n"
+        f"Date: {time.strftime('%a, %d %b %Y %H:%M:%S +0000', time.gmtime())}\r\n"
+        f"Message-ID: <{time.time_ns()}@oxpanel.test>\r\n"
+        f'Content-Type: multipart/mixed; boundary="{b}"\r\n\r\n'
+        f"--{b}\r\nContent-Type: text/plain\r\n\r\nsee the attachment\r\n"
+        f'--{b}\r\nContent-Type: application/octet-stream; name="eicar.com"\r\n'
+        f'Content-Disposition: attachment; filename="eicar.com"\r\n'
+        f"Content-Transfer-Encoding: base64\r\n\r\n{att}\r\n--{b}--\r\n"
+    )
+
+
 def deliver(args):
     hdr = opt(args, "--from-header")
     subject = opt(args, "--subject", f"test {time.time_ns()}")
     size = opt(args, "--size")
     host = opt(args, "--host", "127.0.0.1")
+    eicar = "--eicar" in args
+    if eicar:
+        args.remove("--eicar")
     port, frm, to = args
     s = smtplib.SMTP(host, int(port), timeout=60)
     s.ehlo("tester.oxpanel.test")
     try:
-        s.sendmail(frm, [to], message(hdr or frm, to, subject, size))
+        msg = eicar_message(hdr or frm, to, subject) if eicar else message(hdr or frm, to, subject, size)
+        s.sendmail(frm, [to], msg)
     except smtplib.SMTPException as e:
         print(f"refused: {e}")
         return 2
@@ -80,9 +104,9 @@ def submit(args):
     subject = opt(args, "--subject", f"test {time.time_ns()}")
     port, user, pw, frm, to = args
     if int(port) == 465:
-        s = smtplib.SMTP_SSL("127.0.0.1", 465, context=CTX, timeout=60)
+        s = smtplib.SMTP_SSL(HOST, 465, context=CTX, timeout=60)
     else:
-        s = smtplib.SMTP("127.0.0.1", int(port), timeout=60)
+        s = smtplib.SMTP(HOST, int(port), timeout=60)
         s.ehlo()
         s.starttls(context=CTX)
         s.ehlo()
@@ -107,7 +131,7 @@ def submit(args):
 
 
 def imap_login(user, pw):
-    m = imaplib.IMAP4_SSL("127.0.0.1", 993, ssl_context=CTX)
+    m = imaplib.IMAP4_SSL(HOST, 993, ssl_context=CTX, timeout=30)
     try:
         m.login(user, pw)
     except imaplib.IMAP4.error as e:

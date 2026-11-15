@@ -30,6 +30,11 @@ oxpanel-ctl vhost list --tenant $T > vhosts.before
 oxpanel-ctl host reconcile > reconcile.before 2>&1; info "reconcile before: $(head -1 reconcile.before)"
 cp -a /var/lib/oxpanel /root/acc/state.before
 ls /etc/nginx/oxpanel.d > nginx-files.before
+MAILPKGS="postfix dovecot dovecot-pigeonhole rspamd roundcubemail clamav clamd"
+mail_pkgs() { rpm -q $MAILPKGS 2>/dev/null | grep -v 'is not installed' | sort; }
+mail_pkgs > mail-pkgs.before; info "mail packages before the upgrade: $(tr '\n' ' ' < mail-pkgs.before)"
+fw_mail() { command -v firewall-cmd >/dev/null && systemctl -q is-active firewalld || return 0; firewall-cmd --list-services; firewall-cmd --permanent --list-services; firewall-cmd --list-ports; firewall-cmd --permanent --list-ports; }
+fw_mail > fw.before
 
 # ---- the upgrade, as the operator would do it
 start=$(date +%s)
@@ -71,6 +76,10 @@ check "the engine answers about email: off" bash -c 'oxpanel-ctl mail host | gre
 check "an email request is refused with mail_unavailable, nothing else" bash -c 'out=$(oxpanel-ctl mail domain-list --tenant '"$T"' 2>&1); echo "$out" | grep -q "mail_unavailable"'
 check "the upgrade created the email accounts" bash -c 'getent passwd oxpanel-mail >/dev/null && getent passwd oxpanel-webmail >/dev/null'
 check "the upgrade did not touch Postfix or Dovecot (no OxPanel configuration while email is off)" bash -c '! grep -qs "Managed by oxpanel-daemon" /etc/postfix/main.cf /etc/dovecot/dovecot.conf && test ! -e /var/lib/oxpanel-mail'
+check "the upgrade installed no mail package (email stays off until install.sh --mail)" diff <(mail_pkgs) mail-pkgs.before
+check "the upgrade opened nothing in the firewall" diff <(fw_mail) fw.before
+check "no mail port listens (25, 465, 587, 993, 995)" bash -c '! ss -Hltn | grep -E ":(25|465|587|993|995) "'
+check "no mail jail for login banning" test ! -e /etc/fail2ban/jail.d/50-oxpanel-mail.local
 check "PHP sends through OxPanel's sendmail, which hands non-account mail to Postfix unchanged" bash -c 'php -i 2>/dev/null | grep -q "^sendmail_path => /usr/sbin/oxpanel-daemon sendmail -t -i"'
 check "the new host info shows the databases" bash -c 'oxpanel-ctl host info | grep -q "^database_engine=mariadb available=true"'
 check "an SFTP key can be added to the pre-existing tenant" bash -c "ssh-keygen -q -t ed25519 -N '' -f /root/acc/upg.key && oxpanel-ctl sftp add-key $T --key-file /root/acc/upg.key.pub --label upg | grep -q '^changed=true'"

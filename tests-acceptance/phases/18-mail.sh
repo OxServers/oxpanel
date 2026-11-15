@@ -12,9 +12,9 @@ echo "== phase 18: email"
 MC=/root/acc/mail-client.py
 HOSTNAME_MAIL=mail.oxacc.test
 AVC0=$(avc_count); START_TIME=$(date +%T)
+INST=/root/acc/release/install.sh; [ -f "$INST" ] || INST=/root/acc/install.sh
 
 if ! grep -q '^OXPANEL_MAIL=true' /etc/oxpanel/daemon.env 2>/dev/null || ! systemctl -q is-active postfix; then
-  INST=/root/acc/release/install.sh; [ -f "$INST" ] || INST=/root/acc/install.sh
   info "installing the mail component with $INST"
   if bash "$INST" --only mail --mail --mail-hostname "$HOSTNAME_MAIL" --enable-epel --yes > /root/acc/install-mail.log 2>&1; then
     ok "install.sh --mail succeeded"
@@ -28,6 +28,15 @@ check "email is on" test -n "$HOSTNAME_MAIL"
 for u in postfix dovecot rspamd oxpanel-mail-policy oxpanel-webmail; do
   eventually "$u is active" 60 0.5 systemctl -q is-active "$u"
 done
+
+echo "-- the host checks behind GetMailHost's warnings (reverse DNS, outbound port 25)"
+oxpanel-ctl mail host >/dev/null
+eventually "the first GetMailHost starts the checks in the background; they finish" 120 1 test -s /var/lib/oxpanel-mail/host-checks.json
+info "host checks: $(tr -d '\n' < /var/lib/oxpanel-mail/host-checks.json)"
+info "$(oxpanel-ctl mail host | grep '^warning' | tr '\n' ' ')"
+# $HOSTNAME_MAIL is not in public DNS, so its reverse name cannot match.
+check "the reverse-DNS warning is produced (the mail host name does not resolve here)" bash -c "oxpanel-ctl mail host | grep -q '^warning: \[reverse_dns\]'"
+check "the port-25 result is either a warning or nothing (it depends on this network)" bash -c "python3 -c 'import json,sys; d=json.load(open(\"/var/lib/oxpanel-mail/host-checks.json\")); sys.exit(0 if d[\"port25\"] is None or \"port 25\" in d[\"port25\"] else 1)'"
 
 echo "-- SELinux domains and labels"
 ctx_of() { ps -eo label,comm | awk -v c="$1" '$2==c {print $1; exit}'; }
@@ -53,6 +62,7 @@ check "mailbox info@m2" bash -c "echo '$P2' | oxpanel-ctl mail mailbox-set info@
 check "the mailbox directory belongs to the account, private" test "$(stat -c '%U %a' /home/acmail1/mail/m1.oxacc.test/info)" = "acmail1 700"
 check "delivery on port 25" python3 "$MC" deliver 25 a@remote.example info@m1.oxacc.test --subject acc-in
 eventually "IMAPS reads it" 40 0.5 python3 "$MC" imap-find info@m1.oxacc.test "$P1" acc-in
+eventually "the IMAP login is recorded as the mailbox's last login (Dovecot's dict service under enforcing)" 20 0.5 bash -c "oxpanel-ctl mail mailbox-list m1.oxacc.test --tenant acmail1 | grep -q '^mailbox=info@m1.oxacc.test .* last_login=[0-9]\{10\}\$'"
 check "delivered files belong to the account" bash -c "test -z \"\$(find /home/acmail1/mail -type f ! -user acmail1)\""
 check "submission sends to the other customer" python3 "$MC" submit 587 info@m1.oxacc.test "$P1" info@m1.oxacc.test info@m2.oxacc.test --subject acc-sub
 eventually "it arrives, DKIM-signed" 40 0.5 python3 "$MC" imap-find info@m2.oxacc.test "$P2" acc-sub --out /root/acc/acc-sub.eml
@@ -90,6 +100,64 @@ page="$("${W[@]}" https://webmail.m1.oxacc.test/)"
 tok="$(grep -o 'name="_token" value="[^"]*"' <<<"$page" | head -1 | sed 's/.*value="//; s/"$//')"
 "${W[@]}" -o /dev/null -d "_token=$tok&_task=login&_action=login&_timezone=UTC&_url=&_user=info@m1.oxacc.test&_pass=$P1" 'https://webmail.m1.oxacc.test/?_task=login'
 check "a webmail login succeeds under enforcing" bash -c "curl -sk --resolve webmail.m1.oxacc.test:443:127.0.0.1 -b /root/acc/wm.cj 'https://webmail.m1.oxacc.test/?_task=mail&_mbox=INBOX' | grep -q Inbox"
+
+echo "-- antivirus (install.sh --mail-antivirus): the standard test virus is refused"
+MEM_MB=$(( $(awk '/^MemTotal:/ {print $2}' /proc/meminfo) / 1024 ))
+if [ "$MEM_MB" -lt 3500 ]; then
+  info "ClamAV not tried: this VM has ${MEM_MB} MB of memory and ClamAV needs about 1 GB more than the rest (run with VM_MEM=4096)"
+else
+  if bash "$INST" --only mail --mail --mail-antivirus --mail-hostname "$HOSTNAME_MAIL" --enable-epel --yes > /root/acc/install-av.log 2>&1; then
+    ok "install.sh --mail-antivirus succeeded"
+  else
+    tail -30 /root/acc/install-av.log; fail "install.sh --mail-antivirus failed"
+  fi
+  check "the engine reports the antivirus component" bash -c "oxpanel-ctl mail host | grep -q 'antivirus=true'"
+  eventually "clamd has its signatures and is running" 600 2 bash -c "systemctl -q is-active clamd@scan && test -S /run/clamd.scan/clamd.sock"
+  check "a clean message is still accepted" python3 "$MC" deliver 25 a@remote.example info@m1.oxacc.test --subject acc-clean
+  out="$(python3 "$MC" deliver 25 a@remote.example info@m1.oxacc.test --subject acc-eicar --eicar)"; info "EICAR delivery: $out"
+  check "a message with the EICAR test file is refused" grep -q '^refused' <<<"$out"
+  sleep 3
+  check_not "and it never reaches the mailbox" python3 "$MC" imap-find info@m1.oxacc.test "$P1" acc-eicar
+  check "the filter's log names the virus" bash -c "journalctl -u rspamd --since '-5min' --no-pager | grep -qi 'eicar' || grep -qi eicar /var/log/rspamd/rspamd.log"
+  # Off again: the later phases measure the host without it.
+  bash "$INST" --only mail --mail --no-mail-antivirus --mail-hostname "$HOSTNAME_MAIL" --enable-epel --yes >> /root/acc/install-av.log 2>&1
+  systemctl disable --now clamd@scan clamav-freshclam >/dev/null 2>&1 || true
+  check "the engine reports it off again" bash -c "oxpanel-ctl mail host | grep -q 'antivirus=false'"
+  eventually "mail flows without it" 30 1 python3 "$MC" deliver 25 a@remote.example info@m1.oxacc.test --subject acc-after-av
+fi
+
+echo "-- login banning (fail2ban, when the installer turned it on)"
+if systemctl -q is-active fail2ban; then
+  check "the mail jails are set up with login banning" bash -c "bash $INST --only fail2ban --fail2ban --mail --mail-hostname $HOSTNAME_MAIL --enable-epel --yes >> /root/acc/install-mail.log 2>&1 && fail2ban-client status dovecot >/dev/null && fail2ban-client status postfix-sasl >/dev/null"
+  # Two addresses on the far side of veth pairs (not loopback traffic: the
+  # firewall's ban rule really applies), one network namespace each.
+  netns_up() { # name host-address peer-address
+    ip netns add "$1" && ip link add "v$1" type veth peer name "p$1" && ip link set "p$1" netns "$1" &&
+    ip addr add "$2/24" dev "v$1" && ip link set "v$1" up && ip netns exec "$1" ip link set lo up &&
+    ip netns exec "$1" ip addr add "$3/24" dev "p$1" && ip netns exec "$1" ip link set "p$1" up
+  }
+  netns_down() { ip netns del "$1" >/dev/null 2>&1; ip link del "v$1" >/dev/null 2>&1; true; }
+  netns_down mbad; netns_down mgood
+  check "two client networks" bash -c "$(declare -f netns_up); netns_up mbad 10.98.0.1 10.98.0.2 && netns_up mgood 10.98.1.1 10.98.1.2"
+  from() { local ns="$1" host="$2"; shift 2; ip netns exec "$ns" env MAIL_CLIENT_HOST="$host" timeout 40 python3 "$MC" "$@"; }
+  jail_has() { fail2ban-client get "$1" banip 2>/dev/null | tr ', ' '\n\n' | grep -qx "$2"; }
+  eventually "IMAPS works from the client network" 10 2 from mgood 10.98.1.1 imap-count info@m1.oxacc.test "$P1"
+  for i in $(seq 1 12); do jail_has dovecot 10.98.0.2 && break; from mbad 10.98.0.1 imap-count info@m1.oxacc.test "guess-$i-wrong" >/dev/null 2>&1; sleep 1; done
+  eventually "IMAP password guessing gets the address banned (dovecot jail)" 20 1 jail_has dovecot 10.98.0.2
+  check "the ban is a firewall rule" bash -c "firewall-cmd --list-rich-rules | grep -q 10.98.0.2"
+  check_not "the banned address cannot reach IMAPS even with the right password" from mbad 10.98.0.1 imap-count info@m1.oxacc.test "$P1"
+  check "another address still logs in" from mgood 10.98.1.1 imap-count info@m1.oxacc.test "$P1"
+  for i in $(seq 1 12); do jail_has postfix-sasl 10.98.0.2 && break; from mbad 10.98.0.1 submit 587 info@m1.oxacc.test "guess-$i-wrong" info@m1.oxacc.test info@m2.oxacc.test >/dev/null 2>&1; sleep 1; done
+  eventually "SMTP AUTH guessing on submission gets it banned too (postfix-sasl jail)" 20 1 jail_has postfix-sasl 10.98.0.2
+  check_not "the banned address cannot submit even with the right password" from mbad 10.98.0.1 submit 587 info@m1.oxacc.test "$P1" info@m1.oxacc.test info@m2.oxacc.test
+  check "lift both bans by hand" bash -c "fail2ban-client set dovecot unbanip 10.98.0.2 && fail2ban-client set postfix-sasl unbanip 10.98.0.2"
+  check "no rule is left for it" bash -c "! firewall-cmd --list-rich-rules | grep -q 10.98.0.2"
+  eventually "after the unban, IMAPS works from it again" 10 2 from mbad 10.98.0.1 imap-count info@m1.oxacc.test "$P1"
+  eventually "and submission" 10 2 from mbad 10.98.0.1 submit 587 info@m1.oxacc.test "$P1" info@m1.oxacc.test info@m2.oxacc.test
+  netns_down mbad; netns_down mgood
+else
+  info "fail2ban is not active (the installer's --fail2ban was not used in this mode): the mail jails' bans are proven in INSTALL=installer"
+fi
 
 echo "-- clean up (email stays on)"
 check "delete acmail1 with everything" bash -c "oxpanel-ctl tenant delete acmail1 --cascade --confirm acmail1 --wait >/dev/null"

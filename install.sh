@@ -784,6 +784,8 @@ mail_antivirus_setup() {
   if getent group virusgroup >/dev/null && ! id -nG _rspamd | tr ' ' '\n' | grep -qx virusgroup; then
     run usermod -aG virusgroup _rspamd || return 1
     changed "_rspamd added to virusgroup (it may scan through clamd's socket)"
+    # A running Rspamd gets the new group only from a restart (a reload keeps it without).
+    if unit_active rspamd; then run systemctl restart rspamd || return 1; fi
   fi
   if [ ! -s /var/lib/clamav/main.cvd ] && [ ! -s /var/lib/clamav/main.cld ]; then
     run freshclam || warn "freshclam could not download the virus signatures yet; clamav-freshclam.service retries"
