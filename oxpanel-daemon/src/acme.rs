@@ -292,6 +292,27 @@ async fn run_unit(ctx: &Ctx, domain: &Domain, cmd: CommandSpec) -> Result<(bool,
     Ok((succeeded, output))
 }
 
+/// The client's own last line in what [`run_unit`] returns: the journal of
+/// the unit also holds systemd's lines about it ("<unit>.service: Failed with
+/// result 'exit-code'.", "Started …"), and systemd-run may add its own; none
+/// of those says why the client failed. `None` when the client printed nothing.
+pub fn failure_reason(output: &str) -> Option<&str> {
+    const SYSTEMD: [&str; 7] = [
+        "oxpanel-acme-",
+        "Started ",
+        "Starting ",
+        "Stopped ",
+        "Finished ",
+        "Job for ",
+        "Running as unit",
+    ];
+    output
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|l| !l.is_empty() && !SYSTEMD.iter().any(|p| l.starts_with(p)))
+}
+
 /// Run the ACME client for `domain` in a transient unit and wait for it.
 /// Returns whether it reported success and what it printed; a refusal by the
 /// certificate authority is a result, not an error.
@@ -372,7 +393,7 @@ pub async fn run_precheck(ctx: &Ctx, domain: &Domain, names: &[Domain]) -> Resul
     let report = fsutil::read_untrusted(&out, MAX_PRECHECK_BYTES)?;
     fsutil::remove_if_exists(&out)?;
     let Some(bytes) = report.filter(|_| succeeded) else {
-        let why = output.lines().last().unwrap_or("the pre-check did not run");
+        let why = failure_reason(&output).unwrap_or("the pre-check did not run");
         return Err(Error::AcmeUnavailable(format!(
             "the reachability check failed: {}",
             printable(why)
@@ -441,4 +462,30 @@ pub fn discard(ctx: &Ctx, domain: &Domain) -> Result<()> {
     fsutil::remove_if_exists(&csr_path(cfg, domain))?;
     fsutil::remove_if_exists(&issued_path(cfg, domain))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::failure_reason;
+
+    #[test]
+    fn the_failure_reason_is_the_clients_not_systemds() {
+        // What run_unit returns for a failed request: the unit's journal
+        // (systemd's lines about the unit included), then systemd-run's own.
+        let output = "Started /usr/libexec/oxpanel/oxpanel-acme --directory https://localhost:14000/dir --domain panel.example.org.\n\
+                      ordered a certificate for panel.example.org\n\
+                      panel.example.org: the authority refused: 403 urn:ietf:params:acme:error:unauthorized\n\
+                      oxpanel-acme-panel.example.org.service: Main process exited, code=exited, status=1/FAILURE\n\
+                      oxpanel-acme-panel.example.org.service: Failed with result 'exit-code'.\n\
+                      Job for oxpanel-acme-panel.example.org.service failed.\n";
+        assert_eq!(
+            failure_reason(output),
+            Some("panel.example.org: the authority refused: 403 urn:ietf:params:acme:error:unauthorized")
+        );
+        assert_eq!(
+            failure_reason("oxpanel-acme-x.service: Failed with result 'exit-code'.\n\n"),
+            None
+        );
+        assert_eq!(failure_reason(""), None);
+    }
 }

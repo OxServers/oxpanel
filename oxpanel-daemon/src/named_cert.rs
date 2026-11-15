@@ -114,9 +114,7 @@ pub(crate) async fn obtain(ctx: &Ctx, name: &Domain) -> std::result::Result<Mate
     let result = async {
         let (ok, output) = ran.map_err(|e| e.to_string())?;
         if !ok {
-            return Err(output
-                .lines()
-                .last()
+            return Err(crate::acme::failure_reason(&output)
                 .unwrap_or("the ACME client failed")
                 .to_owned());
         }

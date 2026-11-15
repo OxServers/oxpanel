@@ -533,7 +533,7 @@ fn record_order(
                 .lines()
                 .rev()
                 .find(|l| l.contains("no certificate") || l.contains("not installed"))
-                .or_else(|| o.output.lines().last())
+                .or_else(|| crate::acme::failure_reason(&o.output))
                 .unwrap_or("the certificate authority did not issue")
                 .to_owned();
             for n in passed {

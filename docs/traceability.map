@@ -1151,6 +1151,7 @@
   sh tests-integration/run-inside.sh but not changed
 
 [HTTPS (certificates)] Host certificates
+  unit acme the_failure_reason_is_the_clients_not_systemds
   unit host_certs registrations_are_read_strictly
   unit host_certs invalid_registration_files_are_reported_and_nothing_is_done
   unit host_certs a_registered_name_gets_a_certificate_and_the_challenge_server

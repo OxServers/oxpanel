@@ -547,7 +547,11 @@ JSON
   check "ACME: the alias too" https_eventually www.acme.test / "$T/pebble-root.pem" hello-from-alice
   check "ACME: HTTP redirects" code_eventually acme.test / 301
   check "ACME: private key is root 0600" test "$(stat -c '%U %a' /etc/pki/oxpanel/acme.test.key)" = "root 600"
-  check "ACME: no challenge, request, reply or pending key is left behind" bash -c 'test -z "$(find /var/lib/oxpanel-acme/challenges /var/lib/oxpanel-acme/csr /var/lib/oxpanel-acme/issued -mindepth 1)" && ! ls /etc/pki/oxpanel/*.pending >/dev/null 2>&1'
+  # The restart above starts Automatic HTTPS for the other sites in the
+  # background; its pre-check report exists for a moment while it runs. What
+  # must hold is that nothing *stays*: wait up to 30 s for the directories to empty.
+  acme_dirs_empty() { local i; for i in $(seq 1 150); do [ -z "$(find /var/lib/oxpanel-acme/challenges /var/lib/oxpanel-acme/csr /var/lib/oxpanel-acme/issued -mindepth 1)" ] && return 0; sleep 0.2; done; find /var/lib/oxpanel-acme/challenges /var/lib/oxpanel-acme/csr /var/lib/oxpanel-acme/issued -mindepth 1; return 1; }
+  check "ACME: no challenge, request, reply or pending key is left behind" bash -c "$(declare -f acme_dirs_empty); acme_dirs_empty && ! ls /etc/pki/oxpanel/*.pending >/dev/null 2>&1"
   check "ACME: the client ran as oxpanel-acme (it owns its account key, 0600)" bash -c 'test "$(stat -c "%U %a" /var/lib/oxpanel-acme/account/*.pk8)" = "oxpanel-acme 600"'
   check "ACME: the client's account cannot read any site key" bash -c '! setpriv --reuid=oxpanel-acme --regid=oxpanel-acme --clear-groups -- cat /etc/pki/oxpanel/acme.test.key >/dev/null 2>&1'
   check "ACME: the client's output reached the journal" bash -c 'journalctl --no-pager -u oxpanel-acme-acme.test.service | grep -q "certificate issued"'
@@ -643,7 +647,7 @@ JSON
   check "chain 0644 and key 0600, both root" bash -c 'test "$(stat -c "%U %a" "$1/itpanel.crt")" = "root 644" && test "$(stat -c "%U %a" "$1/itpanel.key")" = "root 600"' _ "$HP"
   check "the chain is the CA's, for the name" bash -c 'openssl x509 -in "$1/itpanel.crt" -noout -issuer | grep -qi pebble && openssl x509 -in "$1/itpanel.crt" -noout -ext subjectAltName | grep -q "DNS:panel.oxtest"' _ "$HP"
   check "key and certificate belong together" test "$(openssl x509 -in "$HP/itpanel.crt" -noout -pubkey)" = "$(openssl pkey -in "$HP/itpanel.key" -pubout)"
-  check "no placeholder, request or reply is left behind" bash -c 'test "$(ls "$1" | tr "\n" " ")" = "itpanel.crt itpanel.key " && test -z "$(find /var/lib/oxpanel-acme/csr /var/lib/oxpanel-acme/issued -mindepth 1)"' _ "$HP"
+  check "no placeholder, request or reply is left behind" bash -c "$(declare -f acme_dirs_empty); test \"\$(ls \"\$1\" | tr '\n' ' ')\" = 'itpanel.crt itpanel.key ' && acme_dirs_empty" _ "$HP"
   # The consumer's own server (here a stand-in for the panel) uses the pair.
   printf 'server {\n  listen 127.0.0.1:8443 ssl;\n  server_name panel.oxtest;\n  ssl_certificate %s/itpanel.crt;\n  ssl_certificate_key %s/itpanel.key;\n  return 200 "panel\\n";\n}\n' "$HP" "$HP" > /etc/nginx/conf.d/zz-it-panel.conf
   systemctl reload nginx
