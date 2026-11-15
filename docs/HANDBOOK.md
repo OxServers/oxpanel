@@ -1,6 +1,6 @@
 # OxPanel engine handbook
 
-Installation, configuration and operation of `oxpanel-daemon` v0.2.0 on
+Installation, configuration and operation of `oxpanel-daemon` v0.3.2 on
 AlmaLinux 9. Every command in this handbook has been run as written; where a
 step is only verifiable on a real host (SELinux, `PrivateNetwork`) that is said.
 
@@ -114,7 +114,8 @@ nothing to do and the run resumes at the failure. The outcome of the last run is
 one can be answered on the command line or in an answers file (`--answers FILE`,
 lines `key=value`, `#` comments; the keys are `fail2ban`, `epel`, `quota`, `reboot`,
 `mariadb`, `php`, `nodejs`, `ignore_ip`, `home_base`, `panel_rpm`, `panel_account`,
-`panel_scopes`, `harden_existing_mariadb`, `mask_php_fpm`, `switch_nodejs`; options on
+`panel_scopes`, `harden_existing_mariadb`, `mask_php_fpm`, `switch_nodejs`,
+`public_ipv4`, `public_ipv6`, and those of DNS hosting and email below; options on
 the command line win). `--yes` (or running without a terminal) asks nothing and
 takes the safe defaults: **no EPEL, no fail2ban, no change of the boot
 configuration, no reboot**, nothing destructive.
@@ -124,6 +125,51 @@ sudo ./install.sh --yes --fail2ban --enable-epel --quota --reboot
 printf 'fail2ban=yes\nepel=yes\nquota=yes\nreboot=no\nignore_ip=203.0.113.5\n' > answers
 sudo ./install.sh --yes --answers answers
 ```
+
+**This host's public addresses.** `--public-ipv4 ADDR` / `--public-ipv6 ADDR` (or
+`public_ipv4=` / `public_ipv6=` in the answers file) write `OXPANEL_PUBLIC_IPV4` /
+`OXPANEL_PUBLIC_IPV6` into the installer's block; the engine reports them in
+`GetHostInfo` (`public_ipv4=` in `oxpanel-ctl host info`) so that the panel can tell
+customers where to point their domains. They are never guessed from the interfaces
+(behind NAT those are private); `--dns-ipv4`/`--dns-ipv6` fill them when they are not
+given, and without either the engine reports DNS hosting's addresses, else nothing. A
+loopback, unspecified or multicast address is refused before anything changes (the
+engine would refuse to start with it). A later run that does not mention them keeps them.
+
+#### Switching on an optional feature later
+
+On a host that is already installed, run the installer again from the release
+directory with the feature's options and `--only` naming the stages it needs
+(one stage, or a comma-separated list; they run in the usual order, after the
+preflight checks), so nothing else is touched. Each command is idempotent: run it
+again after fixing whatever it reports; a second run says `changes=0`.
+
+```sh
+# DNS hosting: BIND as oxpanel-dns, port 53 opened. Needs the two name servers,
+# the SOA contact and this host's public address (it also becomes the address
+# the panel shows customers).
+sudo ./install.sh --yes --only dns,firewall --dns --dns-nameservers ns1.example.net,ns2.example.net --dns-contact hostmaster@example.net --dns-ipv4 203.0.113.10
+
+# Email: Postfix, Dovecot, Rspamd, Roundcube; the mail ports opened. EPEL must be allowed.
+sudo ./install.sh --yes --only mail,firewall --mail --mail-hostname mail.example.net --enable-epel
+
+# Disk quotas (homes on XFS only): the boot setting, then a reboot ...
+sudo ./install.sh --yes --only quota --quota --reboot
+# ... and after the reboot, the same stage finds them active and finishes.
+sudo ./install.sh --yes --only quota --quota
+
+# Login banning: fail2ban from EPEL, the SSH jail (and the mail jails when email is on).
+# --ignore-ip: the addresses you administer from (optional).
+sudo ./install.sh --yes --only fail2ban --fail2ban --enable-epel --ignore-ip 203.0.113.5
+
+# The public addresses only (the engine is restarted to read them).
+sudo ./install.sh --yes --only daemon --public-ipv4 203.0.113.10 --public-ipv6 2001:db8::10
+```
+
+With login banning already on, switching email on later needs the mail jails
+too: add `fail2ban` to `--only` and `--fail2ban` to the options
+(`--only mail,firewall,fail2ban ... --fail2ban`). A run that does not mention a
+feature keeps it as it is; `--no-dns`, `--no-mail` switch one off again.
 
 **Login banning with fail2ban (optional).** Guards tenants' SFTP passwords and
 every other SSH login against guessing. fail2ban is not in AlmaLinux's own
@@ -191,15 +237,27 @@ administrator and checks that the panel answers over HTTPS:
   its server block is read before OxPanel's own, so a customer site with the same
   name can never capture it). The block is `/etc/nginx/conf.d/00-oxpanel-panel.conf`,
   outside the engine's directory, so `host reconcile` never reports it.
-* **Certificate.** A self-signed one (`/etc/pki/oxpanel-panel/`) is made at install so
-  the panel works at once (browsers warn). Install a real one with
+* **Certificate.** Since engine 0.3.2 the engine obtains a certificate for the
+  panel's own name by itself (a *host certificate*, §9.4), once the name points at
+  this host: the panel 0.2.2 registers it when it is enabled, and the installer
+  starts a certificate run right after (`oxpanel-ctl cert auto run`). The name is
+  `--panel-hostname`, else the mail host name (with email), else the host's
+  fully-qualified name (`hostname -f`, when it has a dot); in port mode it is passed
+  as `--name` to a setup tool that knows the option (an older panel installs as
+  before). The installer's last lines say which certificate the panel serves. Until
+  the automatic one exists, a self-signed one (`/etc/pki/oxpanel-panel/`) is made at
+  install so the panel works at once (browsers warn). Install a real one with
   `oxpanel-panel-setup certificate --cert fullchain.pem --key key.pem` (checked against
   the key and the host name, `nginx -t`, rolled back if refused). In host-name mode
   `/.well-known/acme-challenge/` of the panel's name is served from
   `/var/lib/oxpanel-panel-acme`, so any ACME client works with a webroot, e.g.
   `certbot certonly --webroot -w /var/lib/oxpanel-panel-acme -d panel.example.net`
-  with a deploy hook that runs the command above. The engine's own certificate
-  machinery is for customers' sites and is not used for the panel.
+  with a deploy hook that runs the command above. Which certificate the panel
+  serves is the panel's decision (its setup tool, `oxpanel-panel-setup status`): a
+  certificate installed with `certificate --cert/--key` from panel 0.2.2 on always
+  wins; otherwise the automatic one once it exists; otherwise what was there before
+  (one installed by hand with an older panel, or the self-signed one).
+  `oxpanel-panel-setup certificate --automatic` returns to the automatic one.
 * **The first administrator** (`--panel-admin NAME`, default `admin`) gets a random
   one-time password, **printed at the end of the run and never written to the log**;
   the first sign-in forces a new password and two-factor enrolment. A later run finds
@@ -696,6 +754,12 @@ sudo oxpanel-ctl backup restore acme b1794571200123 --keep-existing --wait
 # A database comes back separately from the files, always into a NEW name
 # (never over an existing database), without grants
 sudo oxpanel-ctl backup restore-db acme b1794571200123 acme_shop acme_shopold --wait
+# Download one file of a complete backup (a member of `backup list`, or
+# manifest.json), 1 MiB per request; the file is created, never overwritten.
+# Compare it with the manifest: the SHA-256 is listed there.
+sudo oxpanel-ctl backup download acme b1794571200123 home.tar.gz -o /root/acme-home.tar.gz
+# bytes=47101
+sudo oxpanel-ctl backup download acme b1794571200123 manifest.json | grep sha256
 sudo oxpanel-ctl backup delete acme b1794571200123
 
 # Back the tenant up every night by itself (the engine does it, also while the
@@ -1605,6 +1669,74 @@ deleted with everything it has.
 `--purge-mail` to put Postfix's and Dovecot's own files back and remove
 OxPanel's mail state; mailboxes in homes are never removed by it).
 
+### 9.4 Host certificates: names that are not sites (the panel's own)
+
+A program on the host that serves its own name — the panel is the first —
+*registers* that name, and the engine obtains and renews a certificate for it
+exactly as it does for the mail host name: the reachability check first (a name
+that does not resolve to this host, or does not serve the probe, never reaches
+the authority), back-off (1 h, 6 h, then daily), renewal 30 days before expiry,
+every 15 minutes and on `oxpanel-ctl cert auto run`. The panel (0.2.2 and
+later) registers its own name this way and serves the certificate unless the
+administrator installed one (§3.0, "Certificate"). Nothing is requested while
+Automatic HTTPS is off (`OXPANEL_AUTO_HTTPS=false`) or the ACME client is not
+available.
+
+A registration is a root-owned file, not writable by group or others,
+`/etc/oxpanel/host-certificates.d/<consumer>.conf` (consumer: a lower-case
+letter, then up to 30 lower-case letters, digits or `-`):
+
+```ini
+# the panel, in port mode
+name=panel.example.net
+challenges=engine
+redirect_port=8443
+```
+
+`challenges=engine`: the engine answers the HTTP-01 challenge for the name on
+port 80 itself, in `/etc/nginx/conf.d/oxpanel-host-certificates.conf` (one
+server per name that no site, alias or email name already answers; checked with
+`nginx -t` and rolled back like every Nginx change); other paths answer 404, or
+with `redirect_port` a redirect to `https://<name>:<port>`. `challenges=consumer`:
+the consumer's own port-80 server for the name serves
+`/var/lib/oxpanel-acme/challenges` under `/.well-known/acme-challenge/`. Any
+other line makes the registration *invalid*, and nothing is done for it.
+
+The certificate is written to `/etc/pki/oxpanel-host/<consumer>.crt` (the chain,
+`0644`) and `<consumer>.key` (`0600`), both root's, only after it was verified
+against its key and the name; then `nginx -t` (the previous pair is put back if
+Nginx refuses) and a reload, so a consumer that points `ssl_certificate` at those
+paths picks up every renewal by itself. No placeholder is ever written there:
+until a real certificate exists the files do not exist. When the registration is
+removed, the engine removes the pair at its next run (kept, and retried later,
+while Nginx still refers to it).
+
+```sh
+sudo oxpanel-ctl cert host            # every registration; or: cert host panel
+# consumer=panel
+# name=panel.example.net
+# state=issued                        # renewing | pending | disabled | invalid
+# issuer=CN=R11,O=Let's Encrypt,C=US
+# not_after=2027-02-14T09:12:00Z
+# next_attempt=
+# reason=
+# certificate=/etc/pki/oxpanel-host/panel.crt
+# key=/etc/pki/oxpanel-host/panel.key
+```
+
+`pending` comes with the reason (e.g. "the name does not resolve") and the next
+attempt; `oxpanel-ctl cert auto run` tries again at once once the back-off is
+over. `host reconcile` reports a key that is not root-only
+(`HOST_CERTIFICATE_KEY_EXPOSED`), a file no registration accounts for
+(`ORPHAN_HOST_CERTIFICATE_FILE`) and a challenge file that differs from what the
+registrations render (`HOST_CERTIFICATE_CHALLENGE_DRIFT`).
+
+**Login banning in the engine's view.** `oxpanel-ctl host info` prints
+`login_banning=true jails=sshd,dovecot,…` when fail2ban runs with OxPanel's jail
+files (`/etc/fail2ban/jail.d/50-oxpanel-*.local`), with a plain-words
+`login_banning_detail=` line otherwise; the engine only reads the files and asks
+systemd whether `fail2ban.service` is active.
+
 ## 10. Troubleshooting
 
 | Symptom | Cause / fix |
@@ -1774,6 +1906,35 @@ is written, `oxpanel-mail-resolver` starts); a plain `install.sh --yes` run
 keeps the email settings it finds. The acceptance rig proves both upgrades:
 `INSTALL=upgrade` (from 0.2.0) and `INSTALL=upgrade OLD_REF=v0.3.0` (from 0.3.0
 with email set up by its own installer and email limits in its records).
+
+**0.3.1 to 0.3.2** changes nothing on the host by itself. The package creates
+two empty directories (`/etc/oxpanel/host-certificates.d`,
+`/etc/pki/oxpanel-host`, §9.4) and relabels them; the engine writes nothing
+there until a consumer registers a name (the panel 0.2.2 does when it is
+enabled). `host reconcile` no longer reports backups made by an older engine as
+`BACKUP_ARCHIVE_MODIFIED` (their manifest names the version that wrote it).
+`install.sh` gains `--public-ipv4`/`--public-ipv6` and a list for `--only`; a
+plain `install.sh --yes` run writes `OXPANEL_PUBLIC_IPV4`/`_IPV6` only when
+`--dns-ipv4`/`--dns-ipv6` or the new options are given.
+
+*A panel certificate copied by hand from the mail certificate.* If the engine's
+certificate for the mail host name was copied to the panel with
+`oxpanel-panel-setup certificate --cert … --key …` (panel 0.2.1), often with a
+cron job that repeats the copy after each renewal: after upgrading to engine
+0.3.2 and panel 0.2.2 that copy counts as a certificate installed before 0.2.2.
+It is kept until the engine's automatic certificate for the panel's name exists,
+and then the automatic one is served — for a name that already resolves to this
+host that happens at the first certificate run after the upgrade (within 15
+minutes; `sudo oxpanel-ctl cert auto run` does it at once). **Delete the cron
+job**: a `certificate --cert` run after the upgrade marks the copy as installed
+by the administrator, and that wins over the automatic certificate for good. If
+it already ran, return to the automatic certificate with
+
+```sh
+sudo oxpanel-panel-setup certificate --automatic
+sudo oxpanel-panel-setup status        # says which certificate is served, and why
+sudo oxpanel-ctl cert host panel       # the engine's view: state=issued, issuer, not_after
+```
 
 **Uninstall the engine, keep the tenants:** `sudo ./install.sh --uninstall` (asks first;
 `--yes` to skip the question). It removes the engine package (and the panel package, if
