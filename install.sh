@@ -1144,7 +1144,9 @@ stage_panelweb() {
     die "could not create the panel's first administrator: $(printf '%s' "$out" | grep -v -i 'password' | head -3)"
   fi
   for _ in $(seq 1 20); do
-    code="$("$PANEL_SETUP" status 2>/dev/null | sed -n 's/^health:[[:space:]]*HTTP //p')"
+    # `status` exits non-zero while the panel is not answering (yet): that is
+    # what this loop waits out, so it must not end the run (set -e, pipefail).
+    code="$("$PANEL_SETUP" status 2>/dev/null | sed -n 's/^health:[[:space:]]*HTTP //p' || true)"
     [ "$code" = 200 ] && break; sleep 1
   done
   [ "$code" = 200 ] || die "the panel does not answer over HTTPS (HTTP ${code:-none}); see: journalctl -u oxpanel-panel -u nginx"
