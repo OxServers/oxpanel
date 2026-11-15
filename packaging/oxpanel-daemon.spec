@@ -1,5 +1,5 @@
 Name:           oxpanel-daemon
-Version:        0.3.1
+Version:        0.3.2
 Release:        1%{?dist}
 Summary:        OxPanel engine: tenants, Nginx sites, apps and databases over a local gRPC API
 License:        Apache-2.0
@@ -98,6 +98,8 @@ install -D -m 0644 packaging/selinux/oxpanel.cil %{buildroot}%{_datadir}/oxpanel
 install -D -m 0644 packaging/fail2ban/oxpanel-sshd.local %{buildroot}%{_datadir}/oxpanel/fail2ban/oxpanel-sshd.local
 install -D -m 0644 packaging/fail2ban/oxpanel-mail.local %{buildroot}%{_datadir}/oxpanel/fail2ban/oxpanel-mail.local
 install -D -m 0644 packaging/fail2ban/filter.d/oxpanel-webmail.conf %{buildroot}%{_datadir}/oxpanel/fail2ban/filter.d/oxpanel-webmail.conf
+install -d -m 0755 %{buildroot}%{_sysconfdir}/pki/oxpanel-host
+install -d -m 0755 %{buildroot}%{_sysconfdir}/oxpanel/host-certificates.d
 
 %pre
 %sysusers_create_compat packaging/sysusers.d/oxpanel.conf
@@ -114,7 +116,7 @@ if /usr/sbin/selinuxenabled 2>/dev/null; then /usr/sbin/setsebool -P httpd_enabl
 if /usr/sbin/selinuxenabled 2>/dev/null; then /usr/sbin/semodule -i %{_datadir}/oxpanel/selinux/oxpanel.cil || :; fi
 # The ACME challenge directory was created (by tmpfiles above) before the module
 # that labels it for the web server was loaded.
-if /usr/sbin/selinuxenabled 2>/dev/null; then /usr/sbin/restorecon -R /var/lib/oxpanel-acme /etc/pki/oxpanel || :; fi
+if /usr/sbin/selinuxenabled 2>/dev/null; then /usr/sbin/restorecon -R /var/lib/oxpanel-acme /etc/pki/oxpanel /etc/pki/oxpanel-host /etc/oxpanel/host-certificates.d || :; fi
 # DNS hosting directories exist only once DNS hosting was used (the daemon
 # creates and labels them); an upgrade relabels them with the current module.
 if /usr/sbin/selinuxenabled 2>/dev/null; then for d in /var/lib/oxpanel-dns /etc/named/oxpanel; do [ -d "$d" ] && /usr/sbin/restorecon -R "$d" || :; done; fi
@@ -152,6 +154,10 @@ if [ "$1" -eq 0 ] && /usr/sbin/selinuxenabled 2>/dev/null; then /usr/sbin/semodu
 %{_tmpfilesdir}/oxpanel.conf
 %dir %attr(0750,root,oxpanel) %{_sysconfdir}/oxpanel
 %config(noreplace) %attr(0640,root,root) %{_sysconfdir}/oxpanel/daemon.env
+# Host certificates: registrations (written by consumers such as the panel)
+# and the certificates the engine obtains for them.
+%dir %attr(0755,root,root) %{_sysconfdir}/oxpanel/host-certificates.d
+%dir %attr(0755,root,root) %{_sysconfdir}/pki/oxpanel-host
 %config(noreplace) %{_sysconfdir}/logrotate.d/oxpanel
 %dir %{_datadir}/oxpanel
 %dir %{_datadir}/oxpanel/selinux

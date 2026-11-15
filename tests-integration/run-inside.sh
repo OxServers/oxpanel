@@ -623,6 +623,67 @@ JSON
   check "its state goes with the sites" bash -c 'test -z "$(find /var/lib/oxpanel/auto-https -name "auto.test.json" -o -name "susp.test.json" -o -name "off.test.json")"'
   oxpanel-ctl tenant delete carol --remove-home >/dev/null
 
+  echo "-- host certificates (a consumer's own name, through the engine)"
+  HC=/etc/oxpanel/host-certificates.d; HP=/etc/pki/oxpanel-host; HN=/etc/nginx/conf.d/oxpanel-host-certificates.conf
+  check "the registration and certificate directories exist (package)" bash -c 'test "$(stat -c "%U %a" "$1" "$2" | sort -u)" = "root 755"' _ "$HC" "$HP"
+  echo "127.0.0.1 panel.oxtest" >> /etc/hosts
+  printf '# the integration test panel\nname=panel.oxtest\nchallenges=engine\nredirect_port=8443\n' > "$HC/itpanel.conf"; chmod 0644 "$HC/itpanel.conf"
+  check "registered: pending before the first sweep" grep -q '^state=pending$' <(oxpanel-ctl cert host itpanel)
+  oxpanel-ctl cert auto run >/dev/null || true
+  check "the engine renders the challenge-only server" grep -q 'server_name panel.oxtest;' "$HN"
+  check "nginx -t accepts it" nginx -t -q
+  setpriv --reuid=oxpanel-acme --regid=oxpanel-acme --clear-groups -- sh -c 'echo host-challenge-ok > /var/lib/oxpanel-acme/challenges/it-host-token'
+  check "the challenge-only server answers the engine's challenges for the name" test "$(curl -s -H 'Host: panel.oxtest' http://127.0.0.1/.well-known/acme-challenge/it-host-token)" = host-challenge-ok
+  rm -f /var/lib/oxpanel-acme/challenges/it-host-token
+  check "other paths redirect to the consumer's port" bash -c 'test "$(curl -s -o /dev/null -w "%{http_code} %{redirect_url}" -H "Host: panel.oxtest" http://127.0.0.1/x?y=1)" = "301 https://panel.oxtest:8443/x?y=1"'
+  check "the certificate is obtained (Pebble's 10 days: due at once, so renewing)" grep -q '^state=\(issued\|renewing\)$' <(oxpanel-ctl cert host itpanel)
+  check "HostInfo reports the registration" grep -q '^host_certificates=1$' <(oxpanel-ctl host info)
+  check "cert host prints the documented keys" bash -c 'test "$(oxpanel-ctl cert host itpanel | cut -d= -f1 | tr "\n" " ")" = "consumer name state issuer not_after next_attempt reason certificate key "'
+  check "issuer and expiry are reported" bash -c 'oxpanel-ctl cert host itpanel | grep -qi "^issuer=.*pebble" && oxpanel-ctl cert host itpanel | grep -qE "^not_after=20[0-9]{2}-[0-9]{2}-[0-9]{2}T"'
+  check "chain 0644 and key 0600, both root" bash -c 'test "$(stat -c "%U %a" "$1/itpanel.crt")" = "root 644" && test "$(stat -c "%U %a" "$1/itpanel.key")" = "root 600"' _ "$HP"
+  check "the chain is the CA's, for the name" bash -c 'openssl x509 -in "$1/itpanel.crt" -noout -issuer | grep -qi pebble && openssl x509 -in "$1/itpanel.crt" -noout -ext subjectAltName | grep -q "DNS:panel.oxtest"' _ "$HP"
+  check "key and certificate belong together" test "$(openssl x509 -in "$HP/itpanel.crt" -noout -pubkey)" = "$(openssl pkey -in "$HP/itpanel.key" -pubout)"
+  check "no placeholder, request or reply is left behind" bash -c 'test "$(ls "$1" | tr "\n" " ")" = "itpanel.crt itpanel.key " && test -z "$(find /var/lib/oxpanel-acme/csr /var/lib/oxpanel-acme/issued -mindepth 1)"' _ "$HP"
+  # The consumer's own server (here a stand-in for the panel) uses the pair.
+  printf 'server {\n  listen 127.0.0.1:8443 ssl;\n  server_name panel.oxtest;\n  ssl_certificate %s/itpanel.crt;\n  ssl_certificate_key %s/itpanel.key;\n  return 200 "panel\\n";\n}\n' "$HP" "$HP" > /etc/nginx/conf.d/zz-it-panel.conf
+  systemctl reload nginx
+  hc_served() { openssl s_client -connect 127.0.0.1:8443 -servername panel.oxtest </dev/null 2>/dev/null | openssl x509 -noout -fingerprint -sha256 2>/dev/null; }
+  hc_file() { openssl x509 -in "$HP/itpanel.crt" -noout -fingerprint -sha256; }
+  hc_same() { local i a; for i in $(seq 1 100); do a="$(hc_served)"; [ -n "$a" ] && [ "$a" = "$(hc_file)" ] && return 0; sleep 0.2; done; return 1; }
+  check "Nginx serves the consumer's name with it" hc_same
+  before="$(hc_file)"
+  oxpanel-ctl cert auto run >/dev/null || true
+  check "renewal: a due certificate is replaced by a new one" test "$(hc_file)" != "$before"
+  check "renewal: Nginx was reloaded and serves the new one" hc_same
+  check "host certificates are not drift" grep -q '^drifts=0$' <(oxpanel-ctl host reconcile)
+  printf 'name=nx-panel.oxtest\nchallenges=engine\n' > "$HC/itnx.conf"; chmod 0644 "$HC/itnx.conf"
+  since="$(date '+%Y-%m-%d %H:%M:%S')"
+  oxpanel-ctl cert auto run >/dev/null || true
+  check "a name that does not resolve stays pending, with the reason" bash -c 'oxpanel-ctl cert host itnx | grep -q "^state=pending$" && oxpanel-ctl cert host itnx | grep -q "^reason=.*resolve" && oxpanel-ctl cert host itnx | grep -qE "^next_attempt=20"'
+  check "... and never reached the authority (only the reachability check ran)" bash -c '! journalctl --no-pager -u oxpanel-daemon --since "$1" | grep "ACME client finished" | grep -q "nx-panel.oxtest"' _ "$since"
+  check "... and has no files" test ! -e "$HP/itnx.crt"
+  printf 'name=bad.oxtest\n' > "$HC/itbad.conf"; chmod 0644 "$HC/itbad.conf"
+  printf 'name=loose.oxtest\nchallenges=engine\n' > "$HC/itloose.conf"; chmod 0666 "$HC/itloose.conf"
+  printf 'name=odd.oxtest\nchallenges=engine\ncolour=blue\n' > "$HC/itodd.conf"; chmod 0644 "$HC/itodd.conf"
+  check "a registration with an unknown setting is INVALID, with the line" bash -c 'oxpanel-ctl cert host itodd | grep -q "^state=invalid$" && oxpanel-ctl cert host itodd | grep -q "^reason=.*line 3: unknown setting .colour."'
+  check "an incomplete registration is INVALID, with the reason" bash -c 'oxpanel-ctl cert host itbad | grep -q "^state=invalid$" && oxpanel-ctl cert host itbad | grep -q "^reason=challenges= is missing$"'
+  check "a registration others may write is INVALID" bash -c 'oxpanel-ctl cert host itloose | grep -q "^state=invalid$" && oxpanel-ctl cert host itloose | grep -q "writable by root only"'
+  check "an unknown consumer is NOT_FOUND" grep -q NotFound <(oxpanel-ctl cert host nosuch 2>&1 || true)
+  check "invalid registrations get no challenge server and no files" bash -c '! grep -q "bad.oxtest\|loose.oxtest\|odd.oxtest" "$1" && test ! -e "$2/itbad.crt" -a ! -e "$2/itloose.crt" -a ! -e "$2/itodd.crt"' _ "$HN" "$HP"
+  chmod 0644 "$HP/itpanel.key"; touch "$HP/stray.pem"
+  check "Reconcile reports an exposed key and a stray file" bash -c 'r="$(oxpanel-ctl host reconcile)"; grep -q HOST_CERTIFICATE_KEY_EXPOSED <<<"$r" && grep -q ORPHAN_HOST_CERTIFICATE_FILE <<<"$r"'
+  chmod 0600 "$HP/itpanel.key"; rm -f "$HP/stray.pem"
+  rm -f "$HC/itnx.conf" "$HC/itbad.conf" "$HC/itloose.conf" "$HC/itodd.conf" "$HC/itpanel.conf"
+  oxpanel-ctl cert auto run >/dev/null || true
+  check "a removed registration's pair Nginx still uses is kept" test -s "$HP/itpanel.crt"
+  check "... and Nginx keeps working" nginx -t -q
+  rm -f /etc/nginx/conf.d/zz-it-panel.conf; systemctl reload nginx
+  oxpanel-ctl cert auto run >/dev/null || true
+  check "once unused, the removed registration's pair is removed" test -z "$(ls "$HP")"
+  check "and the challenge server with it" test ! -e "$HN"
+  check "nothing is reported any more" grep -q '^host_certificates=0$' <(oxpanel-ctl host info)
+  check "host certificates leave no drift" grep -q '^drifts=0$' <(oxpanel-ctl host reconcile)
+
   echo "-- External Account Binding (Pebble requiring it)"
   systemctl stop oxpanel-it-pebble
   EAB_KEY="$(openssl rand 32 | base64 -w0 | tr '+/' '-_' | tr -d '=')"
@@ -1201,6 +1262,21 @@ check_not "the tenant cannot list the backup store" as_user alice ls "$BK"
 check_not "the tenant cannot read its own archive" as_user alice cat "$BK/alice/$A1/home.tar.gz"
 check_not "another tenant cannot read it either" as_user bob cat "$BK/alice/$A1/home.tar.gz"
 check "backups are not drift" grep -q '^drifts=0$' <(oxpanel-ctl host reconcile)
+
+echo "-- downloading a backup (ReadBackupMember, 1 MiB at a time)"
+DL="$(mktemp -d /root/backup-dl.XXXXXX)"
+check "the archive downloads to a file" grep -q '^bytes=[1-9][0-9]*$' <(oxpanel-ctl backup download alice "$A1" home.tar.gz -o "$DL/home.tar.gz")
+check "its SHA-256 is the manifest's" grep -q "\"sha256\": \"$(sha256sum "$DL/home.tar.gz" | cut -d' ' -f1)\"" "$BK/alice/$A1/manifest.json"
+check "it is byte for byte the stored archive" cmp -s "$DL/home.tar.gz" "$BK/alice/$A1/home.tar.gz"
+check "the records member downloads to standard output" bash -c 'oxpanel-ctl backup download alice "$1" records.json | cmp -s - "$2"' _ "$A1" "$BK/alice/$A1/records.json"
+check "manifest.json downloads too" bash -c 'oxpanel-ctl backup download alice "$1" manifest.json | cmp -s - "$2"' _ "$A1" "$BK/alice/$A1/manifest.json"
+check_not "an existing output file is never overwritten" oxpanel-ctl backup download alice "$A1" home.tar.gz -o "$DL/home.tar.gz"
+check "another tenant's backup is NOT_FOUND" grep -q 'NotFound' <(oxpanel-ctl backup download bob "$A1" home.tar.gz 2>&1 || true)
+check "a path-like member is refused (INVALID_ARGUMENT)" grep -q 'InvalidArgument.*member' <(oxpanel-ctl backup download alice "$A1" ../../../etc/shadow 2>&1 || true)
+check "a file that is not a member is refused" grep -q 'InvalidArgument.*member' <(oxpanel-ctl backup download alice "$A1" other.tar.gz 2>&1 || true)
+oxpanel-ctl backup download alice "$A1" nope.tar.gz -o "$DL/x" >/dev/null 2>&1 || true
+check "a refused download leaves no partial file" test ! -e "$DL/x"
+rm -rf "$DL"
 
 as_user alice sh -c 'echo changed > /home/alice/public_html/backup.html; rm -f "/home/alice/public_html/new
 line.txt"; echo extra > /home/alice/public_html/added-later.html'

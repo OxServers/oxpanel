@@ -587,12 +587,17 @@ async fn forget_unregistered(
 // ---- The sweep -------------------------------------------------------------------------
 
 /// The challenge file and the removal of unregistered pairs: done whether or
-/// not certificates can be requested. Never fatal.
-pub async fn converge(ctx: &Ctx) {
+/// not certificates can be requested. Never fatal. Returns whether the
+/// challenge file changed (Nginx was reloaded).
+pub async fn converge(ctx: &Ctx) -> bool {
     let _guard = ctx.lock.lock().await;
-    if let Err(e) = apply_challenges(ctx).await {
-        warn!(error = %e, "host certificates: the challenge configuration could not be applied");
-    }
+    let changed = match apply_challenges(ctx).await {
+        Ok(changed) => changed,
+        Err(e) => {
+            warn!(error = %e, "host certificates: the challenge configuration could not be applied");
+            false
+        }
+    };
     let mut state = load_state(&ctx.config);
     match forget_unregistered(ctx, &mut state).await {
         Ok(true) => {
@@ -603,6 +608,7 @@ pub async fn converge(ctx: &Ctx) {
         Ok(false) => {}
         Err(e) => warn!(error = %e, "host certificates: removed registrations not cleaned up"),
     }
+    changed
 }
 
 /// Obtain or renew every registered name that needs it (back-off is
@@ -610,7 +616,11 @@ pub async fn converge(ctx: &Ctx) {
 /// periodic tasks start together, and skipping would skip every time.
 /// Returns how many certificates were installed.
 pub async fn sweep(ctx: &Ctx) -> Result<usize> {
-    converge(ctx).await;
+    if converge(ctx).await && !ctx.config.dry_run && !cfg!(test) {
+        // Nginx's reload returns before its new workers answer the new
+        // challenge server; the pre-check must not run against the old ones.
+        tokio::time::sleep(crate::auto_https::AFTER_CHANGE_DELAY).await;
+    }
     if disabled_reason(ctx).await?.is_some() {
         return Ok(0);
     }

@@ -63,6 +63,10 @@ ProtectSystem=strict
 # ACME signing requests and issued chains to /var/lib/oxpanel-acme (under /var/lib). The ACME
 # client itself never runs in this unit (PrivateNetwork=yes) but in a transient unit started
 # with systemd-run, as the unprivileged account oxpanel-acme.
+#            Host certificates (0.3.2) need no entry either: registrations are read from
+#            /etc/oxpanel/host-certificates.d, certificates written to /etc/pki/oxpanel-host and
+#            the challenge server to /etc/nginx/conf.d (all under /etc); login banning only
+#            reads /etc/fail2ban/jail.d and asks systemctl whether fail2ban runs.
 # DNS hosting needs no further entries either: the DNS server's configuration and keys go to
 # /etc/named/oxpanel (under /etc), zone files to /var/lib/oxpanel-dns (under /var/lib); the
 # checkers (named-checkconf, named-checkzone) only read. The server itself runs in its own unit
