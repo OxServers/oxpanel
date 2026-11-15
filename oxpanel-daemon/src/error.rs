@@ -165,6 +165,11 @@ pub enum Error {
     #[error("backup '{0}' is not complete yet")]
     BackupNotReady(String),
 
+    /// A file of a sealed backup is missing or no longer what its record
+    /// says (size, kind of file): it is not handed out.
+    #[error("file '{member}' of backup '{id}' no longer matches its record")]
+    BackupMemberChanged { id: String, member: String },
+
     #[error("job '{0}' not found")]
     JobNotFound(String),
 
@@ -336,6 +341,7 @@ impl Error {
                 | Self::TrashNotFound { .. }
                 | Self::BackupNotFound { .. }
                 | Self::BackupNotReady(_)
+                | Self::BackupMemberChanged { .. }
                 | Self::JobNotFound(_)
                 | Self::JobRunning { .. }
                 | Self::TooManyJobs
@@ -405,6 +411,7 @@ impl From<Error> for Status {
             | Error::TenantHasDatabases(_)
             | Error::DbTrashFull { .. }
             | Error::BackupNotReady(_)
+            | Error::BackupMemberChanged { .. }
             | Error::JobRunning { .. }
             | Error::TenantHasBackups(_)
             | Error::TenantSuspended(_)

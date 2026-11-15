@@ -56,6 +56,10 @@ use crate::validate::{retention, BackupId, DbName, JobId, Username};
 use crate::vhost::VHostService;
 use crate::worker::{self, Task};
 
+#[path = "backup_read.rs"]
+mod read;
+pub use read::{MemberChunk, MAX_CHUNK};
+
 /// Version of the on-disk layout described in the module documentation.
 pub const MANIFEST_FORMAT: u32 = 1;
 pub const MANIFEST: &str = "manifest.json";
@@ -202,12 +206,25 @@ pub fn unit_name(job: &JobId) -> String {
 /// What `manifest.json` of a sealed backup contains — the single definition,
 /// shared by sealing and reconciliation.
 pub fn render_manifest(rec: &BackupRecord) -> Result<Vec<u8>> {
+    render_manifest_as(rec, env!("CARGO_PKG_VERSION"))
+}
+
+/// Whether `bytes` is the manifest of `rec`, as written by whichever engine
+/// version sealed it (an upgrade does not make every older backup "modified").
+pub fn manifest_matches(rec: &BackupRecord, bytes: &[u8]) -> Result<bool> {
+    let Ok(on_disk) = serde_json::from_slice::<Manifest>(bytes) else {
+        return Ok(false);
+    };
+    Ok(render_manifest_as(rec, &on_disk.engine_version)? == bytes)
+}
+
+fn render_manifest_as(rec: &BackupRecord, engine_version: &str) -> Result<Vec<u8>> {
     let manifest = Manifest {
         format: MANIFEST_FORMAT,
         id: rec.id.clone(),
         tenant: rec.tenant.clone(),
         created_at_unix: rec.created_at_unix,
-        engine_version: env!("CARGO_PKG_VERSION").to_owned(),
+        engine_version: engine_version.to_owned(),
         members: rec.members.clone(),
         exclude_rules: EXCLUDE_RULES.iter().map(|r| (*r).to_owned()).collect(),
         excluded: rec.excluded.clone(),
@@ -3788,6 +3805,183 @@ mod tests {
                 Err(Error::InvalidInput { .. })
             ));
         }
+        Ok(())
+    }
+
+    /// Read a member to the end in chunks of `chunk` bytes, as a download does.
+    async fn download(
+        h: &Harness,
+        tenant: &str,
+        id: &str,
+        member: &str,
+        chunk: u32,
+    ) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        loop {
+            let c = h
+                .backups
+                .read_member(tenant, id, member, out.len() as u64, chunk)
+                .await?;
+            assert!(c.data.len() <= if chunk == 0 { MAX_CHUNK } else { chunk } as usize);
+            out.extend_from_slice(&c.data);
+            if c.eof {
+                assert_eq!(out.len() as u64, c.size);
+                return Ok(out);
+            }
+            assert!(!c.data.is_empty(), "no progress before the end");
+        }
+    }
+
+    #[tokio::test]
+    async fn backup_members_are_read_in_chunks_and_match_the_manifest() -> Result<()> {
+        let h = harness(false).await;
+        let made = h.backup("alice").await?;
+        let id = BackupId::parse(&made.backup_id)?;
+        let rec = h
+            .ctx
+            .store
+            .load_backup(&id)?
+            .unwrap_or_else(|| panic!("record"));
+        h.sys.clear_calls();
+        let scratch = tempfile::tempdir().unwrap_or_else(|e| panic!("{e}"));
+        for m in &rec.members {
+            let bytes = download(&h, "alice", id.as_str(), &m.name, 7).await?;
+            let copy = scratch.path().join(&m.name);
+            std::fs::write(&copy, &bytes).unwrap_or_else(|e| panic!("{e}"));
+            assert_eq!(
+                worker::hash_file(&copy)?,
+                (m.size_bytes, m.sha256.clone()),
+                "{}",
+                m.name
+            );
+        }
+        let manifest = download(&h, "alice", id.as_str(), MANIFEST, 0).await?;
+        assert_eq!(
+            manifest,
+            std::fs::read(h.dir(&made).join(MANIFEST)).unwrap_or_default()
+        );
+        // Past the end: nothing, at the end.
+        let past = h
+            .backups
+            .read_member("alice", id.as_str(), MANIFEST, 1 << 40, 0)
+            .await?;
+        assert!(past.data.is_empty() && past.eof);
+        assert!(
+            h.sys.calls().is_empty(),
+            "nothing ran: reading is the daemon's own work"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn backup_members_are_refused_unless_they_are_the_tenants_and_unchanged() -> Result<()> {
+        let h = harness(false).await;
+        let made = h.backup("alice").await?;
+        let id = made.backup_id.clone();
+        let read = |t: &'static str, m: &'static str| {
+            let b = h.backups.clone();
+            let id = id.clone();
+            async move { b.read_member(t, &id, m, 0, 0).await }
+        };
+        assert!(matches!(
+            read("bob", HOME_MEMBER).await,
+            Err(Error::BackupNotFound { .. })
+        ));
+        for path_like in ["../alice/x", "/etc/shadow", "a/b", ".", ".."] {
+            assert!(
+                matches!(
+                    read("alice", path_like).await,
+                    Err(Error::InvalidInput {
+                        field: "member",
+                        ..
+                    })
+                ),
+                "{path_like}"
+            );
+        }
+        assert!(matches!(
+            read("alice", "other.tar.gz").await,
+            Err(Error::InvalidInput { .. })
+        ));
+        assert!(matches!(
+            h.backups
+                .read_member("alice", &id, HOME_MEMBER, 0, MAX_CHUNK + 1)
+                .await,
+            Err(Error::InvalidInput {
+                field: "length",
+                ..
+            })
+        ));
+        // A file that no longer has its recorded size is not handed out.
+        let home = h.dir(&made).join(HOME_MEMBER);
+        let original = std::fs::read(&home).unwrap_or_default();
+        std::fs::write(&home, b"tampered").unwrap_or_else(|e| panic!("{e}"));
+        assert!(matches!(
+            read("alice", HOME_MEMBER).await,
+            Err(Error::BackupMemberChanged { .. })
+        ));
+        // Nor one replaced by a symlink (to a file of the same size).
+        let elsewhere = h.dir(&made).with_file_name("elsewhere");
+        std::fs::write(&elsewhere, &original).unwrap_or_else(|e| panic!("{e}"));
+        std::fs::remove_file(&home).unwrap_or_else(|e| panic!("{e}"));
+        std::os::unix::fs::symlink(&elsewhere, &home).unwrap_or_else(|e| panic!("{e}"));
+        assert!(matches!(
+            read("alice", HOME_MEMBER).await,
+            Err(Error::BackupMemberChanged { .. })
+        ));
+        // A changed manifest neither.
+        let manifest = h.dir(&made).join(MANIFEST);
+        let mut m = std::fs::read(&manifest).unwrap_or_default();
+        m.extend_from_slice(b" ");
+        std::fs::write(&manifest, &m).unwrap_or_else(|e| panic!("{e}"));
+        assert!(matches!(
+            read("alice", MANIFEST).await,
+            Err(Error::BackupMemberChanged { .. })
+        ));
+        // A record of another uid (a re-created account) does not exist here.
+        let bid = BackupId::parse(&id)?;
+        let mut rec = h
+            .ctx
+            .store
+            .load_backup(&bid)?
+            .unwrap_or_else(|| panic!("record"));
+        rec.uid = 29999;
+        h.ctx.store.save_backup(&rec)?;
+        assert!(matches!(
+            read("alice", RECORDS_MEMBER).await,
+            Err(Error::BackupNotFound { .. })
+        ));
+        // Nor is a backup that is not sealed read.
+        rec.uid = 20000;
+        rec.state = BackupState::Creating;
+        h.ctx.store.save_backup(&rec)?;
+        assert!(matches!(
+            read("alice", RECORDS_MEMBER).await,
+            Err(Error::BackupNotReady(_))
+        ));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_manifest_written_by_an_older_engine_is_not_drift() -> Result<()> {
+        let h = harness(false).await;
+        let made = h.backup("alice").await?;
+        let rec = h
+            .ctx
+            .store
+            .load_backup(&BackupId::parse(&made.backup_id)?)?
+            .unwrap_or_else(|| panic!("record"));
+        let older = render_manifest_as(&rec, "0.3.1")?;
+        assert!(manifest_matches(&rec, &older)?);
+        assert!(!manifest_matches(&rec, b"{}")?);
+        std::fs::write(h.dir(&made).join(MANIFEST), &older).unwrap_or_else(|e| panic!("{e}"));
+        assert!(crate::host::HostService::new(h.ctx.clone())
+            .reconcile()
+            .await?
+            .is_empty());
+        assert!(!download(&h, "alice", &made.backup_id, MANIFEST, 0)
+            .await?
+            .is_empty());
         Ok(())
     }
 }

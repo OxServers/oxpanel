@@ -179,6 +179,8 @@ fn scope_table() -> BTreeMap<&'static str, Scope> {
         // shows a customer its effective limits), only staff change them.
         ("GetMailDefaults", Scope::Read),
         ("SetMailDefaults", Scope::Tenant),
+        // A file of one of the account's backups, for a download (like ReadFile).
+        ("ReadBackupMember", Scope::VHost),
     ]
     .into_iter()
     .collect()
