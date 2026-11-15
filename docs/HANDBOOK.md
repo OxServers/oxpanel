@@ -1764,6 +1764,17 @@ sendmail, which hands the message to Postfix's own sendmail unchanged while
 email is off). Switch email on afterwards with `install.sh --mail`. The
 acceptance rig proves the upgrade from 0.2.0 (`INSTALL=upgrade`).
 
+**0.3.0 to 0.3.1** lowers the host's default sending limits to 30 and 20
+recipients an hour and makes the default a setting (§9.3 "Email limits"):
+email limits held exactly at the old defaults follow the new default; other
+values stay as account overrides (0 becomes an explicit unlimited). The
+package upgrade installs nothing: the filter's own resolver comes with the
+next `install.sh --mail` run (Unbound is installed, `OXPANEL_MAIL_RESOLVER=true`
+is written, `oxpanel-mail-resolver` starts); a plain `install.sh --yes` run
+keeps the email settings it finds. The acceptance rig proves both upgrades:
+`INSTALL=upgrade` (from 0.2.0) and `INSTALL=upgrade OLD_REF=v0.3.0` (from 0.3.0
+with email set up by its own installer and email limits in its records).
+
 **Uninstall the engine, keep the tenants:** `sudo ./install.sh --uninstall` (asks first;
 `--yes` to skip the question). It removes the engine package (and the panel package, if
 installed) and what the installer itself added (the fail2ban jail file, the repository

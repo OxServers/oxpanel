@@ -19,7 +19,7 @@
 # /var/lib/oxpanel-installer/status. Licence: Apache-2.0.
 set -euo pipefail
 
-INSTALLER_VERSION="0.3.0"
+INSTALLER_VERSION="0.3.1"
 
 # ---------------------------------------------------------------------------
 # Where a real release would be fetched from. NOT SET: there is no published
