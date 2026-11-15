@@ -19,7 +19,7 @@
 # /var/lib/oxpanel-installer/status. Licence: Apache-2.0.
 set -euo pipefail
 
-INSTALLER_VERSION="0.3.1"
+INSTALLER_VERSION="0.3.2"
 
 # ---------------------------------------------------------------------------
 # Where a real release would be fetched from. NOT SET: there is no published
@@ -49,6 +49,7 @@ OPT_HARDEN_EXISTING="" OPT_PANEL_ACCOUNT="" OPT_SWITCH_NODEJS="" OPT_MASK_PHPFPM
 OPT_IGNORE_IP="" OPT_PANEL_SCOPES="" OPT_PANEL_RPM="" OPT_REPO_URL="" OPT_ANSWERS="" OPT_HOME_BASE=""
 OPT_PANEL_PORT="" OPT_PANEL_HOSTNAME="" OPT_PANEL_ADMIN="" OPT_NO_PANEL="" OPT_PURGE_PANEL=""
 OPT_DNS="" OPT_DNS_NAMESERVERS="" OPT_DNS_CONTACT="" OPT_DNS_IPV4="" OPT_DNS_IPV6="" OPT_DISABLE_STOCK_NAMED=""
+OPT_PUBLIC_IPV4="" OPT_PUBLIC_IPV6=""
 DNS_KEYS='^OXPANEL_DNS(_NAMESERVERS|_SOA_CONTACT|_IPV4|_IPV6)?='
 OPT_MAIL="" OPT_MAIL_HOSTNAME="" OPT_MAIL_ANTIVIRUS="" OPT_MAIL_WEBMAIL="" OPT_PURGE_MAIL="" OPT_MAIL_RESOLVER=""
 MAIL_KEYS='^OXPANEL_MAIL(_HOSTNAME|_WEBMAIL|_ANTIVIRUS|_RESOLVER)?='
@@ -100,7 +101,7 @@ General
                         option names below without "--" (fail2ban=yes, epel=yes,
                         quota=yes, reboot=no, ignore_ip=203.0.113.5, ...)
   --check               preflight checks only; changes nothing
-  --only STAGE          run only this stage (after preflight); stages:
+  --only STAGE[,STAGE]  run only these stages (after preflight), in the usual order; stages:
                         nodejs engine selinux nginx mariadb php panel daemon dns
                         mail
                         panelweb firewall fail2ban quota verify
@@ -133,6 +134,8 @@ Optional features (each asks when interactive; each is off with --yes)
   --reboot              reboot at the end if a reboot is needed
   --no-fail2ban --no-quota --no-reboot   say no explicitly
   --home-base PATH      where tenant homes live (default: OXPANEL_HOME_BASE or /home)
+  --public-ipv4 ADDR    this host's PUBLIC addresses, as the panel shows them to
+  --public-ipv6 ADDR    customers (never guessed; default: --dns-ipv4/--dns-ipv6)
 
 DNS hosting (optional; this host as the name server of its customers' domains)
   --dns                 install BIND and switch DNS hosting on (needs the four below)
@@ -198,7 +201,8 @@ parse_args() {
       -h|--help) usage; exit 0;;
       --answers) [ $# -ge 2 ] || die "--answers needs a file"; OPT_ANSWERS="$2"; shift;;
       --check) OPT_CHECK=1;;
-      --only) [ $# -ge 2 ] || die "--only needs a stage name"; OPT_ONLY="$2"; shift;;
+      --only) [ $# -ge 2 ] || die "--only needs a stage name"; OPT_ONLY="$2"; shift
+              valid_only "$OPT_ONLY" || die "--only: '$OPT_ONLY' is not a stage or a comma-separated list of stages (see --help)";;
       --force) OPT_FORCE=1;;
       --uninstall) OPT_UNINSTALL=1;;
       --rpm) [ $# -ge 2 ] || die "--rpm needs a file"; ENGINE_RPM="$2"; shift;;
@@ -218,6 +222,8 @@ parse_args() {
       --reboot) OPT_REBOOT=yes;;
       --no-reboot) OPT_REBOOT=no;;
       --home-base) [ $# -ge 2 ] || die "--home-base needs a path"; OPT_HOME_BASE="$2"; shift;;
+      --public-ipv4) [ $# -ge 2 ] || die "--public-ipv4 needs an address"; OPT_PUBLIC_IPV4="$2"; shift;;
+      --public-ipv6) [ $# -ge 2 ] || die "--public-ipv6 needs an address"; OPT_PUBLIC_IPV6="$2"; shift;;
       --panel-rpm) [ $# -ge 2 ] || die "--panel-rpm needs a file"; OPT_PANEL_RPM="$2"; OPT_PANEL_ACCOUNT=yes; shift;;
       --panel-account) OPT_PANEL_ACCOUNT=yes;;
       --panel-port) [ $# -ge 2 ] || die "--panel-port needs a number"; OPT_PANEL_PORT="$2"; shift;;
@@ -286,6 +292,8 @@ load_answers() {
       switch_nodejs) [ -n "$OPT_SWITCH_NODEJS" ] || OPT_SWITCH_NODEJS="$(yesno_value "$key" "$val")";;
       ignore_ip) [ -n "$OPT_IGNORE_IP" ] || OPT_IGNORE_IP="$val";;
       home_base) [ -n "$OPT_HOME_BASE" ] || OPT_HOME_BASE="$val";;
+      public_ipv4) [ -n "$OPT_PUBLIC_IPV4" ] || OPT_PUBLIC_IPV4="$val";;
+      public_ipv6) [ -n "$OPT_PUBLIC_IPV6" ] || OPT_PUBLIC_IPV6="$val";;
       panel_scopes) [ -n "$OPT_PANEL_SCOPES" ] || OPT_PANEL_SCOPES="$val";;
       panel_rpm) [ -n "$OPT_PANEL_RPM" ] || { OPT_PANEL_RPM="$val"; OPT_PANEL_ACCOUNT=yes; };;
       panel_account) [ -n "$OPT_PANEL_ACCOUNT" ] || OPT_PANEL_ACCOUNT="$(yesno_value "$key" "$val")";;
@@ -369,9 +377,18 @@ session_addr() {
 
 # ------------------------------------------------------------------ stage runner
 STAGES_RUN=0
+ALL_STAGES="nodejs engine selinux nginx mariadb php panel daemon dns mail panelweb firewall fail2ban quota verify"
+valid_only() { # every name in the comma-separated list is a stage
+  local s
+  [ -n "$1" ] || return 1
+  case "$1" in ,*|*,|*,,*|*[!a-z0-9,]*) return 1;; esac
+  for s in ${1//,/ }; do
+    case " $ALL_STAGES " in *" $s "*) ;; *) return 1;; esac
+  done
+}
 stage() { # <name> <title> <function>
   local name="$1" title="$2" fn="$3" rc=0 before after
-  if [ -n "$OPT_ONLY" ] && [ "$OPT_ONLY" != "$name" ]; then return 0; fi
+  if [ -n "$OPT_ONLY" ] && ! printf ',%s,' "$OPT_ONLY" | grep -q ",$name,"; then return 0; fi
   STAGES_RUN=$((STAGES_RUN + 1))
   say "[$name] $title"
   before="$(wc -l <"$CHANGE_FILE")"
@@ -545,6 +562,45 @@ env_block_content() {
   if [ -n "$scopes" ]; then echo "$scopes"; fi
   dns_env_lines
   mail_env_lines
+  public_env_lines
+}
+
+# This host's public addresses (OXPANEL_PUBLIC_IPV4/_IPV6), per family: the
+# one given (--public-ipv4, else --dns-ipv4), else what the block says. Never
+# guessed from the interfaces (behind NAT they are private).
+public_env_lines() {
+  local fam want
+  for fam in 4 6; do
+    if [ "$fam" = 4 ]; then want="${OPT_PUBLIC_IPV4:-$OPT_DNS_IPV4}"; else want="${OPT_PUBLIC_IPV6:-$OPT_DNS_IPV6}"; fi
+    if [ -n "$want" ]; then echo "OXPANEL_PUBLIC_IPV$fam=$want"
+    else env_block_current | grep -E "^OXPANEL_PUBLIC_IPV$fam=" || true; fi
+  done
+}
+
+# The checks the engine applies to OXPANEL_PUBLIC_IPV4/_IPV6 (it would refuse
+# to start otherwise): an address of the family, not unspecified, loopback or
+# multicast (nor broadcast).
+valid_public_ipv4() {
+  local a b c d
+  printf '%s' "$1" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$' || return 1
+  IFS=. read -r a b c d <<<"$1"
+  [ "$a" -le 255 ] && [ "$b" -le 255 ] && [ "$c" -le 255 ] && [ "$d" -le 255 ] || return 1
+  [ "$a" -ne 0 ] && [ "$a" -ne 127 ] && [ "$a" -lt 224 ]
+}
+valid_public_ipv6() {
+  printf '%s' "$1" | grep -Eq '^[0-9a-fA-F:]+$' && printf '%s' "$1" | grep -q ':' || return 1
+  case "$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')" in ::|::1|ff*) return 1;; esac
+}
+decide_public() {
+  if [ -n "$OPT_PUBLIC_IPV4" ]; then valid_public_ipv4 "$OPT_PUBLIC_IPV4" || die "--public-ipv4: '$OPT_PUBLIC_IPV4' is not a public IPv4 address of this host"; fi
+  if [ -n "$OPT_PUBLIC_IPV6" ]; then valid_public_ipv6 "$OPT_PUBLIC_IPV6" || die "--public-ipv6: '$OPT_PUBLIC_IPV6' is not a public IPv6 address of this host"; fi
+  if [ -z "$OPT_PUBLIC_IPV4" ] && [ -n "$OPT_DNS_IPV4" ] && ! valid_public_ipv4 "$OPT_DNS_IPV4"; then die "--dns-ipv4: '$OPT_DNS_IPV4' cannot be this host's public address"; fi
+  if [ -z "$OPT_PUBLIC_IPV6" ] && [ -n "$OPT_DNS_IPV6" ] && ! valid_public_ipv6 "$OPT_DNS_IPV6"; then die "--dns-ipv6: '$OPT_DNS_IPV6' cannot be this host's public address"; fi
+  if grep -Eq '^[[:space:]]*OXPANEL_PUBLIC_IPV[46]=' "$ENV_FILE" 2>/dev/null && ! env_block_current | grep -Eq '^OXPANEL_PUBLIC_IPV[46]='; then
+    if [ -n "$OPT_PUBLIC_IPV4$OPT_PUBLIC_IPV6" ]; then
+      die "$ENV_FILE already sets OXPANEL_PUBLIC_IPV4/_IPV6 outside the installer's block; change it there, or remove those lines and run again"
+    fi
+  fi
 }
 
 # The DNS hosting lines of the installer's block: written once BIND is there
@@ -720,7 +776,9 @@ stage_php() {
 
 # ------------------------------------------------------------------ stage: daemon
 stage_daemon() {
-
+  # The installer's block is current (a run with --only daemon, e.g. for
+  # --public-ipv4, writes it here; after the engine stage this changes nothing).
+  engine_env_block
   if ! unit_enabled oxpanel-daemon || ! unit_active oxpanel-daemon; then
     run systemctl daemon-reload || return 1
     run systemctl enable --now oxpanel-daemon || return 1
@@ -1131,8 +1189,51 @@ PANEL_SETUP=/usr/sbin/oxpanel-panel-setup
 panel_installed() { installed oxpanel-panel && [ -x "$PANEL_SETUP" ]; }
 
 panel_mode_args() {
-  if [ -n "$OPT_PANEL_HOSTNAME" ]; then printf -- '--hostname %s' "$OPT_PANEL_HOSTNAME"
-  elif [ -n "$OPT_PANEL_PORT" ]; then printf -- '--port %s' "$OPT_PANEL_PORT"; fi
+  local name
+  if [ -n "$OPT_PANEL_HOSTNAME" ]; then printf -- '--hostname %s' "$OPT_PANEL_HOSTNAME"; return 0; fi
+  if [ -n "$OPT_PANEL_PORT" ]; then printf -- '--port %s' "$OPT_PANEL_PORT"; fi
+  # Port mode (asked for, or kept): the name the engine gets the panel's
+  # certificate for. Only a setup tool that knows --name (panel 0.2.2 and
+  # later) is given it; an older one installs as before.
+  if grep -qx 'MODE=hostname' /etc/oxpanel-panel/setup.conf 2>/dev/null && [ -z "$OPT_PANEL_PORT" ]; then return 0; fi
+  # A name the setup tool already keeps (given to it by the administrator,
+  # or by an earlier run) stays unless --panel-port is given again.
+  if grep -q '^NAME=.' /etc/oxpanel-panel/setup.conf 2>/dev/null && [ -z "$OPT_PANEL_PORT" ]; then return 0; fi
+  name="$(panel_name)"
+  if [ -n "$name" ] && panel_setup_knows_name; then printf -- ' --name %s' "$name"; fi
+}
+
+# The panel's host name for its certificate: --panel-hostname, else the mail
+# host name (with email), else this host's fully-qualified name (with a dot);
+# empty when there is none. Never invented.
+panel_name() {
+  local fqdn
+  if [ -n "$OPT_PANEL_HOSTNAME" ]; then printf '%s' "$OPT_PANEL_HOSTNAME"; return 0; fi
+  if mail_wanted && [ -n "$OPT_MAIL_HOSTNAME" ]; then printf '%s' "$OPT_MAIL_HOSTNAME"; return 0; fi
+  fqdn="$(hostname -f 2>/dev/null || true)"
+  case "$fqdn" in
+    *.*) printf '%s' "$fqdn" | tr '[:upper:]' '[:lower:]' | grep -E '^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]*[a-z0-9]$' || true;;
+  esac
+}
+
+# Whether the installed setup tool's usage mentions --name (it prints its
+# usage for an unknown command, with exit status 2: captured first, as under
+# pipefail a pipe from it would always fail).
+panel_setup_knows_name() {
+  local usage
+  usage="$("$PANEL_SETUP" help 2>&1 || true)"
+  grep -q -- '--name' <<<"$usage"
+}
+
+# Which certificate the panel serves, in one line (from the setup tool's
+# status; the engine's view of the automatic one as a fallback).
+panel_certificate_line() {
+  local line
+  line="$("$PANEL_SETUP" status 2>/dev/null | sed -n 's/^certificate:[[:space:]]*//p' | head -1 || true)"
+  if [ -z "$line" ] && quiet oxpanel-ctl cert host panel; then
+    line="automatic certificate $(oxpanel-ctl cert host panel | sed -n 's/^state=//p') ($(oxpanel-ctl cert host panel | sed -n 's/^reason=//p'))"
+  fi
+  printf '%s' "${line:-unknown (see: oxpanel-panel-setup status)}"
 }
 
 # The panel's port in port mode (as configured), else nothing.
@@ -1150,8 +1251,15 @@ stage_panelweb() {
   if [ -n "$OPT_PANEL_PORT" ] && [ -n "$OPT_PANEL_HOSTNAME" ]; then die "--panel-port and --panel-hostname exclude each other"; fi
   before="$(panel_web_state)"
   args="$(panel_mode_args)"
-  # shellcheck disable=SC2086  # $args is "--port N" or "--hostname NAME", validated by the setup tool
+  # shellcheck disable=SC2086  # $args is "--port N [--name NAME]" or "--hostname NAME", validated by the setup tool
   run "$PANEL_SETUP" enable $args || return 1
+  # The engine looks for the panel's certificate now (a registration the
+  # panel just wrote), not at its next sweep. Failing here is not fatal: the
+  # sweep runs every 15 minutes, and `status` says why there is none yet.
+  if [ -d /etc/oxpanel/host-certificates.d ] && oxpanel-ctl cert host >/dev/null 2>&1; then
+    printf '+ timeout 300 oxpanel-ctl cert auto run\n' >>"$LOG"
+    timeout 300 oxpanel-ctl cert auto run >>"$LOG" 2>&1 || note "certificates: not all could be obtained yet (oxpanel-ctl cert auto status; oxpanel-ctl cert host)"
+  fi
   after="$(panel_web_state)"
   if [ "$before" != "$after" ]; then changed "panel served by Nginx at $("$PANEL_SETUP" url)"; else note "panel already served at $("$PANEL_SETUP" url)"; fi
   if ! unit_enabled oxpanel-panel || ! unit_active oxpanel-panel; then
@@ -1183,6 +1291,7 @@ stage_panelweb() {
   done
   [ "$code" = 200 ] || die "the panel does not answer over HTTPS (HTTP ${code:-none}); see: journalctl -u oxpanel-panel -u nginx"
   note "panel answers over HTTPS: $("$PANEL_SETUP" url)"
+  note "panel certificate: $(panel_certificate_line)"
 }
 
 # ------------------------------------------------------------------ stage: verify
@@ -1383,6 +1492,7 @@ enabled afterwards (fail2ban needs its updates). Disable it later with: dnf conf
   check_quota_offer
   decide_dns
   decide_mail
+  decide_public
   say "decisions: fail2ban=${OPT_FAIL2BAN:-no} epel=${OPT_EPEL:-no} quota=${OPT_QUOTA:-no} reboot=${OPT_REBOOT:-no} mariadb=$OPT_MARIADB php=$OPT_PHP nodejs=$OPT_NODEJS dns=$(dns_wanted && echo yes || echo no) mail=$(mail_wanted && echo yes || echo no)$([ "$INTERACTIVE" -eq 1 ] && echo ' (interactive)' || echo ' (unattended)')"
 
   if ! installed php-fpm && [ ! -e "$STATE_DIR/php-fpm-installed-by-installer" ]; then : >"$STATE_DIR/php-fpm-installed-by-installer"; fi
@@ -1522,12 +1632,14 @@ finish() {
     printf '\nThe panel: %s\n' "$("$PANEL_SETUP" url)"
     printf '  administrator:      %s\n' "$(cat "$FLAG_DIR/panel-admin")"
     printf '  one-time password:  %s\n' "$(cat "$FLAG_DIR/panel-admin-password" 2>/dev/null)"
-    printf '  It is shown only now. Sign in, then choose a new password and set up two-factor authentication.\n'
-    printf '  The certificate is self-signed until you install your own:\n'
-    printf '    oxpanel-panel-setup certificate --cert FULLCHAIN.pem --key KEY.pem\n\n'
+    printf '  It is shown only now. Sign in, then choose a new password and set up two-factor authentication.\n\n'
     say "panel administrator created; its one-time password was printed on the terminal (not logged)"
   elif panel_installed && [ -e /etc/nginx/conf.d/00-oxpanel-panel.conf ]; then
     say "The panel: $("$PANEL_SETUP" url)"
+  fi
+  if panel_installed && [ -e /etc/nginx/conf.d/00-oxpanel-panel.conf ]; then
+    say "The panel's certificate: $(panel_certificate_line)"
+    say "  (your own instead: oxpanel-panel-setup certificate --cert FULLCHAIN.pem --key KEY.pem)"
   fi
   printf 'result=ok\nversion=%s\nchanges=%s\nwarnings=%s\nreboot_required=%s\nfinished=%s\n' "$(cur_version)" "$n" "$w" "$reboot" "$(date -u +%FT%TZ)" >"$STATE_DIR/status"
   if [ "$reboot" = yes ]; then

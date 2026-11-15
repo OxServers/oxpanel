@@ -29,6 +29,7 @@ check "its answers are the decisions taken" bash -c 'grep -q "^decisions: fail2b
 printf 'bogus=1\n' > bad.txt
 check_not "an unknown key in the answers file is refused" bash -c "$INST --answers bad.txt --only verify"
 check_not "an unknown option is refused" bash -c "$INST --no-such-option"
+check_not "an unknown stage in --only is refused (a typo never runs nothing quietly)" bash -c "$INST --only dns,firewal"
 check "a flag wins over the answers file" bash -c "$INST --answers answers.txt --no-fail2ban --only verify 2>&1 | grep -q '^decisions: fail2ban=no'"
 
 # --- the panel hook (without a panel package)
@@ -60,7 +61,11 @@ check "oxpanel-dns runs" systemctl -q is-active oxpanel-dns
 check "it answers, authoritatively only (a name it does not host is refused, not resolved)" bash -c 'dig +norec +time=2 @127.0.0.1 example.org A | grep -q "status: REFUSED"'
 check "the engine reports DNS hosting available" bash -c 'oxpanel-ctl host info | grep -q "^dns=true .*dns_available=true"'
 check "a second run changes nothing" bash -c "$INST --dns $DNSF --only dns 2>&1 | grep -q '^RESULT: ok changes=0 '"
-check "the firewall stage opens 53 for it" bash -c "$INST --dns $DNSF --only firewall >/dev/null 2>&1 && firewall-cmd -q --query-service=dns"
+check "the DNS address is also the public address (0.3.2)" bash -c "grep -qx OXPANEL_PUBLIC_IPV4=192.0.2.53 $ENVF && oxpanel-ctl host info | grep -qx 'public_ipv4=192.0.2.53 public_ipv6=-'"
+check_not "a loopback public address is refused" bash -c "$INST --public-ipv4 127.0.0.1 --only daemon"
+check "--public-ipv4 with --only daemon sets it and restarts the engine" bash -c "$INST --public-ipv4 198.51.100.7 --only daemon >/dev/null 2>&1 && grep -qx OXPANEL_PUBLIC_IPV4=198.51.100.7 $ENVF && oxpanel-ctl host info | grep -q '^public_ipv4=198.51.100.7 '"
+check "a run that does not mention it keeps it" bash -c "$INST --only daemon 2>&1 | grep -q '^RESULT: ok changes=0 ' && grep -qx OXPANEL_PUBLIC_IPV4=198.51.100.7 $ENVF"
+check "--only dns,firewall (the handbook's command) opens 53 for it" bash -c "$INST --dns $DNSF --only dns,firewall 2>&1 | grep -q '^\[firewall\]' && firewall-cmd -q --query-service=dns"
 check "a run that does not mention DNS keeps it" bash -c "$INST --only engine >/dev/null 2>&1; grep -qx OXPANEL_DNS=true $ENVF"
 check "--no-dns takes the lines out" bash -c "$INST --no-dns --only dns >/dev/null 2>&1; ! grep -q '^OXPANEL_DNS' $ENVF"
 firewall-cmd -q --remove-service=dns; firewall-cmd -q --permanent --remove-service=dns
@@ -87,7 +92,7 @@ for u in postfix dovecot rspamd oxpanel-mail-policy oxpanel-webmail; do check "$
 check "the engine reports email on with that host name" bash -c 'oxpanel-ctl mail host | grep -q "^enabled=true host_name=mail.inst.example "'
 check "OxPanel took over Postfix and kept the original" bash -c 'head -1 /etc/postfix/main.cf | grep -q "Managed by oxpanel-daemon" && test -s /etc/postfix/main.cf.oxpanel-orig'
 check "a second run changes nothing" bash -c "$INST $MAILF --only mail 2>&1 | grep -q '^RESULT: ok changes=0 '"
-check "the firewall stage opens the mail ports" bash -c "$INST $MAILF --only firewall >/dev/null 2>&1 && for s in smtp smtps smtp-submission imaps pop3s; do firewall-cmd -q --query-service=\$s && firewall-cmd -q --permanent --query-service=\$s || exit 1; done"
+check "--only mail,firewall (the handbook's command) opens the mail ports" bash -c "$INST $MAILF --only mail,firewall >/dev/null 2>&1 && for s in smtp smtps smtp-submission imaps pop3s; do firewall-cmd -q --query-service=\$s && firewall-cmd -q --permanent --query-service=\$s || exit 1; done"
 check "with login banning, the mail jails run" bash -c "$INST $MAILF --fail2ban --only fail2ban >/dev/null 2>&1 && fail2ban-client status dovecot >/dev/null && fail2ban-client status postfix-sasl >/dev/null && fail2ban-client status oxpanel-webmail >/dev/null"
 check "the mail jails never ban the loopback (webmail logs in from there)" bash -c 'grep -q "^ignoreip  = 127.0.0.1/8 ::1" /etc/fail2ban/jail.d/50-oxpanel-mail.local'
 check "a run that does not mention email keeps it" bash -c "$INST --only engine >/dev/null 2>&1; grep -qx OXPANEL_MAIL=true $ENVF"
