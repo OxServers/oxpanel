@@ -19,6 +19,98 @@ pub(crate) enum Mode {
     Off,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub(crate) enum LimitLayer {
+    Account,
+    Plan,
+}
+
+/// `inherit`, `unlimited` or a number (0 is refused: say `unlimited`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LimitValue {
+    Inherit,
+    Unlimited,
+    Value(u64),
+}
+
+impl std::str::FromStr for LimitValue {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "inherit" => Ok(Self::Inherit),
+            "unlimited" => Ok(Self::Unlimited),
+            _ => match s.parse::<u64>() {
+                Ok(0) => Err("0 is not a limit: say `unlimited` (or `inherit`)".into()),
+                Ok(n) => Ok(Self::Value(n)),
+                Err(_) => Err(format!("'{s}' is not a number, `unlimited` or `inherit`")),
+            },
+        }
+    }
+}
+
+fn setting(v: Option<LimitValue>) -> Option<pb::MailLimitSetting> {
+    let (mode, value) = match v? {
+        LimitValue::Inherit => (pb::MailLimitMode::Inherit, 0),
+        LimitValue::Unlimited => (pb::MailLimitMode::Unlimited, 0),
+        LimitValue::Value(n) => (pb::MailLimitMode::Value, n),
+    };
+    Some(pb::MailLimitSetting {
+        mode: mode.into(),
+        value,
+    })
+}
+
+fn settings(
+    max_mailboxes: Option<LimitValue>,
+    max_mailbox_bytes: Option<LimitValue>,
+    per_hour_account: Option<LimitValue>,
+    per_hour_mailbox: Option<LimitValue>,
+) -> pb::MailLimitSettings {
+    pb::MailLimitSettings {
+        max_mailboxes: setting(max_mailboxes),
+        max_mailbox_bytes: setting(max_mailbox_bytes),
+        max_messages_per_hour_account: setting(per_hour_account),
+        max_messages_per_hour_mailbox: setting(per_hour_mailbox),
+    }
+}
+
+fn setting_text(s: Option<&pb::MailLimitSetting>) -> String {
+    match s.map(|s| (pb::MailLimitMode::try_from(s.mode), s.value)) {
+        Some((Ok(pb::MailLimitMode::Value), v)) => v.to_string(),
+        Some((Ok(pb::MailLimitMode::Unlimited), _)) => "unlimited".into(),
+        _ => "inherit".into(),
+    }
+}
+
+fn settings_text(l: Option<&pb::MailLimitSettings>) -> String {
+    let d = pb::MailLimitSettings::default();
+    let l = l.unwrap_or(&d);
+    format!(
+        "max_mailboxes={} max_mailbox_bytes={} per_hour_account={} per_hour_mailbox={}",
+        setting_text(l.max_mailboxes.as_ref()),
+        setting_text(l.max_mailbox_bytes.as_ref()),
+        setting_text(l.max_messages_per_hour_account.as_ref()),
+        setting_text(l.max_messages_per_hour_mailbox.as_ref())
+    )
+}
+
+fn effective_text(e: Option<&pb::MailLimitEffective>) -> String {
+    let Some(e) = e else {
+        return "unknown".into();
+    };
+    let source = match pb::MailLimitSource::try_from(e.source) {
+        Ok(pb::MailLimitSource::HostDefault) => "default",
+        Ok(pb::MailLimitSource::Plan) => "plan",
+        Ok(pb::MailLimitSource::Account) => "account",
+        _ => "unknown",
+    };
+    if e.unlimited {
+        format!("unlimited({source})")
+    } else {
+        format!("{}({source})", e.value)
+    }
+}
+
 #[derive(Subcommand, Debug)]
 pub(crate) enum MailCmd {
     /// The mail component: enabled, host name, components, warnings.
@@ -146,20 +238,42 @@ pub(crate) enum MailCmd {
         #[arg(long)]
         tenant: String,
     },
+    /// An account's effective limits with their sources, and its layers.
     Limits {
         tenant: String,
     },
-    /// Set an account's limits (0 = unlimited).
+    /// Replace one layer of an account's limits. Each value is a number,
+    /// `unlimited`, or `inherit` (follow the plan layer, then the host
+    /// default); a limit left out is `inherit`.
     LimitsSet {
         tenant: String,
+        /// `account` (an override for this account) or `plan`.
+        #[arg(long, value_enum, default_value_t = LimitLayer::Account)]
+        layer: LimitLayer,
         #[arg(long)]
-        max_mailboxes: u32,
+        max_mailboxes: Option<LimitValue>,
         #[arg(long)]
-        max_mailbox_bytes: u64,
+        max_mailbox_bytes: Option<LimitValue>,
         #[arg(long)]
-        per_hour_account: u32,
+        per_hour_account: Option<LimitValue>,
         #[arg(long)]
-        per_hour_mailbox: u32,
+        per_hour_mailbox: Option<LimitValue>,
+    },
+    /// The host's default limits (what accounts follow unless their plan
+    /// or an override says otherwise).
+    Defaults,
+    /// Change host default limits: a number or `unlimited`; a limit left
+    /// out stays as it is. Every account following a default follows the
+    /// new one at once.
+    DefaultsSet {
+        #[arg(long)]
+        max_mailboxes: Option<LimitValue>,
+        #[arg(long)]
+        max_mailbox_bytes: Option<LimitValue>,
+        #[arg(long)]
+        per_hour_account: Option<LimitValue>,
+        #[arg(long)]
+        per_hour_mailbox: Option<LimitValue>,
     },
     Usage {
         tenant: String,
@@ -271,11 +385,18 @@ fn print_limits(l: &pb::MailLimits) {
     emit(&format!(
         "tenant={} max_mailboxes={} max_mailbox_bytes={} per_hour_account={} per_hour_mailbox={}",
         l.tenant,
-        l.max_mailboxes,
-        l.max_mailbox_bytes,
-        l.max_messages_per_hour_account,
-        l.max_messages_per_hour_mailbox
+        effective_text(l.effective_max_mailboxes.as_ref()),
+        effective_text(l.effective_max_mailbox_bytes.as_ref()),
+        effective_text(l.effective_max_messages_per_hour_account.as_ref()),
+        effective_text(l.effective_max_messages_per_hour_mailbox.as_ref())
     ));
+    emit(&format!("plan: {}", settings_text(l.plan.as_ref())));
+    emit(&format!("account: {}", settings_text(l.account.as_ref())));
+}
+
+fn print_defaults(d: &pb::MailDefaults) {
+    emit(&format!("defaults: {}", settings_text(d.settings.as_ref())));
+    emit(&format!("builtin: {}", settings_text(d.builtin.as_ref())));
 }
 
 fn stamp(secs: i64) -> Option<prost_types::Timestamp> {
@@ -298,9 +419,10 @@ pub(crate) async fn run_mail(
                 .into_inner();
             let comp = h.components.unwrap_or_default();
             emit(&format!(
-                "enabled={} host_name={} postfix={} dovecot={} filter={} antivirus={} webmail={} webmail_url={}",
+                "enabled={} host_name={} postfix={} dovecot={} filter={} antivirus={} webmail={} webmail_url={} filter_resolver={}",
                 h.enabled, h.host_name, comp.postfix, comp.dovecot, comp.filter, comp.antivirus, comp.webmail,
-                if h.webmail_url_pattern.is_empty() { "-" } else { &h.webmail_url_pattern }
+                if h.webmail_url_pattern.is_empty() { "-" } else { &h.webmail_url_pattern },
+                comp.filter_resolver
             ));
             for w in &h.warnings {
                 let kind = match pb::MailWarningKind::try_from(w.kind) {
@@ -308,6 +430,7 @@ pub(crate) async fn run_mail(
                     Ok(pb::MailWarningKind::Port25Blocked) => "port_25",
                     Ok(pb::MailWarningKind::NoCertificate) => "no_certificate",
                     Ok(pb::MailWarningKind::ServiceNotRunning) => "service_not_running",
+                    Ok(pb::MailWarningKind::FilterResolverDown) => "filter_resolver_down",
                     _ => "other",
                 };
                 emit(&format!("warning: [{kind}] {}", w.detail));
@@ -563,6 +686,7 @@ pub(crate) async fn run_mail(
         }
         MailCmd::LimitsSet {
             tenant,
+            layer,
             max_mailboxes,
             max_mailbox_bytes,
             per_hour_account,
@@ -571,14 +695,60 @@ pub(crate) async fn run_mail(
             let l = c
                 .set_mail_limits(pb::SetMailLimitsRequest {
                     tenant,
-                    max_mailboxes,
-                    max_mailbox_bytes,
-                    max_messages_per_hour_account: per_hour_account,
-                    max_messages_per_hour_mailbox: per_hour_mailbox,
+                    layer: match layer {
+                        LimitLayer::Account => pb::MailLimitLayer::Account,
+                        LimitLayer::Plan => pb::MailLimitLayer::Plan,
+                    }
+                    .into(),
+                    settings: Some(settings(
+                        max_mailboxes,
+                        max_mailbox_bytes,
+                        per_hour_account,
+                        per_hour_mailbox,
+                    )),
+                    ..pb::SetMailLimitsRequest::default()
                 })
                 .await?
                 .into_inner();
             print_limits(&l);
+        }
+        MailCmd::Defaults => {
+            let d = c
+                .get_mail_defaults(pb::GetMailDefaultsRequest {})
+                .await?
+                .into_inner();
+            print_defaults(&d);
+        }
+        MailCmd::DefaultsSet {
+            max_mailboxes,
+            max_mailbox_bytes,
+            per_hour_account,
+            per_hour_mailbox,
+        } => {
+            if [
+                max_mailboxes,
+                max_mailbox_bytes,
+                per_hour_account,
+                per_hour_mailbox,
+            ]
+            .contains(&Some(LimitValue::Inherit))
+            {
+                return Err(tonic::Status::invalid_argument(
+                    "a host default is a number or `unlimited`",
+                ));
+            }
+            let d = c
+                .set_mail_defaults(pb::SetMailDefaultsRequest {
+                    settings: Some(settings(
+                        max_mailboxes,
+                        max_mailbox_bytes,
+                        per_hour_account,
+                        per_hour_mailbox,
+                    )),
+                })
+                .await?
+                .into_inner();
+            print_defaults(&d);
         }
         MailCmd::Usage { tenant } => {
             let u = c

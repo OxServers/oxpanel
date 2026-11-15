@@ -23,14 +23,22 @@ pub struct MailConfig {
     /// `OXPANEL_MAIL_ANTIVIRUS`: scan mail with ClamAV through the filter
     /// (default off: ClamAV needs about 1 GB of memory).
     pub antivirus: bool,
-    /// `OXPANEL_MAIL_MAX_MAILBOXES`: mailboxes per account unless the
-    /// account has its own limit (0 = unlimited).
+    /// `OXPANEL_MAIL_RESOLVER`: the filter uses its own caching, validating
+    /// DNS resolver (Unbound on the loopback, [`RESOLVER_PORT`]) instead of
+    /// the system's. Written by `install.sh --mail` (off with
+    /// `--no-mail-resolver`); off when absent, so a package upgrade never
+    /// starts it on its own.
+    pub resolver: FilterResolver,
+    /// `OXPANEL_MAIL_MAX_MAILBOXES`: the built-in host default for
+    /// mailboxes per account (0 = unlimited), used until the host default
+    /// is set with `SetMailDefaults` (see [`super::limits`]).
     pub max_mailboxes: u32,
-    /// `OXPANEL_MAIL_MAX_MAILBOX_BYTES`: largest mailbox size (0 = unlimited).
+    /// `OXPANEL_MAIL_MAX_MAILBOX_BYTES`: built-in default largest mailbox (0 = unlimited).
     pub max_mailbox_bytes: u64,
-    /// `OXPANEL_MAIL_RATE_ACCOUNT` / `OXPANEL_MAIL_RATE_MAILBOX`: recipients
-    /// per clock hour an account (all its mailboxes and sites) and one
-    /// mailbox may send to (0 = unlimited).
+    /// `OXPANEL_MAIL_RATE_ACCOUNT` / `OXPANEL_MAIL_RATE_MAILBOX`: built-in
+    /// defaults of the recipients per clock hour an account (all its
+    /// mailboxes and sites) and one mailbox may send to (30 and 20; 0 =
+    /// unlimited), used until the host default is set with `SetMailDefaults`.
     pub rate_account: u32,
     pub rate_mailbox: u32,
     /// `OXPANEL_MAIL_MESSAGE_MAX_BYTES`: largest message accepted.
@@ -67,6 +75,11 @@ pub struct MailConfig {
     pub selfsigned_dir: PathBuf,
     /// Roundcube's front page as packaged: webmail is offered when it exists.
     pub roundcube_index: PathBuf,
+    /// The filter's resolver: its configuration (and `local.d/` for the
+    /// operator's own additions), and the program, which must be installed
+    /// for the resolver to be used.
+    pub resolver_dir: PathBuf,
+    pub resolver_binary: PathBuf,
     /// bcrypt cost of mailbox password hashes. Not configurable from the
     /// environment: always [`super::password::COST`] in production; tests
     /// lower it to keep debug builds fast.
@@ -80,10 +93,11 @@ impl Default for MailConfig {
             hostname: None,
             webmail: true,
             antivirus: false,
+            resolver: FilterResolver::System,
             max_mailboxes: 0,
             max_mailbox_bytes: 0,
-            rate_account: 500,
-            rate_mailbox: 200,
+            rate_account: 30,
+            rate_mailbox: 20,
             message_max_bytes: 25 * 1024 * 1024,
             port25_check: Domain::parse(DEFAULT_PORT25_CHECK).ok(),
             postfix_dir: PathBuf::from("/etc/postfix"),
@@ -97,12 +111,27 @@ impl Default for MailConfig {
             milter_dir: PathBuf::from("/var/spool/postfix/oxpanel-milter"),
             selfsigned_dir: PathBuf::from("/etc/pki/oxpanel-mail"),
             roundcube_index: PathBuf::from("/usr/share/roundcubemail/public_html/index.php"),
+            resolver_dir: PathBuf::from("/etc/oxpanel-mail-resolver"),
+            resolver_binary: PathBuf::from("/usr/sbin/unbound"),
             password_cost: super::password::COST,
         }
     }
 }
 
+/// Which DNS resolver the mail filter asks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilterResolver {
+    /// The system's (`/etc/resolv.conf`).
+    System,
+    /// Its own (Unbound on the loopback).
+    Own,
+}
+
 pub const DEFAULT_PORT25_CHECK: &str = "gmail-smtp-in.l.google.com";
+
+/// The filter's resolver listens on 127.0.0.1 at this port (not 53: the
+/// host may run OxPanel's DNS server or a resolver of its own there).
+pub const RESOLVER_PORT: u16 = 5335;
 
 fn bad(key: &str, why: impl std::fmt::Display) -> Error {
     Error::invalid("config", format!("{key}: {why}"))
@@ -134,6 +163,13 @@ impl MailConfig {
         }
         if let Some(v) = get("OXPANEL_MAIL_ANTIVIRUS") {
             c.antivirus = parse_bool("OXPANEL_MAIL_ANTIVIRUS", &v)?;
+        }
+        if let Some(v) = get("OXPANEL_MAIL_RESOLVER") {
+            c.resolver = if parse_bool("OXPANEL_MAIL_RESOLVER", &v)? {
+                FilterResolver::Own
+            } else {
+                FilterResolver::System
+            };
         }
         if let Some(v) = get("OXPANEL_MAIL_PORT25_CHECK") {
             let v = v.trim().trim_end_matches('.');
@@ -175,6 +211,11 @@ impl MailConfig {
         Ok(c)
     }
 
+    /// The filter uses its own resolver: switched on and Unbound installed.
+    pub fn resolver_offered(&self) -> bool {
+        self.resolver == FilterResolver::Own && self.resolver_binary.exists()
+    }
+
     pub fn validate(&self) -> Result<()> {
         if !(1024 * 1024..=200 * 1024 * 1024).contains(&self.message_max_bytes) {
             return Err(bad(
@@ -210,7 +251,13 @@ mod tests {
     fn email_is_off_by_default_and_needs_a_host_name_when_on() {
         let c = from(&[]).unwrap();
         assert!(!c.enabled);
-        assert!(c.webmail && !c.antivirus);
+        assert!(c.webmail && !c.antivirus && c.resolver == FilterResolver::System);
+        assert_eq!((c.rate_account, c.rate_mailbox), (30, 20));
+        assert_eq!(
+            from(&[("OXPANEL_MAIL_RESOLVER", "true")]).unwrap().resolver,
+            FilterResolver::Own
+        );
+        assert!(from(&[("OXPANEL_MAIL_RESOLVER", "maybe")]).is_err());
         assert!(from(&[("OXPANEL_MAIL", "yes")]).is_err());
         let c = from(&[
             ("OXPANEL_MAIL", "yes"),

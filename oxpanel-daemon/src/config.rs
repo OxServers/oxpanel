@@ -929,6 +929,8 @@ pub(crate) fn sandbox_feature_paths(cfg: &mut Config, dir: &Path) {
     cfg.mail.milter_dir = mail.join("milter");
     cfg.mail.selfsigned_dir = mail.join("pki");
     cfg.mail.roundcube_index = mail.join("roundcube").join("index.php");
+    cfg.mail.resolver_dir = mail.join("resolver");
+    cfg.mail.resolver_binary = mail.join("unbound");
     for d in [dir.join("sshd_config.d"), dir.join("run")] {
         std::fs::create_dir_all(&d).unwrap_or_else(|e| panic!("{}: {e}", d.display()));
     }

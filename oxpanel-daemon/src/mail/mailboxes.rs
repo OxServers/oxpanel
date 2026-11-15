@@ -4,6 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use tracing::{info, warn};
 
+use super::limits::{Layer, Resolved, Setting};
 use super::store::{
     AutoreplyRecord, ForwarderRecord, MailDomainRecord, MailMode, MailStore, MailboxRecord,
     RecordState,
@@ -23,6 +24,18 @@ use crate::validate::{
 
 /// Autoresponder dates end with the year 9999: the script compares ISO 8601
 /// text, which only orders correctly with four-digit years.
+/// A change of an account's email limits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LimitsChange {
+    /// Replace the plan layer.
+    Plan(Layer),
+    /// Replace the account layer.
+    Account(Layer),
+    /// A client older than engine 0.3.1: flat values (0 = inherit) for the
+    /// account layer; the plan layer is cleared.
+    Legacy(Limits),
+}
+
 const LAST_AUTOREPLY_TIME: u64 = 253_402_300_799;
 
 /// Space used and messages of a mailbox, from Dovecot's quota (`doveadm -f
@@ -526,28 +539,75 @@ impl MailService {
 
     // -- limits and usage --
 
-    pub async fn get_limits(&self, tenant: &str) -> Result<Limits> {
+    pub async fn get_limits(&self, tenant: &str) -> Result<Resolved> {
         let tenant = Username::parse_field(tenant, "tenant")?;
         require_available(&self.ctx).await?;
         self.tenant(&tenant, false)?;
-        self.limits(&tenant)
+        self.resolved_limits(&tenant)
     }
 
-    pub async fn set_limits(&self, tenant: &str, l: Limits) -> Result<Limits> {
+    /// Replace one layer of the account's limits (or, for a client older
+    /// than engine 0.3.1, its account layer from flat values, 0 = inherit).
+    pub async fn set_limits(&self, tenant: &str, change: LimitsChange) -> Result<Resolved> {
         let tenant = Username::parse_field(tenant, "tenant")?;
+        match &change {
+            LimitsChange::Plan(l) | LimitsChange::Account(l) => l.validate()?,
+            LimitsChange::Legacy(_) => {}
+        }
         require_available(&self.ctx).await?;
         let _guard = self.ctx.lock.lock().await;
         self.tenant(&tenant, false)?;
-        self.store().save_limits(&super::store::MailLimitsRecord {
-            tenant: tenant.to_string(),
-            max_mailboxes: Some(l.max_mailboxes),
-            max_mailbox_bytes: Some(l.max_mailbox_bytes),
-            rate_account: Some(l.rate_account),
-            rate_mailbox: Some(l.rate_mailbox),
-        })?;
+        let mut rec = self.store().load_limits(&tenant)?;
+        match change {
+            LimitsChange::Plan(l) => rec.plan = l,
+            LimitsChange::Account(l) => rec.account = l,
+            LimitsChange::Legacy(l) => {
+                let s = |v: u64| {
+                    if v == 0 {
+                        Setting::Inherit
+                    } else {
+                        Setting::Value(v)
+                    }
+                };
+                let account = Layer {
+                    max_mailboxes: s(u64::from(l.max_mailboxes)),
+                    max_mailbox_bytes: s(l.max_mailbox_bytes),
+                    rate_account: s(u64::from(l.rate_account)),
+                    rate_mailbox: s(u64::from(l.rate_mailbox)),
+                };
+                account.validate()?;
+                rec.account = account;
+                rec.plan = Layer::default();
+            }
+        }
+        self.store().save_limits(&rec)?;
         self.apply(None).await?;
-        info!(tenant = %tenant, ?l, "mail limits set");
-        self.limits(&tenant)
+        info!(tenant = %tenant, plan = ?rec.plan, account = ?rec.account, "mail limits set");
+        self.resolved_limits(&tenant)
+    }
+
+    /// The host's default limits and the built-in ones.
+    pub async fn get_defaults(&self) -> Result<(Layer, Layer)> {
+        require_available(&self.ctx).await?;
+        let cfg = &self.ctx.config.mail;
+        Ok((
+            super::ops::host_defaults(cfg, &self.store())?,
+            super::limits::builtin(cfg),
+        ))
+    }
+
+    /// Change the host's default limits (a limit left `inherit` stays as it
+    /// is). Every account that follows a default follows the new one at once.
+    pub async fn set_defaults(&self, update: Layer) -> Result<(Layer, Layer)> {
+        update.validate()?;
+        require_available(&self.ctx).await?;
+        let _guard = self.ctx.lock.lock().await;
+        let cfg = &self.ctx.config.mail;
+        let next = super::ops::host_defaults(cfg, &self.store())?.merged(&update);
+        self.store().save_defaults(&next)?;
+        self.apply(None).await?;
+        info!(defaults = ?next, "host default mail limits set");
+        Ok((next, super::limits::builtin(cfg)))
     }
 
     pub async fn usage(&self, tenant: &str) -> Result<Usage> {

@@ -7,10 +7,12 @@ use tracing::info;
 
 use super::{detached, fail, timestamp, Engine};
 use crate::auth::Scope;
+use crate::error::Error;
+use crate::mail::limits::{Effective, Layer, Resolved, Setting, Source};
 use crate::mail::store::MailMode;
 use crate::mail::{
-    AutoreplyView, Check, CheckStatus, DomainView, ForwarderView, HostView, Limits, MailboxView,
-    Published, QueueEntry, WarningKind,
+    AutoreplyView, Check, CheckStatus, DomainView, ForwarderView, HostView, Limits, LimitsChange,
+    MailboxView, Published, QueueEntry, WarningKind,
 };
 use oxpanel_proto::v1 as pb;
 
@@ -125,13 +127,115 @@ fn autoreply_to(a: &AutoreplyView) -> pb::Autoresponder {
     }
 }
 
-fn limits_to(tenant: &str, l: &Limits) -> pb::MailLimits {
+fn setting_to(s: Setting) -> pb::MailLimitSetting {
+    match s {
+        Setting::Inherit => pb::MailLimitSetting {
+            mode: pb::MailLimitMode::Inherit.into(),
+            value: 0,
+        },
+        Setting::Value(v) => pb::MailLimitSetting {
+            mode: pb::MailLimitMode::Value.into(),
+            value: v,
+        },
+        Setting::Unlimited => pb::MailLimitSetting {
+            mode: pb::MailLimitMode::Unlimited.into(),
+            value: 0,
+        },
+    }
+}
+
+/// A left-out setting is `inherit`; an unknown mode is refused.
+fn setting_from(s: Option<pb::MailLimitSetting>, field: &'static str) -> Result<Setting, Error> {
+    let Some(s) = s else {
+        return Ok(Setting::Inherit);
+    };
+    match pb::MailLimitMode::try_from(s.mode) {
+        Ok(pb::MailLimitMode::Inherit) => Ok(Setting::Inherit),
+        Ok(pb::MailLimitMode::Value) => Ok(Setting::Value(s.value)),
+        Ok(pb::MailLimitMode::Unlimited) => Ok(Setting::Unlimited),
+        Err(_) => Err(Error::invalid(field, "unknown mode")),
+    }
+}
+
+fn layer_to(l: &Layer) -> pb::MailLimitSettings {
+    pb::MailLimitSettings {
+        max_mailboxes: Some(setting_to(l.max_mailboxes)),
+        max_mailbox_bytes: Some(setting_to(l.max_mailbox_bytes)),
+        max_messages_per_hour_account: Some(setting_to(l.rate_account)),
+        max_messages_per_hour_mailbox: Some(setting_to(l.rate_mailbox)),
+    }
+}
+
+fn layer_from(l: Option<pb::MailLimitSettings>) -> Result<Layer, Error> {
+    let l = l.unwrap_or_default();
+    Ok(Layer {
+        max_mailboxes: setting_from(l.max_mailboxes, "max_mailboxes")?,
+        max_mailbox_bytes: setting_from(l.max_mailbox_bytes, "max_mailbox_bytes")?,
+        rate_account: setting_from(
+            l.max_messages_per_hour_account,
+            "max_messages_per_hour_account",
+        )?,
+        rate_mailbox: setting_from(
+            l.max_messages_per_hour_mailbox,
+            "max_messages_per_hour_mailbox",
+        )?,
+    })
+}
+
+fn effective_to(e: Effective) -> pb::MailLimitEffective {
+    pb::MailLimitEffective {
+        unlimited: e.value.is_none(),
+        value: e.value.unwrap_or(0),
+        source: match e.source {
+            Source::HostDefault => pb::MailLimitSource::HostDefault,
+            Source::Plan => pb::MailLimitSource::Plan,
+            Source::Account => pb::MailLimitSource::Account,
+        }
+        .into(),
+    }
+}
+
+fn limits_to(tenant: &str, r: &Resolved) -> pb::MailLimits {
+    let l = r.flat();
     pb::MailLimits {
         tenant: tenant.to_owned(),
         max_mailboxes: l.max_mailboxes,
         max_mailbox_bytes: l.max_mailbox_bytes,
         max_messages_per_hour_account: l.rate_account,
         max_messages_per_hour_mailbox: l.rate_mailbox,
+        plan: Some(layer_to(&r.plan)),
+        account: Some(layer_to(&r.account)),
+        effective_max_mailboxes: Some(effective_to(r.max_mailboxes)),
+        effective_max_mailbox_bytes: Some(effective_to(r.max_mailbox_bytes)),
+        effective_max_messages_per_hour_account: Some(effective_to(r.rate_account)),
+        effective_max_messages_per_hour_mailbox: Some(effective_to(r.rate_mailbox)),
+    }
+}
+
+/// The change a `SetMailLimitsRequest` asks for.
+fn limits_change(r: &pb::SetMailLimitsRequest) -> Result<LimitsChange, Error> {
+    match pb::MailLimitLayer::try_from(r.layer) {
+        Ok(pb::MailLimitLayer::Plan) => Ok(LimitsChange::Plan(layer_from(r.settings)?)),
+        Ok(pb::MailLimitLayer::Account) => Ok(LimitsChange::Account(layer_from(r.settings)?)),
+        Ok(pb::MailLimitLayer::Unspecified) if r.settings.is_none() => {
+            Ok(LimitsChange::Legacy(Limits {
+                max_mailboxes: r.max_mailboxes,
+                max_mailbox_bytes: r.max_mailbox_bytes,
+                rate_account: r.max_messages_per_hour_account,
+                rate_mailbox: r.max_messages_per_hour_mailbox,
+            }))
+        }
+        _ => Err(Error::invalid(
+            "layer",
+            "settings need a layer (PLAN or ACCOUNT)",
+        )),
+    }
+}
+
+fn defaults_to(current: &Layer, builtin: &Layer) -> pb::MailDefaults {
+    pb::MailDefaults {
+        settings: Some(layer_to(current)),
+        builtin: Some(layer_to(builtin)),
     }
 }
 
@@ -145,6 +249,7 @@ fn host_to(h: &HostView) -> pb::MailHost {
             filter: h.components.filter,
             antivirus: h.components.antivirus,
             webmail: h.components.webmail,
+            filter_resolver: h.components.filter_resolver,
         }),
         warnings: h
             .warnings
@@ -155,6 +260,7 @@ fn host_to(h: &HostView) -> pb::MailHost {
                     WarningKind::Port25 => pb::MailWarningKind::Port25Blocked,
                     WarningKind::NoCertificate => pb::MailWarningKind::NoCertificate,
                     WarningKind::ServiceDown => pb::MailWarningKind::ServiceNotRunning,
+                    WarningKind::FilterResolverDown => pb::MailWarningKind::FilterResolverDown,
                 }
                 .into(),
                 detail: d.clone(),
@@ -549,23 +655,43 @@ impl Engine {
         let peer = self.authorise(&req, RPC, Scope::Tenant)?;
         let r = req.into_inner();
         info!(rpc = RPC, peer, tenant = %r.tenant, "request");
+        let change = limits_change(&r).map_err(|e| fail(RPC, &peer, e))?;
         let mail = self.mail.clone();
         let tenant = r.tenant.clone();
-        let l = detached(async move {
-            mail.set_limits(
-                &r.tenant,
-                Limits {
-                    max_mailboxes: r.max_mailboxes,
-                    max_mailbox_bytes: r.max_mailbox_bytes,
-                    rate_account: r.max_messages_per_hour_account,
-                    rate_mailbox: r.max_messages_per_hour_mailbox,
-                },
-            )
+        let l = detached(async move { mail.set_limits(&r.tenant, change).await })
             .await
-        })
-        .await
-        .map_err(|e| fail(RPC, &peer, e))?;
+            .map_err(|e| fail(RPC, &peer, e))?;
         Ok(Response::new(limits_to(&tenant, &l)))
+    }
+
+    pub(super) async fn get_mail_defaults_rpc(
+        &self,
+        req: Request<pb::GetMailDefaultsRequest>,
+    ) -> Result<Response<pb::MailDefaults>, Status> {
+        const RPC: &str = "GetMailDefaults";
+        let peer = self.authorise(&req, RPC, Scope::Read)?;
+        let (current, builtin) = self
+            .mail
+            .get_defaults()
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(defaults_to(&current, &builtin)))
+    }
+
+    pub(super) async fn set_mail_defaults_rpc(
+        &self,
+        req: Request<pb::SetMailDefaultsRequest>,
+    ) -> Result<Response<pb::MailDefaults>, Status> {
+        const RPC: &str = "SetMailDefaults";
+        let peer = self.authorise(&req, RPC, Scope::Tenant)?;
+        let r = req.into_inner();
+        info!(rpc = RPC, peer, "request");
+        let update = layer_from(r.settings).map_err(|e| fail(RPC, &peer, e))?;
+        let mail = self.mail.clone();
+        let (current, builtin) = detached(async move { mail.set_defaults(update).await })
+            .await
+            .map_err(|e| fail(RPC, &peer, e))?;
+        Ok(Response::new(defaults_to(&current, &builtin)))
     }
 
     pub(super) async fn get_mail_usage_rpc(

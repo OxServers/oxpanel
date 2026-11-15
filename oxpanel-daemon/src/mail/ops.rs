@@ -35,6 +35,10 @@ pub const DOVECOT_SERVICE: &str = "dovecot.service";
 pub const RSPAMD_SERVICE: &str = "rspamd.service";
 pub const POLICY_SERVICE: &str = "oxpanel-mail-policy.service";
 pub const CLAMD_SERVICE: &str = "clamd@scan.service";
+/// The filter's own resolver (Unbound), shipped with the engine.
+pub const RESOLVER_SERVICE: &str = "oxpanel-mail-resolver.service";
+/// The account the resolver runs as (Unbound's packaged one).
+pub const RESOLVER_USER: &str = "unbound";
 
 /// How long a retired DKIM key stays published.
 pub const DKIM_RETIRE_SECS: u64 = 7 * 86_400;
@@ -138,14 +142,19 @@ fn sender_domains(
     out
 }
 
-/// Effective limits of an account: its own, or the host's.
-pub fn limits_of(cfg: &MailConfig, rec: &super::store::MailLimitsRecord) -> super::Limits {
-    super::Limits {
-        max_mailboxes: rec.max_mailboxes.unwrap_or(cfg.max_mailboxes),
-        max_mailbox_bytes: rec.max_mailbox_bytes.unwrap_or(cfg.max_mailbox_bytes),
-        rate_account: rec.rate_account.unwrap_or(cfg.rate_account),
-        rate_mailbox: rec.rate_mailbox.unwrap_or(cfg.rate_mailbox),
-    }
+/// The host's default email limits: as set, or the built-in ones.
+pub fn host_defaults(cfg: &MailConfig, store: &MailStore) -> Result<super::limits::Layer> {
+    Ok(store
+        .load_defaults()?
+        .unwrap_or_else(|| super::limits::builtin(cfg)))
+}
+
+/// An account's limits resolved through its layers and the host defaults.
+pub fn limits_of(
+    defaults: &super::limits::Layer,
+    rec: &super::store::MailLimitsRecord,
+) -> super::limits::Resolved {
+    super::limits::resolve(defaults, &rec.plan, &rec.account)
 }
 
 /// Gather the model the files are rendered from.
@@ -173,9 +182,10 @@ pub fn records_model(ctx: &Ctx, host: &Domain) -> Result<Model> {
         .collect();
     let vhosts = ctx.store.list_vhosts()?;
     let mut accounts = BTreeMap::new();
+    let defaults = host_defaults(&cfg.mail, &store)?;
     for t in &tenants {
         let name = crate::validate::Username::parse(&t.username)?;
-        let limits = limits_of(&cfg.mail, &store.load_limits(&name)?);
+        let limits = limits_of(&defaults, &store.load_limits(&name)?).flat();
         accounts.insert(
             t.username.clone(),
             Account {
@@ -229,6 +239,7 @@ pub struct Changed {
     pub policy: bool,
     pub nginx: bool,
     pub webmail: bool,
+    pub resolver: bool,
 }
 
 impl Changed {
@@ -241,6 +252,7 @@ impl Changed {
             policy: true,
             nginx: true,
             webmail: true,
+            resolver: true,
         }
     }
 }
@@ -389,6 +401,14 @@ pub async fn ensure_layout(ctx: &Ctx) -> Result<()> {
             fsutil::set_owner(&cfg.state_dir.join("usage"), u.uid, g)?;
         }
     }
+    if cfg.resolver_offered() {
+        // Unbound's account reads its configuration and the operator's
+        // additions; nobody else needs to.
+        for dir in [cfg.resolver_dir.clone(), cfg.resolver_dir.join("local.d")] {
+            fsutil::ensure_dir(&dir, 0o750)?;
+            own_group(ctx, &dir, RESOLVER_USER).await?;
+        }
+    }
     if created && ctx.selinux {
         ctx.sys
             .run_ok(
@@ -399,6 +419,35 @@ pub async fn ensure_layout(ctx: &Ctx) -> Result<()> {
             .await?;
     }
     Ok(())
+}
+
+fn resolver_file(cfg: &MailConfig) -> Result<File> {
+    Ok(file(
+        render::resolver_conf_path(cfg),
+        render::resolver_conf(cfg)?,
+        0o640,
+        Some(Group::Named(RESOLVER_USER)),
+    ))
+}
+
+/// The resolver's configuration while it is used; when it is no longer
+/// (`--no-mail-resolver`, Unbound removed), OxPanel's file is removed and
+/// the service stopped. Whether anything changed.
+async fn resolver_files(ctx: &Ctx) -> Result<bool> {
+    let cfg = &ctx.config.mail;
+    if cfg.resolver_offered() {
+        return write(ctx, &resolver_file(cfg)?).await;
+    }
+    let path = render::resolver_conf_path(cfg);
+    let ours = fsutil::read_optional(&path)?.is_some_and(|b| b.starts_with(HEADER.as_bytes()));
+    if ours {
+        ctx.sys
+            .run_ok(systemctl(ctx).args(["disable", "--now", "--", RESOLVER_SERVICE]))
+            .await?;
+        fsutil::remove_if_exists(&path)?;
+        info!("the mail filter's resolver is no longer used: its configuration removed and the service stopped");
+    }
+    Ok(false)
 }
 
 /// The webmail is offered: switched on and Roundcube installed.
@@ -616,6 +665,7 @@ pub async fn apply(ctx: &Ctx) -> Result<Changed> {
         .map(|(name, text)| file(cfg.rspamd_dir.join(name), text, 0o644, None))
         .collect();
     c.rspamd |= write_all(ctx, &rspamd).await?;
+    c.resolver |= resolver_files(ctx).await?;
     c.rspamd |= dkim_files(ctx, &m).await?;
     let policy = serde_json::to_vec_pretty(&render::policy_map(&m))
         .map_err(|e| Error::Internal(format!("policy map: {e}")))?;
@@ -671,6 +721,10 @@ pub async fn reload(ctx: &Ctx, c: Changed) -> Result<()> {
     if c.dovecot || c.dovecot_auth {
         units.push(DOVECOT_SERVICE);
     }
+    // The resolver before the filter that will ask it.
+    if c.resolver && ctx.config.mail.resolver_offered() {
+        units.push(RESOLVER_SERVICE);
+    }
     if c.rspamd {
         units.push(RSPAMD_SERVICE);
     }
@@ -698,12 +752,11 @@ pub async fn reload(ctx: &Ctx, c: Changed) -> Result<()> {
 
 /// The servers the mail component runs, enabled and started.
 pub fn services(ctx: &Ctx) -> Vec<&'static str> {
-    let mut out = vec![
-        POSTFIX_SERVICE,
-        DOVECOT_SERVICE,
-        RSPAMD_SERVICE,
-        POLICY_SERVICE,
-    ];
+    let mut out = vec![POSTFIX_SERVICE, DOVECOT_SERVICE];
+    if ctx.config.mail.resolver_offered() {
+        out.push(RESOLVER_SERVICE);
+    }
+    out.extend([RSPAMD_SERVICE, POLICY_SERVICE]);
     if ctx.config.mail.antivirus {
         out.push(CLAMD_SERVICE);
     }
@@ -895,6 +948,9 @@ pub fn expected(ctx: &Ctx, m: &Model) -> Result<Vec<(PathBuf, String)>> {
     files.extend(auth);
     for (name, text) in render::rspamd_files(cfg)? {
         files.push(file(cfg.rspamd_dir.join(name), text, 0o644, None));
+    }
+    if cfg.resolver_offered() {
+        files.push(resolver_file(cfg)?);
     }
     files.push(file(
         cfg.state_dir.join("dkim").join("selectors.map"),

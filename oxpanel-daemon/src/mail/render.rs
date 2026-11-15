@@ -605,6 +605,28 @@ pub fn sieve_script(addr: &str, r: &super::store::AutoreplyRecord) -> String {
 
 // ---- Rspamd ----------------------------------------------------------------
 
+/// The filter's general options: which addresses are local, and, with its
+/// own resolver, where it sends its DNS questions (blocklists refuse
+/// questions that come through public resolvers; a local recursive
+/// resolver asks them itself, and caches).
+fn rspamd_options(cfg: &MailConfig) -> String {
+    let mut out = format!("{HEADER}local_addrs = [\"127.0.0.0/8\", \"::1\"];\n");
+    if cfg.resolver_offered() {
+        let port = super::config::RESOLVER_PORT;
+        let _ = write!(
+            out,
+            "# The mail filter's own resolver (oxpanel-mail-resolver.service).
+dns {{
+  nameserver = [\"127.0.0.1:{port}\"];
+  timeout = 1s;
+  retransmits = 2;
+}}
+"
+        );
+    }
+    out
+}
+
 /// `local.d` files of the filter, and its Lua rule.
 pub fn rspamd_files(cfg: &MailConfig) -> Result<BTreeMap<&'static str, String>> {
     let milter_path = milter_socket(cfg);
@@ -638,10 +660,7 @@ upstream \"local\" {{
             "local.d/worker-fuzzy.inc",
             format!("{HEADER}enabled = false;\n"),
         ),
-        (
-            "local.d/options.inc",
-            format!("{HEADER}local_addrs = [\"127.0.0.0/8\", \"::1\"];\n"),
-        ),
+        ("local.d/options.inc", rspamd_options(cfg)),
         (
             "local.d/dkim_signing.conf",
             format!(
@@ -793,4 +812,79 @@ pub fn policy_map(m: &Model) -> PolicyMap {
 /// Whether a record takes part in rendering.
 pub fn live(d: &MailDomainRecord) -> bool {
     d.state != RecordState::Deleting
+}
+
+// ---- The filter's resolver (Unbound) -----------------------------------------
+
+pub fn resolver_conf_path(cfg: &MailConfig) -> PathBuf {
+    cfg.resolver_dir.join("unbound.conf")
+}
+
+/// Unbound for the mail filter only: recursive and caching, DNSSEC
+/// validating, on 127.0.0.1 at [`super::config::RESOLVER_PORT`], refusing
+/// everyone but the loopback, with bounded caches and query slots so that
+/// local programs (customer code can reach the loopback too) can neither
+/// exhaust its memory nor change it: no remote control, no ANY, never
+/// asking a server on the loopback (a delegation to 127.0.0.1 cannot lead
+/// it to a local listener). The operator may add files to `local.d/`
+/// (e.g. forwarders where outbound DNS is blocked); they are not managed.
+pub fn resolver_conf(cfg: &MailConfig) -> Result<String> {
+    let dir = safe_path_str(&cfg.resolver_dir)?;
+    let port = super::config::RESOLVER_PORT;
+    Ok(format!(
+        "{HEADER}server:
+  # Run by oxpanel-mail-resolver.service as the unbound account (no root,
+  # no chroot); logs go to the journal.
+  username: \"\"
+  chroot: \"\"
+  directory: \"{dir}\"
+  pidfile: \"\"
+  use-syslog: no
+  logfile: \"\"
+  log-time-ascii: yes
+  verbosity: 1
+  # The loopback only, its own port; everyone else is refused.
+  interface: 127.0.0.1@{port}
+  port: {port}
+  access-control: 0.0.0.0/0 refuse
+  access-control: ::0/0 refuse
+  access-control: 127.0.0.0/8 allow
+  do-not-query-localhost: yes
+  # Bounded: one thread, a few thousand queries in flight at most, caches
+  # of about 60 MB in all (the unit also caps its memory).
+  num-threads: 1
+  so-sndbuf: 0
+  outgoing-range: 1024
+  num-queries-per-thread: 512
+  jostle-timeout: 200
+  msg-cache-size: 16m
+  rrset-cache-size: 32m
+  key-cache-size: 8m
+  neg-cache-size: 4m
+  infra-cache-numhosts: 10000
+  ratelimit: 1000
+  # Outgoing ports as the distribution's own configuration (SELinux).
+  outgoing-port-permit: 32768-60999
+  outgoing-port-avoid: 0-32767
+  outgoing-port-avoid: 61000-65535
+  # Answers are validated (DNSSEC) and checked against forgery.
+  module-config: \"validator iterator\"
+  trust-anchor-file: \"/var/lib/unbound/root.key\"
+  val-permissive-mode: no
+  harden-glue: yes
+  harden-dnssec-stripped: yes
+  harden-below-nxdomain: yes
+  unwanted-reply-threshold: 10000000
+  qname-minimisation: yes
+  aggressive-nsec: yes
+  prefetch: yes
+  deny-any: yes
+  minimal-responses: yes
+  hide-identity: yes
+  hide-version: yes
+remote-control:
+  control-enable: no
+include: \"{dir}/local.d/*.conf\"
+"
+    ))
 }

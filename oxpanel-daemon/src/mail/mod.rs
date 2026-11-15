@@ -34,6 +34,7 @@
 pub mod certs;
 pub mod config;
 pub mod hostcheck;
+pub mod limits;
 pub mod ops;
 pub mod password;
 pub mod policy;
@@ -206,6 +207,8 @@ pub enum WarningKind {
     Port25,
     NoCertificate,
     ServiceDown,
+    /// The filter's own resolver is configured but not running.
+    FilterResolverDown,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -216,6 +219,7 @@ pub struct Components {
     pub filter: bool,
     pub antivirus: bool,
     pub webmail: bool,
+    pub filter_resolver: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -427,10 +431,14 @@ impl MailService {
     }
 
     pub fn limits(&self, tenant: &Username) -> Result<Limits> {
-        Ok(ops::limits_of(
-            &self.ctx.config.mail,
-            &self.store().load_limits(tenant)?,
-        ))
+        Ok(self.resolved_limits(tenant)?.flat())
+    }
+
+    /// The account's limits with their layers and sources.
+    pub fn resolved_limits(&self, tenant: &Username) -> Result<limits::Resolved> {
+        let store = self.store();
+        let defaults = ops::host_defaults(&self.ctx.config.mail, &store)?;
+        Ok(ops::limits_of(&defaults, &store.load_limits(tenant)?))
     }
 
     fn domain_view(&self, r: &MailDomainRecord, host: &Domain) -> Result<DomainView> {
@@ -509,6 +517,7 @@ impl MailService {
                 filter: ctx.sys.is_installed(bin::RSPAMD).await,
                 antivirus: cfg.antivirus,
                 webmail: ops::webmail_offered(ctx),
+                filter_resolver: cfg.resolver_offered(),
             },
             ..HostView::default()
         };
@@ -526,8 +535,14 @@ impl MailService {
         }
         for unit in ops::services(ctx) {
             if !ops::unit_active(ctx, unit).await? {
-                v.warnings
-                    .push((WarningKind::ServiceDown, format!("{unit} is not running")));
+                v.warnings.push(if unit == ops::RESOLVER_SERVICE {
+                    (
+                        WarningKind::FilterResolverDown,
+                        format!("{unit} (the mail filter's DNS resolver) is not running: the filter's DNS lookups fail, so blocklist checks are skipped and mail is filtered less well; see journalctl -u {unit}"),
+                    )
+                } else {
+                    (WarningKind::ServiceDown, format!("{unit} is not running"))
+                });
             }
         }
         // The network checks come from the last background run (a few
@@ -795,6 +810,7 @@ pub use lifecycle::{
     accounts_changed, converge, drifts, refuse_tenant_deletion, remove_tenant_mail, tenant_changed,
     zone_records,
 };
+pub use mailboxes::LimitsChange;
 
 /// Mailboxes, forwarders and autoresponders as they are listed.
 pub(crate) fn mailbox_view(rec: &MailDomainRecord, local: &str, m: &MailboxRecord) -> MailboxView {

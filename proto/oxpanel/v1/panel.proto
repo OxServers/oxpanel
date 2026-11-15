@@ -328,6 +328,14 @@ service OxPanelEngine {
   rpc GetMailLimits(GetMailLimitsRequest) returns (MailLimits);
   rpc SetMailLimits(SetMailLimitsRequest) returns (MailLimits);
   rpc GetMailUsage(GetMailUsageRequest) returns (MailUsage);
+
+  // --- Email defaults (engine 0.3.1) ----------------------------------------
+  // The host's default email limits: what every account follows for each
+  // limit that neither its plan layer nor its account layer sets (see
+  // SetMailLimitsRequest). Changing them changes those accounts at once.
+  // GetMailDefaults needs `read`, SetMailDefaults `tenant` (staff).
+  rpc GetMailDefaults(GetMailDefaultsRequest) returns (MailDefaults);
+  rpc SetMailDefaults(SetMailDefaultsRequest) returns (MailDefaults);
 }
 
 // Per-tenant resource limits, applied through systemd (cgroups v2).
@@ -2308,6 +2316,9 @@ message MailComponents {
   bool antivirus = 4;
   // Roundcube.
   bool webmail = 5;
+  // The filter's own caching DNS resolver (Unbound on the loopback), used
+  // for its blocklist and other DNS lookups (engine 0.3.1).
+  bool filter_resolver = 6;
 }
 
 enum MailWarningKind {
@@ -2317,6 +2328,9 @@ enum MailWarningKind {
   MAIL_WARNING_KIND_NO_CERTIFICATE = 3;
   // A component is installed but its service is not running.
   MAIL_WARNING_KIND_SERVICE_NOT_RUNNING = 4;
+  // The mail filter's own DNS resolver is configured but not running: the
+  // filter's DNS lookups fail, so blocklist checks are skipped (engine 0.3.1).
+  MAIL_WARNING_KIND_FILTER_RESOLVER_DOWN = 5;
 }
 
 message MailWarning {
@@ -2567,20 +2581,42 @@ message GetAutoresponderRequest { string tenant = 1; string address = 2; }
 
 message GetMailLimitsRequest { string tenant = 1; }
 
+// An account's email limits come in two layers above the host's defaults
+// (GetMailDefaults): the PLAN layer (what a panel copies from the account's
+// plan) and the ACCOUNT layer (staff's override for this account). For each
+// limit the effective value is the ACCOUNT layer's setting unless it is
+// INHERIT, else the PLAN layer's unless INHERIT, else the host default.
+// "Unlimited" is never implied: only MAIL_LIMIT_MODE_UNLIMITED gives it.
 message SetMailLimitsRequest {
   string tenant = 1;
+  // Before engine 0.3.1 (kept for older clients; ignored when `layer` is
+  // set): all four replace the ACCOUNT layer and clear the PLAN layer,
+  // 0 now meaning INHERIT (the host default), never unlimited.
   uint32 max_mailboxes = 2;
   uint64 max_mailbox_bytes = 3;
   uint32 max_messages_per_hour_account = 4;
   uint32 max_messages_per_hour_mailbox = 5;
+  // The layer `settings` replace (all four limits; a limit left out is
+  // INHERIT).
+  MailLimitLayer layer = 6;
+  MailLimitSettings settings = 7;
 }
 
 message MailLimits {
   string tenant = 1;
+  // The effective limits (0 = unlimited), as before engine 0.3.1.
   uint32 max_mailboxes = 2;
   uint64 max_mailbox_bytes = 3;
   uint32 max_messages_per_hour_account = 4;
   uint32 max_messages_per_hour_mailbox = 5;
+  // The two layers as set (engine 0.3.1).
+  MailLimitSettings plan = 6;
+  MailLimitSettings account = 7;
+  // Each effective limit with where it comes from (engine 0.3.1).
+  MailLimitEffective effective_max_mailboxes = 8;
+  MailLimitEffective effective_max_mailbox_bytes = 9;
+  MailLimitEffective effective_max_messages_per_hour_account = 10;
+  MailLimitEffective effective_max_messages_per_hour_mailbox = 11;
 }
 
 message GetMailUsageRequest { string tenant = 1; }
@@ -2592,4 +2628,64 @@ message MailUsage {
   // Recipients of mail the account sent in the current clock hour (UTC),
   // through every mailbox and its sites.
   uint32 messages_sent_this_hour = 4;
+}
+
+// ---- Email limits: layers and host defaults (engine 0.3.1) --------------------
+
+enum MailLimitMode {
+  // Follow the next layer: ACCOUNT -> PLAN -> the host default. Not allowed
+  // for a host default.
+  MAIL_LIMIT_MODE_INHERIT = 0;
+  // `value` (at least 1; a mailbox size at least 1 MiB).
+  MAIL_LIMIT_MODE_VALUE = 1;
+  // No limit, chosen explicitly.
+  MAIL_LIMIT_MODE_UNLIMITED = 2;
+}
+
+message MailLimitSetting {
+  MailLimitMode mode = 1;
+  uint64 value = 2;
+}
+
+message MailLimitSettings {
+  MailLimitSetting max_mailboxes = 1;
+  MailLimitSetting max_mailbox_bytes = 2;
+  MailLimitSetting max_messages_per_hour_account = 3;
+  MailLimitSetting max_messages_per_hour_mailbox = 4;
+}
+
+enum MailLimitLayer {
+  MAIL_LIMIT_LAYER_UNSPECIFIED = 0;
+  MAIL_LIMIT_LAYER_PLAN = 1;
+  MAIL_LIMIT_LAYER_ACCOUNT = 2;
+}
+
+enum MailLimitSource {
+  MAIL_LIMIT_SOURCE_UNSPECIFIED = 0;
+  MAIL_LIMIT_SOURCE_HOST_DEFAULT = 1;
+  MAIL_LIMIT_SOURCE_PLAN = 2;
+  MAIL_LIMIT_SOURCE_ACCOUNT = 3;
+}
+
+message MailLimitEffective {
+  bool unlimited = 1;
+  // The limit when not unlimited.
+  uint64 value = 2;
+  MailLimitSource source = 3;
+}
+
+message GetMailDefaultsRequest {}
+
+message SetMailDefaultsRequest {
+  // Each limit: VALUE or UNLIMITED; a limit left out (INHERIT) stays as it is.
+  MailLimitSettings settings = 1;
+}
+
+message MailDefaults {
+  // VALUE or UNLIMITED for each limit.
+  MailLimitSettings settings = 1;
+  // The engine's own defaults, for "back to the default" in a panel:
+  // 30 and 20 messages per hour (account, mailbox), mailboxes and mailbox
+  // size unlimited (unless OXPANEL_MAIL_* in the environment says otherwise).
+  MailLimitSettings builtin = 2;
 }

@@ -1,5 +1,5 @@
 Name:           oxpanel-daemon
-Version:        0.3.0
+Version:        0.3.1
 Release:        1%{?dist}
 Summary:        OxPanel engine: tenants, Nginx sites, apps and databases over a local gRPC API
 License:        Apache-2.0
@@ -88,6 +88,7 @@ install -D -m 0644 packaging/systemd/oxpanel-daemon.service %{buildroot}%{_unitd
 install -D -m 0644 packaging/systemd/oxpanel-dns.service %{buildroot}%{_unitdir}/oxpanel-dns.service
 install -D -m 0644 packaging/systemd/oxpanel-mail-policy.service %{buildroot}%{_unitdir}/oxpanel-mail-policy.service
 install -D -m 0644 packaging/systemd/oxpanel-webmail.service %{buildroot}%{_unitdir}/oxpanel-webmail.service
+install -D -m 0644 packaging/systemd/oxpanel-mail-resolver.service %{buildroot}%{_unitdir}/oxpanel-mail-resolver.service
 install -D -m 0644 packaging/php.d/90-oxpanel-mail.ini %{buildroot}%{_sysconfdir}/php.d/90-oxpanel-mail.ini
 install -D -m 0644 packaging/sysusers.d/oxpanel.conf %{buildroot}%{_sysusersdir}/oxpanel.conf
 install -D -m 0644 packaging/tmpfiles.d/oxpanel.conf %{buildroot}%{_tmpfilesdir}/oxpanel.conf
@@ -125,6 +126,7 @@ if /usr/sbin/selinuxenabled 2>/dev/null; then for d in /var/lib/oxpanel-mail /et
 %systemd_preun oxpanel-dns.service
 %systemd_preun oxpanel-mail-policy.service
 %systemd_preun oxpanel-webmail.service
+%systemd_preun oxpanel-mail-resolver.service
 
 %postun
 %systemd_postun_with_restart oxpanel-daemon.service
@@ -143,6 +145,7 @@ if [ "$1" -eq 0 ] && /usr/sbin/selinuxenabled 2>/dev/null; then /usr/sbin/semodu
 %{_unitdir}/oxpanel-dns.service
 %{_unitdir}/oxpanel-mail-policy.service
 %{_unitdir}/oxpanel-webmail.service
+%{_unitdir}/oxpanel-mail-resolver.service
 # PHP's mail() through OxPanel's sendmail. The directory belongs to PHP.
 %config(noreplace) %{_sysconfdir}/php.d/90-oxpanel-mail.ini
 %{_sysusersdir}/oxpanel.conf
@@ -160,6 +163,17 @@ if [ "$1" -eq 0 ] && /usr/sbin/selinuxenabled 2>/dev/null; then /usr/sbin/semodu
 %{_datadir}/oxpanel/fail2ban/filter.d/oxpanel-webmail.conf
 
 %changelog
+* Sun Nov 15 2026 OxPanel contributors - 0.3.1-1
+- Email limits: the host's default sending limits are low (30 recipients an
+  hour per account, 20 per mailbox) and set with SetMailDefaults or
+  oxpanel-ctl mail defaults-set; an account's limits come from its account
+  layer, then its plan layer, then the host default, which accounts follow
+  live. Unlimited is only ever an explicit choice. Engine 0.3.0 records are
+  converted when read (exactly the old defaults follow the new default).
+- The mail filter's own DNS resolver (oxpanel-mail-resolver.service, Unbound
+  on 127.0.0.1:5335), set up by install.sh --mail unless --no-mail-resolver:
+  blocklists answer it, unlike public resolvers; resolv.conf is untouched.
+
 * Sat Nov 14 2026 OxPanel contributors - 0.3.0-1
 - Email, an optional component (install.sh --mail): Postfix, Dovecot and
   Rspamd configured entirely by the engine; mail domains (local, external or

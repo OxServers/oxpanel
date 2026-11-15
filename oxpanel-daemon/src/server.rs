@@ -2236,6 +2236,20 @@ impl OxPanelEngine for Engine {
     ) -> Result<Response<pb::MailUsage>, Status> {
         self.get_mail_usage_rpc(req).await
     }
+
+    async fn get_mail_defaults(
+        &self,
+        req: Request<pb::GetMailDefaultsRequest>,
+    ) -> Result<Response<pb::MailDefaults>, Status> {
+        self.get_mail_defaults_rpc(req).await
+    }
+
+    async fn set_mail_defaults(
+        &self,
+        req: Request<pb::SetMailDefaultsRequest>,
+    ) -> Result<Response<pb::MailDefaults>, Status> {
+        self.set_mail_defaults_rpc(req).await
+    }
 }
 
 fn trashed_to(t: &DbTrashRecord) -> pb::TrashedDatabase {

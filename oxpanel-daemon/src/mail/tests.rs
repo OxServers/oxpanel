@@ -18,6 +18,15 @@ use crate::system::{bin, FakeSystem};
 use crate::tenant::TenantService;
 use crate::validate::Limits as TenantLimits;
 use crate::vhost::{VHostRequest, VHostService};
+use limits::Setting::{Unlimited as U, Value as V};
+
+/// The sending limits of an account in the rendered policy map.
+fn policy_rates(h: &H, account: &str) -> (u32, u32) {
+    let policy: render::PolicyMap =
+        serde_json::from_str(&h.read(h.cfg().state_dir.join("policy.json"))).unwrap();
+    let a = &policy.accounts[account];
+    (a.rate_account, a.rate_mailbox)
+}
 
 const PW: &str = "Correct-Horse-9";
 const PW2: &str = "Another-Secret-77";
@@ -605,12 +614,12 @@ async fn mailbox_refusals_carry_their_codes() {
     h.mail
         .set_limits(
             "alice",
-            Limits {
-                max_mailboxes: 1,
-                max_mailbox_bytes: 50 << 20,
-                rate_account: 10,
-                rate_mailbox: 5,
-            },
+            LimitsChange::Account(limits::Layer {
+                max_mailboxes: V(1),
+                max_mailbox_bytes: V(50 << 20),
+                rate_account: V(10),
+                rate_mailbox: V(5),
+            }),
         )
         .await
         .unwrap();
@@ -1409,31 +1418,41 @@ async fn limits_and_usage() {
     let h = harness().await;
     h.domain().await;
     h.mailbox("info").await;
+    // Out of the box: the low built-in sending limits, from the host default.
+    let r = h.mail.get_limits("alice").await.unwrap();
     assert_eq!(
-        h.mail.get_limits("alice").await.unwrap(),
+        r.flat(),
         Limits {
             max_mailboxes: 0,
             max_mailbox_bytes: 0,
-            rate_account: 500,
-            rate_mailbox: 200
+            rate_account: 30,
+            rate_mailbox: 20
         }
     );
-    let l = Limits {
-        max_mailboxes: 3,
-        max_mailbox_bytes: 0,
-        rate_account: 50,
-        rate_mailbox: 0,
+    assert_eq!(r.rate_account.source, limits::Source::HostDefault);
+    let account = limits::Layer {
+        max_mailboxes: V(3),
+        max_mailbox_bytes: U,
+        rate_account: V(50),
+        rate_mailbox: limits::Setting::Inherit,
     };
-    assert_eq!(h.mail.set_limits("alice", l).await.unwrap(), l);
-    let policy: render::PolicyMap =
-        serde_json::from_str(&h.read(h.cfg().state_dir.join("policy.json"))).unwrap();
+    let r = h
+        .mail
+        .set_limits("alice", LimitsChange::Account(account))
+        .await
+        .unwrap();
     assert_eq!(
-        (
-            policy.accounts["alice"].rate_account,
-            policy.accounts["alice"].rate_mailbox
-        ),
-        (50, 0)
+        r.flat(),
+        Limits {
+            max_mailboxes: 3,
+            max_mailbox_bytes: 0,
+            rate_account: 50,
+            rate_mailbox: 20,
+        }
     );
+    assert_eq!(r.rate_mailbox.source, limits::Source::HostDefault);
+    assert_eq!(r.rate_account.source, limits::Source::Account);
+    assert_eq!(policy_rates(&h, "alice"), (50, 20));
     // The counters the policy service writes.
     let usage = policy::Usage {
         hour: policy::current_hour(),
@@ -1733,7 +1752,10 @@ async fn everything_works_in_a_dry_run() {
         1
     );
     assert_eq!(h.mail.list_domains("alice").await.unwrap().len(), 1);
-    h.mail.set_limits("alice", Limits::default()).await.unwrap();
+    h.mail
+        .set_limits("alice", LimitsChange::Legacy(Limits::default()))
+        .await
+        .unwrap();
     h.mail.usage("alice").await.unwrap();
     h.mail.host().await.unwrap();
     h.mail.queue(0, 10).await.unwrap();
@@ -1794,4 +1816,309 @@ async fn the_webmail_is_offered_with_roundcube_and_only_over_https_once_certifie
     let nginx = h.read(h.cfg().nginx_file.clone());
     assert!(nginx.contains("listen 443 ssl http2;"), "{nginx}");
     assert!(nginx.contains("return 301 https://$host$request_uri;"));
+}
+
+/// The plan and account layers over the host default, through plan changes
+/// (with limits → without, without → with, with → with), a staff override,
+/// and a change of the host default, which reaches exactly the accounts
+/// that follow it, in the policy map, at once.
+#[tokio::test]
+async fn limit_layers_plan_changes_and_live_defaults() {
+    use limits::{Layer, Setting::Inherit as I, Source};
+    let h = harness().await;
+    h.domain().await;
+    let plan = |a: limits::Setting, m: limits::Setting| Layer {
+        rate_account: a,
+        rate_mailbox: m,
+        ..Layer::default()
+    };
+    let set = |c: LimitsChange| {
+        let mail = h.mail.clone();
+        async move { mail.set_limits("alice", c).await.unwrap() }
+    };
+    // without → with: the plan's values, higher than the default.
+    let r = set(LimitsChange::Plan(plan(V(1000), V(300)))).await;
+    assert_eq!(
+        (r.rate_account.value, r.rate_account.source),
+        (Some(1000), Source::Plan)
+    );
+    assert_eq!(policy_rates(&h, "alice"), (1000, 300));
+    // with → with (lower than the default, one limit left to it).
+    let r = set(LimitsChange::Plan(plan(V(10), I))).await;
+    assert_eq!(r.rate_account.value, Some(10));
+    assert_eq!(
+        (r.rate_mailbox.value, r.rate_mailbox.source),
+        (Some(20), Source::HostDefault)
+    );
+    // with → without: the host default, never unlimited.
+    let r = set(LimitsChange::Plan(Layer::default())).await;
+    assert_eq!(r.flat().rate_account, 30);
+    assert_eq!(policy_rates(&h, "alice"), (30, 20));
+    // A staff override beats the plan; a plan change keeps the account layer
+    // (a panel clears it explicitly when its policy says so).
+    set(LimitsChange::Account(plan(V(5), I))).await;
+    let r = set(LimitsChange::Plan(plan(V(1000), V(300)))).await;
+    assert_eq!(
+        (r.rate_account.value, r.rate_account.source),
+        (Some(5), Source::Account)
+    );
+    assert_eq!(
+        (r.rate_mailbox.value, r.rate_mailbox.source),
+        (Some(300), Source::Plan)
+    );
+    let r = set(LimitsChange::Account(Layer::default())).await;
+    assert_eq!(r.rate_account.value, Some(1000));
+    // Unlimited only when asked for.
+    let r = set(LimitsChange::Account(plan(U, I))).await;
+    assert_eq!(r.rate_account.value, None);
+    assert_eq!(policy_rates(&h, "alice"), (0, 300));
+    set(LimitsChange::Account(Layer::default())).await;
+    set(LimitsChange::Plan(plan(I, V(300)))).await;
+    // A default change: alice follows it for the account rate only.
+    let (d, builtin) = h.mail.get_defaults().await.unwrap();
+    assert_eq!(d, builtin);
+    assert_eq!(d.rate_account, V(30));
+    let (d, _) = h.mail.set_defaults(plan(V(60), I)).await.unwrap();
+    assert_eq!(
+        (d.rate_account, d.rate_mailbox, d.max_mailboxes),
+        (V(60), V(20), U)
+    );
+    assert_eq!(policy_rates(&h, "alice"), (60, 300));
+    // An invalid default is refused before anything changes.
+    assert!(h.mail.set_defaults(plan(V(0), I)).await.is_err());
+    assert!(h.mail.set_defaults(plan(V(2_000_000), I)).await.is_err());
+    assert_eq!(h.mail.get_defaults().await.unwrap().0.rate_account, V(60));
+    // Out-of-range layer values are refused.
+    assert!(h
+        .mail
+        .set_limits("alice", LimitsChange::Plan(plan(V(0), I)))
+        .await
+        .is_err());
+    // The default is kept across a restart (it is a record).
+    let again = MailStore::new(&h.ctx.config).load_defaults().unwrap();
+    assert_eq!(again.map(|l| l.rate_account), Some(V(60)));
+}
+
+/// An engine 0.3.0 limits record is read in the new form: exactly the old
+/// defaults follow the host default; other values are kept.
+#[tokio::test]
+async fn limits_records_of_engine_0_3_0_are_migrated() {
+    let h = harness().await;
+    h.domain().await;
+    let dir = h.ctx.config.state_dir.join("mail").join("limits");
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("alice.json");
+    std::fs::write(
+        &path,
+        r#"{"tenant":"alice","max_mailboxes":0,"max_mailbox_bytes":0,"rate_account":500,"rate_mailbox":200}"#,
+    )
+    .unwrap();
+    let r = h.mail.get_limits("alice").await.unwrap();
+    assert_eq!(r.flat().rate_account, 30);
+    assert_eq!(r.rate_mailbox.source, limits::Source::HostDefault);
+    std::fs::write(
+        &path,
+        r#"{"tenant":"alice","max_mailboxes":4,"max_mailbox_bytes":0,"rate_account":0,"rate_mailbox":120}"#,
+    )
+    .unwrap();
+    let r = h.mail.get_limits("alice").await.unwrap();
+    assert_eq!(r.max_mailboxes.value, Some(4));
+    assert_eq!(r.max_mailbox_bytes.value, None);
+    assert_eq!(r.rate_account.value, None);
+    assert_eq!(r.rate_mailbox.value, Some(120));
+    assert_eq!(r.rate_mailbox.source, limits::Source::Account);
+    // Not rewritten by a read; written in the new form by the next change.
+    assert!(!h.read(path.clone()).contains("\"version\""));
+    h.mail
+        .set_limits(
+            "alice",
+            LimitsChange::Plan(limits::Layer {
+                max_mailboxes: V(9),
+                ..limits::Layer::default()
+            }),
+        )
+        .await
+        .unwrap();
+    let text = h.read(path.clone());
+    assert!(
+        text.contains("\"version\": 2") && !text.contains("\"rate_account\": 0"),
+        "{text}"
+    );
+    let r = h.mail.get_limits("alice").await.unwrap();
+    assert_eq!(
+        r.max_mailboxes.value,
+        Some(4),
+        "the migrated account layer still wins"
+    );
+    assert_eq!(r.rate_mailbox.value, Some(120));
+    // The legacy request form (an older panel): 0 is the host default now.
+    let r = h
+        .mail
+        .set_limits(
+            "alice",
+            LimitsChange::Legacy(Limits {
+                max_mailboxes: 2,
+                max_mailbox_bytes: 0,
+                rate_account: 0,
+                rate_mailbox: 0,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(r.flat().rate_account, 30);
+    assert_eq!(r.max_mailboxes.value, Some(2));
+    assert_eq!(r.plan, limits::Layer::default());
+}
+
+/// Crash safety: a default written but not yet applied (the daemon died
+/// between the record and the reload) reaches the policy map with the next
+/// apply, which the start-up convergence makes; a damaged defaults record
+/// fails closed instead of meaning "unlimited".
+#[tokio::test]
+async fn host_defaults_survive_an_interrupted_change_and_fail_closed() {
+    let h = harness().await;
+    h.domain().await;
+    let store = MailStore::new(&h.ctx.config);
+    let mut d = limits::builtin(h.cfg());
+    d.rate_mailbox = V(7);
+    store.save_defaults(&d).unwrap();
+    assert_eq!(policy_rates(&h, "alice"), (30, 20), "not applied yet");
+    {
+        let _g = h.ctx.lock.lock().await;
+        ops::apply(&h.ctx).await.unwrap();
+    }
+    assert_eq!(policy_rates(&h, "alice"), (30, 7));
+    let path = h.ctx.config.state_dir.join("mail").join("defaults.json");
+    std::fs::write(
+        &path,
+        r#"{"version":1,"defaults":{"rate_account":{"mode":"inherit"}}}"#,
+    )
+    .unwrap();
+    assert!(h.mail.get_limits("alice").await.is_err());
+    std::fs::write(&path, b"{not json").unwrap();
+    assert!(h.mail.get_limits("alice").await.is_err());
+}
+
+/// The filter's own resolver: used only when switched on and Unbound is
+/// installed; its configuration (loopback, own port, refusing everyone
+/// else, no remote control), the filter pointed at it, its service started
+/// before the filter's and reported when down; switched off, OxPanel's file
+/// goes and the service is stopped.
+#[tokio::test]
+async fn the_filter_resolver_is_configured_started_and_watched() {
+    let h = harness_with(|c| {
+        c.mail.resolver = config::FilterResolver::Own;
+        // "Unbound is installed".
+        std::fs::create_dir_all(c.mail.resolver_binary.parent().unwrap()).unwrap();
+        std::fs::write(&c.mail.resolver_binary, b"").unwrap();
+    })
+    .await;
+    h.domain().await;
+    let conf = h.read(render::resolver_conf_path(h.cfg()));
+    for line in [
+        "interface: 127.0.0.1@5335",
+        "access-control: 0.0.0.0/0 refuse",
+        "access-control: ::0/0 refuse",
+        "access-control: 127.0.0.0/8 allow",
+        "control-enable: no",
+        "deny-any: yes",
+        "do-not-query-localhost: yes",
+        "module-config: \"validator iterator\"",
+        "username: \"\"",
+    ] {
+        assert!(conf.contains(line), "{line} missing:\n{conf}");
+    }
+    assert!(!conf.contains("interface: 0.0.0.0") && !conf.contains("@53\n"));
+    let options = h.read(h.cfg().rspamd_dir.join("local.d/options.inc"));
+    assert!(
+        options.contains("nameserver = [\"127.0.0.1:5335\"];"),
+        "{options}"
+    );
+    // Started (enabled) before the filter that asks it; reloaded when its file changes.
+    let units = ops::services(&h.ctx);
+    let at = |u: &str| units.iter().position(|x| *x == u).unwrap();
+    assert!(
+        at(ops::RESOLVER_SERVICE) < at(ops::RSPAMD_SERVICE),
+        "{units:?}"
+    );
+    std::fs::remove_file(render::resolver_conf_path(h.cfg())).unwrap();
+    h.sys.clear_calls();
+    {
+        let _g = h.ctx.lock.lock().await;
+        ops::apply(&h.ctx).await.unwrap();
+    }
+    assert!(h.argvs(bin::SYSTEMCTL).contains(
+        &["reload-or-restart", "--", ops::RESOLVER_SERVICE]
+            .map(str::to_owned)
+            .to_vec()
+    ));
+    assert!(ops::services(&h.ctx).contains(&ops::RESOLVER_SERVICE));
+    // Down: its own warning (not the generic one); the component is shown.
+    h.sys.script_pass_through(bin::SYSTEMCTL);
+    h.sys.script_pass_through(bin::SYSTEMCTL);
+    h.sys.script_failure(bin::SYSTEMCTL, 3, "");
+    let v = h.mail.host().await.unwrap();
+    assert!(v.components.filter_resolver);
+    let kinds: Vec<WarningKind> = v.warnings.iter().map(|(k, _)| *k).collect();
+    assert!(
+        kinds.contains(&WarningKind::FilterResolverDown),
+        "{kinds:?}"
+    );
+    assert!(!kinds.contains(&WarningKind::ServiceDown), "{kinds:?}");
+    // Its file is checked like every other mail file.
+    let path = render::resolver_conf_path(h.cfg());
+    let drift = |h: &H| {
+        let host = HostService::new(h.ctx.clone());
+        async move {
+            host.reconcile()
+                .await
+                .unwrap()
+                .into_iter()
+                .filter(|d| d.kind == DriftKind::MailConfigDrift)
+                .map(|d| d.subject)
+                .collect::<Vec<_>>()
+        }
+    };
+    assert!(!drift(&h).await.contains(&path.display().to_string()));
+    std::fs::write(&path, "server:\n  interface: 0.0.0.0\n").unwrap();
+    assert!(drift(&h).await.contains(&path.display().to_string()));
+    {
+        let _g = h.ctx.lock.lock().await;
+        ops::apply(&h.ctx).await.unwrap();
+    }
+    assert!(
+        !drift(&h).await.contains(&path.display().to_string()),
+        "repaired"
+    );
+    // Switched off (or Unbound removed): OxPanel's file goes, the service stops.
+    std::fs::remove_file(&h.cfg().resolver_binary).unwrap();
+    h.sys.clear_calls();
+    {
+        let _g = h.ctx.lock.lock().await;
+        ops::apply(&h.ctx).await.unwrap();
+    }
+    assert!(!path.exists());
+    assert!(h.argvs(bin::SYSTEMCTL).contains(
+        &["disable", "--now", "--", ops::RESOLVER_SERVICE]
+            .map(str::to_owned)
+            .to_vec()
+    ));
+    let options = h.read(h.cfg().rspamd_dir.join("local.d/options.inc"));
+    assert!(!options.contains("nameserver"), "{options}");
+}
+
+/// Without `OXPANEL_MAIL_RESOLVER` (a host upgraded by the package alone)
+/// nothing of the resolver is written and the filter uses the system's.
+#[tokio::test]
+async fn without_the_setting_the_resolver_is_left_alone() {
+    let h = harness().await;
+    h.domain().await;
+    assert!(!render::resolver_conf_path(h.cfg()).exists());
+    let options = h.read(h.cfg().rspamd_dir.join("local.d/options.inc"));
+    assert!(!options.contains("nameserver"), "{options}");
+    assert!(!ops::services(&h.ctx).contains(&ops::RESOLVER_SERVICE));
+    assert!(!h
+        .argvs(bin::SYSTEMCTL)
+        .iter()
+        .any(|a| a.iter().any(|x| x == ops::RESOLVER_SERVICE)));
 }

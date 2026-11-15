@@ -175,6 +175,10 @@ fn scope_table() -> BTreeMap<&'static str, Scope> {
         ("GetMailLimits", Scope::Read),
         ("SetMailLimits", Scope::Tenant),
         ("GetMailUsage", Scope::Read),
+        // The host's default email limits: anyone may read them (a panel
+        // shows a customer its effective limits), only staff change them.
+        ("GetMailDefaults", Scope::Read),
+        ("SetMailDefaults", Scope::Tenant),
     ]
     .into_iter()
     .collect()

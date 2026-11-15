@@ -1,0 +1,62 @@
+# The mail filter's own DNS resolver: Unbound (from AlmaLinux), recursive,
+# caching and DNSSEC-validating, on 127.0.0.1:5335 only, for Rspamd's
+# lookups (blocklists refuse questions that arrive through public
+# resolvers). It is not the system's resolver: /etc/resolv.conf is not
+# changed, and the distribution's unbound.service is not used.
+#
+# Configuration: /etc/oxpanel-mail-resolver/unbound.conf, rendered by
+# oxpanel-daemon (which starts this unit) once install.sh --mail has set
+# OXPANEL_MAIL_RESOLVER=true; local.d/*.conf there is the operator's own.
+
+[Unit]
+Description=OxPanel mail filter DNS resolver (Unbound on 127.0.0.1:5335)
+Documentation=https://github.com/OxServers/oxpanel
+After=network-online.target
+Wants=network-online.target
+Before=rspamd.service
+ConditionPathExists=/etc/oxpanel-mail-resolver/unbound.conf
+
+[Service]
+Type=simple
+ExecStart=/usr/sbin/unbound -d -p -c /etc/oxpanel-mail-resolver/unbound.conf
+ExecReload=/bin/kill -HUP $MAINPID
+Restart=on-failure
+RestartSec=2s
+# Unbound's own packaged account; no root at any time (its port is above
+# 1024, no chroot, no privileges to drop).
+User=unbound
+Group=unbound
+UMask=0077
+# Bounded even if its own limits were raised in local.d.
+MemoryMax=256M
+TasksMax=16
+LimitNOFILE=4096
+
+# --- Isolation ---------------------------------------------------------------
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+NoNewPrivileges=yes
+CapabilityBoundingSet=
+AmbientCapabilities=
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM
+
+[Install]
+WantedBy=multi-user.target

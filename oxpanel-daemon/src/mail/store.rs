@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use super::limits::Layer;
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::fsutil;
@@ -194,24 +195,76 @@ pub fn check_selector(s: &str) -> Result<()> {
     }
 }
 
-/// An account's own email limits; `None` = the host default.
+/// An account's email limits: its plan layer and its account layer (see
+/// [`super::limits`]). Version 2 (engine 0.3.1); a version-1 record (engine
+/// 0.3.0: one optional value per limit) is converted when read.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MailLimitsRecord {
+    #[serde(default)]
+    pub version: u32,
     pub tenant: String,
     #[serde(default)]
-    pub max_mailboxes: Option<u32>,
+    pub plan: Layer,
     #[serde(default)]
-    pub max_mailbox_bytes: Option<u64>,
-    #[serde(default)]
-    pub rate_account: Option<u32>,
-    #[serde(default)]
-    pub rate_mailbox: Option<u32>,
+    pub account: Layer,
+    // Version 1 only (read, never written).
+    #[serde(default, skip_serializing)]
+    max_mailboxes: Option<u32>,
+    #[serde(default, skip_serializing)]
+    max_mailbox_bytes: Option<u64>,
+    #[serde(default, skip_serializing)]
+    rate_account: Option<u32>,
+    #[serde(default, skip_serializing)]
+    rate_mailbox: Option<u32>,
+}
+
+pub const LIMITS_VERSION: u32 = 2;
+
+impl MailLimitsRecord {
+    pub fn new(tenant: &str, plan: Layer, account: Layer) -> Self {
+        Self {
+            version: LIMITS_VERSION,
+            tenant: tenant.to_owned(),
+            plan,
+            account,
+            ..Self::default()
+        }
+    }
+
+    /// A version-1 record in the current form.
+    fn upgraded(mut self) -> Self {
+        if self.version < LIMITS_VERSION {
+            self.account = super::limits::migrate_legacy(
+                self.max_mailboxes.take(),
+                self.max_mailbox_bytes.take(),
+                self.rate_account.take(),
+                self.rate_mailbox.take(),
+            );
+            self.plan = Layer::default();
+            self.version = LIMITS_VERSION;
+        }
+        self
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        Username::parse_field(&self.tenant, "tenant")?;
+        self.plan.validate()?;
+        self.account.validate()
+    }
+}
+
+/// The host's default email limits (`defaults.json`); absent: the built-in ones.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MailDefaultsRecord {
+    pub version: u32,
+    pub defaults: Layer,
 }
 
 #[derive(Debug, Clone)]
 pub struct MailStore {
     domains: PathBuf,
     limits: PathBuf,
+    defaults: PathBuf,
 }
 
 impl MailStore {
@@ -220,6 +273,7 @@ impl MailStore {
         Self {
             domains: root.join("domains"),
             limits: root.join("limits"),
+            defaults: root.join("defaults.json"),
         }
     }
 
@@ -276,19 +330,50 @@ impl MailStore {
         self.limits.join(format!("{tenant}.json"))
     }
 
+    /// The account's limits (a missing record: every limit inherited).
     pub fn load_limits(&self, tenant: &Username) -> Result<MailLimitsRecord> {
-        Ok(
-            read_json(&self.limits_path(tenant))?.unwrap_or_else(|| MailLimitsRecord {
-                tenant: tenant.to_string(),
-                ..MailLimitsRecord::default()
-            }),
-        )
+        let rec = read_json::<MailLimitsRecord>(&self.limits_path(tenant))?.map_or_else(
+            || MailLimitsRecord::new(tenant.as_str(), Layer::default(), Layer::default()),
+            MailLimitsRecord::upgraded,
+        );
+        if rec.tenant != tenant.as_str() {
+            return Err(Error::CorruptRecord {
+                path: self.limits_path(tenant),
+                reason: "the record names another account".into(),
+            });
+        }
+        rec.validate()?;
+        Ok(rec)
     }
 
     pub fn save_limits(&self, rec: &MailLimitsRecord) -> Result<()> {
+        rec.validate()?;
         let tenant = Username::parse_field(&rec.tenant, "tenant")?;
+        let mut rec = rec.clone();
+        rec.version = LIMITS_VERSION;
         fsutil::ensure_dir(&self.limits, DIR_MODE)?;
-        write_json(&self.limits_path(&tenant), rec)
+        write_json(&self.limits_path(&tenant), &rec)
+    }
+
+    /// The host defaults set with `SetMailDefaults`, if any.
+    pub fn load_defaults(&self) -> Result<Option<Layer>> {
+        let Some(rec) = read_json::<MailDefaultsRecord>(&self.defaults)? else {
+            return Ok(None);
+        };
+        rec.defaults.validate_defaults()?;
+        Ok(Some(rec.defaults))
+    }
+
+    pub fn save_defaults(&self, defaults: &Layer) -> Result<()> {
+        defaults.validate_defaults()?;
+        fsutil::ensure_dir(self.defaults.parent().unwrap_or(&self.limits), DIR_MODE)?;
+        write_json(
+            &self.defaults,
+            &MailDefaultsRecord {
+                version: 1,
+                defaults: *defaults,
+            },
+        )
     }
 
     pub fn delete_limits(&self, tenant: &Username) -> Result<bool> {
