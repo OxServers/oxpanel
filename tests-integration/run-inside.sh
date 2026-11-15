@@ -1404,6 +1404,14 @@ dry() { setpriv --reuid=panelapi --regid=panelapi --clear-groups --no-new-privs 
   OXPANEL_BACKUP_DIR="$DRY/backups" OXPANEL_MAIL=true OXPANEL_MAIL_HOSTNAME=mail.dry.test \
   OXPANEL_SOCKET_GROUP= OXPANEL_ALLOWED_UIDS="$(id -u panelapi)" "$@"; }
 real_dropin="$(sha256sum /etc/ssh/sshd_config.d/60-oxpanel.conf 2>/dev/null || true)"
+# A real host's filter resolver configuration must survive a dry run (found on
+# the VM: the dry run took it for its own and tried to remove it). One is
+# planted where there is none.
+planted_resolver=0
+if [ ! -e /etc/oxpanel-mail-resolver/unbound.conf ]; then
+  mkdir -p /etc/oxpanel-mail-resolver; printf '# Managed by oxpanel-daemon. Manual edits will be overwritten.\nserver:\n' > /etc/oxpanel-mail-resolver/unbound.conf; planted_resolver=1
+fi
+real_resolver="$(sha256sum /etc/oxpanel-mail-resolver/unbound.conf)"
 dry /usr/sbin/oxpanel-daemon --dry-run > /root/dry-run.log 2>&1 &
 DRYPID=$!
 for _ in $(seq 1 50); do [ -S "$DRY/sock" ] && break; sleep 0.1; done
@@ -1421,6 +1429,8 @@ check "no real unit or Nginx file was written" bash -c '! ls /etc/systemd/system
 kill "$DRYPID"; wait "$DRYPID" 2>/dev/null || true
 check "the real daemon was not disturbed" systemctl -q is-active oxpanel-daemon
 check "the real sshd drop-in was not touched" test "$(sha256sum /etc/ssh/sshd_config.d/60-oxpanel.conf 2>/dev/null || true)" = "$real_dropin"
+check "the real filter resolver's configuration was not touched" test "$(sha256sum /etc/oxpanel-mail-resolver/unbound.conf 2>/dev/null)" = "$real_resolver"
+if [ "$planted_resolver" = 1 ]; then rm -rf /etc/oxpanel-mail-resolver; fi
 rm -rf "$DRY"
 
 echo "== preflight refusals"

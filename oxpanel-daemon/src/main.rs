@@ -528,6 +528,11 @@ fn make_system(config: &mut Config) -> Result<Arc<dyn System>, Fatal> {
         config.mail.run_dir = mail.join("run");
         config.mail.milter_dir = mail.join("milter");
         config.mail.selfsigned_dir = mail.join("pki");
+        // The filter's resolver too: never /etc/oxpanel-mail-resolver (a
+        // real one would otherwise be taken for the dry run's and removed);
+        // no Unbound there, so it is not used.
+        config.mail.resolver_dir = mail.join("resolver");
+        config.mail.resolver_binary = mail.join("resolver").join("unbound");
         warn!("DRY RUN: no accounts, files under /etc or services will be touched");
         return Ok(Arc::new(fake));
     }
