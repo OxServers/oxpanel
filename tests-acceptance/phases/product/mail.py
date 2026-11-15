@@ -125,8 +125,11 @@ def step_on(admin, cust, st):
     comps = b.get("components") or {}
     warns = [w.get("kind") if isinstance(w, dict) else w for w in b.get("warnings", [])]
     D.check(r.status == 200 and b.get("enabled") is True and b.get("available") is True
-            and comps == {"postfix": True, "dovecot": True, "filter": True, "antivirus": False, "webmail": True},
-            "administrator reads the mail server: on, Postfix, Dovecot, filter and webmail, no antivirus",
+            and comps == {"postfix": True, "dovecot": True, "filter": True, "antivirus": False, "webmail": True,
+                          "filter_resolver": True}
+            and "filter_resolver_down" not in warns,
+            "administrator reads the mail server: on, Postfix, Dovecot, filter, the filter's own resolver (running)"
+            " and webmail, no antivirus",
             repr(r)[:600])
     D.check("service_not_running" not in warns, "no mail service is reported as not running", repr(warns))
     D.info(f"mail server warnings on the VM: {json.dumps(b.get('warnings'))[:600]}")
