@@ -336,6 +336,17 @@ service OxPanelEngine {
   // GetMailDefaults needs `read`, SetMailDefaults `tenant` (staff).
   rpc GetMailDefaults(GetMailDefaultsRequest) returns (MailDefaults);
   rpc SetMailDefaults(SetMailDefaultsRequest) returns (MailDefaults);
+
+  // --- Usability (engine 0.3.2) ---------------------------------------------
+  // Read part of one file of a READY backup of the tenant, so that a panel
+  // can offer the backup as a download (streamed chunk by chunk, never held
+  // whole in memory). `member` is exactly one of the backup's
+  // `members[].name` or "manifest.json"; nothing else is accepted (no paths).
+  // Another tenant's backup, or one taken from another uid, is NOT_FOUND (as
+  // for RestoreBackup); a backup that is not READY or whose file no longer
+  // matches its record is FAILED_PRECONDITION. Needs `vhost` (it is the
+  // account's data, like ReadFile).
+  rpc ReadBackupMember(ReadBackupMemberRequest) returns (ReadBackupMemberResponse);
 }
 
 // Per-tenant resource limits, applied through systemd (cgroups v2).
@@ -697,6 +708,17 @@ message HostInfo {
   BackupFrequency backup_schedule_default = 42;
   // DNS hosting: configuration and state.
   DnsHostInfo dns = 43;
+  // Host-level certificates the engine obtains and renews for consumers
+  // registered in /etc/oxpanel/host-certificates.d (e.g. the panel's own
+  // host name). Engine 0.3.2.
+  repeated HostCertificate host_certificates = 44;
+  // This host's public addresses as the operator configured them
+  // (OXPANEL_PUBLIC_IPV4/_IPV6, else DNS hosting's OXPANEL_DNS_IPV4/_IPV6);
+  // empty when not known. Never guessed from interfaces. Engine 0.3.2.
+  string public_ipv4 = 45;
+  string public_ipv6 = 46;
+  // Login banning (the fail2ban jails install.sh writes). Engine 0.3.2.
+  LoginBanning login_banning = 47;
 }
 
 // Database engines OxPanel can manage. More will follow (PostgreSQL,
@@ -2688,4 +2710,64 @@ message MailDefaults {
   // 30 and 20 messages per hour (account, mailbox), mailboxes and mailbox
   // size unlimited (unless OXPANEL_MAIL_* in the environment says otherwise).
   MailLimitSettings builtin = 2;
+}
+
+// ---- Usability (engine 0.3.2) -------------------------------------------------
+
+message ReadBackupMemberRequest {
+  string tenant = 1;
+  string backup_id = 2;
+  // One of Backup.members[].name, or "manifest.json".
+  string member = 3;
+  uint64 offset = 4;
+  // 1 to 1048576 bytes (0 = 1048576).
+  uint32 length = 5;
+}
+
+message ReadBackupMemberResponse {
+  bytes data = 1;
+  // The whole member's size (as recorded and verified on disk).
+  uint64 size_bytes = 2;
+  // `offset + len(data)` reached the end of the member.
+  bool eof = 3;
+}
+
+enum HostCertificateState {
+  HOST_CERTIFICATE_STATE_UNSPECIFIED = 0;
+  // A certificate from the ACME authority is installed and not yet due.
+  HOST_CERTIFICATE_STATE_ISSUED = 1;
+  // Installed but due for renewal (or expired); being renewed.
+  HOST_CERTIFICATE_STATE_RENEWING = 2;
+  // None yet: waiting until the name resolves to this host and serves the
+  // challenge, or backing off after a failure (`reason`, `next_attempt`).
+  HOST_CERTIFICATE_STATE_PENDING = 3;
+  // Automatic HTTPS is off or the ACME client is not available.
+  HOST_CERTIFICATE_STATE_DISABLED = 4;
+  // The registration file is not valid (`reason` says why); nothing is done.
+  HOST_CERTIFICATE_STATE_INVALID = 5;
+}
+
+message HostCertificate {
+  // The registration's file name without ".conf", e.g. "panel".
+  string consumer = 1;
+  // The host name the certificate is for.
+  string name = 2;
+  HostCertificateState state = 3;
+  string issuer = 4;
+  google.protobuf.Timestamp not_after = 5;
+  // Why there is no (current) certificate yet; empty when ISSUED.
+  string reason = 6;
+  google.protobuf.Timestamp next_attempt = 7;
+  // Where the consumer reads it (root-only key).
+  string certificate_path = 8;
+  string key_path = 9;
+}
+
+message LoginBanning {
+  // fail2ban is running with OxPanel's jails.
+  bool active = 1;
+  // OxPanel's jails that are configured (e.g. "sshd", "dovecot").
+  repeated string jails = 2;
+  // In plain words: what was found, or why it is off.
+  string detail = 3;
 }
