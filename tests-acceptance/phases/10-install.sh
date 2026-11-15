@@ -55,13 +55,27 @@ case "$INSTALL" in
     check "the release directory is intact (SHA256SUMS)" bash -c 'cd release && sha256sum -c --quiet SHA256SUMS'
     check "the bundle includes the panel RPM" bash -c 'ls release/oxpanel-panel-[0-9]*.rpm'
     check "install firewalld and start it (a host that has a firewall)" bash -c 'dnf -y -q install firewalld && systemctl enable --now firewalld'
+    # The test host never reaches out: the engine's outbound port-25 probe
+    # (GetMailHost's warning, by default a connection to a public mail server)
+    # is off, and its ACME client points at nothing, so no run can contact a
+    # real certificate authority. A drop-in of the test host, in place before
+    # the engine first starts; the product's own files are left as shipped.
+    mkdir -p /etc/systemd/system/oxpanel-daemon.service.d
+    printf '[Service]\nEnvironment=OXPANEL_MAIL_PORT25_CHECK=off\nEnvironment=OXPANEL_ACME_DIRECTORY_URL=https://127.0.0.1:9/directory\n' \
+      > /etc/systemd/system/oxpanel-daemon.service.d/50-acceptance-offline.conf
+    info "test host: OXPANEL_MAIL_PORT25_CHECK=off and the ACME directory at https://127.0.0.1:9/ (unit drop-in)"
+    # Email on from the start (install.sh --mail, which needs EPEL; ClamAV off).
+    MAILF=(--mail --mail-hostname mail.oxacc.test --no-mail-antivirus)
     start=$(date +%s)
-    bash release/install.sh --yes --fail2ban --enable-epel > install-1.log 2>&1; rc=$?
+    bash release/install.sh --yes --fail2ban --enable-epel "${MAILF[@]}" > install-1.log 2>&1; rc=$?
     # The log printed here must not show the password: keep it out of the phase log too.
     echo "--- install-1.log (password line masked) ---"; sed 's/\(one-time password: *\).*/\1<masked>/' install-1.log; echo "---------------------"
     [ "$rc" = 0 ] || fail "install.sh exited $rc (see above)"
     ok "install.sh --yes with the bundled panel ran clean ($(( $(date +%s) - start ))s)"
-    check "every stage ran, the panel's included" bash -c 'for s in preflight nodejs engine selinux nginx mariadb php panel daemon dns panelweb firewall fail2ban quota verify; do grep -q "^\[$s\]" install-1.log || { echo "stage $s missing"; exit 1; }; done'
+    check "every stage ran, the panel's and email's included" bash -c 'for s in preflight nodejs engine selinux nginx mariadb php panel daemon dns mail panelweb firewall fail2ban quota verify; do grep -q "^\[$s\]" install-1.log || { echo "stage $s missing"; exit 1; }; done'
+    check "email is on (the engine reports it)" bash -c 'oxpanel-ctl mail host | grep -q "^enabled=true host_name=mail.oxacc.test "'
+    check "ClamAV is not installed (antivirus off)" bash -c '! rpm -q clamd >/dev/null 2>&1'
+    check "firewalld opened the mail services (25, 465, 587, IMAPS, POP3S)" bash -c 'for s in smtp smtps smtp-submission imaps pop3s; do firewall-cmd -q --query-service=$s || exit 1; done'
     check "the run reports success" grep -q '^RESULT: ok changes=[1-9]' install-1.log
     sed -n 's/^  administrator: *//p' install-1.log > panel-admin.once
     sed -n 's/^  one-time password: *//p' install-1.log >> panel-admin.once
@@ -69,7 +83,7 @@ case "$INSTALL" in
     check "the installer printed the first administrator and a one-time password" bash -c 'test "$(wc -l < panel-admin.once)" = 2 && test "$(sed -n 2p panel-admin.once | wc -c)" -gt 12'
     check "the one-time password is not in the installer's log file" bash -c '! grep -qF -- "$(sed -n 2p panel-admin.once)" /var/log/oxpanel-install.log'
     check "the installer checked the panel over HTTPS" grep -q 'panel answers over HTTPS' install-1.log
-    bash release/install.sh --yes --fail2ban --enable-epel > install-2.log 2>&1; rc=$?
+    bash release/install.sh --yes --fail2ban --enable-epel "${MAILF[@]}" > install-2.log 2>&1; rc=$?
     tail -25 install-2.log
     [ "$rc" = 0 ] || fail "second install.sh run exited $rc"
     check "the second run changes nothing" bash -c 'grep -q "^RESULT: ok changes=0 " install-2.log'

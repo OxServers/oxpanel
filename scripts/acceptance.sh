@@ -80,8 +80,9 @@ if [ -n "${TARGET_KEY:-}" ]; then ARGS+=(-v "$TARGET_KEY:/target-key:ro" -e TARG
 say "run directory: dist/acceptance/$STAMP"
 if [ "$KEEP" = 1 ] && [ -z "$TARGET" ]; then
   podman rm -f oxpanel-acceptance-vm >/dev/null 2>&1 || true
-  # 8443: the panel's HTTPS port (INSTALL=product), for a browser on this machine.
-  cid="$(podman run -d --name oxpanel-acceptance-vm -p 127.0.0.1:2222:2222 -p 127.0.0.1:8080:8080 -p 127.0.0.1:8443:8443 "${ARGS[@]}" "$RIG" /work/tests-acceptance/acceptance.sh)"
+  # 8443: the panel's HTTPS port (INSTALL=product), for a browser on this machine;
+  # 8444: the VM's port 443 (customers' sites and webmail over HTTPS).
+  cid="$(podman run -d --name oxpanel-acceptance-vm -p 127.0.0.1:2222:2222 -p 127.0.0.1:8080:8080 -p 127.0.0.1:8443:8443 -p 127.0.0.1:8444:8444 "${ARGS[@]}" "$RIG" /work/tests-acceptance/acceptance.sh)"
   podman logs -f "$cid" 2>&1 | sed '/^ACCEPTANCE_DONE/q'
   rc="$(cat "$OUT/exit-code" 2>/dev/null || echo 2)"
 else

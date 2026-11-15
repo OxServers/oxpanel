@@ -27,6 +27,8 @@ import tempfile
 import time
 import urllib.parse
 
+import mail as mail_drive
+
 FAILED = 0
 CONTINUE = os.environ.get("CONTINUE", "0") == "1"
 WORK = tempfile.mkdtemp(prefix="oxp-drive-")
@@ -443,6 +445,7 @@ def sftp(key, user, batch, tries=40):
 
 def main():
     url, admin_user, admin_temp = sys.argv[1:4]
+    mail_drive.bind(sys.modules[__name__])
     pw = {"admin": "Admin-acceptance-passphrase-1", "reseller": "Reseller-acceptance-pass-1",
           "customer": "Customer-acceptance-pass-1"}
     rss0 = None
@@ -654,6 +657,9 @@ echo "php-ok ", PHP_VERSION, " uid=", getmyuid(), " euid=", function_exists('pos
     drive_task(cust, alice_uid)
     dns_switched = drive_dns(admin, cust)
 
+    # ------------------------------------------------------------ email (phases/product/mail.py)
+    mst = mail_drive.drive_mail(url, admin, reseller, cust, plan, plan_id)
+
     # ------------------------------------------------------------ HTTPS
     cert = os.path.join(WORK, "c.pem")
     ckey = os.path.join(WORK, "k.pem")
@@ -724,6 +730,7 @@ echo "php-ok ", PHP_VERSION, " uid=", getmyuid(), " euid=", function_exists('pos
     info(f"usage: {r.raw[:300]}")
 
     # ------------------------------------------------------------ backups
+    mail_drive.before_backup(mst)
     r = cust.post("/api/v1/accounts/alice/backups")
     check(r.status == 202 and r.body.get("job", {}).get("id"), "customer starts a backup (202 + job)", repr(r), fatal=True)
     job = r.body["job"]["id"]
@@ -735,6 +742,7 @@ echo "php-ok ", PHP_VERSION, " uid=", getmyuid(), " euid=", function_exists('pos
           "the backup is listed as ready", repr(r)[:300])
     backup = r.body["items"][0]
     info(f"backup: size={backup.get('size_bytes')} members={backup.get('members')} excluded={backup.get('excluded')}")
+    mail_drive.after_backup(mst)
     open(os.path.join(files, "index.html"), "w").write("changed-after-backup\n")
     sftp(key, "alice", f"put {files}/index.html public_html/index.html\n")
     good, code, body = wait_site(sites["static"], "200", "changed-after-backup")
@@ -749,6 +757,7 @@ echo "php-ok ", PHP_VERSION, " uid=", getmyuid(), " euid=", function_exists('pos
         info(f"restore job: restored={j.body.get('restored_entries')} skipped={j.body.get('skipped_entries')} sites={json.dumps(j.body.get('sites'))[:300]}")
     good, code, body = wait_site(sites["static"], "200", "static-ok")
     check(good, "the restored page is served", f"{code} {body[:100]}")
+    mail_drive.after_restore(mst)
     good, code, body = wait_site(sites["php"], "200", "DB-OK 42", "/?db=1")
     check(good, "PHP and its database work after the restore", f"{code} {body[:200]}")
     res = eventually(lambda: (lambda c_b: (c_b[0] == "200" and c_b[1].startswith("node-ok"), c_b))(curl_site(sites["node"])), 90, 1)
@@ -770,6 +779,7 @@ echo "php-ok ", PHP_VERSION, " uid=", getmyuid(), " euid=", function_exists('pos
     check(r.status == 200, "its reseller may still change the site", repr(r))
     good, code, _ = wait_site(sites["static"], "503", tries=6)
     check(good, "the changed site of a suspended account still answers 503", code)
+    mail_drive.while_suspended(admin, reseller, cust, mst)
     r = reseller.post("/api/v1/accounts/alice/resume")
     check(r.status == 200, "reseller resumes the account", repr(r))
     good, code, body = wait_site(sites["static"], "200", "static-ok")
@@ -778,6 +788,7 @@ echo "php-ok ", PHP_VERSION, " uid=", getmyuid(), " euid=", function_exists('pos
     check(res[0] is True, "the Node.js application is back after resuming", repr(res[1])[:200])
     p = sftp(key, "alice", "pwd\n")
     check(p.returncode == 0, "SFTP works again after resuming", p.stdout + p.stderr)
+    mail_drive.after_resume(reseller, mst)
 
     p = sh("oxpanel-ctl", "host", "reconcile")
     check(p.returncode == 0, "engine reconcile is clean with the panel and a customer's sites present", p.stdout + p.stderr)
@@ -814,6 +825,8 @@ echo "php-ok ", PHP_VERSION, " uid=", getmyuid(), " euid=", function_exists('pos
     check(r.status == 200, "customer empties the database trash through the panel", repr(r))
     r = cust.get("/api/v1/accounts/alice/database-trash")
     check(r.status == 200 and not r.body.get("items"), "the trash is empty", repr(r)[:300])
+    mail_drive.deletion_impact(admin, reseller, cust_id)
+    mail_drive.plain_delete_refused(cust, reseller)
     # Something in the trash again, for the one-step deletion to take with it.
     r = cust.post("/api/v1/accounts/alice/databases", {"suffix": "scratch"})
     check(r.status == 201, "customer creates another database", repr(r))
@@ -838,6 +851,9 @@ echo "php-ok ", PHP_VERSION, " uid=", getmyuid(), " euid=", function_exists('pos
     p = sh("oxpanel-ctl", "tenant", "get", "alice")
     check(p.returncode != 0, "the engine no longer has the account", p.stdout)
     check(not os.path.exists("/home/alice"), "its home is gone")
+    mail_drive.after_deletion(mst)
+    mail_drive.domain_reused(mst)
+    mail_drive.delete_bob(reseller, mst)
     if dns_switched:
         res = eventually(lambda: (lambda a: (a == "", a))(dig("alice.test", "SOA")), 30, 1)
         check(res[0] is True, "the account's zone went with it", repr(res[1]))
@@ -852,8 +868,12 @@ echo "php-ok ", PHP_VERSION, " uid=", getmyuid(), " euid=", function_exists('pos
     check(r.status in (200, 204), "administrator deletes the plan", repr(r))
     r = admin.get("/api/v1/audit?limit=200")
     check(r.status == 200 and r.body.get("total", 0) > 20, "the audit log recorded the session", repr(r)[:200])
-    for secret_value in (pw["customer"], db_pw, open(ckey).read().splitlines()[1]):
+    for secret_value in (pw["customer"], db_pw, open(ckey).read().splitlines()[1], mst["p_info"], mst["p_sales"]):
         check(secret_value not in r.raw, "no password or key in the audit log")
+    p = sh("bash", "-c", "journalctl -b -u oxpanel-panel -u oxpanel-daemon -u oxpanel-mail-policy -u postfix -u dovecot"
+                         " --no-pager -o cat")
+    check(p.returncode == 0 and mst["p_info"] not in p.stdout and mst["p_sales"] not in p.stdout,
+          "no mailbox password in the journal of the panel, the engine or the mail servers")
     r = admin.post("/api/v1/auth/logout")
     check(r.status in (200, 204), "administrator signs out", repr(r))
     r = admin.get("/api/v1/accounts")

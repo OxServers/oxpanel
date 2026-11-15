@@ -11,7 +11,7 @@ INSTALL="${INSTALL:-git}"; PHASES="${PHASES:-10 15 20 30 40 50 60 70 80 90}"; SO
 ACCEL="${ACCEL:-kvm}"; CONTINUE="${CONTINUE:-0}"; KEEP="${KEEP:-0}"; REFRESH_IMAGE="${REFRESH_IMAGE:-0}"
 GIT_URL="${GIT_URL:-}"; GIT_REF="${GIT_REF:-}"; RPM_DIR="${RPM_DIR:-/work/dist/rpms}"
 TARGET="${TARGET:-}"; TARGET_PORT="${TARGET_PORT:-22}"; TARGET_KEY="${TARGET_KEY:-}"; I_UNDERSTAND="${I_UNDERSTAND:-0}"
-SSH_PORT="${SSH_PORT:-2222}"; HTTP_PORT="${HTTP_PORT:-8080}"; PANEL_HTTPS_PORT="${PANEL_HTTPS_PORT:-8443}"
+SSH_PORT="${SSH_PORT:-2222}"; HTTP_PORT="${HTTP_PORT:-8080}"; PANEL_HTTPS_PORT="${PANEL_HTTPS_PORT:-8443}"; SITES_HTTPS_PORT="${SITES_HTTPS_PORT:-8444}"
 PHASE_TIMEOUT="${PHASE_TIMEOUT:-900}"; INSTALL_TIMEOUT="${INSTALL_TIMEOUT:-2400}"
 IMAGE_BASE=https://repo.almalinux.org/almalinux/9/cloud/x86_64/images
 IMAGE_NAME=AlmaLinux-9-GenericCloud-latest.x86_64.qcow2
@@ -81,10 +81,10 @@ provision() {
   local accel_args net_args
   if [ "$ACCEL" = kvm ]; then accel_args="-accel kvm -cpu host"; else accel_args="-accel tcg -cpu max"; fi
   if "$QEMU" -netdev help 2>/dev/null | grep -qx user; then
-    net_args="-netdev user,id=n0,hostfwd=tcp:0.0.0.0:$SSH_PORT-:22,hostfwd=tcp:0.0.0.0:$HTTP_PORT-:80,hostfwd=tcp:0.0.0.0:$PANEL_HTTPS_PORT-:8443"
+    net_args="-netdev user,id=n0,hostfwd=tcp:0.0.0.0:$SSH_PORT-:22,hostfwd=tcp:0.0.0.0:$HTTP_PORT-:80,hostfwd=tcp:0.0.0.0:$PANEL_HTTPS_PORT-:8443,hostfwd=tcp:0.0.0.0:$SITES_HTTPS_PORT-:443"
     VM_DESC="qemu $("$QEMU" --version | head -1 | awk '{print $4}') · $ACCEL · ${cpus} vCPU · ${mem} MB · slirp"
   else
-    passt -f -s "$RUN/passt.sock" -t "$SSH_PORT:22" -t "$HTTP_PORT:80" -t "$PANEL_HTTPS_PORT:8443" > "$OUT/passt.log" 2>&1 &
+    passt -f -s "$RUN/passt.sock" -t "$SSH_PORT:22" -t "$HTTP_PORT:80" -t "$PANEL_HTTPS_PORT:8443" -t "$SITES_HTTPS_PORT:443" > "$OUT/passt.log" 2>&1 &
     PASST_PID=$!
     for _ in $(seq 1 50); do [ -S "$RUN/passt.sock" ] && break; sleep 0.1; done
     net_args="-netdev stream,id=n0,server=off,addr.type=unix,addr.path=$RUN/passt.sock"

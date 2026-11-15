@@ -153,7 +153,7 @@ which now also reads Dovecot's last-login file once per call.
 | `PutForwarder` | 71 ms |
 | `GetMailUsage`, 21 mailboxes | 226 ms |
 | `GetMailQueue` (Postfix's `postqueue` in a transient unit) | 47 ms |
-| One message accepted on port 25, the filter included | 1619 ms |
+| One message accepted on port 25, the filter included | 1619 ms (between 1.6 s and 6.2 s across runs when it is the host's first message; 8 to 350 ms once Rspamd's DNS answers are cached; see below) |
 
 Reading: Rspamd dominates the stack's memory (its Lua runtime and maps);
 ClamAV, off by default, would add about 1 GB. `PutMailbox` costs what
@@ -163,6 +163,27 @@ number of mailboxes (one `doveadm` per mailbox); at hundreds of mailboxes
 per domain a single `doveadm quota get -A` would be cheaper (not needed at
 this scale). Every change re-renders the mail servers' files (a few
 milliseconds) and reloads only the servers whose files changed.
+
+**Why one port-25 message takes 50 ms or 6 s.** Phase 90 measures a single
+message, and on a fresh VM it is among the first the host receives. Rspamd
+then makes about 20 DNS queries for it (the sender's SPF and DMARC records,
+the DNS blocklists for the HELO name, the reverse name, the sender and
+Message-ID domains), through the host's resolver, which on the acceptance VM is
+QEMU's user-mode forwarder in front of the workstation's own resolver. With
+nothing cached those lookups took 4.07 s of a 5.65 s delivery on the VM of
+`20261115T032503Z` (Rspamd's log: `time: 4074.681ms, dns req: 20`); the next
+seven messages to the same mailbox took 135, 50, 51, 309, 273, 348 and 51 ms,
+Rspamd's share 8 to 307 ms. The spread across runs is therefore the upstream
+resolver's latency on cache misses, not greylisting (off), Postfix lookups
+(the client is 127.0.0.1, resolved locally) or the milter timeout (120 s,
+never reached). It is not a misconfiguration of the product; a production
+host with a nearby caching resolver pays the cold cost once per name. One
+related finding for the owner: the same log shows `DBL_BLOCKED_OPENRESOLVER`,
+i.e. Spamhaus refuses blocklist queries that arrive through a public
+resolver, so on hosts whose `/etc/resolv.conf` points at a public resolver
+Rspamd's Spamhaus lists do nothing. Rspamd's documentation recommends a
+local recursive resolver (for example Unbound) for that reason; whether
+`install.sh --mail` should set one up is a product decision, not made here.
 
 ## Budgets
 

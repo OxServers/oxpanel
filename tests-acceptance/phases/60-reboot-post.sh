@@ -53,6 +53,15 @@ r = b.post("/api/v1/auth/login", {"username": cred["user"], "password": cred["pa
 assert r.status == 200 and not r.body.get("restriction"), r
 r = b.get("/api/v1/host")
 assert r.status == 200 and r.body.get("engine_version"), r
+if (r.body.get("mail") or {}).get("enabled"):
+    # Email through the panel after the reboot: every mail service is back.
+    for _ in range(60):
+        m = b.get("/api/v1/host/mail")
+        kinds = [w.get("kind") if isinstance(w, dict) else w for w in (m.body or {}).get("warnings", [])]
+        if m.status == 200 and m.body.get("available") is True and "service_not_running" not in kinds:
+            break
+        time.sleep(1)
+    assert m.status == 200 and m.body.get("available") is True and "service_not_running" not in kinds, m
 EOF
   fi
 fi
