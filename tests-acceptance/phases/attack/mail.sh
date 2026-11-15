@@ -168,23 +168,30 @@ PY
     check "no remote control to flush or change it (nothing on 8953)" bash -c '! ss -Hltn "sport = :8953" | grep -q LISTEN'
     check "unbound-control cannot reach it" bash -c "! timeout 10 unbound-control -s 127.0.0.1@5336 status >/dev/null 2>&1"
     # Forged answers: the attacker races the resolver for a name it is about
-    # to look up, sending answers with every ID to the loopback's ports.
+    # to look up, sending answers with random IDs to the resolver's port and
+    # to the loopback's ports in the resolver's outgoing range.
+    local SEEN=/root/acc/poison-answers.txt; : > "$SEEN"
     asa3 python3 - <<'PY' &
 import socket, struct, time, random
 def ans(qid, name, ip):
     q = b"".join(bytes([len(l)]) + l.encode() for l in name.split(".")) + b"\0" + struct.pack(">HH", 1, 1)
     return struct.pack(">HHHHHH", qid, 0x8400, 1, 1, 0, 0) + q + b"\xc0\x0c" + struct.pack(">HHIH", 1, 1, 86400, 4) + bytes(ip)
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-end = time.time() + 8
+end, n = time.time() + 8, 0
 while time.time() < end:
     pkt = ans(random.randrange(65536), "poison.oxresolve.test", [6, 6, 6, 6])
     for port in (5336, random.randrange(32768, 61000)):
-        try: s.sendto(pkt, ("127.0.0.1", port))
+        try: s.sendto(pkt, ("127.0.0.1", port)); n += 1
         except OSError: pass
+    if n % 200 == 0: time.sleep(0.01)
 PY
-    sleep 1
-    check "forged answers do not get into the cache" bash -c "test \"\$(dig +short +tries=1 +time=5 @127.0.0.1 -p 5336 poison.oxresolve.test A)\" = 192.0.2.53"
-    wait
+    local FORGER=$!
+    for _ in $(seq 1 8); do dig +short +tries=1 +time=2 @127.0.0.1 -p 5336 poison.oxresolve.test A >> "$SEEN" 2>&1; sleep 1; done
+    wait "$FORGER"
+    dig +short +tries=2 +time=3 @127.0.0.1 -p 5336 poison.oxresolve.test A >> "$SEEN" 2>&1
+    info "answers seen for the raced name: $(sort | uniq -c < "$SEEN" | tr -s ' \n' ' ')"
+    check "forged answers never got into the cache (no 6.6.6.6 at any time)" bash -c "! grep -q 6.6.6.6 $SEEN"
+    check "the real answer is what the name resolves to" bash -c "tail -1 $SEEN | grep -qx 192.0.2.53"
     # Exhaustion: a flood of random names for ten seconds.
     asa3 python3 - <<'PY'
 import socket, struct, time, random, string
