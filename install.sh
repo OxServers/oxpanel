@@ -1502,7 +1502,8 @@ enabled afterwards (fail2ban needs its updates). Disable it later with: dnf conf
   if ! installed php-fpm && [ ! -e "$STATE_DIR/php-fpm-installed-by-installer" ]; then : >"$STATE_DIR/php-fpm-installed-by-installer"; fi
   # The panel's name as the setup tool kept it before anything here changed
   # (the panel stage may upgrade the panel, whose package then derives one).
-  PANEL_NAME_BEFORE="$(sed -n 's/^NAME=//p' /etc/oxpanel-panel/setup.conf 2>/dev/null | tail -1)"
+  # (No panel, no file: under pipefail a failed sed would end the run.)
+  PANEL_NAME_BEFORE="$(sed -n 's/^NAME=//p' /etc/oxpanel-panel/setup.conf 2>/dev/null | tail -1 || true)"
   stage nodejs   "Node.js 22 module stream"                      stage_nodejs
   stage engine   "OxPanel engine package"                        stage_engine
   stage selinux  "SELinux booleans and the OxPanel policy module" stage_selinux
