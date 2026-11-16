@@ -244,7 +244,8 @@ administrator and checks that the panel answers over HTTPS:
   `--panel-hostname`, else the mail host name (with email), else the host's
   fully-qualified name (`hostname -f`, when it has a dot); in port mode it is passed
   as `--name` to a setup tool that knows the option (an older panel installs as
-  before). The installer's last lines say which certificate the panel serves. Until
+  before); a name the panel already had before the run is kept (change it with
+  `oxpanel-panel-setup enable --port PORT --name NAME`). The installer's last lines say which certificate the panel serves. Until
   the automatic one exists, a self-signed one (`/etc/pki/oxpanel-panel/`) is made at
   install so the panel works at once (browsers warn). Install a real one with
   `oxpanel-panel-setup certificate --cert fullchain.pem --key key.pem` (checked against
@@ -1941,8 +1942,9 @@ sudo rm -f /etc/cron.weekly/oxpanel-panel-cert
 sudo crontab -l 2>/dev/null | grep oxpanel-panel-setup    # nothing left?
 # 2. Upgrade engine and panel together: the new bundle, the same options as before.
 sudo ./install.sh --yes <the same options as before>
-# 3. Check which certificate the panel serves, and the engine's view of it.
-sudo oxpanel-panel-setup status        # certificate: automatic (…, until …)
+# 3. Check the panel's name (the mail host name, or --panel-hostname), which
+#    certificate it serves, and the engine's view of it.
+sudo oxpanel-panel-setup status        # name: mail.example.net / certificate: automatic (…, until …)
 sudo oxpanel-ctl cert host panel       # state=issued, issuer, not_after
 ```
 
