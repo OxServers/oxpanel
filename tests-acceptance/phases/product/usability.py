@@ -157,6 +157,15 @@ def wait_service_run(before, tries=60):
     return False, res, log
 
 
+def why_not_switched():
+    """What the path unit, its service and the setup tool say (for a failure)."""
+    p = D.sh("bash", "-c", "systemctl show -p ActiveState -p SubState -p Result oxpanel-panel-certificate.path "
+                           "oxpanel-panel-certificate.service; journalctl -b --no-pager -o short-precise -n 25 "
+                           "-u oxpanel-panel-certificate.path -u oxpanel-panel-certificate.service; "
+                           "/usr/sbin/oxpanel-panel-setup status; grep -v '^#' /etc/oxpanel-panel/setup.conf")
+    return p.stdout[-2500:]
+
+
 def health(url_port=8443, host=None, sni=None):
     h = host or f"127.0.0.1:{url_port}"
     args = ["curl", "-sk", "--max-time", "10", "-o", "/dev/null", "-w", "%{http_code}", "-H", f"Host: {h}"]
@@ -460,8 +469,14 @@ def hostname_mode(admin):
     tok = "/var/lib/oxpanel-acme/challenges/acc-hostname-mode-token"
     D.sh("setpriv", "--reuid=oxpanel-acme", "--regid=oxpanel-acme", "--clear-groups", "--", "sh", "-c",
          f"echo hostname-mode-challenge > {tok}")
-    got = D.sh("curl", "-s", "-H", f"Host: {HOSTNAME_MODE_NAME}",
-               "http://127.0.0.1/.well-known/acme-challenge/acc-hostname-mode-token").stdout.strip()
+    # Nginx applies the reload of `enable` a moment after it returns: poll.
+    got = ""
+    for _ in range(40):
+        got = D.sh("curl", "-s", "-H", f"Host: {HOSTNAME_MODE_NAME}",
+                   "http://127.0.0.1/.well-known/acme-challenge/acc-hostname-mode-token").stdout.strip()
+        if got == "hostname-mode-challenge":
+            break
+        time.sleep(0.25)
     D.sh("rm", "-f", tok)
     D.check(got == "hostname-mode-challenge", "the panel's port-80 server serves the engine's challenge directory", got)
     runs0, _, _ = cert_service_runs()
@@ -474,7 +489,7 @@ def hostname_mode(admin):
     wait_service_run(runs0)
     good, got = served_becomes(443, HOSTNAME_MODE_NAME, fp_file(AUTO_CRT))
     D.check(good and served_lines() == [AUTO_CRT], "the panel answers on 443 for its name with the automatic certificate",
-            f"{got} {served_lines()}")
+            f"{got} {served_lines()}\n{why_not_switched()}")
     D.check(health(443, sni=HOSTNAME_MODE_NAME, host=HOSTNAME_MODE_NAME) == "200", "the panel answers there", "")
     D.check(D.sh("nginx", "-t").returncode == 0, "nginx -t passes in host-name mode", "")
     # Back to port mode, under the mail host name.
@@ -487,7 +502,8 @@ def hostname_mode(admin):
     auto_run()
     wait_service_run(runs1)
     good, got = served_becomes(8443, PANEL_NAME, fp_file(AUTO_CRT))
-    D.check(good and served_lines() == [AUTO_CRT], "and then the automatic one for the mail host name", f"{got} {served_lines()}")
+    D.check(good and served_lines() == [AUTO_CRT], "and then the automatic one for the mail host name",
+            f"{got} {served_lines()}\n{why_not_switched()}")
     r = admin.get("/api/v1/host")
     D.check(r.status == 200, "the administrator's session still works after the moves (sessions survive the panel's restart)",
             repr(r)[:200])
