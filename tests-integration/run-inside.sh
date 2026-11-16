@@ -528,6 +528,10 @@ JSON
   systemd-run --unit=oxpanel-it-pebble --collect --setenv=PEBBLE_VA_NOSLEEP=1 "$PEBBLE" -config "$P/pebble.json" >/dev/null
   check "Pebble is up" bash -c 'for i in $(seq 1 100); do curl -sf --cacert "$1" https://localhost:14000/dir >/dev/null && exit 0; sleep 0.1; done; exit 1' _ "$P/ca.crt"
   cp -p /etc/hosts "$T/hosts.bak"
+  # Pebble (Go) reads /etc/hosts again at most every 5 s: a name added while it
+  # runs can still be unknown to it for that long ("lookup … no such host" on
+  # the VM's DNS server, seen in acceptance). A real authority uses public DNS.
+  pebble_hosts() { echo "127.0.0.1 $*" >> /etc/hosts; sleep 6; }
   echo "127.0.0.1 acme.test www.acme.test" >> /etc/hosts
   cp -p /etc/oxpanel/daemon.env "$T/daemon.env.bak"
   printf 'OXPANEL_ACME_DIRECTORY_URL=https://localhost:14000/dir\nOXPANEL_ACME_CA_FILE=%s/ca.crt\nOXPANEL_ACME_EMAIL=hostmaster@example.org\n' "$P" >> /etc/oxpanel/daemon.env
@@ -574,7 +578,7 @@ JSON
   cert_names_eventually() { local i; for i in $(seq 1 $(( ${3:-60} * 2 ))); do oxpanel-ctl cert show "$1" 2>/dev/null | grep -q " source=acme .* names=$2 " && return 0; sleep 0.5; done; oxpanel-ctl cert show "$1"; oxpanel-ctl cert auto status "$1"; return 1; }
   auto_status_eventually() { local i; for i in $(seq 1 120); do oxpanel-ctl cert auto status "$1" | grep -q "$2" && return 0; sleep 0.5; done; oxpanel-ctl cert auto status "$1"; return 1; }
   check "Automatic HTTPS is on by default" grep -q ' auto_https=true$' <(oxpanel-ctl host info)
-  echo "127.0.0.1 auto.test www.auto.test new.auto.test optout.test susp.test off.test" >> /etc/hosts
+  pebble_hosts auto.test www.auto.test new.auto.test optout.test susp.test off.test
   oxpanel-ctl vhost set auto.test --tenant alice --alias www.auto.test >/dev/null
   check "a new site gets a certificate with no request at all" cert_names_eventually auto.test "auto.test,www.auto.test"
   check "... and is served over HTTPS with it" https_eventually auto.test / "$T/pebble-root.pem" hello-from-alice
@@ -630,7 +634,10 @@ JSON
   echo "-- host certificates (a consumer's own name, through the engine)"
   HC=/etc/oxpanel/host-certificates.d; HP=/etc/pki/oxpanel-host; HN=/etc/nginx/conf.d/oxpanel-host-certificates.conf
   check "the registration and certificate directories exist (package)" bash -c 'test "$(stat -c "%U %a" "$1" "$2" | sort -u)" = "root 755"' _ "$HC" "$HP"
-  echo "127.0.0.1 panel.oxtest" >> /etc/hosts
+  # Registrations that exist already (the real panel's, on a product host) are
+  # left alone: the counts and listings below are relative to them.
+  HC0="$(oxpanel-ctl host info | sed -n 's/^host_certificates=//p')"
+  pebble_hosts panel.oxtest
   printf '# the integration test panel\nname=panel.oxtest\nchallenges=engine\nredirect_port=8443\n' > "$HC/itpanel.conf"; chmod 0644 "$HC/itpanel.conf"
   check "registered: pending before the first sweep" grep -q '^state=pending$' <(oxpanel-ctl cert host itpanel)
   oxpanel-ctl cert auto run >/dev/null || true
@@ -640,14 +647,15 @@ JSON
   check "the challenge-only server answers the engine's challenges for the name" test "$(curl -s -H 'Host: panel.oxtest' http://127.0.0.1/.well-known/acme-challenge/it-host-token)" = host-challenge-ok
   rm -f /var/lib/oxpanel-acme/challenges/it-host-token
   check "other paths redirect to the consumer's port" bash -c 'test "$(curl -s -o /dev/null -w "%{http_code} %{redirect_url}" -H "Host: panel.oxtest" http://127.0.0.1/x?y=1)" = "301 https://panel.oxtest:8443/x?y=1"'
-  check "the certificate is obtained (Pebble's 10 days: due at once, so renewing)" grep -q '^state=\(issued\|renewing\)$' <(oxpanel-ctl cert host itpanel)
-  check "HostInfo reports the registration" grep -q '^host_certificates=1$' <(oxpanel-ctl host info)
+  hc_why() { oxpanel-ctl cert host itpanel; journalctl --no-pager -o cat -n 40 -u 'oxpanel-acme-panel.oxtest*'; journalctl --no-pager -n 30 -u oxpanel-daemon | grep -i 'host cert\|panel.oxtest\|nginx'; }
+  check "the certificate is obtained (Pebble's 10 days: due at once, so renewing)" bash -c "oxpanel-ctl cert host itpanel | grep -q '^state=\(issued\|renewing\)$' || { $(declare -f hc_why); hc_why; false; }"
+  check "HostInfo reports the registration" grep -qx "host_certificates=$((HC0 + 1))" <(oxpanel-ctl host info)
   check "cert host prints the documented keys" bash -c 'test "$(oxpanel-ctl cert host itpanel | cut -d= -f1 | tr "\n" " ")" = "consumer name state issuer not_after next_attempt reason certificate key "'
   check "issuer and expiry are reported" bash -c 'oxpanel-ctl cert host itpanel | grep -qi "^issuer=.*pebble" && oxpanel-ctl cert host itpanel | grep -qE "^not_after=20[0-9]{2}-[0-9]{2}-[0-9]{2}T"'
   check "chain 0644 and key 0600, both root" bash -c 'test "$(stat -c "%U %a" "$1/itpanel.crt")" = "root 644" && test "$(stat -c "%U %a" "$1/itpanel.key")" = "root 600"' _ "$HP"
   check "the chain is the CA's, for the name" bash -c 'openssl x509 -in "$1/itpanel.crt" -noout -issuer | grep -qi pebble && openssl x509 -in "$1/itpanel.crt" -noout -ext subjectAltName | grep -q "DNS:panel.oxtest"' _ "$HP"
   check "key and certificate belong together" test "$(openssl x509 -in "$HP/itpanel.crt" -noout -pubkey)" = "$(openssl pkey -in "$HP/itpanel.key" -pubout)"
-  check "no placeholder, request or reply is left behind" bash -c "$(declare -f acme_dirs_empty); test \"\$(ls \"\$1\" | tr '\n' ' ')\" = 'itpanel.crt itpanel.key ' && acme_dirs_empty" _ "$HP"
+  check "no placeholder, request or reply is left behind" bash -c "$(declare -f acme_dirs_empty); test \"\$(ls \"\$1\" | grep '^it' | tr '\n' ' ')\" = 'itpanel.crt itpanel.key ' && acme_dirs_empty" _ "$HP"
   # The consumer's own server (here a stand-in for the panel) uses the pair.
   printf 'server {\n  listen 127.0.0.1:8443 ssl;\n  server_name panel.oxtest;\n  ssl_certificate %s/itpanel.crt;\n  ssl_certificate_key %s/itpanel.key;\n  return 200 "panel\\n";\n}\n' "$HP" "$HP" > /etc/nginx/conf.d/zz-it-panel.conf
   systemctl reload nginx
@@ -666,6 +674,9 @@ JSON
   check "a name that does not resolve stays pending, with the reason" bash -c 'oxpanel-ctl cert host itnx | grep -q "^state=pending$" && oxpanel-ctl cert host itnx | grep -q "^reason=.*resolve" && oxpanel-ctl cert host itnx | grep -qE "^next_attempt=20"'
   check "... and never reached the authority (only the reachability check ran)" bash -c '! journalctl --no-pager -u oxpanel-daemon --since "$1" | grep "ACME client finished" | grep -q "nx-panel.oxtest"' _ "$since"
   check "... and has no files" test ! -e "$HP/itnx.crt"
+  pebble_hosts nx-panel.oxtest
+  oxpanel-ctl cert auto run >/dev/null || true
+  check "once it resolves, the operator's run gets it at once, back-off or not" grep -Eq '^state=(issued|renewing)$' <(oxpanel-ctl cert host itnx)
   printf 'name=bad.oxtest\n' > "$HC/itbad.conf"; chmod 0644 "$HC/itbad.conf"
   printf 'name=loose.oxtest\nchallenges=engine\n' > "$HC/itloose.conf"; chmod 0666 "$HC/itloose.conf"
   printf 'name=odd.oxtest\nchallenges=engine\ncolour=blue\n' > "$HC/itodd.conf"; chmod 0644 "$HC/itodd.conf"
@@ -683,9 +694,10 @@ JSON
   check "... and Nginx keeps working" nginx -t -q
   rm -f /etc/nginx/conf.d/zz-it-panel.conf; systemctl reload nginx
   oxpanel-ctl cert auto run >/dev/null || true
-  check "once unused, the removed registration's pair is removed" test -z "$(ls "$HP")"
-  check "and the challenge server with it" test ! -e "$HN"
-  check "nothing is reported any more" grep -q '^host_certificates=0$' <(oxpanel-ctl host info)
+  check "once unused, the removed registration's pair is removed" test -z "$(ls "$HP" | grep '^it')"
+  check "and the challenge server with it" bash -c '! grep -qs "panel.oxtest" "$1"' _ "$HN"
+  if [ "$HC0" = 0 ]; then check "... the file too, when it was the only one" test ! -e "$HN"; fi
+  check "nothing is reported any more" grep -qx "host_certificates=$HC0" <(oxpanel-ctl host info)
   check "host certificates leave no drift" grep -q '^drifts=0$' <(oxpanel-ctl host reconcile)
 
   echo "-- External Account Binding (Pebble requiring it)"
@@ -699,7 +711,7 @@ JSON
 JSON
   systemd-run --unit=oxpanel-it-pebble-eab --collect --setenv=PEBBLE_VA_NOSLEEP=1 "$PEBBLE" -config "$P/pebble-eab.json" >/dev/null
   check "Pebble (EAB required) is up" bash -c 'for i in $(seq 1 100); do curl -sf --cacert "$1" https://localhost:14000/dir >/dev/null && exit 0; sleep 0.1; done; exit 1' _ "$P/ca.crt"
-  echo "127.0.0.1 eab.test" >> /etc/hosts
+  pebble_hosts eab.test
   oxpanel-ctl vhost set eab.test --tenant alice --no-auto-https >/dev/null
   code_eventually eab.test / 200 || true
   check "EAB: without a binding the CA refuses" bash -c 'oxpanel-ctl cert request eab.test > /root/eab.out 2>&1; grep -q "^succeeded=false" /root/eab.out && grep -qi "externalAccountBinding" /root/eab.out'

@@ -94,6 +94,14 @@ automatic certificate without a second ACME client on the host.
   host-name mode already has a port-80 server for its name and serves the
   engine's challenge directory there. Both validated with `nginx -t` and
   rolled back like every Nginx change; drift-checked.
+- **An operator's run does not wait.** The periodic task respects the
+  back-off (1 h, 6 h, then daily); `RunAutoHttps` without a domain
+  (`oxpanel-ctl cert auto run`, also run by the installer after enabling the
+  panel) tries host certificates at once, back-off or not, as a run for one
+  site does. Found on the VM: a panel installed before its name resolved had
+  backed off, and after the operator fixed DNS the panel waited up to a day.
+  The reachability check still runs first, so the authority is never asked
+  for a name that does not resolve here.
 - **No placeholder.** The paths do not exist until a real certificate does, so
   "the file exists" means "a verified certificate for the name"; the panel
   keeps its self-signed one until then.

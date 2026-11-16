@@ -1725,8 +1725,10 @@ sudo oxpanel-ctl cert host            # every registration; or: cert host panel
 ```
 
 `pending` comes with the reason (e.g. "the name does not resolve") and the next
-attempt; `oxpanel-ctl cert auto run` tries again at once once the back-off is
-over. `host reconcile` reports a key that is not root-only
+attempt. The periodic run waits for that attempt; `sudo oxpanel-ctl cert auto run`
+tries every registered name at once, back-off or not (run it after pointing the
+name at this host); a name that still does not resolve stops at the reachability
+check and waits longer. `host reconcile` reports a key that is not root-only
 (`HOST_CERTIFICATE_KEY_EXPOSED`), a file no registration accounts for
 (`ORPHAN_HOST_CERTIFICATE_FILE`) and a challenge file that differs from what the
 registrations render (`HOST_CERTIFICATE_CHALLENGE_DRIFT`).
@@ -1917,24 +1919,36 @@ enabled). `host reconcile` no longer reports backups made by an older engine as
 plain `install.sh --yes` run writes `OXPANEL_PUBLIC_IPV4`/`_IPV6` only when
 `--dns-ipv4`/`--dns-ipv6` or the new options are given.
 
-*A panel certificate copied by hand from the mail certificate.* If the engine's
-certificate for the mail host name was copied to the panel with
-`oxpanel-panel-setup certificate --cert … --key …` (panel 0.2.1), often with a
-cron job that repeats the copy after each renewal: after upgrading to engine
-0.3.2 and panel 0.2.2 that copy counts as a certificate installed before 0.2.2.
-It is kept until the engine's automatic certificate for the panel's name exists,
-and then the automatic one is served — for a name that already resolves to this
-host that happens at the first certificate run after the upgrade (within 15
-minutes; `sudo oxpanel-ctl cert auto run` does it at once). **Delete the cron
-job**: a `certificate --cert` run after the upgrade marks the copy as installed
-by the administrator, and that wins over the automatic certificate for good. If
-it already ran, return to the automatic certificate with
+*A panel certificate copied by hand from the mail certificate.* A host where
+the engine's certificate for the mail host name was copied onto the panel with
+panel 0.2.1 (`oxpanel-panel-setup certificate --cert /etc/pki/oxpanel-mail/<name>.crt
+--key /etc/pki/oxpanel-mail/<name>.key`), often with a cron job that repeats the
+copy, needs one extra step. After the upgrade that copy counts as a certificate
+installed by hand before 0.2.2: it is kept only until the engine's automatic
+certificate for the panel's name exists. When the mail host name already
+resolves to this host, that happens during the upgrade run itself (the
+installer asks the engine for the panel's certificate right after enabling the
+panel, and its last lines say "The panel's certificate: automatic (…)"). The
+cron job does nothing while the mail certificate is unchanged, but after the
+next renewal of the mail certificate it copies it again, and a copy installed
+with `certificate --cert` from 0.2.2 on is the administrator's own: it wins over
+the automatic certificate for good. So, on such a host:
 
 ```sh
-sudo oxpanel-panel-setup certificate --automatic
-sudo oxpanel-panel-setup status        # says which certificate is served, and why
-sudo oxpanel-ctl cert host panel       # the engine's view: state=issued, issuer, not_after
+# 1. Before the upgrade: remove the cron job that copies the certificate
+#    (wherever it is: /etc/cron.weekly/, /etc/cron.d/, root's crontab).
+sudo rm -f /etc/cron.weekly/oxpanel-panel-cert
+sudo crontab -l 2>/dev/null | grep oxpanel-panel-setup    # nothing left?
+# 2. Upgrade engine and panel together: the new bundle, the same options as before.
+sudo ./install.sh --yes <the same options as before>
+# 3. Check which certificate the panel serves, and the engine's view of it.
+sudo oxpanel-panel-setup status        # certificate: automatic (…, until …)
+sudo oxpanel-ctl cert host panel       # state=issued, issuer, not_after
 ```
+
+If the cron job already ran after the upgrade (status says "installed by the
+administrator"), delete it and return to the automatic certificate with
+`sudo oxpanel-panel-setup certificate --automatic`.
 
 **Uninstall the engine, keep the tenants:** `sudo ./install.sh --uninstall` (asks first;
 `--yes` to skip the question). It removes the engine package (and the panel package, if

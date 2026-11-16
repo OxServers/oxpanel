@@ -612,10 +612,24 @@ pub async fn converge(ctx: &Ctx) -> bool {
 }
 
 /// Obtain or renew every registered name that needs it (back-off is
-/// respected). Waits for a mail-certificate sweep that is running: the
-/// periodic tasks start together, and skipping would skip every time.
-/// Returns how many certificates were installed.
+/// respected): the periodic task. Waits for a mail-certificate sweep that is
+/// running: the periodic tasks start together, and skipping would skip every
+/// time. Returns how many certificates were installed.
 pub async fn sweep(ctx: &Ctx) -> Result<usize> {
+    sweep_with(ctx, false).await
+}
+
+/// The same, asked for by the operator (`RunAutoHttps` without a domain,
+/// `oxpanel-ctl cert auto run`, which the installer runs after enabling the
+/// panel): names that are backing off are tried now too, as a run for one
+/// site is. A name that still does not resolve here or serve the probe
+/// stops at the reachability check, so the authority is still never asked
+/// for it; the failure extends its back-off as usual.
+pub async fn sweep_now(ctx: &Ctx) -> Result<usize> {
+    sweep_with(ctx, true).await
+}
+
+async fn sweep_with(ctx: &Ctx, ignore_backoff: bool) -> Result<usize> {
     if converge(ctx).await && !ctx.config.dry_run && !cfg!(test) {
         // Nginx's reload returns before its new workers answer the new
         // challenge server; the pre-check must not run against the old ones.
@@ -631,17 +645,17 @@ pub async fn sweep(ctx: &Ctx) -> Result<usize> {
     };
     let mut installed = 0;
     for reg in regs {
-        if sweep_one(ctx, &reg).await? {
+        if sweep_one(ctx, &reg, ignore_backoff).await? {
             installed += 1;
         }
     }
     Ok(installed)
 }
 
-/// One registration: nothing if its certificate is current or it is backing
-/// off; otherwise an attempt, booked into the state. Returns whether a
-/// certificate was installed.
-async fn sweep_one(ctx: &Ctx, reg: &Registration) -> Result<bool> {
+/// One registration: nothing if its certificate is current or (unless
+/// `ignore_backoff`) it is backing off; otherwise an attempt, booked into the
+/// state. Returns whether a certificate was installed.
+async fn sweep_one(ctx: &Ctx, reg: &Registration, ignore_backoff: bool) -> Result<bool> {
     let cfg = &ctx.config.host_certs;
     let (crt, key) = (cert_path(cfg, &reg.consumer), key_path(cfg, &reg.consumer));
     let mut st = load_state(&ctx.config)
@@ -661,7 +675,7 @@ async fn sweep_one(ctx: &Ctx, reg: &Registration) -> Result<bool> {
         });
         st.backoff = None;
         false
-    } else if st.backoff.as_ref().is_some_and(Backoff::waiting) {
+    } else if !ignore_backoff && st.backoff.as_ref().is_some_and(Backoff::waiting) {
         return Ok(false);
     } else {
         match named_cert::obtain(ctx, &reg.name).await {
@@ -982,6 +996,63 @@ mod tests {
         // Another name starts afresh.
         register(&h, "panel", "name=panel.example.org\nchallenges=engine\n");
         assert_eq!(sweep(&h.ctx).await.unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn an_operators_run_tries_a_name_that_is_backing_off() {
+        let h = harness().await;
+        register(&h, "panel", "name=panel.example.org\nchallenges=engine\n");
+        // The authority refuses once: the name backs off for an hour.
+        h.sys.set_acme_refuses(true);
+        assert_eq!(sweep(&h.ctx).await.unwrap(), 0);
+        let s = one(&status(&h.ctx).await.unwrap()).clone();
+        assert_eq!(s.state, State::Pending);
+        assert!(s.next_attempt_unix.unwrap() >= now_unix() + 3500);
+        h.sys.set_acme_refuses(false);
+        // The periodic task waits ...
+        h.sys.clear_calls();
+        assert_eq!(sweep(&h.ctx).await.unwrap(), 0);
+        assert!(
+            client_runs(&h).is_empty(),
+            "the periodic task respects the back-off"
+        );
+        // ... the operator's run does not.
+        assert_eq!(sweep_now(&h.ctx).await.unwrap(), 1);
+        assert_eq!(
+            client_runs(&h),
+            vec![
+                (true, vec!["panel.example.org".to_owned()]),
+                (false, vec!["panel.example.org".to_owned()])
+            ]
+        );
+        let s = one(&status(&h.ctx).await.unwrap()).clone();
+        assert!(matches!(s.state, State::Issued | State::Renewing), "{s:?}");
+        assert!(s.next_attempt_unix.is_none());
+        // A name that does not resolve: the operator's run stops at the
+        // reachability check (the authority is never asked) and backs off longer.
+        register(
+            &h,
+            "other",
+            "name=nx-other.example.org\nchallenges=engine\n",
+        );
+        sweep(&h.ctx).await.unwrap();
+        h.sys.clear_calls();
+        sweep_now(&h.ctx).await.unwrap();
+        assert_eq!(
+            client_runs(&h),
+            vec![(true, vec!["nx-other.example.org".to_owned()])],
+            "only the reachability check; the issued panel certificate is current"
+        );
+        let other = status(&h.ctx)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| s.consumer.as_str() == "other")
+            .unwrap();
+        assert!(
+            other.next_attempt_unix.unwrap() >= now_unix() + 6 * 3600 - 100,
+            "{other:?}"
+        );
     }
 
     #[tokio::test]

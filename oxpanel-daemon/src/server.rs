@@ -1005,10 +1005,11 @@ impl OxPanelEngine for Engine {
             .await
             .map_err(|e| fail(RPC, &peer, e))?;
         if everything {
-            // Host certificates too (the panel's own name, …); their result
-            // is in HostInfo.host_certificates.
+            // Host certificates too (the panel's own name, …), now, back-off
+            // or not (the operator asked); their result is in
+            // HostInfo.host_certificates.
             let ctx = self.tls.ctx.clone();
-            detached(async move { crate::host_certs::sweep(&ctx).await })
+            detached(async move { crate::host_certs::sweep_now(&ctx).await })
                 .await
                 .map_err(|e| fail(RPC, &peer, e))?;
         }

@@ -1151,6 +1151,10 @@
   sh tests-integration/run-inside.sh but not changed
 
 [HTTPS (certificates)] Host certificates
+  sh tests-acceptance/phases/product/usability.py the path unit ran oxpanel-panel-certificate.service, which succeeded
+  sh tests-acceptance/phases/product/usability.py renewal: the panel answers with the new one
+  sh tests-acceptance/phases/25-product.sh the authority was never asked for it (only the reachability check ran)
+  sh tests-acceptance/phases/25-product.sh the engine: pending, the name does not resolve, a next attempt
   unit acme the_failure_reason_is_the_clients_not_systemds
   unit host_certs registrations_are_read_strictly
   unit host_certs invalid_registration_files_are_reported_and_nothing_is_done
@@ -1161,6 +1165,8 @@
   unit host_certs due_certificates_are_renewed_and_removed_registrations_cleaned_up
   unit host_certs exposed_keys_strays_and_an_edited_challenge_file_are_drift
   unit host_certs nothing_is_requested_while_automatic_https_is_off
+  unit host_certs an_operators_run_tries_a_name_that_is_backing_off
+  sh tests-integration/run-inside.sh once it resolves, the operator's run gets it at once, back-off or not
   sh tests-integration/run-inside.sh the certificate is obtained (Pebble's 10 days: due at once, so renewing)
   sh tests-integration/run-inside.sh renewal: a due certificate is replaced by a new one
   sh tests-integration/run-inside.sh ... and never reached the authority (only the reachability check ran)
@@ -1170,6 +1176,8 @@
   sh tests-integration/run-inside.sh once unused, the removed registration's pair is removed
 
 [Backups and restores] Download
+  sh tests-acceptance/phases/product/drive.py every member's size and SHA-256 match the manifest
+  sh tests-acceptance/phases/product/usability.py the panel streams it: its memory stays flat (< 48 MiB above where it was)
   unit backup backup_members_are_read_in_chunks_and_match_the_manifest
   unit backup backup_members_are_refused_unless_they_are_the_tenants_and_unchanged
   unit backup_read only_plain_file_names_are_members
