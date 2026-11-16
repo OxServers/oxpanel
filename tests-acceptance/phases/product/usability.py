@@ -444,6 +444,7 @@ def panel_certificate(admin):
         D.check(good, "... and it is served", got)
         D.check(D.sh("systemctl", "show", "-p", "Result", "--value", "oxpanel-panel-certificate.service").stdout.strip() == "success",
                 "the certificate oneshot is not left failed", "")
+        burst_of_writes()
 
         hostname_mode(admin)
 
@@ -456,6 +457,72 @@ def panel_certificate(admin):
     n = avc_count() - avc0
     D.check(n == 0, "zero SELinux denials for the certificate oneshot, its path unit and the engine's certificate runs",
             D.sh("bash", "-c", "ausearch --input-logs -m avc -ts boot -i </dev/null 2>/dev/null | tail -30").stdout)
+
+
+def write_pair(key_bytes, crt_bytes):
+    """As the engine writes the pair: key first, then the certificate, each atomically."""
+    for p, data, mode in ((AUTO_KEY, key_bytes, 0o600), (AUTO_CRT, crt_bytes, 0o644)):
+        with open(p + ".acc", "wb") as f:
+            f.write(data)
+        os.chmod(p + ".acc", mode)
+        os.replace(p + ".acc", p)
+    D.sh("restorecon", AUTO_KEY, AUTO_CRT)
+
+
+def burst_of_writes(writes=11, gap=1.2):
+    """Writes of the pair one after the other, more than systemd's default
+    start limit (5 starts in 10 s, which stopped the path unit on the VM): the
+    path unit must keep watching, and the pair written last must be served.
+    The writes are a little apart so that each one starts the oneshot (while
+    it runs, the path unit does not watch)."""
+    good_key, good_crt = open(AUTO_KEY, "rb").read(), open(AUTO_CRT, "rb").read()
+    o_crt, o_key = make_cert("burst-other", "other.oxacc.test", ["other.oxacc.test"])
+    other_key, other_crt = open(o_key, "rb").read(), open(o_crt, "rb").read()
+    runs0, _, _ = cert_service_runs()
+    t0 = time.time()
+    for i in range(writes):
+        # Alternately a pair not for the panel's name (the fallback is chosen)
+        # and the engine's pair again; the last one is the engine's.
+        if (writes - 1 - i) % 2:
+            write_pair(other_key, other_crt)
+        else:
+            write_pair(good_key, good_crt)
+        time.sleep(gap)
+    D.info(f"burst: {writes} writes of the pair in {time.time() - t0:.1f}s")
+    # Let the oneshot settle: idle, and the panel answering with the last pair.
+    want = fp_file(AUTO_CRT)
+    settled = False
+    for _ in range(60):
+        active = D.sh("systemctl", "is-active", "oxpanel-panel-certificate.service").stdout.strip()
+        if active in ("inactive", "failed") and served_lines() == [AUTO_CRT] and fp_served(8443, PANEL_NAME) == want:
+            settled = True
+            break
+        time.sleep(0.5)
+    runs1, res, _ = cert_service_runs()
+    D.info(f"burst: the certificate oneshot ran {runs1 - runs0} times, last result {res}")
+    D.check(runs1 - runs0 >= 6, "the burst started the oneshot more often than systemd's default limit (5 in 10 s)",
+            f"{runs1 - runs0} starts")
+    path_active = D.sh("systemctl", "show", "-p", "ActiveState", "--value", "oxpanel-panel-certificate.path").stdout.strip()
+    path_result = D.sh("systemctl", "show", "-p", "Result", "--value", "oxpanel-panel-certificate.path").stdout.strip()
+    D.check(path_active == "active" and path_result == "success" and res != "start-limit-hit",
+            "a burst of certificate writes leaves the path unit watching (no start limit hit)",
+            f"path={path_active}/{path_result} service result={res}\n{why_not_switched()}")
+    D.check(settled, "after the burst the panel serves the pair written last", why_not_switched())
+    rc, out = setup("status")
+    D.check("watcher:     active" in out and "should be" not in out,
+            "status: the watcher is active and the served file is the one that applies", out[-800:])
+    # The watcher still works after the burst: a later write is followed.
+    runs2, _, _ = cert_service_runs()
+    write_pair(other_key, other_crt)
+    good, res, _ = wait_service_run(runs2, tries=40)
+    D.check(good and served_lines() == [OWN_CRT], "after the burst a single write is still followed (fallback chosen)",
+            f"{served_lines()}\n{why_not_switched()}")
+    runs3, _, _ = cert_service_runs()
+    write_pair(good_key, good_crt)
+    good, res, _ = wait_service_run(runs3, tries=40)
+    ok, got = served_becomes(8443, PANEL_NAME, fp_file(AUTO_CRT))
+    D.check(good and ok and served_lines() == [AUTO_CRT], "... and so is the engine's pair written again",
+            f"{got}\n{why_not_switched()}")
 
 
 def hostname_mode(admin):
