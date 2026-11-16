@@ -164,8 +164,13 @@ installer does that, with EPEL as an explicit decision).
 - The panel's name for its certificate: `--panel-hostname`, else the mail host
   name (with email), else `hostname -f` when it has a dot; passed as `--name`
   in port mode only to a setup tool whose usage mentions it (panel 0.2.1 does
-  not and installs as before), and not over a name the setup tool already
-  keeps. After `enable` a certificate run (`oxpanel-ctl cert auto run`, bounded
+  not and installs as before), and not over a name the setup tool kept before
+  the run (the administrator's). A name the 0.2.2 package derives while the
+  run upgrades it from 0.2.1 does not count: it is taken from the subject CN
+  of the certificate installed by hand, which ACME certificates (the engine's
+  among them) no longer carry, so it falls back to `hostname -f`. Found on the
+  VM with the owner's upgrade: the panel got a certificate for the host's own
+  name instead of the mail host name it is reached by. After `enable` a certificate run (`oxpanel-ctl cert auto run`, bounded
   by `timeout 300`, not fatal); the summary says which certificate the panel
   serves, from `oxpanel-panel-setup status`.
 

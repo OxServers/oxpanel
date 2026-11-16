@@ -50,6 +50,7 @@ OPT_IGNORE_IP="" OPT_PANEL_SCOPES="" OPT_PANEL_RPM="" OPT_REPO_URL="" OPT_ANSWER
 OPT_PANEL_PORT="" OPT_PANEL_HOSTNAME="" OPT_PANEL_ADMIN="" OPT_NO_PANEL="" OPT_PURGE_PANEL=""
 OPT_DNS="" OPT_DNS_NAMESERVERS="" OPT_DNS_CONTACT="" OPT_DNS_IPV4="" OPT_DNS_IPV6="" OPT_DISABLE_STOCK_NAMED=""
 OPT_PUBLIC_IPV4="" OPT_PUBLIC_IPV6=""
+PANEL_NAME_BEFORE=""
 DNS_KEYS='^OXPANEL_DNS(_NAMESERVERS|_SOA_CONTACT|_IPV4|_IPV6)?='
 OPT_MAIL="" OPT_MAIL_HOSTNAME="" OPT_MAIL_ANTIVIRUS="" OPT_MAIL_WEBMAIL="" OPT_PURGE_MAIL="" OPT_MAIL_RESOLVER=""
 MAIL_KEYS='^OXPANEL_MAIL(_HOSTNAME|_WEBMAIL|_ANTIVIRUS|_RESOLVER)?='
@@ -1196,9 +1197,12 @@ panel_mode_args() {
   # certificate for. Only a setup tool that knows --name (panel 0.2.2 and
   # later) is given it; an older one installs as before.
   if grep -qx 'MODE=hostname' /etc/oxpanel-panel/setup.conf 2>/dev/null && [ -z "$OPT_PANEL_PORT" ]; then return 0; fi
-  # A name the setup tool already keeps (given to it by the administrator,
-  # or by an earlier run) stays unless --panel-port is given again.
-  if grep -q '^NAME=.' /etc/oxpanel-panel/setup.conf 2>/dev/null && [ -z "$OPT_PANEL_PORT" ]; then return 0; fi
+  # A name the setup tool kept BEFORE this run (given to it by the
+  # administrator, or by an earlier run) stays unless --panel-port is given
+  # again. One its package derived while this run upgraded it from 0.2.1 does
+  # not count: it comes from the certificate's subject, which ACME
+  # certificates no longer carry, and then falls back to `hostname -f`.
+  if [ -n "$PANEL_NAME_BEFORE" ] && [ -z "$OPT_PANEL_PORT" ]; then return 0; fi
   name="$(panel_name)"
   if [ -n "$name" ] && panel_setup_knows_name; then printf -- ' --name %s' "$name"; fi
 }
@@ -1496,6 +1500,9 @@ enabled afterwards (fail2ban needs its updates). Disable it later with: dnf conf
   say "decisions: fail2ban=${OPT_FAIL2BAN:-no} epel=${OPT_EPEL:-no} quota=${OPT_QUOTA:-no} reboot=${OPT_REBOOT:-no} mariadb=$OPT_MARIADB php=$OPT_PHP nodejs=$OPT_NODEJS dns=$(dns_wanted && echo yes || echo no) mail=$(mail_wanted && echo yes || echo no)$([ "$INTERACTIVE" -eq 1 ] && echo ' (interactive)' || echo ' (unattended)')"
 
   if ! installed php-fpm && [ ! -e "$STATE_DIR/php-fpm-installed-by-installer" ]; then : >"$STATE_DIR/php-fpm-installed-by-installer"; fi
+  # The panel's name as the setup tool kept it before anything here changed
+  # (the panel stage may upgrade the panel, whose package then derives one).
+  PANEL_NAME_BEFORE="$(sed -n 's/^NAME=//p' /etc/oxpanel-panel/setup.conf 2>/dev/null | tail -1)"
   stage nodejs   "Node.js 22 module stream"                      stage_nodejs
   stage engine   "OxPanel engine package"                        stage_engine
   stage selinux  "SELinux booleans and the OxPanel policy module" stage_selinux
