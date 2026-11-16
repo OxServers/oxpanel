@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Phase 12 — upgrade (INSTALL=upgrade). Phase 10 installed the old engine by hand:
-# 0.2.0 (without email; OLD_REF=v0.2.0, the default) or 0.3.0 (OLD_REF=v0.3.0:
+# 0.2.0 (without email; OLD_REF=v0.2.0, the default), 0.3.0 (OLD_REF=v0.3.0:
 # email is then set up here with 0.3.0's own installer, and the email limits it
-# held must come through the upgrade as the 0.3.1 migration says).
+# held must come through the upgrade as the 0.3.1 migration says) or 0.3.1
+# (OLD_REF=v0.3.1: email with its installer, the filter's resolver included;
+# email, the resolver and every limit must come through exactly as they were).
 # Here: tenants and sites are created with it (static, PHP, Node.js), then the
 # release's install.sh upgrades the host. The tenants must survive with the same
 # uid and home, the sites must keep answering, and the new features must work on the
@@ -15,20 +17,36 @@ OLDV=$(rpm -q --qf '%{VERSION}-%{RELEASE}' oxpanel-daemon)
 info "installed before the upgrade: $OLDV ($(oxpanel-daemon --version))"
 check "the old engine is running" daemon_active
 
-OLD_MAIL=0
+OLD_MAIL=0; OLD_030=0
 case "$OLDV" in 0.3.*) OLD_MAIL=1;; esac
+case "$OLDV" in 0.3.0-*) OLD_030=1;; esac
+lim() { oxpanel-ctl mail limits "$1" | head -1; }
 if [ "$OLD_MAIL" = 1 ]; then
   echo "-- the old engine with email (its own installer), and email limits it holds"
   [ -f old-rpms/install.sh ] || fail "no old installer in old-rpms/ (scripts/build-old-rpm.sh copies it)"
   if bash old-rpms/install.sh --only mail --mail --mail-hostname mail.upg.test --enable-epel --yes > old-mail.log 2>&1; then ok "the old installer set email up"; else tail -30 old-mail.log; fail "old install.sh --mail failed"; fi
   eventually "the old engine reports email on" 60 1 bash -c 'oxpanel-ctl mail host | grep -q "^enabled=true "'
   for t in upgd upgv upgu; do check "account $t (old engine)" oxpanel-ctl tenant create $t; done
-  # 0.3.0 records: upgd exactly the old defaults, upgv staff's values, upgu
-  # unlimited (0 then); upg1 (created below) has none.
-  check "upgd: exactly the old defaults (0 0 500 200)" oxpanel-ctl mail limits-set upgd --max-mailboxes 0 --max-mailbox-bytes 0 --per-hour-account 500 --per-hour-mailbox 200
-  check "upgv: staff's own values (3 mailboxes, 1000 and 50 an hour)" oxpanel-ctl mail limits-set upgv --max-mailboxes 3 --max-mailbox-bytes 0 --per-hour-account 1000 --per-hour-mailbox 50
-  check "upgu: unlimited (0 in 0.3.0)" oxpanel-ctl mail limits-set upgu --max-mailboxes 0 --max-mailbox-bytes 0 --per-hour-account 0 --per-hour-mailbox 0
-  check "the old engine has no resolver for the filter (and Unbound is not installed)" bash -c '! rpm -q unbound >/dev/null && ! grep -q "^OXPANEL_MAIL_RESOLVER" /etc/oxpanel/daemon.env'
+  if [ "$OLD_030" = 1 ]; then
+    # 0.3.0 records: upgd exactly the old defaults, upgv staff's values, upgu
+    # unlimited (0 then); upg1 (created below) has none.
+    check "upgd: exactly the old defaults (0 0 500 200)" oxpanel-ctl mail limits-set upgd --max-mailboxes 0 --max-mailbox-bytes 0 --per-hour-account 500 --per-hour-mailbox 200
+    check "upgv: staff's own values (3 mailboxes, 1000 and 50 an hour)" oxpanel-ctl mail limits-set upgv --max-mailboxes 3 --max-mailbox-bytes 0 --per-hour-account 1000 --per-hour-mailbox 50
+    check "upgu: unlimited (0 in 0.3.0)" oxpanel-ctl mail limits-set upgu --max-mailboxes 0 --max-mailbox-bytes 0 --per-hour-account 0 --per-hour-mailbox 0
+  else
+    # 0.3.1 semantics: upgd follows the host default, upgv staff's values,
+    # upgu explicitly unlimited.
+    check "upgv: staff's own values (3 mailboxes, 1000 and 50 an hour)" oxpanel-ctl mail limits-set upgv --max-mailboxes 3 --max-mailbox-bytes unlimited --per-hour-account 1000 --per-hour-mailbox 50
+    check "upgu: unlimited" oxpanel-ctl mail limits-set upgu --max-mailboxes unlimited --max-mailbox-bytes unlimited --per-hour-account unlimited --per-hour-mailbox unlimited
+  fi
+  if [ "$OLD_030" = 1 ]; then
+    check "the old engine has no resolver for the filter (and Unbound is not installed)" bash -c '! rpm -q unbound >/dev/null && ! grep -q "^OXPANEL_MAIL_RESOLVER" /etc/oxpanel/daemon.env'
+  else
+    eventually "the old engine's filter has its resolver (0.3.1)" 60 1 systemctl -q is-active oxpanel-mail-resolver
+    for t in upgd upgv upgu; do lim $t; done > mail-limits.before
+    oxpanel-ctl mail defaults > mail-defaults.before
+    info "limits before the upgrade: $(tr '\n' ' ' < mail-limits.before)"
+  fi
 fi
 
 check "create a tenant with the old engine" oxpanel-ctl tenant create $T --memory 512M --tasks-max 200
@@ -54,6 +72,38 @@ mail_pkgs() { rpm -q $MAILPKGS 2>/dev/null | grep -v 'is not installed' | sort; 
 mail_pkgs > mail-pkgs.before; info "mail packages before the upgrade: $(tr '\n' ' ' < mail-pkgs.before)"
 fw_mail() { command -v firewall-cmd >/dev/null && systemctl -q is-active firewalld || return 0; firewall-cmd --list-services; firewall-cmd --permanent --list-services; firewall-cmd --list-ports; firewall-cmd --permanent --list-ports; }
 fw_mail > fw.before
+
+# ---- the owner's host (OLD_REF=v0.3.1 with OLD_PANEL_RPM and a release that
+# bundles the new panel): panel 0.2.1 in port mode; the engine's certificate for
+# the mail host name copied onto the panel by hand, and a weekly cron job that
+# repeats the copy. Certificates come from a local Pebble, never a real authority.
+OWNER=0
+OLDPANEL="$(ls old-panel/oxpanel-panel-[0-9]*.rpm 2>/dev/null | head -1)"
+if [ "$OLD_MAIL" = 1 ] && [ "$OLD_030" = 0 ] && [ -n "$OLDPANEL" ] && ls release/oxpanel-panel-[0-9]*.rpm >/dev/null 2>&1; then OWNER=1; fi
+MN=mail.upg.test; MC=/etc/pki/oxpanel-mail/$MN.crt; MK=/etc/pki/oxpanel-mail/$MN.key
+CRON=/etc/cron.weekly/oxpanel-panel-cert
+fp() { openssl x509 -in "$1" -noout -fingerprint -sha256 2>/dev/null; }
+fp_panel() { echo | openssl s_client -connect 127.0.0.1:8443 -servername "$MN" 2>/dev/null | openssl x509 -noout -fingerprint -sha256 2>/dev/null; }
+serves() { local i; for i in $(seq 1 60); do [ "$(fp_panel)" = "$(fp "$1")" ] && return 0; sleep 0.5; done; return 1; }
+export -f fp fp_panel serves; export MN
+if [ "$OWNER" = 1 ]; then
+  echo "-- the owner's host before the upgrade: $(basename "$OLDPANEL"), the mail certificate copied by hand, a weekly cron"
+  if bash old-rpms/install.sh --yes --panel-rpm "$OLDPANEL" --only panel > old-panel.log 2>&1 \
+     && bash old-rpms/install.sh --yes --panel-rpm "$OLDPANEL" --only panelweb >> old-panel.log 2>&1; then
+    ok "the 0.3.1 installer set up the 0.2.1 panel (port mode)"
+  else sed 's/\(password: *\).*/\1<masked>/' old-panel.log | tail -30; fail "old install.sh --panel-rpm failed"; fi
+  check "the panel is 0.2.1" bash -c "rpm -q --qf '%{VERSION}' oxpanel-panel | grep -qx 0.2.1"
+  echo "127.0.0.1 $MN" >> /etc/hosts
+  check "a local authority for the engine (Pebble, 10-day certificates: every sweep renews)" pebble_up 10
+  eventually "the 0.3.1 engine obtains the mail host name's certificate" 90 2 bash -c "openssl x509 -in $MC -noout -issuer | grep -qi pebble"
+  info "mail certificate: $(openssl x509 -in $MC -noout -subject -issuer -enddate | tr '\n' ' ')"
+  check "the owner copies it onto the panel by hand (0.2.1)" oxpanel-panel-setup certificate --cert "$MC" --key "$MK"
+  check "0.2.1 serves the copy" serves "$MC"
+  printf '#!/bin/sh\nc=%s; k=%s; [ -r "$c" ] && [ -r "$k" ] || exit 0; cmp -s "$c" /etc/pki/oxpanel-panel/panel.crt && exit 0; /usr/sbin/oxpanel-panel-setup certificate --cert "$c" --key "$k" >/dev/null\n' "$MC" "$MK" > "$CRON"
+  chmod 0755 "$CRON"
+  check "and the weekly cron job that repeats the copy" test -x "$CRON"
+  check "setup.conf of 0.2.1: no NAME=, no CERT=" bash -c '! grep -Eq "^(NAME|CERT)=" /etc/oxpanel-panel/setup.conf'
+fi
 
 # ---- the upgrade, as the operator would do it
 start=$(date +%s)
@@ -100,9 +150,18 @@ check "the upgrade opened nothing in the firewall" diff <(fw_mail) fw.before
 [ "$OLD_MAIL" = 1 ] || check "no mail port listens (25, 465, 587, 993, 995)" bash -c '! ss -Hltn | grep -E ":(25|465|587|993|995) "'
 [ "$OLD_MAIL" = 1 ] || check "no mail jail for login banning" test ! -e /etc/fail2ban/jail.d/50-oxpanel-mail.local
 check "PHP sends through OxPanel's sendmail, which hands non-account mail to Postfix unchanged" bash -c 'php -i 2>/dev/null | grep -q "^sendmail_path => /usr/sbin/oxpanel-daemon sendmail -t -i"'
-if [ "$OLD_MAIL" = 1 ]; then
+if [ "$OLD_MAIL" = 1 ] && [ "$OLD_030" = 0 ]; then
+  echo "-- email after the upgrade from 0.3.1: everything as it was"
+  check "email is still on" bash -c 'oxpanel-ctl mail host | grep -q "^enabled=true "'
+  eventually "the filter's resolver still runs" 60 1 systemctl -q is-active oxpanel-mail-resolver
+  check "the engine reports it" bash -c 'oxpanel-ctl mail host | head -1 | grep -q filter_resolver=true'
+  check "every account's limits are exactly as before" diff <(for t in upgd upgv upgu; do lim $t; done) mail-limits.before
+  check "the host defaults are exactly as before" diff <(oxpanel-ctl mail defaults) mail-defaults.before
+  check "upgv still has staff's values" grep -q 'max_mailboxes=3(account) .*per_hour_account=1000(account) per_hour_mailbox=50(account)' <(lim upgv)
+  for t in upgd upgv upgu; do oxpanel-ctl tenant delete $t --cascade --confirm $t --wait >/dev/null 2>&1 || true; done
+fi
+if [ "$OLD_030" = 1 ]; then
   echo "-- email after the upgrade: the limits as the migration says, no resolver until install.sh --mail"
-  lim() { oxpanel-ctl mail limits "$1" | head -1; }
   check "the upgrade installed no new mail package (no Unbound)" bash -c '! rpm -q unbound >/dev/null'
   check "the filter's resolver is not set up by the package upgrade" bash -c '! systemctl -q is-active oxpanel-mail-resolver && ! grep -q "^OXPANEL_MAIL_RESOLVER" /etc/oxpanel/daemon.env && oxpanel-ctl mail host | head -1 | grep -q filter_resolver=false'
   check "email is still on" bash -c 'oxpanel-ctl mail host | grep -q "^enabled=true "'
@@ -121,6 +180,33 @@ if [ "$OLD_MAIL" = 1 ]; then
   check "the filter asks it" grep -q '127.0.0.1:5336' /etc/rspamd/local.d/options.inc
   check "the limits are unchanged by it" grep -q 'per_hour_account=1000(account)' <(lim upgv)
   for t in upgd upgv upgu; do oxpanel-ctl tenant delete $t --cascade --confirm $t --wait >/dev/null 2>&1 || true; done
+fi
+if [ "$OWNER" = 1 ]; then
+  echo "-- the owner's host after the upgrade (engine $(rpm -q --qf '%{VERSION}' oxpanel-daemon), panel $(rpm -q --qf '%{VERSION}' oxpanel-panel))"
+  check "the panel was upgraded to the bundled one" bash -c "test \"\$(rpm -q --qf '%{VERSION}' oxpanel-panel)\" = \"\$(rpm -qp --qf '%{VERSION}' release/oxpanel-panel-[0-9]*.rpm)\""
+  info "setup.conf after the upgrade: $(grep -v '^#' /etc/oxpanel-panel/setup.conf | tr '\n' ' ')"
+  info "registration: $(grep -v '^#' /etc/oxpanel/host-certificates.d/panel.conf 2>/dev/null | tr '\n' ' ')"
+  info "the panel's certificate in the installer's summary: $(sed -n "s/^The panel's certificate: //p" upgrade.log)"
+  check "the copy was not taken for the administrator's own (no CERT=manual)" bash -c '! grep -qx CERT=manual /etc/oxpanel-panel/setup.conf'
+  check "the panel's name is the mail host name" grep -qx "NAME=$MN" /etc/oxpanel-panel/setup.conf
+  check "the engine has the panel's automatic certificate after the install run" bash -c 'oxpanel-ctl cert host panel | grep -Eqx "state=(issued|renewing)"'
+  check "the installer's summary already says automatic (the switch happens during the install run)" grep -q "^The panel's certificate: automatic (" upgrade.log
+  check "the panel serves the automatic certificate" serves /etc/pki/oxpanel-host/panel.crt
+  check "status: automatic" bash -c "oxpanel-panel-setup status | grep -q '^certificate: automatic ('"
+  check "the cron job left in place does nothing while the mail certificate is unchanged" bash -c "$CRON && ! grep -qx CERT=manual /etc/oxpanel-panel/setup.conf && serves /etc/pki/oxpanel-host/panel.crt"
+  before="$(fp "$MC")"
+  systemctl restart oxpanel-daemon
+  eventually "the engine renews the mail certificate (Pebble's 10 days are always due)" 90 2 bash -c "test \"\$(fp $MC)\" != '$before'"
+  check "after a renewal the cron job copies it again" "$CRON"
+  check "... which pins the copy as the administrator's own (CERT=manual)" grep -qx CERT=manual /etc/oxpanel-panel/setup.conf
+  check "... and serves it instead of the automatic one" serves "$MC"
+  check "status says so, and how to return" bash -c "oxpanel-panel-setup status | grep -q '^certificate: installed by the administrator.*certificate --automatic'"
+  check "the handbook's steps: delete the cron job" rm -f "$CRON"
+  check "... and return to the automatic certificate" oxpanel-panel-setup certificate --automatic
+  check "the automatic certificate is served again" serves /etc/pki/oxpanel-host/panel.crt
+  check "no AVC denial in all this" test "$(avc_count)" = 0
+  pebble_down
+  sed -i "/^127.0.0.1 $MN\$/d" /etc/hosts
 fi
 check "the new host info shows the databases" bash -c 'oxpanel-ctl host info | grep -q "^database_engine=mariadb available=true"'
 check "an SFTP key can be added to the pre-existing tenant" bash -c "ssh-keygen -q -t ed25519 -N '' -f /root/acc/upg.key && oxpanel-ctl sftp add-key $T --key-file /root/acc/upg.key.pub --label upg | grep -q '^changed=true'"

@@ -247,6 +247,10 @@ if [ "$INSTALL" = installer ] || [ "$INSTALL" = upgrade ] || [ "$INSTALL" = prod
   vm_ssh 'mkdir -p /root/acc/release'
   vm_scp "$WORK"/dist/release/. /root/acc/release/
 fi
+if [ "$INSTALL" = upgrade ] && ls "$WORK"/dist/old-panel/oxpanel-panel-[0-9]*.rpm >/dev/null 2>&1; then
+  vm_ssh 'mkdir -p /root/acc/old-panel'
+  vm_scp "$WORK"/dist/old-panel/oxpanel-panel-[0-9]*.rpm /root/acc/old-panel/
+fi
 if [ "$INSTALL" = upgrade ]; then
   ls "$WORK"/dist/old-rpms/oxpanel-daemon-[0-9]*.rpm >/dev/null 2>&1 || die "no old RPM in dist/old-rpms (make rpm-old)"
   vm_ssh 'mkdir -p /root/acc/old-rpms'

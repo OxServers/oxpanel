@@ -56,11 +56,31 @@ check "a request on the socket without the proxy secret is refused (403 direct_a
 SECRET="$(sed -n 's/^PANEL_PROXY_SECRET=//p' /etc/oxpanel-panel/secret.env)"
 check "with the secret (Nginx's view) it answers" bash -c "curl -s -H 'X-Panel-Proxy-Secret: $SECRET' --unix-socket /run/oxpanel-panel/panel.sock http://x/api/v1/health | grep -q status"
 
+# ------------------------------------------------------------ the panel's own certificate (engine 0.3.2, panel 0.2.2)
+# As install.sh left it: named after the mail host name, which does not resolve
+# on this VM, so the engine keeps it pending and never asks an authority. (The
+# drive then obtains it for real from a local Pebble: phases/product/usability.py.)
+REG=/etc/oxpanel/host-certificates.d/panel.conf; PB=/etc/nginx/conf.d/00-oxpanel-panel.conf; HP=/etc/pki/oxpanel-host
+NAME0=mail.oxacc.test; NAME1=panel.oxacc.test
+check "install.sh gave the panel its name (the mail host name); the setup tool keeps it" grep -qx "NAME=$NAME0" /etc/oxpanel-panel/setup.conf
+check "the registration: root 0644, the name, engine challenges, a redirect to the panel's port" bash -c "test \"\$(stat -c '%U %a' $REG)\" = 'root 644' && grep -qx 'name=$NAME0' $REG && grep -qx 'challenges=engine' $REG && grep -qx 'redirect_port=$PORT' $REG"
+check "the panel's address for display" grep -qx "PANEL_ADDRESS=https://$NAME0:$PORT/" /etc/oxpanel-panel/address.env
+check "the engine: pending, the name does not resolve, a next attempt" bash -c 'o="$(oxpanel-ctl cert host panel)"; grep -qx state=pending <<<"$o" && grep -q "^reason=.*resolve" <<<"$o" && grep -qE "^next_attempt=20" <<<"$o"'
+check "the authority was never asked for it (only the reachability check ran)" bash -c "! journalctl -b --no-pager -u oxpanel-daemon | grep 'ACME client finished' | grep -q 'domain=$NAME0'"
+check "no certificate files exist for it (never a placeholder)" bash -c "test ! -e $HP/panel.crt && test ! -e $HP/panel.key"
+check "the installer ran a certificate sweep after enabling the panel" grep -q 'oxpanel-ctl cert auto run' /var/log/oxpanel-install.log
+check "its summary says which certificate the panel serves" grep -q "^The panel's certificate: self-signed (automatic certificate: pending" install-1.log
+check "Nginx serves the self-signed fallback meanwhile" grep -Eq '^[[:space:]]*ssl_certificate[[:space:]]+/etc/pki/oxpanel-panel/panel.crt;' "$PB"
+check "status says so" bash -c "oxpanel-panel-setup status | grep -q '^certificate: self-signed (automatic certificate: pending'"
+check "the path unit that switches certificates is enabled and active" bash -c 'systemctl -q is-enabled oxpanel-panel-certificate.path && systemctl -q is-active oxpanel-panel-certificate.path'
+
+
 # ------------------------------------------------------------ the product
 start=$(date +%s)
 python3 phases/product/drive.py "$LOCAL" "$(sed -n 1p panel-admin.once)" "$(sed -n 2p panel-admin.once)"; rc=$?
 info "drive.py finished in $(( $(date +%s) - start ))s (exit $rc)"
 [ "$rc" = 0 ] || fail "the product drive failed (see above)"
+
 
 # ------------------------------------------------------------ a tenant against the panel (host side)
 T=panelatk

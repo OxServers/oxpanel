@@ -33,3 +33,45 @@ avc_dump() {
   journalctl -b -k --no-pager 2>/dev/null | grep 'avc:  denied' | tail -30 || true
 }
 phase_end() { if [ "$PHASE_FAILED" = 1 ]; then echo "PHASE_RESULT: FAIL"; exit 1; else echo "PHASE_RESULT: OK"; exit 0; fi; }
+# A local ACME authority (Pebble, Let's Encrypt's test server, pinned as in
+# tests-integration/run-inside.sh) for the engine on this VM, never a real one.
+# pebble_up DAYS: certificates valid DAYS days (10: always due for renewal).
+# Lines appended to daemon.env (outside the installer's block); pebble_down
+# takes them out again and stops the server.
+PEBBLE_BIN=/usr/local/bin/oxpanel-it-pebble
+PEBBLE_DIR=/usr/local/share/oxpanel-acc-pebble
+pebble_up() {
+  local days="${1:-10}" url=https://github.com/letsencrypt/pebble/releases/download/v2.10.1/pebble-linux-amd64.tar.gz
+  local sum=4f2fcb5bca8c85c9cf73ad140fccfc0d2be40bd81ab99879c79b7b8a0b4f70ed
+  mkdir -p "$PEBBLE_DIR"
+  if [ ! -x "$PEBBLE_BIN" ]; then
+    curl -sSfL -o "$PEBBLE_DIR/pebble.tar.gz" "$url" || return 1
+    echo "$sum  $PEBBLE_DIR/pebble.tar.gz" | sha256sum -c --quiet || return 1
+    tar -xzf "$PEBBLE_DIR/pebble.tar.gz" -C "$PEBBLE_DIR" && install -m0755 "$PEBBLE_DIR/pebble-linux-amd64/linux/amd64/pebble" "$PEBBLE_BIN" || return 1
+  fi
+  openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -days 30 -subj "/CN=OxPanel acceptance CA" \
+    -keyout "$PEBBLE_DIR/ca.key" -out "$PEBBLE_DIR/ca.crt" 2>/dev/null || return 1
+  openssl req -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -subj /CN=localhost \
+    -keyout "$PEBBLE_DIR/pebble.key" -out "$PEBBLE_DIR/pebble.csr" 2>/dev/null || return 1
+  printf 'subjectAltName=DNS:localhost,IP:127.0.0.1\n' > "$PEBBLE_DIR/san.ext"
+  openssl x509 -req -in "$PEBBLE_DIR/pebble.csr" -CA "$PEBBLE_DIR/ca.crt" -CAkey "$PEBBLE_DIR/ca.key" -CAcreateserial -days 30 \
+    -extfile "$PEBBLE_DIR/san.ext" -out "$PEBBLE_DIR/pebble.crt" 2>/dev/null || return 1
+  cat > "$PEBBLE_DIR/pebble.json" <<JSON
+{"pebble": {"listenAddress": "127.0.0.1:14000", "managementListenAddress": "127.0.0.1:15000",
+  "certificate": "$PEBBLE_DIR/pebble.crt", "privateKey": "$PEBBLE_DIR/pebble.key", "httpPort": 80, "tlsPort": 5001,
+  "ocspResponderURL": "", "externalAccountBindingRequired": false,
+  "profiles": {"default": {"description": "OxPanel acceptance", "validityPeriod": $((days * 86400))}}}}
+JSON
+  systemctl stop oxpanel-acc-pebble >/dev/null 2>&1 || true
+  systemd-run --unit=oxpanel-acc-pebble --collect --setenv=PEBBLE_VA_NOSLEEP=1 "$PEBBLE_BIN" -config "$PEBBLE_DIR/pebble.json" >/dev/null || return 1
+  local i; for i in $(seq 1 100); do curl -sf --cacert "$PEBBLE_DIR/ca.crt" https://localhost:14000/dir >/dev/null && break; sleep 0.1; done
+  sed -i '/^OXPANEL_ACME_\(DIRECTORY_URL\|CA_FILE\|EMAIL\)=/d' /etc/oxpanel/daemon.env
+  printf 'OXPANEL_ACME_DIRECTORY_URL=https://localhost:14000/dir\nOXPANEL_ACME_CA_FILE=%s/ca.crt\nOXPANEL_ACME_EMAIL=hostmaster@example.org\n' \
+    "$PEBBLE_DIR" >> /etc/oxpanel/daemon.env
+  systemctl restart oxpanel-daemon
+}
+pebble_down() {
+  sed -i '/^OXPANEL_ACME_\(DIRECTORY_URL\|CA_FILE\|EMAIL\)=/d' /etc/oxpanel/daemon.env
+  systemctl stop oxpanel-acc-pebble >/dev/null 2>&1 || true
+  systemctl restart oxpanel-daemon
+}

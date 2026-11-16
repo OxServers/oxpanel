@@ -5,6 +5,8 @@
 #   make acceptance                      install from git (handbook §3.2) at the current branch
 #   INSTALL=rpm make acceptance          build + install the RPM from the working tree
 #   INSTALL=installer make acceptance    build the release (make dist) and run its install.sh unattended
+#   INSTALL=product PANEL_RPM=… make acceptance   engine release + panel (phase 25 drives it)
+#   INSTALL=upgrade OLD_REF=v0.3.1 PANEL_RPM=… OLD_PANEL_RPM=… make acceptance   also old panel -> new panel
 #   INSTALL=upgrade make acceptance      hand-install the 0.2.0 RPM (OLD_REF, default v0.2.0), create
 #                                        tenants and sites, then upgrade with the release's install.sh
 #   KEEP=1 make acceptance               leave the VM running afterwards
@@ -43,7 +45,17 @@ case "$INSTALL" in
   installer|upgrade)
     podman image exists "$DEV" || { say "building dev image $DEV"; podman build -t "$DEV" -f "$ROOT/tests-integration/Containerfile" "$ROOT/tests-integration" >/dev/null; }
     say "building the release (make dist) from the working tree"
-    (cd "$ROOT" && ./scripts/dev.sh ./scripts/build-rpm.sh >/dev/null && ./scripts/make-dist.sh >/dev/null)
+    # INSTALL=upgrade with PANEL_RPM=… and OLD_PANEL_RPM=… (and OLD_REF=v0.3.1):
+    # the old engine gets the old panel, the release bundles the new one, and
+    # phase 12 upgrades both as the operator would (the owner's host: a
+    # certificate copied onto the panel by hand, a cron job repeating it).
+    rm -rf "$ROOT/dist/old-panel"
+    if [ "$INSTALL" = upgrade ] && [ -n "${OLD_PANEL_RPM:-}" ]; then
+      [ -f "$OLD_PANEL_RPM" ] && [ -f "${PANEL_RPM:-}" ] || die "OLD_PANEL_RPM needs PANEL_RPM too, both existing files"
+      mkdir -p "$ROOT/dist/old-panel"; cp -f "$OLD_PANEL_RPM" "$ROOT/dist/old-panel/"
+      say "old panel: $(basename "$OLD_PANEL_RPM"); new panel in the release: $(basename "$PANEL_RPM")"
+    fi
+    (cd "$ROOT" && ./scripts/dev.sh ./scripts/build-rpm.sh >/dev/null && PANEL_RPM="${PANEL_RPM:-}" ./scripts/make-dist.sh >/dev/null)
     if [ "$INSTALL" = upgrade ]; then say "building the old RPM (${OLD_REF:-v0.2.0})"; (cd "$ROOT" && ./scripts/build-old-rpm.sh "${OLD_REF:-v0.2.0}" >/dev/null); fi
     say "release: $(cd "$ROOT/dist/release" && ls | tr '\n' ' ')";;
   product)

@@ -28,6 +28,7 @@ import time
 import urllib.parse
 
 import mail as mail_drive
+import usability as U
 
 FAILED = 0
 CONTINUE = os.environ.get("CONTINUE", "0") == "1"
@@ -395,8 +396,9 @@ def drive_dns(admin, cust):
     switched = False
     caps = admin.get("/api/v1/host/capabilities").body or {}
     if not (caps.get("dns") or {}).get("available"):
-        p = sh("bash", "/root/acc/release/install.sh", "--yes", "--dns", *DNS_FLAGS, "--only", "dns", timeout=900)
-        check(p.returncode == 0, "the operator switches DNS hosting on with the installer", p.stdout[-1500:] + p.stderr[-500:],
+        # The command the panel's "switch it on" card and the handbook show.
+        p = sh("bash", "/root/acc/release/install.sh", "--yes", "--only", "dns,firewall", "--dns", *DNS_FLAGS, timeout=900)
+        check(p.returncode == 0, "the operator switches DNS hosting on with the installer (install.sh --only dns,firewall --dns ...)", p.stdout[-1500:] + p.stderr[-500:],
               fatal=True)
         switched = True
     res = eventually(lambda: (lambda c: ((c.get("dns") or {}).get("available") is True, c))(
@@ -434,6 +436,100 @@ def drive_dns(admin, cust):
     return switched
 
 
+# The product host as phase 10 installs it: install.sh --fail2ban --mail, no
+# --dns, no --quota, no public address. The panel's name is the mail host name
+# (install.sh: --panel-hostname, else the mail host name, else hostname -f).
+PANEL_NAME = "mail.oxacc.test"
+
+
+def drive_host_features(admin):
+    """What the panel shows of optional features that are off, before anything
+    switches them on (engine 0.3.2: public addresses, login banning, host
+    certificates in GetHostInfo)."""
+    r = admin.get("/api/v1/host")
+    h = r.body or {}
+    dns = h.get("dns") or {}
+    check(r.status == 200 and dns.get("enabled") is False and dns.get("available") is False,
+          "a host installed without DNS hosting: /host says dns.enabled=false, available=false", json.dumps(dns)[:300])
+    caps = admin.get("/api/v1/host/capabilities").body or {}
+    check((caps.get("dns") or {}).get("available") is False, "and the capabilities say dns.available=false",
+          json.dumps(caps.get("dns"))[:300])
+    check(h.get("public_ipv4") == "" and h.get("public_ipv6") == "",
+          "no public address is invented when none was installed (public_ipv4/6 empty)",
+          json.dumps({k: h.get(k) for k in ("public_ipv4", "public_ipv6")}))
+    lb = h.get("login_banning") or {}
+    check(lb.get("active") is True and "sshd" in (lb.get("jails") or []) and lb.get("detail"),
+          "login banning (installed with --fail2ban): active, the sshd jail, a detail", json.dumps(lb)[:300])
+    check("dovecot" in (lb.get("jails") or []), "with email, the mail jails are reported too", json.dumps(lb)[:300])
+    dq = h.get("disk_quota") or {}
+    check(dq.get("available") is False and "uquota" in (dq.get("detail") or ""),
+          "disk quotas (installed without --quota): not available, and the detail says what to change", json.dumps(dq)[:300])
+    pc = [c for c in (h.get("host_certificates") or []) if c.get("consumer") == "panel"]
+    check(len(pc) == 1 and pc[0].get("name") == PANEL_NAME,
+          f"the panel registered its own name ({PANEL_NAME}) for a host certificate", json.dumps(h.get("host_certificates"))[:400])
+    if pc:
+        check(pc[0].get("state") == "pending" and "resolve" in (pc[0].get("reason") or "") and pc[0].get("next_attempt"),
+              "the name does not resolve on this host: pending, with the reason and the next attempt", json.dumps(pc[0])[:400])
+        info(f"panel host certificate: {json.dumps(pc[0])}")
+    r = admin.get("/api/v1/auth/session")
+    check(r.status == 200 and r.body.get("panel_address") == f"https://{PANEL_NAME}:8443/",
+          "the session carries the panel's proper address (https://<name>:8443/)", repr(r)[:300])
+
+
+def drive_backup_download(cust, admin, backup):
+    """The backup as one tar file through the panel (ReadBackupMember behind it)."""
+    bid = backup["id"]
+    path = f"/api/v1/accounts/alice/backups/{bid}/download"
+    r = cust.get(path)
+    check(r.status == 200, "customer downloads the backup through the panel", repr(r)[:200], fatal=True)
+    h = r.headers
+    check(h.get("content-type") == "application/octet-stream" and
+          h.get("content-disposition", "").startswith(f'attachment; filename="alice-{bid}.tar"'),
+          "as an attachment named alice-<id>.tar (application/octet-stream)", repr(h)[:400])
+    check(h.get("x-content-type-options") == "nosniff" and "no-store" in h.get("cache-control", ""),
+          "with nosniff and no-store", repr(h)[:400])
+    n = backup.get("download_size_bytes")
+    check(h.get("content-length") == str(len(r.data)) and n == len(r.data),
+          "Content-Length is exact and equals the listing's download size", f"{h.get('content-length')} {len(r.data)} {n}")
+    tarf = os.path.join(WORK, "backup.tar")
+    open(tarf, "wb").write(r.data)
+    out = os.path.join(WORK, "backup-x")
+    os.makedirs(out)
+    p = sh("tar", "-tf", tarf)
+    names = p.stdout.split()
+    p2 = sh("tar", "-xf", tarf, "-C", out)
+    check(p.returncode == 0 and p2.returncode == 0 and names and names[0] == "manifest.json",
+          "a valid tar file, manifest.json first", repr(names)[:300] + p.stderr + p2.stderr)
+    try:
+        man = json.load(open(os.path.join(out, "manifest.json")))
+    except (OSError, ValueError) as e:
+        man = {}
+        fail(f"the manifest in the download is not JSON: {e!r}")
+    members = man.get("members") or []
+    check(names[1:] == [m["name"] for m in members], "then exactly the manifest's members, in its order", repr(names)[:300])
+    good = bool(members)
+    for m in members:
+        f = os.path.join(out, m["name"])
+        if not (os.path.getsize(f) == m["size_bytes"] and hashlib.sha256(open(f, "rb").read()).hexdigest() == m["sha256"]):
+            good = False
+    check(good, "every member's size and SHA-256 match the manifest", json.dumps(members)[:400])
+    disk = f"/var/lib/oxpanel-backups/alice/{bid}/manifest.json"
+    if os.path.exists(disk):
+        check(open(disk, "rb").read() == open(os.path.join(out, "manifest.json"), "rb").read(),
+              "the manifest is the engine's, byte for byte")
+    r = cust.get("/api/v1/accounts/alice/backups/b999999/download")
+    check(r.status == 404, "an unknown backup id is 404", repr(r)[:200])
+    r = cust.get(f"/api/v1/accounts/bob/backups/{bid}/download")
+    check(r.status in (403, 404), "a customer asking under another account's path is refused (403/404)", repr(r)[:200])
+    r = admin.get(f"/api/v1/accounts/bob/backups/{bid}/download")
+    check(r.status == 404, "the backup under another account (bob) is 404, even for the administrator", repr(r)[:200])
+    r = admin.get("/api/v1/audit?action=backup.download&limit=20")
+    check(r.status == 200 and any(bid in json.dumps(e) for e in (r.body or {}).get("items", [])),
+          "the download is in the audit log (backup.download)", repr(r)[:300])
+    p = sh("bash", "-c", "nginx -T 2>/dev/null | grep -A1 'backups/\\[^/\\]+/download' | grep -q 'proxy_buffering off;'")
+    check(p.returncode == 0, "Nginx streams it (proxy_buffering off on that path)")
+
+
 def sftp(key, user, batch, tries=40):
     for _ in range(tries):
         p = sh("sftp", *SSH_O, "-i", key, "-b", "-", f"{user}@127.0.0.1", inp=batch, timeout=60)
@@ -446,6 +542,7 @@ def sftp(key, user, batch, tries=40):
 def main():
     url, admin_user, admin_temp = sys.argv[1:4]
     mail_drive.bind(sys.modules[__name__])
+    U.bind(sys.modules[__name__])
     pw = {"admin": "Admin-acceptance-passphrase-1", "reseller": "Reseller-acceptance-pass-1",
           "customer": "Customer-acceptance-pass-1"}
     rss0 = None
@@ -507,6 +604,9 @@ def main():
     r = admin.post("/api/v1/host/reconcile")
     check(r.status == 200, "reconcile through the panel (administrator)", repr(r))
     info(f"reconcile before any customer: {r.raw[:300]}")
+
+    drive_host_features(admin)
+    U.off_states(admin)
 
     # ------------------------------------------------------------ plan, reseller, customer
     plan = {"name": "Standard", "memory_max_bytes": 512 * 1024 * 1024, "cpu_weight": 100, "io_weight": 0,
@@ -655,10 +755,13 @@ echo "php-ok ", PHP_VERSION, " uid=", getmyuid(), " euid=", function_exists('pos
     drive_files(cust, sites, alice_uid)
     drive_php_settings(cust, sites)
     drive_task(cust, alice_uid)
+    U.subdomains_before_dns(cust)
     dns_switched = drive_dns(admin, cust)
 
     # ------------------------------------------------------------ email (phases/product/mail.py)
     mst = mail_drive.drive_mail(url, admin, reseller, cust, plan, plan_id)
+    U.subdomains_after_dns(admin, cust, mst)
+    U.www(cust)
 
     # ------------------------------------------------------------ HTTPS
     cert = os.path.join(WORK, "c.pem")
@@ -696,6 +799,8 @@ echo "php-ok ", PHP_VERSION, " uid=", getmyuid(), " euid=", function_exists('pos
     # No explicit certificate request: the engine's default authority is Let's
     # Encrypt's production service, which a test must not call (and .test names
     # cannot be validated). Automatic HTTPS skips names that do not resolve here.
+    U.check_again_now(admin, reseller, cust, sites["php"])
+    U.panel_certificate(admin)
 
     # ------------------------------------------------------------ databases
     r = cust.post("/api/v1/accounts/alice/databases", {"suffix": "shop"})
@@ -742,6 +847,9 @@ echo "php-ok ", PHP_VERSION, " uid=", getmyuid(), " euid=", function_exists('pos
           "the backup is listed as ready", repr(r)[:300])
     backup = r.body["items"][0]
     info(f"backup: size={backup.get('size_bytes')} members={backup.get('members')} excluded={backup.get('excluded')}")
+    drive_backup_download(cust, admin, backup)
+    U.download_checks(cust, mst, admin, backup)
+    U.large_download(cust)
     mail_drive.after_backup(mst)
     open(os.path.join(files, "index.html"), "w").write("changed-after-backup\n")
     sftp(key, "alice", f"put {files}/index.html public_html/index.html\n")
@@ -835,7 +943,7 @@ echo "php-ok ", PHP_VERSION, " uid=", getmyuid(), " euid=", function_exists('pos
     r = cust.post("/api/v1/accounts/alice/deletion", {"confirm_account": "alice", "final_backup_retain_days": 0})
     check(r.status == 409 and r.code == "last_hosting_account",
           "the one-step deletion of a customer's own last account is refused too", repr(r))
-    r = reseller.post("/api/v1/accounts/alice/deletion", {"confirm_account": "alice", "final_backup_retain_days": 0})
+    r = reseller.post("/api/v1/accounts/alice/deletion", {"confirm_account": "alice", "final_backup_retain_days": 1})
     check(r.status == 202 and (r.body.get("deletion") or {}).get("id"),
           "reseller deletes the account in one step, trash, task, zones and files included (202)", repr(r), fatal=True)
     d, secs = poll_deletion(reseller, r.body["deletion"]["id"])
@@ -854,6 +962,8 @@ echo "php-ok ", PHP_VERSION, " uid=", getmyuid(), " euid=", function_exists('pos
     mail_drive.after_deletion(mst)
     mail_drive.domain_reused(mst)
     mail_drive.delete_bob(reseller, mst)
+    U.retained_restore(admin, reseller, plan_id)
+    reseller = U.reset_password(url, reseller, "north", pw["reseller"])
     if dns_switched:
         res = eventually(lambda: (lambda a: (a == "", a))(dig("alice.test", "SOA")), 30, 1)
         check(res[0] is True, "the account's zone went with it", repr(res[1]))
